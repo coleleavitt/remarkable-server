@@ -5,6 +5,7 @@ pub mod checksum;
 pub mod device;
 pub mod error;
 pub mod integrations;
+pub mod protocol;
 pub mod storage;
 pub mod types;
 pub mod readlater;
@@ -34,9 +35,31 @@ use std::path::Path;
 
 pub fn create_router(state: AppState) -> Router {
     Router::new()
+        // V1 Protocol (document-storage JSON API - firmware 1.x-2.x)
+        .route("/document-storage/json/2/docs", get(protocol::v1_list_docs))
+        .route("/document-storage/json/2/upload/request", put(protocol::v1_upload_request))
+        .route("/document-storage/json/2/upload/update-status", put(protocol::v1_update_status))
+        .route("/document-storage/json/2/delete", delete(protocol::v1_delete))
+        
+        // V1.5 Protocol (batch operations)
+        .route("/sync/v1.5/batch", post(protocol::v15_batch_sync))
+        
+        // V2 Protocol (binary with metadata)
+        .route("/sync/v2/root", get(protocol::v2_get_root))
+        .route("/sync/v2/files/{hash}", get(protocol::v2_get_file))
+        .route("/sync/v2/files/{hash}", put(protocol::v2_put_file))
+        
+        // V3 Protocol (hash-based CRDT - current production)
         .route("/sync/v3/root", get(api::get_root))
         .route("/sync/v3/files/{hash}", get(api::get_file))
         .route("/sync/v3/files/{hash}", put(api::put_file))
+        
+        // V4 Protocol (extended metadata - future)
+        .route("/sync/v4/root", get(protocol::v4_get_root))
+        .route("/sync/v4/files/{hash}", get(protocol::v4_get_file))
+        .route("/sync/v4/files/{hash}", put(protocol::v4_put_file))
+        
+        // Device management
         .route("/devices/v1", post(api::create_pairing_code))
         .route("/devices/v1", get(api::list_devices))
         .route("/devices/v1/{id}", delete(api::delete_device))
