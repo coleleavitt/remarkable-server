@@ -1,0 +1,15 @@
+# Rust
+/target/
+Cargo.lock
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Data
+/data/
+
+# OS
+.DS_Store
