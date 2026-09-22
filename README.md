@@ -213,27 +213,62 @@ See [remarkable-research](https://github.com/coleleavitt/remarkable-research) fo
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     remarkable-server                        │
-├─────────────────────────────────────────────────────────────┤
-│  Protocol Layer (V1, V1.5, V2, V3, V4)                      │
-│  ┌─────────┬─────────┬─────────┬─────────┬─────────┐       │
-│  │   V1    │  V1.5   │   V2    │   V3    │   V4    │       │
-│  │  JSON   │  Batch  │ Binary  │  CRDT   │  Meta   │       │
-│  └────┬────┴────┬────┴────┬────┴────┬────┴────┬────┘       │
-│       │         │         │         │         │             │
-│       └─────────┴─────────┴────┬────┴─────────┘             │
-│                                │                             │
-│  ┌─────────────────────────────┴──────────────────────────┐ │
-│  │              Unified Storage Backend                    │ │
-│  │     (Hash-based, CRC32C, Content-addressable)          │ │
-│  └─────────────────────────────────────────────────────────┘ │
-├─────────────────────────────────────────────────────────────┤
-│  Feature Modules:                                            │
-│  • FTS5 Search  • Calendar  • Integrations  • Versions      │
-│  • Read-Later   • RSS/Feeds • Device Mgmt   • GraphQL       │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph clients["Client Devices"]
+        rm1["RM1<br/>Firmware 1.x-2.x"]
+        rm2["RM2<br/>Firmware 3.x"]
+        pp["Paper Pro<br/>Firmware 3.x+"]
+        future["Future Devices<br/>Firmware 4.x"]
+    end
+
+    subgraph protocol["Protocol Layer"]
+        v1["V1<br/>JSON API"]
+        v15["V1.5<br/>Batch"]
+        v2["V2<br/>Binary"]
+        v3["V3<br/>CRDT"]
+        v4["V4<br/>Extended Meta"]
+    end
+
+    subgraph storage["Unified Storage Backend"]
+        hash["Hash-based<br/>Content-Addressable"]
+        crc["CRC32C<br/>Checksums"]
+        files["File Storage"]
+    end
+
+    subgraph features["Feature Modules"]
+        search["FTS5 Search"]
+        calendar["Calendar"]
+        integrations["Cloud Integrations"]
+        versions["Version History"]
+        readlater["Read-it-Later"]
+        feeds["RSS/Feeds"]
+        devices["Device Mgmt"]
+        graphql["GraphQL API"]
+    end
+
+    rm1 --> v1
+    rm2 --> v3
+    pp --> v3
+    future --> v4
+
+    v1 --> hash
+    v15 --> hash
+    v2 --> hash
+    v3 --> hash
+    v4 --> hash
+
+    hash --> crc
+    crc --> files
+
+    files --> search
+    files --> calendar
+    files --> integrations
+    files --> versions
+    files --> readlater
+    files --> feeds
+    files --> devices
+    files --> graphql
 ```
 
 ## Related Projects
