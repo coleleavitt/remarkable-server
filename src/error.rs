@@ -16,6 +16,9 @@ pub enum ServerError {
     #[error("Invalid code: {0}")] InvalidCode(String),
     #[error("Token error: {0}")] TokenError(String),
     #[error("Internal error: {0}")] Internal(String),
+    #[error("Email error: {0}")] Email(String),
+    #[error("IO error: {0}")] Io(String),
+    #[error("Config error: {0}")] Config(String),
 }
 
 impl From<rusqlite::Error> for ServerError {
@@ -39,6 +42,9 @@ impl IntoResponse for ServerError {
             Self::InvalidCode(m) => (StatusCode::BAD_REQUEST, "invalid_code", Some(m.clone())),
             Self::TokenError(m) => (StatusCode::INTERNAL_SERVER_ERROR, "token_error", Some(m.clone())),
             Self::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error", Some(m.clone())),
+            Self::Email(m) => (StatusCode::INTERNAL_SERVER_ERROR, "email_error", Some(m.clone())),
+            Self::Io(m) => (StatusCode::INTERNAL_SERVER_ERROR, "io_error", Some(m.clone())),
+            Self::Config(m) => (StatusCode::BAD_REQUEST, "config_error", Some(m.clone())),
         };
         (status, Json(ErrorBody { error: err.into(), details: det })).into_response()
     }

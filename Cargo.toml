@@ -27,7 +27,22 @@ anyhow = "1"
 parking_lot = "0.12"
 uuid = { version = "1", features = ["v4"] }
 
-[dev-dependencies]
-reqwest = { version = "0.12", features = ["json"] }
+# Cloud and integration dependencies
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+async-trait = "0.1"
+urlencoding = "2"
+
+# Feed sync dependencies
+feed-rs = "2"
+readability = "0.3"
+epub-builder = "0.7"
+imap = "3.0.0-alpha.15"
+native-tls = "0.2"
+mailparse = "0.15"
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-native-tls"] }
+
+# Utilities
 tempfile = "3"
+
+[dev-dependencies]
 tokio-test = "0.4"

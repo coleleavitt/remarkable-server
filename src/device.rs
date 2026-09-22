@@ -120,5 +120,31 @@ impl DeviceManager {
         jsonwebtoken::encode(&header, &claims, &self.inner.encoding_key)
             .map_err(|e| ServerError::TokenError(e.to_string()))
     }
+    
+    /// Get a device by ID
+    pub fn get_device(&self, device_id: &str) -> Result<Option<Device>> {
+        let conn = self.inner.conn.lock();
+        match conn.query_row(
+            "SELECT device_id, device_desc, registered_at, last_refresh, user_id FROM devices WHERE device_id = ?",
+            params![device_id],
+            |row| {
+                Ok(Device {
+                    device_id: row.get(0)?,
+                    device_desc: row.get(1)?,
+                    registered_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(2)?)
+                        .map(|d| d.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now()),
+                    last_refresh: DateTime::parse_from_rfc3339(&row.get::<_, String>(3)?)
+                        .map(|d| d.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now()),
+                    user_id: row.get(4)?,
+                })
+            },
+        ) {
+            Ok(device) => Ok(Some(device)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(ServerError::Database(e.to_string())),
+        }
+    }
 
 }
