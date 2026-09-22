@@ -1,5 +1,5 @@
 use anyhow::Result;
-use remarkable_server::{create_router, AppState, DeviceManager, IntegrationStore, ServerConfig, Storage};
+use remarkable_server::{create_router, AppState, DeviceManager, ServerConfig, Storage};
 use std::env;
 use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -14,22 +14,15 @@ async fn main() -> Result<()> {
     
     std::fs::create_dir_all(&config.storage_path)?;
     
-    // Initialize storage
     let storage = Storage::new(&config.storage_path)?;
     let stats = storage.stats();
     tracing::info!("Storage: {} files, {} bytes", stats.file_count, stats.total_bytes);
     
-    // Initialize device manager  
     let db_path = PathBuf::from(&config.storage_path).join("devices.db");
     let devices = DeviceManager::new(&db_path, &config.region, &config.bind)?;
     tracing::info!("Devices: {} registered", devices.list_devices()?.len());
     
-    // Initialize integrations
-    let integrations_db = PathBuf::from(&config.storage_path).join("integrations.db");
-    let integrations = IntegrationStore::new(&integrations_db)?;
-    tracing::info!("Integrations store initialized");
-    
-    let state = AppState::new(storage, devices, integrations);
+    let state = AppState::new(storage, devices);
     let router = create_router(state);
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
     tracing::info!("Listening on http://{}", config.bind);
