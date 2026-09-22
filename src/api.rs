@@ -4,10 +4,10 @@ use crate::types::{DeviceInfo, DeviceRegisterRequest, PairingCodeResponse, SyncR
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
-pub struct AppState { pub storage: Storage, pub devices: DeviceManager }
+pub struct AppState { pub storage: Storage, pub devices: DeviceManager, pub tree_cache: TreeCache }
 
 impl AppState {
-    pub fn new(storage: Storage, devices: DeviceManager) -> Self { Self { storage, devices } }
+    pub fn new(storage: Storage, devices: DeviceManager) -> Self { Self { storage, devices, tree_cache: TreeCache::new() } }
     fn auth_user(&self, headers: &HeaderMap) -> Result<String> {
         self.devices.validate_token(headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).ok_or(ServerError::Unauthorized)?)
     }
@@ -76,4 +76,10 @@ pub async fn create_test_user(State(state): State<AppState>, Json(body): Json<Cr
     let code = state.devices.create_pairing_code(&user_id)?;
     let (dt, ut) = state.devices.exchange_code(&code, &format!("TEST-{}", &uuid::Uuid::new_v4().to_string()[..8]), "test-client")?;
     Ok(Json(CreateUserResponse { user_id, device_token: dt, user_token: ut }))
+}
+
+/// GET /gentree/v1/ - Generate document tree
+pub async fn get_document_tree(State(state): State<AppState>) -> Result<Json<DocumentTree>> {
+    let tree = state.tree_cache.get_or_compute(&state.storage)?;
+    Ok(Json(tree))
 }

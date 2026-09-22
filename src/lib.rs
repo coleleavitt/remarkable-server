@@ -1,4 +1,6 @@
 pub mod api;
+pub mod calendar;
+pub mod calendar_api;
 pub mod checksum;
 pub mod device;
 pub mod error;
@@ -6,13 +8,17 @@ pub mod storage;
 pub mod types;
 
 pub use api::AppState;
+pub use calendar::{Calendar, CalendarManager, CalendarConfig, CalendarProvider};
+pub use calendar_api::CalendarState;
 pub use device::DeviceManager;
 pub use error::{Result, ServerError};
 pub use storage::Storage;
 
 use axum::{routing::{delete, get, post, put}, Router};
 use tower_http::trace::TraceLayer;
+use std::path::Path;
 
+/// Create router with sync endpoints only
 pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/sync/v3/root", get(api::get_root))
@@ -34,12 +40,61 @@ pub fn create_router(state: AppState) -> Router {
         .layer(TraceLayer::new_for_http())
 }
 
+/// Create calendar sub-router
+fn calendar_router(state: CalendarState) -> Router {
+    Router::new()
+        .route("/", get(calendar_api::list_calendars))
+        .route("/", post(calendar_api::add_calendar))
+        .route("/upcoming", get(calendar_api::get_upcoming_events))
+        .route("/sync-all", post(calendar_api::sync_all_calendars))
+        .route("/:id", get(calendar_api::get_calendar))
+        .route("/:id", delete(calendar_api::delete_calendar))
+        .route("/:id/events", get(calendar_api::get_events))
+        .route("/:id/sync", post(calendar_api::sync_calendar_endpoint))
+        .route("/:id/meeting-notes", get(calendar_api::list_meeting_notes))
+        .route("/:id/events/:event_id/meeting-notes", post(calendar_api::create_meeting_note))
+        .route("/webhook", post(calendar_api::calendar_webhook))
+        .with_state(state)
+}
+
+/// Create router with calendar integration
+pub fn create_router_with_calendar(state: AppState, calendar_state: CalendarState) -> Router {
+    let sync_router = Router::new()
+        .route("/sync/v3/root", get(api::get_root))
+        .route("/sync/v3/files/{hash}", get(api::get_file))
+        .route("/sync/v3/files/{hash}", put(api::put_file))
+        .route("/devices/v1", post(api::create_pairing_code))
+        .route("/devices/v1", get(api::list_devices))
+        .route("/devices/v1/{id}", delete(api::delete_device))
+        .route("/token/json/2/user/new", post(api::refresh_token))
+        .route("/token/json/2/device/new", post(api::register_device))
+        .route("/token/json/3/device/delete", post(api::delete_device_token))
+        .route("/discovery/v1/endpoints", get(api::discovery))
+        .route("/service/json/1/document-storage", get(api::discovery))
+        .route("/admin/create-user", post(api::create_test_user))
+        .route("/health", get(api::health))
+        .route("/debug/files", get(api::list_files))
+        .route("/debug/clear", delete(api::clear_storage))
+        .with_state(state);
+    
+    sync_router
+        .nest("/integrations/v2/calendars", calendar_router(calendar_state))
+        .layer(TraceLayer::new_for_http())
+}
+
+/// Initialize calendar manager
+pub fn init_calendar_manager(storage_path: &Path) -> anyhow::Result<CalendarManager> {
+    let db_path = storage_path.join("calendars.db");
+    Ok(CalendarManager::new(&db_path)?)
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub bind: String,
     pub storage_path: String,
     pub db_path: String,
     pub region: String,
+    pub enable_calendar: bool,
 }
 
 impl Default for ServerConfig {
@@ -49,6 +104,7 @@ impl Default for ServerConfig {
             storage_path: "./remarkable-storage".into(),
             db_path: "./remarkable-storage/devices.db".into(),
             region: "local".into(),
+            enable_calendar: true,
         }
     }
 }

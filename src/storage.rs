@@ -142,6 +142,14 @@ impl Storage {
         self.inner.filename_map.read().get(filename).cloned()
     }
     
+    /// Get filename for a given hash (reverse lookup)
+    pub fn filename_for_hash(&self, hash: &str) -> Option<String> {
+        let map = self.inner.filename_map.read();
+        map.iter()
+            .find(|(_, h)| h.as_str() == hash)
+            .map(|(f, _)| f.clone())
+    }
+    
     /// Store file and return its hash
     pub fn put(&self, data: &[u8], filename: &str) -> Result<String> {
         // Calculate SHA-256 hash
@@ -284,6 +292,19 @@ impl Storage {
         }
         
         Ok(())
+    }
+    
+    /// List all stored files with hash, filename, and size
+    pub fn list(&self) -> Vec<(String, String, usize)> {
+        let filename_map = self.inner.filename_map.read();
+        filename_map.iter().filter_map(|(filename, hash)| {
+            let path = self.inner.base_path.join("blobs").join(&hash[..2]).join(hash);
+            if let Ok(metadata) = std::fs::metadata(&path) {
+                Some((hash.clone(), filename.clone(), metadata.len() as usize))
+            } else {
+                None
+            }
+        }).collect()
     }
 }
 
