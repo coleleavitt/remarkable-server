@@ -69,7 +69,7 @@ struct IdTokenClaims {
 impl DeviceManager {
     pub fn new<P: AsRef<Path>>(db_path: P, region: &str, issuer: &str) -> Result<Self> {
         let conn = Connection::open(db_path)?;
-        conn.execute_batch("CREATE TABLE IF NOT EXISTS devices (device_id TEXT PRIMARY KEY, device_desc TEXT NOT NULL, registered_at TEXT NOT NULL, last_refresh TEXT NOT NULL, user_id TEXT NOT NULL); CREATE TABLE IF NOT EXISTS pending_codes (code TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS passcode_resets (request_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, device_id TEXT NOT NULL, device_name TEXT NOT NULL, created TEXT NOT NULL, expires TEXT NOT NULL, approved INTEGER NOT NULL DEFAULT 0);")?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS devices (device_id TEXT PRIMARY KEY, device_desc TEXT NOT NULL, registered_at TEXT NOT NULL, last_refresh TEXT NOT NULL, user_id TEXT NOT NULL); CREATE TABLE IF NOT EXISTS pending_codes (code TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS passcode_resets (request_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, device_id TEXT NOT NULL, device_name TEXT NOT NULL, created TEXT NOT NULL, expires TEXT NOT NULL, approved INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS mdm_instructions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, data_key TEXT, data_value TEXT, status TEXT NOT NULL DEFAULT 'pending', detail TEXT, created TEXT NOT NULL);")?;
         // One signing key for every token. Defaults to DEFAULT_JWT_SECRET so tokens already issued stay valid.
         let secret = std::env::var("JWT_SECRET").map(String::into_bytes).unwrap_or_else(|_| DEFAULT_JWT_SECRET.to_vec());
         let encoding_key = jsonwebtoken::EncodingKey::from_secret(&secret);
@@ -116,6 +116,43 @@ impl DeviceManager {
         Ok(devices)
     }
     pub fn delete_device(&self, device_id: &str) -> Result<bool> { let conn = self.inner.conn.lock(); Ok(conn.execute("DELETE FROM devices WHERE device_id = ?", params![device_id])? > 0) }
+
+    // ---- MDM instruction queue (enterprise device management, /mdm/v1) ----
+    /// Enqueue an instruction for the user's devices; returns its id.
+    pub fn mdm_enqueue(&self, user_id: &str, name: &str, key: Option<&str>, value: Option<&str>) -> Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let conn = self.inner.conn.lock();
+        conn.execute(
+            "INSERT INTO mdm_instructions (id, user_id, name, data_key, data_value, status, created) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+            params![id, user_id, name, key, value, Utc::now().to_rfc3339()],
+        )?;
+        Ok(id)
+    }
+
+    /// Oldest still-pending instruction for the user: (id, name, key, value).
+    pub fn mdm_next_pending(&self, user_id: &str) -> Result<Option<(String, String, Option<String>, Option<String>)>> {
+        let conn = self.inner.conn.lock();
+        let mut stmt = conn.prepare("SELECT id, name, data_key, data_value FROM mdm_instructions WHERE user_id = ? AND status = 'pending' ORDER BY created ASC LIMIT 1")?;
+        let mut rows = stmt.query(params![user_id])?;
+        match rows.next()? {
+            Some(r) => Ok(Some((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))),
+            None => Ok(None),
+        }
+    }
+
+    /// Record a device-reported status for an instruction.
+    pub fn mdm_set_status(&self, id: &str, status: &str, detail: Option<&str>) -> Result<bool> {
+        let conn = self.inner.conn.lock();
+        Ok(conn.execute("UPDATE mdm_instructions SET status = ?, detail = ? WHERE id = ?", params![status, detail, id])? > 0)
+    }
+
+    /// All instructions for the user: (id, name, status, detail).
+    pub fn mdm_list(&self, user_id: &str) -> Result<Vec<(String, String, String, Option<String>)>> {
+        let conn = self.inner.conn.lock();
+        let mut stmt = conn.prepare("SELECT id, name, status, detail FROM mdm_instructions WHERE user_id = ? ORDER BY created ASC")?;
+        let rows = stmt.query_map(params![user_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.filter_map(|x| x.ok()).collect();
+        Ok(rows)
+    }
     fn gen_device_token(&self, device_id: &str, device_desc: &str, user_id: &str) -> Result<String> {
         let now = Utc::now().timestamp();
         encode(&Header::new(Algorithm::HS256), &DeviceTokenClaims { sub: "rM Device Token".into(), iss: self.inner.issuer.clone(), iat: now, nbf: now, jti: uuid::Uuid::new_v4().to_string(), device_id: device_id.into(), device_desc: device_desc.into(), auth0_userid: user_id.into() }, &self.inner.encoding_key).map_err(|e| ServerError::TokenError(e.to_string()))

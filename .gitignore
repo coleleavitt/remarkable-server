@@ -20,3 +20,4 @@ Cargo.lock
 # Local sync data (real notebooks) and device DB - never commit
 /test-storage/
 /remarkable-storage/
+/crash-dumps/

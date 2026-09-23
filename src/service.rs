@@ -78,7 +78,6 @@ pub async fn search_error(State(state): State<AppState>, headers: HeaderMap, Jso
 }
 
 /// Enterprise device management (mdm-agent): no instructions are ever queued locally.
-pub async fn mdm_no_instruction() -> StatusCode { StatusCode::NO_CONTENT }
 
 /// Third-party storage integrations (Google Drive, Dropbox, ...). None are configured.
 pub async fn list_integrations(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Value>> {

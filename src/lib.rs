@@ -16,6 +16,8 @@ pub mod screenshare;
 pub mod screenshare_rest;
 pub mod gentree;
 pub mod oauth;
+pub mod mdm;
+pub mod crash;
 pub mod service;
 pub mod share_email;
 pub mod share_link;
@@ -177,9 +179,13 @@ pub fn create_router(state: AppState) -> Router {
         .route("/search/v1/settings", get(service::get_search_settings).patch(service::patch_search_settings))
         .route("/search/v1/error", post(service::search_error))
         // mdm-agent polling: nothing to do
-        .route("/mdm/v1/instruction", get(service::mdm_no_instruction))
-        .route("/mdm/devices/v0/instruction", get(service::mdm_no_instruction))
-        .route("/mdm/v1/instruction/status", post(service::mdm_no_instruction))
+        // MDM instruction queue (enterprise device management) + crash-report sink
+        .route("/mdm/v1/instruction", get(mdm::get_instruction))
+        .route("/mdm/devices/v0/instruction", get(mdm::get_instruction))
+        .route("/mdm/v1/instruction/status", post(mdm::post_status))
+        .route("/admin/mdm/enqueue", post(mdm::admin_enqueue))
+        .route("/admin/mdm/instructions", get(mdm::admin_list))
+        .route("/post", post(crash::upload).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)))
         .route("/settings/v1/features", get(service::get_beta))
         // Telemetry / analytics (ping.remarkable.com) - accepted and dropped
         .route("/v1/reports", post(service::null_report))
