@@ -197,6 +197,7 @@ pub fn create_router(state: AppState) -> Router {
         // Third-party integrations (none configured)
         .route("/integrations/v1/", get(service::list_integrations))
         .route("/integrations/v2/instances", get(service::list_integrations))
+        .route("/integrations/v2/messaging/{instance_id}/message", post(service::send_integration_message))
         .route("/updates/v1/check", get(api::check_updates))
         .route("/updates/check", get(api::check_updates))
         .with_state(state)
@@ -294,7 +295,8 @@ pub fn create_router_with_integrations(
         .route("/debug/files", get(api::list_files))
         .route("/debug/clear", delete(api::clear_storage))
         .with_state(state)
-        .nest("/integrations/v2/cloud", integration_router(integration_state))
+        .nest("/integrations/v2/cloud", integration_router(integration_state.clone()))
+        .nest("/integrations/v2/storage", integration_router(integration_state))
         .layer(TraceLayer::new_for_http())
 }
 
@@ -322,7 +324,8 @@ pub fn create_full_router(
         .route("/debug/clear", delete(api::clear_storage))
         .with_state(state)
         .nest("/integrations/v2/calendars", calendar_router(calendar_state))
-        .nest("/integrations/v2/cloud", integration_router(integration_state))
+        .nest("/integrations/v2/cloud", integration_router(integration_state.clone()))
+        .nest("/integrations/v2/storage", integration_router(integration_state))
         .layer(TraceLayer::new_for_http())
 }
 
@@ -405,7 +408,8 @@ pub fn feature_routes(state: AppState, storage_path: &Path, email: Option<email:
         .nest("/versions/v1", versions::version_router(versions))
         .nest("/integrations/v2/calendars", calendar_router(CalendarState::new(init_calendar_manager(storage_path)?)))
         .nest("/integrations/v2/readlater", readlater_router(ReadLaterState::new(init_readlater_manager(storage_path)?)))
-        .nest("/integrations/v2/cloud", integration_router(IntegrationState::new()));
+        .nest("/integrations/v2/cloud", integration_router(IntegrationState::new()))
+        .nest("/integrations/v2/storage", integration_router(IntegrationState::new()));
 
     if let Some(server) = email {
         router = router.nest("/email/v1", Router::new()

@@ -86,6 +86,22 @@ pub async fn list_integrations(State(state): State<AppState>, headers: HeaderMap
 }
 
 /// `/discovery/v1/webapp`: the device only uses the host (https, no port).
+
+/// Messaging integration: POST /integrations/v2/messaging/{instance_id}/message
+/// Used to send documents via messaging services (Slack, email, etc.).
+/// No integrations are configured locally, so this accepts but does nothing.
+pub async fn send_integration_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(instance_id): axum::extract::Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>> {
+    state.auth_user(&headers)?;
+    tracing::info!(instance_id = %instance_id, "messaging integration message (no-op)");
+    Ok(Json(json!({ "status": "ok", "instance_id": instance_id })))
+}
+
+
 pub async fn discovery_webapp(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "Host": state.devices.get_endpoint(), "Status": "OK" }))
 }

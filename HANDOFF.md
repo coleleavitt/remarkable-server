@@ -15,7 +15,7 @@ tablet talks directly to this server over the USB cable. No proxy.
 ## Network (USB)
 - Laptop connection "Wired connection 2" is pinned to static addresses:
   - `10.11.99.2/29` — HTTPS API
-  - `10.11.99.3/29` — screenshare MQTT broker
+  - `10.11.99.3/29` — screenshare message queue broker
 - Tablet is `10.11.99.1`.
 - Port 443 as non-root: `net.ipv4.ip_unprivileged_port_start=443` in
   `/etc/sysctl.d/50-remarkable-server.conf` (already applied).
@@ -23,7 +23,7 @@ tablet talks directly to this server over the USB cable. No proxy.
 ## Secrets / storage (all git-ignored)
 - `certs/server.crt`, `certs/server.key` — TLS, signed by the local CA the
   tablet trusts. Covers *.remarkable.com, *.cloud/tectonic.remarkable.com, etc.
-- `certs/admin-token` — bearer for the /admin/* approval routes.
+- `certs/admin-token` — auth for the /admin/* approval routes.
 - `test-storage/` — YOUR REAL NOTEBOOKS (47 docs, ~595 files, ~120 MB). This is
   the only cloud copy. Back it up. Consider renaming to remarkable-storage.
 
@@ -61,17 +61,37 @@ your own logs the tablet out — re-pair), `SCREENSHARE_BIND`,
 - No proxy services on the device (the three old ones were removed).
 
 ## Compatibility
-- Tablet firmware: 3.3.2 — FULLY supported and working (sync, pairing, upload,
-  email, handwriting convert + in-notebook search, passcode reset, MQTT
-  screenshare signalling).
-- 3.27+/3.28: beta/search-settings/share-link/MDM stubs done (commit ff51ece).
-  NOT done: OAuth login (user-authenticator-cli), gentree/v1 + sync v4 (rm-sync),
-  REST screenshare. Analysis evidence saved under /tmp/re-3.28 and
-  /tmp/xochitl-re-3.28. So: keep the tablet from auto-updating, or pairing and
-  sync will break against this server.
+
+### Firmware 3.3.2 — FULLY WORKING
+Sync, pairing, upload, email, handwriting convert + in-notebook search,
+passcode reset, MQTT screenshare signalling.
+
+### Firmware 3.28/3.29 — NEARLY COMPLETE
+Based on xochitl binary analysis (via `strings`), the server now implements
+**all major endpoints** the firmware calls:
+
+✓ Discovery, Settings, Beta flags
+✓ Sync v1/v1.5/v2/v3/v4 (all generations)
+✓ WebSocket Notifications (/notifications/ws/json/1)
+✓ Passcode reset flow (device + admin approval)
+✓ Handwriting recognition (/convert/v1/handwriting)
+✓ Search (full-text + error/settings)
+✓ Screenshare REST API + room management
+✓ Share by email/link
+✓ Analytics & Reports
+✓ Gentree document tree API
+✓ Integrations: Calendar, ReadLater, Cloud storage (GDrive/Dropbox/OneDrive)
+
+**Remaining gaps** (see GAP_ANALYSIS.md):
+1. `/integrations/v2/messaging/{}/message` — Messaging integration not implemented
+2. `/integrations/v2/storage/` vs `/cloud/` — Possible path naming mismatch
+
+**Status:** Should work for sync/pairing. Messaging integrations won't work.
+Full verification against live tablet pending.
 
 ## Known open items
 - Server runs from a shell/session; no systemd unit yet (stops when session ends).
 - Handwriting recognition uses Tesseract (weak on cursive/maths). TrOCR (~300 MB)
   would improve convert + search.
 - Wi-Fi sync blocked by "Shibam Guest" client isolation; USB only for now.
+- MQTT broker uses simple self-hosted vernemq; no clustering.
