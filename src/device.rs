@@ -12,6 +12,11 @@ const DEFAULT_JWT_SECRET: &[u8] = b"remarkable-local-server-secret-key-v1";
 const USER_TOKEN_LIFETIME: i64 = 3 * 60 * 60;
 const CODE_LIFETIME: i64 = 10 * 60;
 const BLOB_URL_LIFETIME_MINUTES: i64 = 60;
+/// Scopes as xochitl 3.3.2 parses them (sub_4AF728 and helpers): `hwc` and `mail` are
+/// looked up by *substring* and must carry a number (non-zero enables; -1 = unlimited),
+/// e.g. a bare `hwc` fails to parse and leaves handwriting conversion off.
+/// `sync:fox` selects the sync tier; `intgr`/`docedit`/`screenshare` are plain flags.
+const USER_SCOPES: &str = "intgr docedit screenshare sync:fox hwc:-1 mail:-1";
 
 #[derive(Clone)]
 pub struct DeviceManager { inner: Arc<Inner> }
@@ -33,7 +38,7 @@ struct DeviceTokenClaims { sub: String, iss: String, iat: i64, nbf: i64, jti: St
 struct UserTokenClaims { sub: String, iss: String, iat: i64, exp: i64, nbf: i64, jti: String, #[serde(rename = "https://auth.remarkable.com/tectonic")] tectonic: String, scopes: String, #[serde(rename = "auth0-profile")] auth0_profile: Auth0Profile, #[serde(rename = "device-id")] device_id: String, #[serde(rename = "device-desc")] device_desc: String, #[serde(rename = "https://auth.remarkable.com/subscription")] subscription: SubscriptionClaim }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Auth0Profile { #[serde(rename = "UserID")] user_id: String, #[serde(rename = "Email")] email: String, #[serde(rename = "IsConnected")] is_connected: bool, #[serde(rename = "IsBeta")] is_beta: bool }
+struct Auth0Profile { #[serde(rename = "UserID")] user_id: String, #[serde(rename = "Email")] email: String, #[serde(rename = "Name", default)] name: String, #[serde(rename = "Nickname", default)] nickname: String, #[serde(default)] level: String, #[serde(rename = "IsConnected")] is_connected: bool, #[serde(rename = "IsBeta")] is_beta: bool }
 
 /// Tablet-facing passcode reset request (field names match the cloud API).
 #[derive(Debug, Clone, Serialize)]
@@ -108,7 +113,7 @@ impl DeviceManager {
     }
     fn gen_user_token(&self, device_id: &str, device_desc: &str, user_id: &str) -> Result<String> {
         let now = Utc::now().timestamp();
-        encode(&Header::new(Algorithm::HS256), &UserTokenClaims { sub: user_id.into(), iss: self.inner.issuer.clone(), iat: now, exp: now + USER_TOKEN_LIFETIME, nbf: now, jti: uuid::Uuid::new_v4().to_string(), tectonic: self.inner.region.clone(), scopes: "intgr hwcmail:-1 hwc sync:fox screenshare mail:-1".into(), auth0_profile: Auth0Profile { user_id: user_id.into(), email: format!("local@{}", self.inner.issuer), is_connected: true, is_beta: false }, device_id: device_id.into(), device_desc: device_desc.into(), subscription: SubscriptionClaim { status: "active".into(), plan: "connect".into() } }, &self.inner.encoding_key).map_err(|e| ServerError::TokenError(e.to_string()))
+        encode(&Header::new(Algorithm::HS256), &UserTokenClaims { sub: user_id.into(), iss: self.inner.issuer.clone(), iat: now, exp: now + USER_TOKEN_LIFETIME, nbf: now, jti: uuid::Uuid::new_v4().to_string(), tectonic: self.inner.region.clone(), scopes: USER_SCOPES.into(), auth0_profile: Auth0Profile { user_id: user_id.into(), email: format!("local@{}", self.inner.issuer), name: user_id.into(), nickname: user_id.into(), level: "connect".into(), is_connected: true, is_beta: false }, device_id: device_id.into(), device_desc: device_desc.into(), subscription: SubscriptionClaim { status: "active".into(), plan: "connect".into() } }, &self.inner.encoding_key).map_err(|e| ServerError::TokenError(e.to_string()))
     }
     fn decode_device_token(&self, token: &str) -> Result<DeviceTokenClaims> {
         let mut val = Validation::new(Algorithm::HS256); val.validate_exp = false; val.set_required_spec_claims(&["sub", "iss", "iat"]);

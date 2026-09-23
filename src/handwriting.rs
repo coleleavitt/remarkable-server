@@ -141,15 +141,22 @@ pub(crate) async fn recognize(strokes: &[Points]) -> Result<Vec<Word>> {
     Ok(parse_tsv(&tesseract(&png, TESSERACT_LANG).await?, &frame))
 }
 
-/// Words -> JIIX text block (spaces/newlines as separator words, like MyScript).
+/// Words -> JIIX, in the shape xochitl's parser reads (sub_4A155C, 3.3.2):
+/// `root.elements[]` with `type == "Text"`, each with a `bounding-box {x,y,width,height}`
+/// and `words[]`; a line break is a word labelled `"\n"` whose `reflow-label` is used
+/// when text is reflowed (MyScript sets it to a space).
 fn to_jiix(words: &[Word]) -> Value {
     let mut items = Vec::new();
     let mut label = String::new();
     for (i, w) in words.iter().enumerate() {
         if i > 0 {
-            let sep = if words[i - 1].line == w.line { " " } else { "\n" };
-            label.push_str(sep);
-            items.push(json!({ "label": sep }));
+            if words[i - 1].line == w.line {
+                label.push(' ');
+                items.push(json!({ "label": " " }));
+            } else {
+                label.push('\n');
+                items.push(json!({ "label": "\n", "reflow-label": " " }));
+            }
         }
         label.push_str(&w.text);
         items.push(json!({
@@ -158,7 +165,16 @@ fn to_jiix(words: &[Word]) -> Value {
             "bounding-box": { "x": w.x, "y": w.y, "width": w.w, "height": w.h },
         }));
     }
-    json!({ "type": "Text", "label": label, "words": items, "version": "3", "id": "MainBlock" })
+    let (x0, y0) = words.iter().fold((f32::MAX, f32::MAX), |(x, y), w| (x.min(w.x), y.min(w.y)));
+    let (x1, y1) = words.iter().fold((f32::MIN, f32::MIN), |(x, y), w| (x.max(w.x + w.w), y.max(w.y + w.h)));
+    let bbox = if words.is_empty() { json!({ "x": 0, "y": 0, "width": 0, "height": 0 }) }
+        else { json!({ "x": x0, "y": y0, "width": x1 - x0, "height": y1 - y0 }) };
+    json!({
+        "type": "Raw Content",
+        "version": "3",
+        "id": "MainBlock",
+        "elements": [{ "type": "Text", "id": "text-1", "label": label, "bounding-box": bbox, "words": items }],
+    })
 }
 
 fn capture(name: &str, body: &[u8]) {
@@ -185,9 +201,46 @@ pub async fn convert(State(state): State<AppState>, headers: HeaderMap, body: ax
         tracing::warn!(lang, "no tesseract pack for this language; reading as English");
     }
     let jiix = to_jiix(&recognize(&strokes).await?);
-    tracing::info!(strokes = strokes.len(), text = %jiix["label"].as_str().unwrap_or_default(), "handwriting converted");
+    tracing::info!(strokes = strokes.len(), text = %jiix["elements"][0]["label"].as_str().unwrap_or_default(), "handwriting converted");
 
     let out = serde_json::to_vec(&jiix)?;
     capture("response.jiix", &out);
     Ok((StatusCode::OK, [(header::CONTENT_TYPE, JIIX_CONTENT_TYPE)], out).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mirror of xochitl 3.3.2's JIIX reader (sub_4A155C / sub_4A0D18): anything this
+    /// can't find, the tablet can't either.
+    fn read_like_firmware(jiix: &Value) -> Option<(String, [f64; 4])> {
+        let el = jiix["elements"].as_array()?.iter().find(|e| e["type"] == "Text")?;
+        let b = &el["bounding-box"];
+        let bbox = [b["x"].as_f64()?, b["y"].as_f64()?, b["width"].as_f64()?, b["height"].as_f64()?];
+        let text = el["words"].as_array()?.iter().map(|w| {
+            let l = w["label"].as_str().unwrap_or_default();
+            if l == "\n" { w["reflow-label"].as_str().unwrap_or("\n").to_owned() } else { l.to_owned() }
+        }).collect();
+        Some((text, bbox))
+    }
+
+    fn word(text: &str, x: f32, line: u32) -> Word {
+        Word { text: text.into(), x, y: 5.0, w: 10.0, h: 4.0, line: (1, 1, line) }
+    }
+
+    #[test]
+    fn jiix_is_readable_by_firmware_parser() {
+        let jiix = to_jiix(&[word("hello", 0.0, 1), word("world", 20.0, 1), word("again", 0.0, 2)]);
+        let (text, bbox) = read_like_firmware(&jiix).expect("firmware would find no text");
+        assert_eq!(text, "hello world again"); // line break reflows to a space
+        assert_eq!(bbox, [0.0, 5.0, 30.0, 4.0]);
+        assert_eq!(jiix["elements"][0]["label"], "hello world\nagain");
+    }
+
+    #[test]
+    fn empty_page_still_well_formed() {
+        let (text, _) = read_like_firmware(&to_jiix(&[])).expect("well-formed");
+        assert!(text.is_empty());
+    }
 }

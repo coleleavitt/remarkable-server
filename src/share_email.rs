@@ -2,7 +2,9 @@
 //!
 //! Configured by env: `SMTP_HOST`, `SMTP_PORT` (default 587), `SMTP_USER`,
 //! `SMTP_PASSWORD`, `SMTP_FROM`. Without them the endpoint returns 503.
-//! Mail goes out From `SMTP_FROM` with Reply-To set to the address the tablet sends.
+//! Form fields (xochitl 3.3.2, sub_A2310): `from`, `reply-to`, `to`, `subject`, `html`,
+//! `attachment` (multipart), plus `?hwc=true` on the URL. Mail goes out From `SMTP_FROM`
+//! with Reply-To set to the tablet's `reply-to` (falling back to its `from`).
 
 use axum::{extract::{Multipart, State}, http::{HeaderMap, StatusCode}};
 use lettre::{
@@ -45,12 +47,13 @@ pub async fn send(State(state): State<AppState>, headers: HeaderMap, mut form: M
         e
     })?;
 
-    let (mut to, mut reply_to, mut subject, mut html) = (String::new(), String::new(), String::new(), String::new());
+    let (mut to, mut from, mut reply_to, mut subject, mut html) = (String::new(), String::new(), String::new(), String::new(), String::new());
     let mut attachments = Vec::new();
     while let Some(field) = form.next_field().await.map_err(bad)? {
         match field.name().unwrap_or_default() {
             "to" => to = field.text().await.map_err(bad)?,
-            "from" => reply_to = field.text().await.map_err(bad)?,
+            "from" => from = field.text().await.map_err(bad)?,
+            "reply-to" => reply_to = field.text().await.map_err(bad)?,
             "subject" => subject = field.text().await.map_err(bad)?,
             "html" => html = field.text().await.map_err(bad)?,
             "attachment" => {
@@ -66,6 +69,7 @@ pub async fn send(State(state): State<AppState>, headers: HeaderMap, mut form: M
     for addr in to.split([',', ';']).map(str::trim).filter(|a| !a.is_empty()) {
         msg = msg.to(addr.parse().map_err(|e| bad(format!("bad recipient {addr:?}: {e}")))?);
     }
+    let reply_to = if reply_to.trim().is_empty() { from } else { reply_to };
     if let Ok(r) = reply_to.trim().parse::<Mailbox>() {
         msg = msg.reply_to(r);
     }
