@@ -100,9 +100,28 @@ pub struct NotificationAttributes {
     
     #[serde(rename = "vissibleName", skip_serializing_if = "Option::is_none")]
     pub visible_name: Option<String>,
+
+    /// Screenshare room id (`ScreenshareRoomCreated`).
+    #[serde(rename = "roomId", skip_serializing_if = "Option::is_none")]
+    pub room_id: Option<String>,
 }
 
 impl WsMessage {
+    /// Any event, attributed to `source_device_id` (the tablet drops notifications whose
+    /// `sourceDeviceID` is its own id, so events it caused should carry its id).
+    pub fn event(event: &str, source_device_id: &str, auth0_user_id: &str) -> Self {
+        let mut msg = Self::sync_complete(0, source_device_id, auth0_user_id);
+        msg.message.attributes.event = event.into();
+        msg
+    }
+
+    /// Tell the device its passcode reset request was denied (xochitl 3.28 `PasscodeResetDenied`).
+    pub fn passcode_reset_denied(auth0_user_id: &str, request_id: &str) -> Self {
+        let mut msg = Self::event("PasscodeResetDenied", "local-server", auth0_user_id);
+        msg.message.attributes.id = Some(request_id.into());
+        msg
+    }
+
     /// Tell the device its passcode reset request was approved (rmfakecloud `NotifyPasscodeReset`).
     pub fn passcode_reset_approved(auth0_user_id: &str, device_id: &str, device_name: &str, request_id: &str) -> Self {
         use base64::Engine;
@@ -135,6 +154,7 @@ impl WsMessage {
                     source_device_desc: Some("local-server".to_string()),
                     device_id: None,
                     device_name: None,
+                    room_id: None,
                     id: None,
                     parent: None,
                     doc_type: None,

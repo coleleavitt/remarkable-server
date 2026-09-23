@@ -15,6 +15,7 @@ pub mod protocol;
 pub mod screenshare;
 pub mod service;
 pub mod share_email;
+pub mod share_link;
 pub mod storage;
 pub mod sync15;
 pub mod types;
@@ -45,7 +46,7 @@ pub use readlater::{
 };
 pub use readlater_api::{ReadLaterState, readlater_router};
 
-use axum::{extract::DefaultBodyLimit, routing::{delete, get, post, put}, Router};
+use axum::{extract::DefaultBodyLimit, routing::{delete, get, patch, post, put}, Router};
 use tower_http::trace::TraceLayer;
 use std::path::Path;
 
@@ -101,6 +102,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/convert/v1/handwriting", post(handwriting::convert).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)))
         .route("/handwriting/v1/search", get(hw_search::search))
         .route("/api/v1/page", post(handwriting::convert).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)))
+        // Share a page as a link (3.27+)
+        .route("/share/v1/link", post(share_link::create).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)))
+        .route("/share/v1/link/{name}", get(share_link::get))
         // Send by email (SMTP via env)
         .route("/share/v1/email", post(share_email::send).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)))
         // Read on reMarkable / desktop uploads (PDF, EPUB)
@@ -143,7 +147,14 @@ pub fn create_router(state: AppState) -> Router {
         // Notifications (MQTT over WebSocket)
         .route("/notifications/ws/json/1", get(notifications::notifications_ws))
         // Settings and updates
-        .route("/settings/v1/beta", get(service::get_beta).post(service::post_beta))
+        .route("/settings/v1/beta", get(service::get_beta).post(service::post_beta).delete(service::delete_beta))
+        // Search index settings / client error reports (3.27+)
+        .route("/search/v1/settings", get(service::get_search_settings).patch(service::patch_search_settings))
+        .route("/search/v1/error", post(service::search_error))
+        // mdm-agent polling: nothing to do
+        .route("/mdm/v1/instruction", get(service::mdm_no_instruction))
+        .route("/mdm/devices/v0/instruction", get(service::mdm_no_instruction))
+        .route("/mdm/v1/instruction/status", post(service::mdm_no_instruction))
         .route("/settings/v1/features", get(service::get_beta))
         // Telemetry / analytics (ping.remarkable.com) - accepted and dropped
         .route("/v1/reports", post(service::null_report))

@@ -13,15 +13,72 @@ pub async fn analytics_report() -> (StatusCode, Json<Value>) {
     (StatusCode::CREATED, Json(json!({ "message": "Success" })))
 }
 
-pub async fn get_beta() -> Json<Value> {
-    Json(json!({ "enrolled": false, "available": true }))
+/// Beta program state. xochitl 3.28 requires exactly 200 with `enrolled`; POST (enroll)
+/// and DELETE (un-enroll) replies go through the same parser. There is no local beta
+/// channel, so enrollment is recorded but changes nothing. `project_key` is never sent
+/// (the tablet writes it to a crash-reporting key file).
+fn beta_state(enrolled: bool) -> Json<Value> {
+    Json(json!({ "enrolled": enrolled }))
 }
 
-/// Beta enrollment toggle; there is no beta channel locally, so just acknowledge it.
-pub async fn post_beta(body: String) -> StatusCode {
-    tracing::info!(body, "beta enrollment request ignored");
-    StatusCode::OK
+fn beta_enrolled() -> &'static std::sync::atomic::AtomicBool {
+    static ENROLLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    &ENROLLED
 }
+
+pub async fn get_beta() -> Json<Value> {
+    beta_state(beta_enrolled().load(std::sync::atomic::Ordering::Relaxed))
+}
+
+pub async fn post_beta(body: String) -> Json<Value> {
+    tracing::info!(body, "beta enrollment requested (no local beta channel)");
+    beta_enrolled().store(true, std::sync::atomic::Ordering::Relaxed);
+    beta_state(true)
+}
+
+pub async fn delete_beta() -> Json<Value> {
+    beta_enrolled().store(false, std::sync::atomic::Ordering::Relaxed);
+    beta_state(false)
+}
+
+/// Search index settings (xochitl 3.27+): GET/PATCH `{searchEnabled, language?}`, the
+/// reply echoing the stored object. Persisted next to the blobs.
+fn search_settings_path(state: &AppState) -> std::path::PathBuf {
+    state.storage.base_path().join("search_settings.json")
+}
+
+fn load_search_settings(state: &AppState) -> Value {
+    std::fs::read(search_settings_path(state)).ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_else(|| json!({ "searchEnabled": true }))
+}
+
+pub async fn get_search_settings(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Value>> {
+    state.auth_user(&headers)?;
+    Ok(Json(load_search_settings(&state)))
+}
+
+pub async fn patch_search_settings(State(state): State<AppState>, headers: HeaderMap, Json(patch): Json<Value>) -> Result<Json<Value>> {
+    state.auth_user(&headers)?;
+    let mut current = load_search_settings(&state);
+    if let (Some(cur), Some(upd)) = (current.as_object_mut(), patch.as_object()) {
+        for key in ["searchEnabled", "language"] {
+            if let Some(v) = upd.get(key) { cur.insert(key.into(), v.clone()); }
+        }
+    }
+    std::fs::write(search_settings_path(&state), serde_json::to_vec_pretty(&current)?)?;
+    Ok(Json(current))
+}
+
+/// Client-side search errors (`{error:{category,message,id}}`): logged only.
+pub async fn search_error(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<Value>) -> Result<StatusCode> {
+    state.auth_user(&headers)?;
+    tracing::warn!(error = %body["error"], "tablet reported a search error");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Enterprise device management (mdm-agent): no instructions are ever queued locally.
+pub async fn mdm_no_instruction() -> StatusCode { StatusCode::NO_CONTENT }
 
 /// Third-party storage integrations (Google Drive, Dropbox, ...). None are configured.
 pub async fn list_integrations(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Value>> {

@@ -42,7 +42,7 @@ pub struct PutRootResponse { pub generation: u64, pub hash: String }
 
 /// Sync v3 root update: compare-and-swap on `generation`, 412 if another client got there first.
 pub async fn put_root(State(state): State<AppState>, headers: HeaderMap, Json(req): Json<PutRootRequest>) -> Result<Json<PutRootResponse>> {
-    let user_id = state.auth_user(&headers)?;
+    let (user_id, device_id, _) = state.devices.caller(bearer_header(&headers)?)?;
     if !crate::storage::is_valid_hash(&req.hash) {
         return Err(ServerError::InvalidHash(req.hash));
     }
@@ -51,7 +51,7 @@ pub async fn put_root(State(state): State<AppState>, headers: HeaderMap, Json(re
     }
     let root = state.storage.set_root_if(req.hash, Some(req.generation))?;
     if req.broadcast {
-        let _ = state.notification_tx.send(crate::notifications::WsMessage::sync_complete(root.generation, "local-server", &user_id));
+        let _ = state.notification_tx.send(crate::notifications::WsMessage::sync_complete(root.generation, &device_id, &user_id));
     }
     Ok(Json(PutRootResponse { generation: root.generation, hash: root.hash }))
 }
@@ -126,6 +126,11 @@ pub async fn delete_device(State(state): State<AppState>, Path(id): Path<String>
     let _user_id = state.auth_user(&headers)?;
     state.devices.delete_device(&id)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The raw `Authorization` header value (`Bearer ...`).
+fn bearer_header(headers: &HeaderMap) -> Result<&str> {
+    headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).ok_or(ServerError::Unauthorized)
 }
 
 /// Extract the bearer token from the Authorization header.

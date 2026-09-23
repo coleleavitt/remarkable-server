@@ -70,6 +70,7 @@ pub async fn device_deny(State(state): State<AppState>, Path(request_id): Path<S
     if !state.devices.delete_passcode_reset(&request_id, &user_id)? {
         return Err(ServerError::NotFound(request_id));
     }
+    let _ = state.notification_tx.send(WsMessage::passcode_reset_denied(&user_id, &request_id));
     tracing::info!(%request_id, "passcode reset denied");
     Ok(StatusCode::NO_CONTENT)
 }

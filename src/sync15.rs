@@ -148,9 +148,10 @@ pub async fn blob_put(State(state): State<AppState>, Query(q): Query<BlobQuery>,
 }
 
 pub async fn sync_complete(State(state): State<AppState>, headers: HeaderMap, Json(req): Json<SyncCompleteRequest>) -> Result<Json<SyncCompleteResponse>> {
-    let user_id = state.auth_user(&headers)?;
-    tracing::info!(generation = req.generation, "sync complete");
-    let msg = WsMessage::sync_complete(req.generation, "local-server", &user_id);
+    let (user_id, device_id, _) = state.devices.caller(headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or_default())?;
+    tracing::info!(generation = req.generation, device = %device_id, "sync complete");
+    // Attributed to the pushing device so it skips its own notification (xochitl 3.28 C.2).
+    let msg = WsMessage::sync_complete(req.generation, &device_id, &user_id);
     let id = uuid::Uuid::new_v4().to_string();
     // No subscribers is fine; the device just isn't listening right now.
     let _ = state.notification_tx.send(msg);

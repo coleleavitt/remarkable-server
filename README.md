@@ -219,6 +219,22 @@ The device talks to the server directly over HTTPS on port 443; no proxy runs on
 
 `--host` (default `local.tectonic.remarkable.com`) is what discovery hands back to the device; it must be in the device's `/etc/hosts` and covered by the cert.
 
+### Firmware 3.27+ hostnames
+
+Newer firmware reaches more hosts. Add them to the device's `/etc/hosts` (all covered by the
+`*.remarkable.com`, `*.cloud.remarkable.com`, `*.tectonic.remarkable.com` and
+`*.cloud.remarkable.engineering` cert names):
+
+- `local.tectonic.remarkable.com`: the API and notifications host, built from the user token's
+  `https://auth.remarkable.com/tectonic` claim (`local`); discovery is not used for it
+- `auth.remarkable.com` (new OAuth login; not implemented yet), `errors.cloud.remarkable.com`
+- `backtrace-proxy.cloud.remarkable.engineering` (crash reports; not implemented)
+
+3.27+ endpoints implemented: `/settings/v1/beta` (GET/POST/DELETE), `/search/v1/settings`
+(GET/PATCH), `/search/v1/error`, `/share/v1/link`, and MDM instruction polling (always empty).
+Not implemented: REST screenshare (`/screenshare/v1`), gentree/v1 and sync v4 (3.28 `rm-sync`),
+and the OAuth flow of `user-authenticator-cli`.
+
 ### Pairing a device
 
 ```bash
