@@ -57,6 +57,15 @@ struct BlobClaims { blob: String, write: bool, exp: i64 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SubscriptionClaim { status: String, plan: String }
 
+#[derive(Serialize)]
+struct IdTokenClaims {
+    sub: String, iss: String, aud: String, iat: i64, exp: i64, email: String,
+    #[serde(rename = "https://auth.remarkable.com/tectonic")] tectonic: String,
+    #[serde(rename = "https://auth.remarkable.com/subscription")] subscription: String,
+    #[serde(rename = "https://auth.remarkable.com/mdm")] mdm: bool,
+    #[serde(rename = "https://auth.remarkable.com/created_at")] created_at: String,
+}
+
 impl DeviceManager {
     pub fn new<P: AsRef<Path>>(db_path: P, region: &str, issuer: &str) -> Result<Self> {
         let conn = Connection::open(db_path)?;
@@ -199,6 +208,54 @@ impl DeviceManager {
     pub fn create_user_token(&self, user_id: &str) -> Result<String> {
         // Same claims as a device-issued user token, so validate_token accepts it.
         self.gen_user_token("admin", "admin", user_id)
+    }
+
+    /// Register/refresh a device and mint an OAuth bundle for software 3.28:
+    /// access = the same user auth data our sync/gentree auth already accepts,
+    /// refresh = a device auth data, id = an HS512 id auth data with auth.remarkable.com claims.
+    pub fn oauth_bundle(&self, user_id: &str, device_id: &str, device_desc: &str) -> Result<(String, String, String)> {
+        let now = Utc::now();
+        {
+            let conn = self.inner.conn.lock();
+            conn.execute(
+                "INSERT INTO devices (device_id, device_desc, registered_at, last_refresh, user_id) VALUES (?, ?, ?, ?, ?) ON CONFLICT(device_id) DO UPDATE SET device_desc=excluded.device_desc, last_refresh=excluded.last_refresh, user_id=excluded.user_id",
+                params![device_id, device_desc, now.to_rfc3339(), now.to_rfc3339(), user_id],
+            )?;
+        }
+        Ok((
+            self.gen_user_token(device_id, device_desc, user_id)?,
+            self.gen_device_token(device_id, device_desc, user_id)?,
+            self.issue_id_token(user_id)?,
+        ))
+    }
+
+    /// Re-mint an OAuth bundle from a refresh auth data (a device auth data).
+    pub fn refresh_oauth(&self, refresh: &str) -> Result<(String, String, String)> {
+        let c = self.decode_device_token(refresh)?;
+        self.oauth_bundle(&c.auth0_userid, &c.device_id, &c.device_desc)
+    }
+
+    /// Exchange a legacy device auth data for an OAuth bundle (`/token/json/4/device/exchange`).
+    pub fn exchange_device_token(&self, device: &str) -> Result<(String, String, String)> {
+        let c = self.decode_device_token(device)?;
+        self.oauth_bundle(&c.auth0_userid, &c.device_id, &c.device_desc)
+    }
+
+    fn issue_id_token(&self, user_id: &str) -> Result<String> {
+        let now = Utc::now();
+        let claims = IdTokenClaims {
+            sub: user_id.into(),
+            iss: self.inner.issuer.clone(),
+            aud: "remarkable".into(),
+            iat: now.timestamp(),
+            exp: now.timestamp() + USER_TOKEN_LIFETIME,
+            email: format!("local@{}", self.inner.issuer),
+            tectonic: self.inner.region.clone(),
+            subscription: "active".into(),
+            mdm: false,
+            created_at: now.to_rfc3339(),
+        };
+        encode(&Header::new(Algorithm::HS512), &claims, &self.inner.encoding_key).map_err(|e| ServerError::TokenError(e.to_string()))
     }
     
     /// Get a device by ID

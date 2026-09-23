@@ -42,8 +42,9 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     
-    // Create app state
-    let state = AppState::new(storage, devices);
+    // Create app state (ICE servers are shared by the REST screenshare broker)
+    let ice_servers: serde_json::Value = serde_json::from_str(&env::var("SCREENSHARE_ICE_SERVERS").unwrap_or_else(|_| "[]".into())).unwrap_or_else(|_| serde_json::json!([]));
+    let state = AppState::new(storage, devices).with_ice_servers(ice_servers);
     
     // Create router
     // Inbound email -> documents: an SMTP listener, only when EMAIL_INBOUND_BIND is set.
@@ -67,8 +68,7 @@ async fn main() -> Result<()> {
             anyhow::bail!("SCREENSHARE_BIND needs --cert and --key (the broker is TLS-only)");
         };
         let tls = screenshare_tls(cert, key)?;
-        let ice: serde_json::Value = serde_json::from_str(&env::var("SCREENSHARE_ICE_SERVERS").unwrap_or_else(|_| "[]".into()))?;
-        let broker = remarkable_server::screenshare::Broker::new(state.devices.clone(), ice);
+        let broker = remarkable_server::screenshare::Broker::new(state.devices.clone(), (*state.ice_servers).clone());
         let addr: std::net::SocketAddr = bind.parse()?;
         tokio::spawn(async move {
             if let Err(e) = broker.serve(addr, tls).await { tracing::error!("screenshare broker stopped: {e}"); }

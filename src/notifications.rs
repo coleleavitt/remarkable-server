@@ -104,6 +104,10 @@ pub struct NotificationAttributes {
     /// Screenshare room id (`ScreenshareRoomCreated`).
     #[serde(rename = "roomId", skip_serializing_if = "Option::is_none")]
     pub room_id: Option<String>,
+
+    /// Screenshare direct-message target client id.
+    #[serde(rename = "targetClientId", skip_serializing_if = "Option::is_none")]
+    pub target_client_id: Option<String>,
 }
 
 impl WsMessage {
@@ -112,6 +116,24 @@ impl WsMessage {
     pub fn event(event: &str, source_device_id: &str, auth0_user_id: &str) -> Self {
         let mut msg = Self::sync_complete(0, source_device_id, auth0_user_id);
         msg.message.attributes.event = event.into();
+        msg
+    }
+
+    /// Screenshare: a room was created; other clients should join. `source_device_id`
+    /// is the creator's device, so the creator's own client drops it.
+    pub fn screenshare_room_created(auth0_user_id: &str, source_device_id: &str, room_id: &str) -> Self {
+        let mut msg = Self::event("ScreenshareRoomCreated", source_device_id, auth0_user_id);
+        msg.message.attributes.room_id = Some(room_id.into());
+        msg
+    }
+
+    /// Screenshare: relay a signalling message to the user's other clients. `data_b64`
+    /// is base64 of the inner JSON object the sender posted.
+    pub fn screenshare_message(auth0_user_id: &str, source_device_id: &str, room_id: &str, target_client_id: Option<&str>, data_b64: &str) -> Self {
+        let mut msg = Self::event("ScreenshareMessage", source_device_id, auth0_user_id);
+        msg.message.attributes.room_id = Some(room_id.into());
+        msg.message.attributes.target_client_id = target_client_id.map(|s| s.to_string());
+        msg.message.data = Some(data_b64.to_string());
         msg
     }
 
@@ -155,6 +177,7 @@ impl WsMessage {
                     device_id: None,
                     device_name: None,
                     room_id: None,
+                    target_client_id: None,
                     id: None,
                     parent: None,
                     doc_type: None,

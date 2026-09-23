@@ -8,13 +8,17 @@ pub struct AppState {
     pub storage: Storage, 
     pub devices: DeviceManager,
     pub notification_tx: tokio::sync::broadcast::Sender<crate::notifications::WsMessage>,
+    pub screenshare: crate::screenshare_rest::RoomManager,
+    pub ice_servers: std::sync::Arc<serde_json::Value>,
 }
 
 impl AppState {
     pub fn new(storage: Storage, devices: DeviceManager) -> Self { 
-        let (notification_tx, _) = tokio::sync::broadcast::channel(16);
-        Self { storage, devices, notification_tx } 
+        let (notification_tx, _) = tokio::sync::broadcast::channel(64);
+        Self { storage, devices, notification_tx, screenshare: crate::screenshare_rest::RoomManager::new(), ice_servers: std::sync::Arc::new(serde_json::json!([])) } 
     }
+    /// Set the ICE server list handed out to screenshare clients.
+    pub fn with_ice_servers(mut self, ice: serde_json::Value) -> Self { self.ice_servers = std::sync::Arc::new(ice); self }
     pub(crate) fn auth_user(&self, headers: &HeaderMap) -> Result<String> {
         self.devices.validate_token(headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).ok_or(ServerError::Unauthorized)?)
     }

@@ -13,6 +13,9 @@ pub mod integrations;
 pub mod passcode;
 pub mod protocol;
 pub mod screenshare;
+pub mod screenshare_rest;
+pub mod gentree;
+pub mod oauth;
 pub mod service;
 pub mod share_email;
 pub mod share_link;
@@ -121,6 +124,14 @@ pub fn create_router(state: AppState) -> Router {
         .route("/sync/v3/files/{hash}", put(api::put_file).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)))
         
         // V4 Protocol (extended metadata - future)
+        // gentree/v1 delta sync (rm-sync, software 3.28+); /sync/v3/{missing,check-files} are reused above.
+        .route("/gentree/v1/GetEntries", post(gentree::get_entries))
+        .route("/gentree/v1/GetFiles", post(gentree::get_files))
+        .route("/gentree/v1/GetFile", post(gentree::get_file))
+        .route("/gentree/v1/PutFile", post(gentree::put_file).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)))
+        .route("/gentree/v1/DeleteEntry", post(gentree::delete_entry))
+        .route("/gentree/v1/EntrySession", post(gentree::entry_session))
+
         .route("/sync/v4/root", get(protocol::v4_get_root))
         .route("/sync/v4/files/{hash}", get(protocol::v4_get_file))
         .route("/sync/v4/files/{hash}", put(protocol::v4_put_file))
@@ -146,6 +157,20 @@ pub fn create_router(state: AppState) -> Router {
         .route("/debug/clear", delete(api::clear_storage))
         // Notifications (MQTT over WebSocket)
         .route("/notifications/ws/json/1", get(notifications::notifications_ws))
+
+        // Screenshare REST room broker (xochitl 3.27+/3.28)
+        .route("/screenshare/v1/rooms", post(screenshare_rest::create_room))
+        .route("/screenshare/v1/rooms/join-active", post(screenshare_rest::join_active))
+        .route("/screenshare/v1/rooms/{roomId}", get(screenshare_rest::get_room).delete(screenshare_rest::delete_room))
+        .route("/screenshare/v1/rooms/{roomId}/keepalive", post(screenshare_rest::keepalive))
+        .route("/screenshare/v1/rooms/{roomId}/messages/broadcast", post(screenshare_rest::broadcast))
+        .route("/screenshare/v1/rooms/{roomId}/messages/direct", post(screenshare_rest::direct))
+
+        // OAuth2 device-flow login + legacy migration (software 3.28)
+        .route("/oauth/device/code", post(oauth::device_code))
+        .route("/oauth/token", post(oauth::token))
+        .route("/oauth/revoke", post(oauth::revoke))
+        .route("/token/json/4/device/exchange", post(oauth::device_exchange))
         // Settings and updates
         .route("/settings/v1/beta", get(service::get_beta).post(service::post_beta).delete(service::delete_beta))
         // Search index settings / client error reports (3.27+)

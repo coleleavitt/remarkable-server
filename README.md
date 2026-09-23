@@ -279,3 +279,34 @@ See [remarkable-research](https://github.com/coleleavitt/remarkable-research) fo
 ## License
 
 MIT
+
+
+## software 3.27+/3.28 support
+
+Reconstructed from the 3.28 device binaries (xochitl, rm-sync, user-authenticator-cli)
+with a decompiler; see the analysis under `/tmp/re-3.28` and `/tmp/xochitl-re-3.28`.
+The paired tablet runs 3.3.2, so these paths are unit-tested for shape but not yet
+verified against a real 3.28 device. They are additive and do not affect 3.3.2 sync.
+
+### Screenshare (REST, replaces the 3.x MtokenT broker)
+`POST /screenshare/v1/rooms`, `POST /screenshare/v1/rooms/join-active`,
+`GET|DELETE /screenshare/v1/rooms/{roomId}`, `POST .../keepalive`,
+`POST .../messages/broadcast`, `POST .../messages/direct`. Signalling is relayed to the
+user's other clients as `ScreenshareMessage` / `ScreenshareRoomCreated` events on the
+notifications channel (data = base64 inner JSON). ICE servers come from
+`SCREENSHARE_ICE_SERVERS`. Rooms expire 60 s after the last keepalive.
+
+### gentree/v1 delta sync (rm-sync)
+`POST /gentree/v1/{GetEntries,GetFiles,GetFile,PutFile,DeleteEntry,EntrySession}`
+(`/sync/v3/missing` and `/sync/v3/check-files` are reused). Backed by the same content
+store and root as sync v3; `EntrySession` commits a new root under an optimistic
+`preEntryGeneration` lock (412 on conflict). rm-sync also still speaks `/sync/v3/*` and
+`/sync/v4/root`, which remain the reliable path.
+
+### OAuth2 login (auth.remarkable.com flow)
+`POST /oauth/device/code` (device-code grant), `POST /oauth/token` (device_code + refresh_token
+grants), `POST /oauth/revoke`, and `POST /token/json/4/device/exchange` (migrate a legacy
+device access data). The access access data is the same user access data the sync/gentree auth already
+accepts, so no other change is needed; the id access data is an HS512 auth data carrying the
+`https://auth.remarkable.com/{tectonic,subscription,mdm,created_at}` claims. Single-user
+local server: a minted device-code auto-approves to the local account (no web UI).
