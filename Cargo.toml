@@ -52,6 +52,8 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc
 bytes = "1"
 remarkable-lines = { version = "0.1.0", path = "../remarkable/crates/remarkable-lines" }
 remarkable-core = { version = "0.1.0", path = "../remarkable/crates/remarkable-core" }
+regex = "1.13.1"
+tokio-util = { version = "0.7.19", features = ["io"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

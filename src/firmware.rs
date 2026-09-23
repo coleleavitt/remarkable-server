@@ -10,7 +10,7 @@
 use axum::{
     body::Body,
     extract::{Path, Query, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -18,10 +18,10 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs,
-    path::{Path as FilePath, PathBuf},
+    path::PathBuf,
     sync::Arc,
 };
-use tokio::fs::File;
+use tokio::{fs::File, io::{AsyncReadExt, AsyncSeekExt}};
 use tokio_util::io::ReaderStream;
 
 use crate::error::{Result, ServerError};
@@ -483,6 +483,7 @@ pub async fn download_firmware(
     State(state): State<FirmwareState>,
     Path(version): Path<String>,
     Query(query): Query<DownloadQuery>,
+    headers: HeaderMap,
 ) -> Result<Response> {
     // Try to find firmware for any device if not specified
     let devices = if let Some(d) = &query.device {
@@ -513,21 +514,82 @@ pub async fn download_firmware(
     let path = firmware_path
         .ok_or_else(|| ServerError::NotFound(format!("Firmware version not found: {}", version)))?;
 
-    // Stream the file
-    let file = File::open(&path).await.map_err(|e| ServerError::Storage(e))?;
-    let stream = ReaderStream::new(file);
-    let body = Body::from_stream(stream);
+    // Stream the file, honouring a single `Range: bytes=` request so interrupted
+    // update downloads can resume.
+    let mut file = File::open(&path).await.map_err(ServerError::Storage)?;
+    let total = file.metadata().await.map_err(ServerError::Storage)?.len();
+    let _ = size; // index size may be stale; trust the file on disk
+    let disposition = format!("attachment; filename=\"{}\"", filename);
 
-    Ok((
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "application/octet-stream"),
-            (header::CONTENT_LENGTH, &size.to_string()),
-            (header::CONTENT_DISPOSITION, &format!("attachment; filename=\"{}\"", filename)),
-        ],
-        body,
-    )
-        .into_response())
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| parse_byte_range(v, total));
+
+    match range {
+        Some(Some((start, end))) => {
+            file.seek(std::io::SeekFrom::Start(start))
+                .await
+                .map_err(ServerError::Storage)?;
+            let len = end - start + 1;
+            let body = Body::from_stream(ReaderStream::new(file.take(len)));
+            Ok((
+                StatusCode::PARTIAL_CONTENT,
+                [
+                    (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+                    (header::CONTENT_LENGTH, len.to_string()),
+                    (header::CONTENT_RANGE, format!("bytes {}-{}/{}", start, end, total)),
+                    (header::ACCEPT_RANGES, "bytes".to_string()),
+                    (header::CONTENT_DISPOSITION, disposition),
+                ],
+                body,
+            )
+                .into_response())
+        }
+        Some(None) => Ok((
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            [(header::CONTENT_RANGE, format!("bytes */{}", total))],
+        )
+            .into_response()),
+        None => {
+            let body = Body::from_stream(ReaderStream::new(file));
+            Ok((
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+                    (header::CONTENT_LENGTH, total.to_string()),
+                    (header::ACCEPT_RANGES, "bytes".to_string()),
+                    (header::CONTENT_DISPOSITION, disposition),
+                ],
+                body,
+            )
+                .into_response())
+        }
+    }
+}
+
+/// Parse a single-range `bytes=` header against a resource of `total` bytes.
+/// Returns inclusive `(start, end)`, or `None` if unsatisfiable/unsupported.
+fn parse_byte_range(value: &str, total: u64) -> Option<(u64, u64)> {
+    let spec = value.trim().strip_prefix("bytes=")?;
+    if spec.contains(',') || total == 0 {
+        return None; // multi-range not supported
+    }
+    let (a, b) = spec.split_once('-')?;
+    let (a, b) = (a.trim(), b.trim());
+    let (start, end) = if a.is_empty() {
+        // suffix range: last N bytes
+        let n: u64 = b.parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        (total.saturating_sub(n), total - 1)
+    } else {
+        let start: u64 = a.parse().ok()?;
+        let end = if b.is_empty() { total - 1 } else { b.parse::<u64>().ok()?.min(total - 1) };
+        (start, end)
+    };
+    (start <= end && start < total).then_some((start, end))
 }
 
 /// GET /firmware/v1/changelog?device={type}&from={version}&to={version}
@@ -608,6 +670,17 @@ pub fn firmware_router(state: FirmwareState) -> axum::Router {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn byte_range_parsing() {
+        assert_eq!(super::parse_byte_range("bytes=0-1023", 5000), Some((0, 1023)));
+        assert_eq!(super::parse_byte_range("bytes=100-", 5000), Some((100, 4999)));
+        assert_eq!(super::parse_byte_range("bytes=-500", 5000), Some((4500, 4999)));
+        assert_eq!(super::parse_byte_range("bytes=0-99999", 5000), Some((0, 4999)));
+        assert_eq!(super::parse_byte_range("bytes=6000-", 5000), None);
+        assert_eq!(super::parse_byte_range("bytes=0-1,5-9", 5000), None);
+        assert_eq!(super::parse_byte_range("items=0-1", 5000), None);
+    }
     use super::*;
 
     #[test]

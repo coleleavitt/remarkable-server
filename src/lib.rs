@@ -27,6 +27,7 @@ pub mod types;
 pub mod email;
 pub mod email_api;
 pub mod feeds;
+pub mod firmware;
 pub mod search;
 pub mod search_api;
 pub mod versions;
@@ -402,14 +403,16 @@ pub fn feature_routes(state: AppState, storage_path: &Path, email: Option<email:
     let scheduler = tokio::runtime::Handle::try_current().is_ok()
         .then(|| feeds.clone().start_scheduler(FEED_CHECK_SECS));
 
+    let cloud = IntegrationState::new();
     let mut router = Router::new()
         .nest("/feeds/v1", feeds::feeds_router(feeds::FeedState { manager: feeds, scheduler }))
         .nest("/search/v1", search_routes)
         .nest("/versions/v1", versions::version_router(versions))
         .nest("/integrations/v2/calendars", calendar_router(CalendarState::new(init_calendar_manager(storage_path)?)))
         .nest("/integrations/v2/readlater", readlater_router(ReadLaterState::new(init_readlater_manager(storage_path)?)))
-        .nest("/integrations/v2/cloud", integration_router(IntegrationState::new()))
-        .nest("/integrations/v2/storage", integration_router(IntegrationState::new()));
+        // xochitl 3.29 uses /storage/; older builds use /cloud. Share one state so both see the same accounts.
+        .nest("/integrations/v2/cloud", integration_router(cloud.clone()))
+        .nest("/integrations/v2/storage", integration_router(cloud));
 
     if let Some(server) = email {
         router = router.nest("/email/v1", Router::new()
@@ -418,6 +421,15 @@ pub fn feature_routes(state: AppState, storage_path: &Path, email: Option<email:
             .route("/config", get(email_api::config))
             .route("/health", get(email_api::health))
             .with_state(email_api::EmailState::new(server)));
+    }
+
+    // Optional OTA archive (versions/changelogs/downloads). Enabled when FIRMWARE_ARCHIVE points at a directory.
+    if let Ok(dir) = std::env::var("FIRMWARE_ARCHIVE") {
+        let base = std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://localhost:3000".into());
+        match firmware::FirmwareManager::new(&dir, &base) {
+            Ok(m) => router = router.nest("/firmware/v1", firmware::firmware_router(firmware::FirmwareState::new(m))),
+            Err(e) => tracing::warn!("firmware archive disabled ({dir}): {e}"),
+        }
     }
 
     Ok(router.layer(axum::middleware::from_fn_with_state(state, require_auth)))

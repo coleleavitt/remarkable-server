@@ -84,7 +84,12 @@ Based on xochitl binary analysis (via `strings`), the server now implements
 
 **Remaining gaps** (see GAP_ANALYSIS.md):
 1. ~~Messaging integration~~ — DONE (4c1cbfe)
-2. ~~Storage path alias~~ — DONE (4c1cbfe)
+2. ~~Storage path alias~~ — DONE (4c1cbfe); /cloud and /storage now share one IntegrationState
+3. ~~OTA update module orphaned~~ — DONE: `src/firmware.rs` now compiled + mounted at
+   `/firmware/v1/{versions,devices,check,changelog,download/{version}}` when
+   `FIRMWARE_ARCHIVE=<dir>` is set (uses PUBLIC_URL for download links).
+   Download supports HTTP Range (206/416) for resumable fetches. Verified live against
+   the local archive (5 device types, rm2 3.20→3.29 check, byte-exact ranges).
 
 **Status:** Should work for sync/pairing. All 3.29 endpoints covered.
 Full verification against live tablet pending.
