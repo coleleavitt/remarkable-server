@@ -13,3 +13,10 @@ Cargo.lock
 
 # OS
 .DS_Store
+
+# TLS material (device-trusted cert/key, never commit)
+/certs/
+
+# Local sync data (real notebooks) and device DB - never commit
+/test-storage/
+/remarkable-storage/

@@ -496,18 +496,16 @@ impl EmailServer {
                 device_id
             );
             
-            // Store the file
-            let hash = self.inner.storage.put(&attachment.data, &attachment.filename)?;
-            
-            // Create document metadata for sync
-            // Use subject as folder name if available
-            let folder_name = if subject.is_empty() || subject == "No Subject" {
-                "Email Attachments".to_string()
-            } else {
-                sanitize_filename(subject)
+            // Only PDF/EPUB become documents; the tablet can't open anything else.
+            let Some(ext) = document_ext(&attachment.filename, &attachment.content_type) else {
+                tracing::warn!("Skipping attachment {} ({}): not a PDF/EPUB", attachment.filename, attachment.content_type);
+                continue;
             };
-            
-            // Record attachment in database
+            // Adds the document to the sync tree and commits a new root, so the device pulls it.
+            let (doc_id, generation) = crate::documents::create_document(&self.inner.storage, &strip_extension(&attachment.filename), ext, &attachment.data)?;
+            tracing::info!("Emailed {} became document {} (subject {:?}, root generation {})", attachment.filename, doc_id, subject, generation);
+
+            // Record attachment in database (the hash column holds the new document id)
             let attachment_id = Uuid::new_v4().to_string();
             {
                 let db = self.inner.db.lock().unwrap();
@@ -520,64 +518,15 @@ impl EmailServer {
                         attachment.filename,
                         attachment.content_type,
                         attachment.data.len() as i64,
-                        hash,
+                        doc_id,
                     ],
                 )?;
             }
-            
-            // Create a document entry for the device to sync
-            self.create_document_entry(device_id, &attachment.filename, &hash, &folder_name)?;
-            
+
             synced += 1;
         }
         
         Ok(synced)
-    }
-
-    /// Create document entry for sync
-    fn create_document_entry(
-        &self,
-        device_id: &str,
-        filename: &str,
-        content_hash: &str,
-        folder: &str,
-    ) -> Result<()> {
-        let doc_id = Uuid::new_v4().to_string();
-        let now = Utc::now();
-        
-        // Create .metadata file content
-        let metadata = serde_json::json!({
-            "visibleName": strip_extension(filename),
-            "parent": "",  // Root folder for now, could use folder param
-            "type": "DocumentType",
-            "version": 0,
-            "lastModified": now.timestamp_millis().to_string(),
-            "pinned": false,
-            "deleted": false,
-        });
-        
-        // Store metadata
-        let meta_bytes = serde_json::to_vec(&metadata)?;
-        let meta_hash = self.inner.storage.put(&meta_bytes, &format!("{}.metadata", filename))?;
-        
-        // Create .content file
-        let content = serde_json::json!({
-            "fileType": detect_file_type(filename),
-            "pages": [],
-            "coverPageNumber": 0,
-            "documentMetadata": {},
-            "formatVersion": 1,
-            "dummyDocument": false,
-        });
-        let content_bytes = serde_json::to_vec(&content)?;
-        let content_hash_stored = self.inner.storage.put(&content_bytes, &format!("{}.content", filename))?;
-        
-        tracing::info!(
-            "Created document entry {} for {} (hash: {})",
-            doc_id, filename, content_hash
-        );
-        
-        Ok(())
     }
 
     /// Send confirmation email to sender
@@ -785,5 +734,17 @@ mod tests {
         assert_eq!(strip_extension("report.pdf"), "report");
         assert_eq!(strip_extension("my.book.epub"), "my.book");
         assert_eq!(strip_extension("noext"), "noext");
+    }
+}
+
+/// Document type for an attachment, from its extension or MIME type.
+fn document_ext(filename: &str, content_type: &str) -> Option<&'static str> {
+    let lower = filename.to_ascii_lowercase();
+    if lower.ends_with(".pdf") || content_type.eq_ignore_ascii_case("application/pdf") {
+        Some("pdf")
+    } else if lower.ends_with(".epub") || content_type.eq_ignore_ascii_case("application/epub+zip") {
+        Some("epub")
+    } else {
+        None
     }
 }

@@ -19,6 +19,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Blob hashes are 64-char lowercase hex (sha256). Anything else is rejected
+/// before it can be used as a path component.
+pub fn is_valid_hash(hash: &str) -> bool {
+    hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// Hash-based storage backend
 #[derive(Clone)]
 pub struct Storage {
@@ -87,6 +93,11 @@ impl Storage {
         Ok(map)
     }
     
+    /// Directory holding the blobs (and server-side indexes kept alongside them).
+    pub fn base_path(&self) -> &Path {
+        &self.inner.base_path
+    }
+
     /// Get current root
     pub fn get_root(&self) -> SyncRoot {
         self.inner.root.read().clone()
@@ -94,7 +105,18 @@ impl Storage {
     
     /// Set new root hash and increment generation
     pub fn set_root(&self, hash: String) -> Result<SyncRoot> {
+        self.set_root_if(hash, None)
+    }
+
+    /// Set the root hash only if the current generation equals `expected`
+    /// (GCS `x-goog-if-generation-match` semantics). `None` skips the check.
+    pub fn set_root_if(&self, hash: String, expected: Option<u64>) -> Result<SyncRoot> {
         let mut root = self.inner.root.write();
+        if let Some(expected) = expected {
+            if expected != root.generation {
+                return Err(ServerError::GenerationMismatch { current: root.generation });
+            }
+        }
         root.hash = hash;
         root.generation += 1;
         
@@ -117,11 +139,14 @@ impl Storage {
     
     /// Check if a hash exists
     pub fn exists(&self, hash: &str) -> bool {
-        self.hash_path(hash).exists()
+        is_valid_hash(hash) && self.hash_path(hash).exists()
     }
-    
+
     /// Get file by hash
     pub fn get(&self, hash: &str) -> Result<Vec<u8>> {
+        if !is_valid_hash(hash) {
+            return Err(ServerError::InvalidHash(hash.to_string()));
+        }
         let path = self.hash_path(hash);
         if !path.exists() {
             return Err(ServerError::NotFound(hash.to_string()));
@@ -175,19 +200,16 @@ impl Storage {
     }
     
     /// Store file with explicit hash (for uploads with known hash)
+    /// Store a blob under the client-supplied hash.
+    ///
+    /// The hash is not recomputed from `data`: in sync v3 the hash of an index
+    /// (root, `.docSchema`) is derived from its entries' hashes, not its bytes,
+    /// so it can't be verified here. Integrity is checked via `x-goog-hash` by the caller.
     pub fn put_with_hash(&self, data: &[u8], hash: &str, filename: &str) -> Result<()> {
-        // Verify hash matches
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        let actual_hash = hex::encode(hasher.finalize());
-        
-        if actual_hash != hash {
-            return Err(ServerError::InvalidHash(format!(
-                "hash mismatch: expected {}, got {}",
-                hash, actual_hash
-            )));
+        if !is_valid_hash(hash) {
+            return Err(ServerError::InvalidHash(hash.to_string()));
         }
-        
+
         // Write file
         let path = self.hash_path(hash);
         if let Some(parent) = path.parent() {
@@ -224,6 +246,37 @@ impl Storage {
     }
     
     /// List all hashes in storage
+    /// Walk the sync tree from the current root (root index -> document indexes ->
+    /// files) and return every referenced hash that isn't stored.
+    ///
+    /// Index format: first line is the schema version, then `hash:type:id:subfiles:size`.
+    pub fn missing_from_root(&self) -> Result<Vec<String>> {
+        let root = self.get_root();
+        if root.hash.is_empty() {
+            return Ok(Vec::new());
+        }
+        let entries = |index: &[u8]| -> Vec<String> {
+            String::from_utf8_lossy(index)
+                .lines()
+                .skip(1)
+                .filter_map(|l| l.split(':').next())
+                .filter(|h| is_valid_hash(h))
+                .map(str::to_owned)
+                .collect()
+        };
+        let mut missing = Vec::new();
+        let Ok(root_index) = self.get(&root.hash) else {
+            return Ok(vec![root.hash]);
+        };
+        for doc in entries(&root_index) {
+            match self.get(&doc) {
+                Ok(doc_index) => missing.extend(entries(&doc_index).into_iter().filter(|f| !self.exists(f))),
+                Err(_) => missing.push(doc),
+            }
+        }
+        Ok(missing)
+    }
+
     pub fn list_hashes(&self) -> Result<Vec<String>> {
         let mut hashes = Vec::new();
         

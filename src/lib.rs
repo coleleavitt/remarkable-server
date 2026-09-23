@@ -5,11 +5,25 @@ pub mod notifications;
 pub mod calendar_api;
 pub mod checksum;
 pub mod device;
+pub mod documents;
 pub mod error;
+pub mod handwriting;
+pub mod hw_search;
 pub mod integrations;
+pub mod passcode;
 pub mod protocol;
+pub mod screenshare;
+pub mod service;
+pub mod share_email;
 pub mod storage;
+pub mod sync15;
 pub mod types;
+pub mod email;
+pub mod email_api;
+pub mod feeds;
+pub mod search;
+pub mod search_api;
+pub mod versions;
 pub mod readlater;
 pub mod readlater_api;
 
@@ -31,9 +45,34 @@ pub use readlater::{
 };
 pub use readlater_api::{ReadLaterState, readlater_router};
 
-use axum::{routing::{delete, get, post, put}, Router};
+use axum::{extract::DefaultBodyLimit, routing::{delete, get, post, put}, Router};
 use tower_http::trace::TraceLayer;
 use std::path::Path;
+
+/// Max upload body for blob routes. Axum's 2 MB default rejects PDFs/EPUBs and large
+/// notebook pages with 413, which the device reports as "Failed uploading".
+const MAX_BLOB_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Bind a TCP listener, waiting while the address doesn't exist yet (e.g. the tablet's
+/// USB network is down because it's asleep or unplugged) instead of failing startup.
+pub async fn bind_when_available(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    let mut warned = false;
+    loop {
+        match tokio::net::TcpListener::bind(addr).await {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                if !warned {
+                    tracing::warn!(%addr, "address not present yet (tablet asleep/unplugged?); waiting for it");
+                    warned = true;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// How often the feed scheduler looks for subscriptions due a refresh (each has its own interval).
+const FEED_CHECK_SECS: u64 = 300;
 
 pub fn create_router(state: AppState) -> Router {
     Router::new()
@@ -41,7 +80,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/document-storage/json/2/docs", get(protocol::v1_list_docs))
         .route("/document-storage/json/2/upload/request", put(protocol::v1_upload_request))
         .route("/document-storage/json/2/upload/update-status", put(protocol::v1_update_status))
-        .route("/document-storage/json/2/delete", delete(protocol::v1_delete))
+        .route("/document-storage/json/2/delete", put(protocol::v1_delete))
         
         // V1.5 Protocol (batch operations)
         .route("/sync/v1.5/batch", post(protocol::v15_batch_sync))
@@ -51,10 +90,31 @@ pub fn create_router(state: AppState) -> Router {
         .route("/sync/v2/files/{hash}", get(protocol::v2_get_file))
         .route("/sync/v2/files/{hash}", put(protocol::v2_put_file))
         
+        // Sync 1.5 (signed URLs - current xochitl firmware)
+        .route("/sync/v2/signed-urls/downloads", post(sync15::signed_download))
+        .route("/sync/v2/signed-urls/uploads", post(sync15::signed_upload))
+        .route("/sync/v2/sync-complete", post(sync15::sync_complete))
+        .route("/api/v1/signed-urls/downloads", post(sync15::signed_download))
+        .route("/api/v1/signed-urls/uploads", post(sync15::signed_upload))
+        .route("/api/v1/sync-complete", post(sync15::sync_complete))
+        // Handwriting conversion (local tesseract; see handwriting.rs)
+        .route("/convert/v1/handwriting", post(handwriting::convert).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)))
+        .route("/handwriting/v1/search", get(hw_search::search))
+        .route("/api/v1/page", post(handwriting::convert).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)))
+        // Send by email (SMTP via env)
+        .route("/share/v1/email", post(share_email::send).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)))
+        // Read on reMarkable / desktop uploads (PDF, EPUB)
+        .route("/doc/v1/files", post(documents::upload_v1).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)))
+        .route("/doc/v2/files", post(documents::upload_v2).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)))
+        .route("/blobstorage", get(sync15::blob_get).put(sync15::blob_put).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)))
+
         // V3 Protocol (hash-based CRDT - current production)
-        .route("/sync/v3/root", get(api::get_root))
+        .route("/sync/v3/root", get(api::get_root).put(api::put_root))
+        .route("/sync/v3/check-files", post(api::check_files))
+        .route("/sync/v3/missing", get(api::missing_blobs))
+        .route("/sync/v3/files-list", get(api::files_list))
         .route("/sync/v3/files/{hash}", get(api::get_file))
-        .route("/sync/v3/files/{hash}", put(api::put_file))
+        .route("/sync/v3/files/{hash}", put(api::put_file).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)))
         
         // V4 Protocol (extended metadata - future)
         .route("/sync/v4/root", get(protocol::v4_get_root))
@@ -67,18 +127,34 @@ pub fn create_router(state: AppState) -> Router {
         .route("/devices/v1/{id}", delete(api::delete_device))
         .route("/token/json/2/user/new", post(api::refresh_token))
         .route("/token/json/2/device/new", post(api::register_device))
+        .route("/token/json/2/device/delete", post(api::delete_device_token))
         .route("/token/json/3/device/delete", post(api::delete_device_token))
         .route("/discovery/v1/endpoints", get(api::discovery))
-        .route("/service/json/1/document-storage", get(api::discovery))
+        .route("/discovery/v1/webapp", get(service::discovery_webapp))
+        .route("/service/json/1/{service}", get(api::service_locator))
         .route("/admin/create-user", post(api::create_test_user))
+        .route("/admin/passcode/resets/{uuid}/approve", post(passcode::approve))
+        .route("/passcode/v1/resets/{uuid}", post(passcode::create).get(passcode::get))
+        .route("/passcode/v1/reset/{uuid}/approve", post(passcode::device_approve))
+        .route("/passcode/v1/reset/{uuid}/deny", post(passcode::device_deny))
         .route("/health", get(api::health))
         .route("/debug/files", get(api::list_files))
         .route("/debug/clear", delete(api::clear_storage))
         // Notifications (MQTT over WebSocket)
         .route("/notifications/ws/json/1", get(notifications::notifications_ws))
         // Settings and updates
-        .route("/settings/v1/beta", get(api::get_settings))
-        .route("/settings/v1/features", get(api::get_settings))
+        .route("/settings/v1/beta", get(service::get_beta).post(service::post_beta))
+        .route("/settings/v1/features", get(service::get_beta))
+        // Telemetry / analytics (ping.remarkable.com) - accepted and dropped
+        .route("/v1/reports", post(service::null_report))
+        .route("/v2/reports", post(service::null_report))
+        .route("/report/v1", post(service::null_report))
+        .route("/v2/events", post(service::null_report))
+        .route("/sync/reports/v1", post(service::null_report))
+        .route("/analytics/v2/events", post(service::analytics_report))
+        // Third-party integrations (none configured)
+        .route("/integrations/v1/", get(service::list_integrations))
+        .route("/integrations/v2/instances", get(service::list_integrations))
         .route("/updates/v1/check", get(api::check_updates))
         .route("/updates/check", get(api::check_updates))
         .with_state(state)
@@ -91,12 +167,12 @@ fn calendar_router(state: CalendarState) -> Router {
         .route("/", post(calendar_api::add_calendar))
         .route("/upcoming", get(calendar_api::get_upcoming_events))
         .route("/sync-all", post(calendar_api::sync_all_calendars))
-        .route("/:id", get(calendar_api::get_calendar))
-        .route("/:id", delete(calendar_api::delete_calendar))
-        .route("/:id/events", get(calendar_api::get_events))
-        .route("/:id/sync", post(calendar_api::sync_calendar_endpoint))
-        .route("/:id/meeting-notes", get(calendar_api::list_meeting_notes))
-        .route("/:id/events/:event_id/meeting-notes", post(calendar_api::create_meeting_note))
+        .route("/{id}", get(calendar_api::get_calendar))
+        .route("/{id}", delete(calendar_api::delete_calendar))
+        .route("/{id}/events", get(calendar_api::get_events))
+        .route("/{id}/sync", post(calendar_api::sync_calendar_endpoint))
+        .route("/{id}/meeting-notes", get(calendar_api::list_meeting_notes))
+        .route("/{id}/events/{event_id}/meeting-notes", post(calendar_api::create_meeting_note))
         .route("/webhook", post(calendar_api::calendar_webhook))
         .with_state(state)
 }
@@ -109,7 +185,7 @@ pub fn create_router_with_all(
     let sync_router = Router::new()
         .route("/sync/v3/root", get(api::get_root))
         .route("/sync/v3/files/{hash}", get(api::get_file))
-        .route("/sync/v3/files/{hash}", put(api::put_file))
+        .route("/sync/v3/files/{hash}", put(api::put_file).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)))
         .route("/devices/v1", post(api::create_pairing_code))
         .route("/devices/v1", get(api::list_devices))
         .route("/devices/v1/{id}", delete(api::delete_device))
@@ -117,7 +193,7 @@ pub fn create_router_with_all(
         .route("/token/json/2/device/new", post(api::register_device))
         .route("/token/json/3/device/delete", post(api::delete_device_token))
         .route("/discovery/v1/endpoints", get(api::discovery))
-        .route("/service/json/1/document-storage", get(api::discovery))
+        .route("/service/json/1/{service}", get(api::service_locator))
         .route("/admin/create-user", post(api::create_test_user))
         .route("/health", get(api::health))
         .route("/debug/files", get(api::list_files))
@@ -134,7 +210,7 @@ pub fn create_router_with_calendar(state: AppState, calendar_state: CalendarStat
     let sync_router = Router::new()
         .route("/sync/v3/root", get(api::get_root))
         .route("/sync/v3/files/{hash}", get(api::get_file))
-        .route("/sync/v3/files/{hash}", put(api::put_file))
+        .route("/sync/v3/files/{hash}", put(api::put_file).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)))
         .route("/devices/v1", post(api::create_pairing_code))
         .route("/devices/v1", get(api::list_devices))
         .route("/devices/v1/{id}", delete(api::delete_device))
@@ -142,7 +218,7 @@ pub fn create_router_with_calendar(state: AppState, calendar_state: CalendarStat
         .route("/token/json/2/device/new", post(api::register_device))
         .route("/token/json/3/device/delete", post(api::delete_device_token))
         .route("/discovery/v1/endpoints", get(api::discovery))
-        .route("/service/json/1/document-storage", get(api::discovery))
+        .route("/service/json/1/{service}", get(api::service_locator))
         .route("/admin/create-user", post(api::create_test_user))
         .route("/health", get(api::health))
         .route("/debug/files", get(api::list_files))
@@ -162,7 +238,7 @@ pub fn create_router_with_integrations(
     Router::new()
         .route("/sync/v3/root", get(api::get_root))
         .route("/sync/v3/files/{hash}", get(api::get_file))
-        .route("/sync/v3/files/{hash}", put(api::put_file))
+        .route("/sync/v3/files/{hash}", put(api::put_file).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)))
         .route("/devices/v1", post(api::create_pairing_code))
         .route("/devices/v1", get(api::list_devices))
         .route("/devices/v1/{id}", delete(api::delete_device))
@@ -170,7 +246,7 @@ pub fn create_router_with_integrations(
         .route("/token/json/2/device/new", post(api::register_device))
         .route("/token/json/3/device/delete", post(api::delete_device_token))
         .route("/discovery/v1/endpoints", get(api::discovery))
-        .route("/service/json/1/document-storage", get(api::discovery))
+        .route("/service/json/1/{service}", get(api::service_locator))
         .route("/admin/create-user", post(api::create_test_user))
         .route("/health", get(api::health))
         .route("/debug/files", get(api::list_files))
@@ -189,7 +265,7 @@ pub fn create_full_router(
     Router::new()
         .route("/sync/v3/root", get(api::get_root))
         .route("/sync/v3/files/{hash}", get(api::get_file))
-        .route("/sync/v3/files/{hash}", put(api::put_file))
+        .route("/sync/v3/files/{hash}", put(api::put_file).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)))
         .route("/devices/v1", post(api::create_pairing_code))
         .route("/devices/v1", get(api::list_devices))
         .route("/devices/v1/{id}", delete(api::delete_device))
@@ -197,7 +273,7 @@ pub fn create_full_router(
         .route("/token/json/2/device/new", post(api::register_device))
         .route("/token/json/3/device/delete", post(api::delete_device_token))
         .route("/discovery/v1/endpoints", get(api::discovery))
-        .route("/service/json/1/document-storage", get(api::discovery))
+        .route("/service/json/1/{service}", get(api::service_locator))
         .route("/admin/create-user", post(api::create_test_user))
         .route("/health", get(api::health))
         .route("/debug/files", get(api::list_files))
@@ -216,6 +292,8 @@ pub fn init_calendar_manager(storage_path: &Path) -> anyhow::Result<CalendarMana
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub bind: String,
+    /// Public hostname the device reaches us by (discovery + JWT issuer).
+    pub host: String,
     pub storage_path: String,
     pub db_path: String,
     pub region: String,
@@ -229,6 +307,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: "127.0.0.1:8080".into(),
+            host: "local.tectonic.remarkable.com".into(),
             storage_path: "./remarkable-storage".into(),
             db_path: "./remarkable-storage/devices.db".into(),
             region: "local".into(),
@@ -244,4 +323,73 @@ pub fn init_readlater_manager(storage_path: &Path) -> anyhow::Result<ReadLaterMa
     let db_path = storage_path.join("readlater.db");
     std::fs::create_dir_all(storage_path.join("articles"))?;
     Ok(ReadLaterManager::new(&db_path, storage_path)?)
+}
+
+/// Reject requests without a valid device/user token. Applied to every feature API
+/// below, whose handlers don't authenticate on their own.
+async fn require_auth(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> std::result::Result<axum::response::Response, ServerError> {
+    state.auth_user(req.headers())?;
+    Ok(next.run(req).await)
+}
+
+/// Optional feature APIs (search, versions, calendars, read-later, cloud integrations,
+/// inbound email status), all behind token auth. `email` is the inbound mail server,
+/// passed in only when it's enabled.
+pub fn feature_routes(state: AppState, storage_path: &Path, email: Option<email::EmailServer>) -> anyhow::Result<Router> {
+    let search = search_api::SearchState::new(search::SearchIndex::new(storage_path)?, state.storage.clone());
+    let search_routes = Router::new()
+        .route("/query", get(search_api::search))
+        .route("/stats", get(search_api::stats))
+        .route("/reindex", post(search_api::reindex))
+        .route("/suggest", get(search_api::suggest))
+        .with_state(search);
+
+    let versions = versions::VersionState {
+        manager: versions::VersionManager::new(storage_path.join("versions"), state.storage.clone(), versions::VersionConfig::default())?,
+    };
+
+    let feeds = std::sync::Arc::new(feeds::FeedManager::new(&storage_path.join("feeds.db"), state.storage.clone(), &storage_path.join("feeds-epub"))?);
+    // Periodic refresh of due subscriptions; only inside a Tokio runtime (not in unit tests).
+    let scheduler = tokio::runtime::Handle::try_current().is_ok()
+        .then(|| feeds.clone().start_scheduler(FEED_CHECK_SECS));
+
+    let mut router = Router::new()
+        .nest("/feeds/v1", feeds::feeds_router(feeds::FeedState { manager: feeds, scheduler }))
+        .nest("/search/v1", search_routes)
+        .nest("/versions/v1", versions::version_router(versions))
+        .nest("/integrations/v2/calendars", calendar_router(CalendarState::new(init_calendar_manager(storage_path)?)))
+        .nest("/integrations/v2/readlater", readlater_router(ReadLaterState::new(init_readlater_manager(storage_path)?)))
+        .nest("/integrations/v2/cloud", integration_router(IntegrationState::new()));
+
+    if let Some(server) = email {
+        router = router.nest("/email/v1", Router::new()
+            .route("/emails", get(email_api::list_emails))
+            .route("/stats", get(email_api::stats))
+            .route("/config", get(email_api::config))
+            .route("/health", get(email_api::health))
+            .with_state(email_api::EmailState::new(server)));
+    }
+
+    Ok(router.layer(axum::middleware::from_fn_with_state(state, require_auth)))
+}
+
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+
+    /// axum panics at router construction on bad route syntax (e.g. old `/:id` captures),
+    /// which would crash the server at startup. Build every router here instead.
+    #[test]
+    fn all_routers_build() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        let devices = DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        let state = AppState::new(storage, devices);
+        let _ = create_router(state.clone());
+        let _ = feature_routes(state, tmp.path(), None).unwrap();
+    }
 }

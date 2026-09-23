@@ -12,7 +12,7 @@
 use crate::error::{Result, ServerError};
 use crate::storage::Storage;
 use chrono::{DateTime, Utc};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -200,14 +200,16 @@ pub struct FeedStats {
 
 /// Manages feed subscriptions and articles
 pub struct FeedManager {
-    db: Arc<RwLock<Connection>>,
+    db: Arc<Mutex<Connection>>,
     storage: Storage,
     epub_dir: PathBuf,
     http_client: reqwest::Client,
     scheduler_tx: Option<mpsc::Sender<SchedulerCommand>>,
 }
 
-enum SchedulerCommand {
+/// Commands for the background refresh task. Dropping every sender stops the task,
+/// so keep one alive (see `FeedState::scheduler`).
+pub enum SchedulerCommand {
     Refresh(Vec<String>),
     Stop,
 }
@@ -227,7 +229,7 @@ impl FeedManager {
             .map_err(|e| ServerError::Internal(e.to_string()))?;
         
         Ok(Self {
-            db: Arc::new(RwLock::new(conn)),
+            db: Arc::new(Mutex::new(conn)),
             storage,
             epub_dir: epub_dir.to_path_buf(),
             http_client,
@@ -296,7 +298,7 @@ impl FeedManager {
     
     /// List all subscriptions
     pub fn list_subscriptions(&self) -> Result<Vec<Subscription>> {
-        let db = self.db.read();
+        let db = self.db.lock();
         let mut stmt = db.prepare(r#"
             SELECT s.id, s.name, s.url, s.feed_type, s.folder, s.enabled,
                    s.fetch_interval_mins, s.last_fetch, s.last_error,
@@ -328,7 +330,7 @@ impl FeedManager {
     
     /// Get a subscription by ID
     pub fn get_subscription(&self, id: &str) -> Result<Subscription> {
-        let db = self.db.read();
+        let db = self.db.lock();
         let mut stmt = db.prepare(r#"
             SELECT s.id, s.name, s.url, s.feed_type, s.folder, s.enabled,
                    s.fetch_interval_mins, s.last_fetch, s.last_error,
@@ -369,7 +371,7 @@ impl FeedManager {
         let fetch_interval = req.fetch_interval_mins.unwrap_or(60);
         
         {
-            let db = self.db.write();
+            let db = self.db.lock();
             db.execute(
                 r#"INSERT INTO subscriptions (id, name, url, feed_type, folder, enabled, fetch_interval_mins, created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)"#,
@@ -382,7 +384,7 @@ impl FeedManager {
     
     /// Delete a subscription
     pub fn delete_subscription(&self, id: &str) -> Result<()> {
-        let db = self.db.write();
+        let db = self.db.lock();
         let affected = db.execute("DELETE FROM subscriptions WHERE id = ?", [id])?;
         if affected == 0 {
             return Err(ServerError::NotFound(format!("Subscription {}", id)));
@@ -401,7 +403,7 @@ impl FeedManager {
         let interval = updates.get("fetchIntervalMins").and_then(|v| v.as_u64()).unwrap_or(current.fetch_interval_mins as u64) as u32;
         
         {
-            let db = self.db.write();
+            let db = self.db.lock();
             db.execute(
                 "UPDATE subscriptions SET name = ?, folder = ?, enabled = ?, fetch_interval_mins = ?, updated_at = ? WHERE id = ?",
                 params![name, folder, enabled as i32, interval, now.to_rfc3339(), id]
@@ -423,7 +425,8 @@ impl FeedManager {
         let content_type = response.headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_owned();
         
         let body = response.text().await
             .map_err(|e| ServerError::Internal(format!("Failed to read feed: {}", e)))?;
@@ -490,7 +493,7 @@ impl FeedManager {
             
             let content_html = entry.content
                 .and_then(|c| c.body)
-                .or_else(|| entry.summary.map(|s| s.content));
+                .or_else(|| entry.summary.as_ref().map(|s| s.content.clone()));
             
             let content_text = content_html.as_ref().map(|h| strip_html(h));
             let word_count = content_text.as_ref().map(|t| t.split_whitespace().count() as u32);
@@ -519,7 +522,7 @@ impl FeedManager {
     }
     
     fn article_exists_by_url(&self, subscription_id: &str, url: &str) -> Result<bool> {
-        let db = self.db.read();
+        let db = self.db.lock();
         let count: i32 = db.query_row(
             "SELECT COUNT(*) FROM articles WHERE subscription_id = ? AND url = ?",
             params![subscription_id, url],
@@ -630,10 +633,10 @@ impl FeedManager {
                 path
             };
             
-            // Upload to storage
+            // Add to the sync tree as a real document so the device pulls it.
             let epub_data = std::fs::read(&epub_path)?;
-            let filename = epub_path.file_name().unwrap().to_string_lossy();
-            self.storage.put(&epub_data, &format!("{}/{}", folder, filename))?;
+            let (doc_id, _) = crate::documents::create_document(&self.storage, &article.title, "epub", &epub_data)?;
+            tracing::info!("Feed article {:?} ({}) synced as document {}", article.title, folder, doc_id);
             
             // Mark as synced
             self.mark_article_synced(&article.id)?;
@@ -644,7 +647,7 @@ impl FeedManager {
     }
     
     fn update_article_epub(&self, article_id: &str, path: &Path) -> Result<()> {
-        let db = self.db.write();
+        let db = self.db.lock();
         db.execute(
             "UPDATE articles SET epub_path = ? WHERE id = ?",
             params![path.to_string_lossy(), article_id]
@@ -653,7 +656,7 @@ impl FeedManager {
     }
     
     fn mark_article_synced(&self, article_id: &str) -> Result<()> {
-        let db = self.db.write();
+        let db = self.db.lock();
         db.execute("UPDATE articles SET synced = 1 WHERE id = ?", [article_id])?;
         Ok(())
     }
@@ -664,7 +667,7 @@ impl FeedManager {
     
     /// List articles with optional filtering
     pub fn list_articles(&self, query: ArticleQuery) -> Result<Vec<Article>> {
-        let db = self.db.read();
+        let db = self.db.lock();
         
         let mut sql = String::from(r#"
             SELECT id, subscription_id, title, url, author, summary, content_html, content_text,
@@ -723,7 +726,7 @@ impl FeedManager {
     
     /// Get a single article
     pub fn get_article(&self, id: &str) -> Result<Article> {
-        let db = self.db.read();
+        let db = self.db.lock();
         let mut stmt = db.prepare(r#"
             SELECT id, subscription_id, title, url, author, summary, content_html, content_text,
                    published_at, fetched_at, read, synced, epub_path, word_count
@@ -754,14 +757,14 @@ impl FeedManager {
     
     /// Mark article as read
     pub fn mark_read(&self, id: &str, read: bool) -> Result<()> {
-        let db = self.db.write();
+        let db = self.db.lock();
         db.execute("UPDATE articles SET read = ? WHERE id = ?", params![read as i32, id])?;
         Ok(())
     }
     
     /// Save articles to database
     fn save_articles(&self, articles: &[Article]) -> Result<u32> {
-        let db = self.db.write();
+        let db = self.db.lock();
         let mut saved = 0;
         
         for article in articles {
@@ -843,7 +846,7 @@ impl FeedManager {
     }
     
     fn update_last_fetch(&self, subscription_id: &str, error: Option<&str>) -> Result<()> {
-        let db = self.db.write();
+        let db = self.db.lock();
         let now = Utc::now().to_rfc3339();
         db.execute(
             "UPDATE subscriptions SET last_fetch = ?, last_error = ?, updated_at = ? WHERE id = ?",
@@ -897,7 +900,7 @@ impl FeedManager {
             if let Some(url) = outline.xml_url {
                 let req = CreateSubscriptionRequest {
                     url,
-                    name: Some(outline.text),
+                    name: Some(outline.text.clone()),
                     feed_type: outline.feed_type.as_deref().and_then(|t| match t {
                         "rss" => Some(FeedType::Rss),
                         "atom" => Some(FeedType::Atom),
@@ -977,7 +980,7 @@ impl FeedManager {
     
     /// Get feed statistics
     pub fn stats(&self) -> Result<FeedStats> {
-        let db = self.db.read();
+        let db = self.db.lock();
         
         let subscription_count: u32 = db.query_row("SELECT COUNT(*) FROM subscriptions", [], |r| r.get(0))?;
         let article_count: u32 = db.query_row("SELECT COUNT(*) FROM articles", [], |r| r.get(0))?;
@@ -1025,7 +1028,7 @@ pub struct ExtractedArticle {
 impl FeedManager {
     /// Configure IMAP for a newsletter subscription
     pub fn set_imap_config(&self, subscription_id: &str, config: ImapConfig) -> Result<()> {
-        let db = self.db.write();
+        let db = self.db.lock();
         db.execute(
             r#"INSERT OR REPLACE INTO imap_configs
                (id, subscription_id, host, port, username, password, mailbox, tls, delete_after_sync)
@@ -1050,24 +1053,13 @@ impl FeedManager {
         let config = self.get_imap_config(subscription_id)?;
         let mut articles = Vec::new();
         
-        // Connect to IMAP
-        let tls = native_tls::TlsConnector::new()
-            .map_err(|e| ServerError::Internal(format!("TLS error: {}", e)))?;
-        
-        let client = if config.tls {
-            imap::connect(
-                (config.host.as_str(), config.port),
-                &config.host,
-                &tls
-            ).map_err(|e| ServerError::Internal(format!("IMAP connect error: {}", e)))?
-        } else {
-            let tcp = std::net::TcpStream::connect((config.host.as_str(), config.port))
-                .map_err(|e| ServerError::Internal(format!("TCP connect error: {}", e)))?;
-            imap::Client::new(tcp)
-                .secure(&config.host, &tls)
-                .map_err(|e| ServerError::Internal(format!("IMAP upgrade error: {}", e)))?
-        };
-        
+        // Connect to IMAP: implicit TLS when `tls` is set, otherwise STARTTLS (never plaintext).
+        let mode = if config.tls { imap::ConnectionMode::Tls } else { imap::ConnectionMode::StartTls };
+        let client = imap::ClientBuilder::new(config.host.as_str(), config.port)
+            .mode(mode)
+            .connect()
+            .map_err(|e| ServerError::Internal(format!("IMAP connect error: {}", e)))?;
+
         let mut session = client.login(&config.username, &config.password)
             .map_err(|(e, _)| ServerError::Internal(format!("IMAP login error: {}", e)))?;
         
@@ -1139,7 +1131,7 @@ impl FeedManager {
     }
     
     fn get_imap_config(&self, subscription_id: &str) -> Result<ImapConfig> {
-        let db = self.db.read();
+        let db = self.db.lock();
         db.query_row(
             "SELECT host, port, username, password, mailbox, tls, delete_after_sync FROM imap_configs WHERE subscription_id = ?",
             [subscription_id],
@@ -1306,11 +1298,13 @@ fn extract_html_body(mail: &mailparse::ParsedMail) -> Option<String> {
 // Axum API Handlers
 // ============================================================================
 
-use axum::{extract::{Path, Query, State}, http::StatusCode, Json};
+use axum::{extract::{Path as UrlPath, Query, State}, http::StatusCode, Json};
 
 #[derive(Clone)]
 pub struct FeedState {
     pub manager: Arc<FeedManager>,
+    /// Keeps the scheduler task alive (it exits when all senders drop).
+    pub scheduler: Option<mpsc::Sender<SchedulerCommand>>,
 }
 
 /// GET /feeds/v1/subscriptions - List all subscriptions
@@ -1333,7 +1327,7 @@ pub async fn create_subscription(
 /// GET /feeds/v1/subscriptions/:id - Get subscription
 pub async fn get_subscription(
     State(state): State<FeedState>,
-    Path(id): Path<String>,
+    UrlPath(id): UrlPath<String>,
 ) -> Result<Json<Subscription>> {
     let subscription = state.manager.get_subscription(&id)?;
     Ok(Json(subscription))
@@ -1342,7 +1336,7 @@ pub async fn get_subscription(
 /// DELETE /feeds/v1/subscriptions/:id - Delete subscription
 pub async fn delete_subscription(
     State(state): State<FeedState>,
-    Path(id): Path<String>,
+    UrlPath(id): UrlPath<String>,
 ) -> Result<StatusCode> {
     state.manager.delete_subscription(&id)?;
     Ok(StatusCode::NO_CONTENT)
@@ -1351,7 +1345,7 @@ pub async fn delete_subscription(
 /// PATCH /feeds/v1/subscriptions/:id - Update subscription
 pub async fn update_subscription(
     State(state): State<FeedState>,
-    Path(id): Path<String>,
+    UrlPath(id): UrlPath<String>,
     Json(updates): Json<serde_json::Value>,
 ) -> Result<Json<Subscription>> {
     let subscription = state.manager.update_subscription(&id, updates)?;
@@ -1379,7 +1373,7 @@ pub async fn list_articles(
 /// GET /feeds/v1/articles/:id - Get article
 pub async fn get_article(
     State(state): State<FeedState>,
-    Path(id): Path<String>,
+    UrlPath(id): UrlPath<String>,
 ) -> Result<Json<Article>> {
     let article = state.manager.get_article(&id)?;
     Ok(Json(article))
@@ -1388,7 +1382,7 @@ pub async fn get_article(
 /// POST /feeds/v1/articles/:id/read - Mark article read
 pub async fn mark_article_read(
     State(state): State<FeedState>,
-    Path(id): Path<String>,
+    UrlPath(id): UrlPath<String>,
 ) -> Result<StatusCode> {
     state.manager.mark_read(&id, true)?;
     Ok(StatusCode::NO_CONTENT)
@@ -1397,7 +1391,7 @@ pub async fn mark_article_read(
 /// POST /feeds/v1/articles/:id/epub - Generate EPUB
 pub async fn generate_epub(
     State(state): State<FeedState>,
-    Path(id): Path<String>,
+    UrlPath(id): UrlPath<String>,
 ) -> Result<Json<serde_json::Value>> {
     let article = state.manager.get_article(&id)?;
     let path = state.manager.article_to_epub(&article)?;
@@ -1449,7 +1443,7 @@ pub async fn get_stats(
 /// POST /feeds/v1/subscriptions/:id/sync - Sync articles to device
 pub async fn sync_to_device(
     State(state): State<FeedState>,
-    Path(id): Path<String>,
+    UrlPath(id): UrlPath<String>,
 ) -> Result<Json<serde_json::Value>> {
     let sub = state.manager.get_subscription(&id)?;
     let synced = state.manager.sync_articles_to_folder(&sub.folder)?;
@@ -1467,15 +1461,15 @@ pub fn feeds_router(state: FeedState) -> Router {
     Router::new()
         .route("/subscriptions", get(list_subscriptions))
         .route("/subscriptions", post(create_subscription))
-        .route("/subscriptions/:id", get(get_subscription))
-        .route("/subscriptions/:id", delete(delete_subscription))
-        .route("/subscriptions/:id", patch(update_subscription))
-        .route("/subscriptions/:id/sync", post(sync_to_device))
+        .route("/subscriptions/{id}", get(get_subscription))
+        .route("/subscriptions/{id}", delete(delete_subscription))
+        .route("/subscriptions/{id}", patch(update_subscription))
+        .route("/subscriptions/{id}/sync", post(sync_to_device))
         .route("/refresh", post(refresh_feeds))
         .route("/articles", get(list_articles))
-        .route("/articles/:id", get(get_article))
-        .route("/articles/:id/read", post(mark_article_read))
-        .route("/articles/:id/epub", post(generate_epub))
+        .route("/articles/{id}", get(get_article))
+        .route("/articles/{id}/read", post(mark_article_read))
+        .route("/articles/{id}/epub", post(generate_epub))
         .route("/extract", post(extract_article))
         .route("/import/opml", post(import_opml))
         .route("/export/opml", get(export_opml))

@@ -1,6 +1,6 @@
 use crate::error::{Result, ServerError};
 use chrono::{DateTime, Duration, Utc};
-use jsonwebtoken::{encode, decode, Algorithm, EncodingKey, DecodingKey, Header, Validation};
+use jsonwebtoken::{encode, decode, Algorithm, Header, Validation};
 use rand::Rng;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -8,9 +8,10 @@ use std::path::Path;
 use std::sync::Arc;
 use parking_lot::Mutex;
 
-const JWT_SECRET: &[u8] = b"remarkable-local-server-secret-key-v1";
+const DEFAULT_JWT_SECRET: &[u8] = b"remarkable-local-server-secret-key-v1";
 const USER_TOKEN_LIFETIME: i64 = 3 * 60 * 60;
 const CODE_LIFETIME: i64 = 10 * 60;
+const BLOB_URL_LIFETIME_MINUTES: i64 = 60;
 
 #[derive(Clone)]
 pub struct DeviceManager { inner: Arc<Inner> }
@@ -34,16 +35,31 @@ struct UserTokenClaims { sub: String, iss: String, iat: i64, exp: i64, nbf: i64,
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Auth0Profile { #[serde(rename = "UserID")] user_id: String, #[serde(rename = "Email")] email: String, #[serde(rename = "IsConnected")] is_connected: bool, #[serde(rename = "IsBeta")] is_beta: bool }
 
+/// Tablet-facing passcode reset request (field names match the cloud API).
+#[derive(Debug, Clone, Serialize)]
+pub struct PasscodeReset {
+    #[serde(rename = "DeviceID")] pub device_id: String,
+    #[serde(rename = "DeviceName")] pub device_name: String,
+    #[serde(rename = "RequestID")] pub request_id: String,
+    #[serde(rename = "Created")] pub created: DateTime<Utc>,
+    #[serde(rename = "Expires")] pub expires: DateTime<Utc>,
+    #[serde(rename = "Approved")] pub approved: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BlobClaims { blob: String, write: bool, exp: i64 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SubscriptionClaim { status: String, plan: String }
 
 impl DeviceManager {
     pub fn new<P: AsRef<Path>>(db_path: P, region: &str, issuer: &str) -> Result<Self> {
         let conn = Connection::open(db_path)?;
-        conn.execute_batch("CREATE TABLE IF NOT EXISTS devices (device_id TEXT PRIMARY KEY, device_desc TEXT NOT NULL, registered_at TEXT NOT NULL, last_refresh TEXT NOT NULL, user_id TEXT NOT NULL); CREATE TABLE IF NOT EXISTS pending_codes (code TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at TEXT NOT NULL);")?;
-        let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "remarkable-local-server-secret".to_string());
-        let encoding_key = jsonwebtoken::EncodingKey::from_secret(secret.as_bytes());
-        let decoding_key = jsonwebtoken::DecodingKey::from_secret(secret.as_bytes());
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS devices (device_id TEXT PRIMARY KEY, device_desc TEXT NOT NULL, registered_at TEXT NOT NULL, last_refresh TEXT NOT NULL, user_id TEXT NOT NULL); CREATE TABLE IF NOT EXISTS pending_codes (code TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS passcode_resets (request_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, device_id TEXT NOT NULL, device_name TEXT NOT NULL, created TEXT NOT NULL, expires TEXT NOT NULL, approved INTEGER NOT NULL DEFAULT 0);")?;
+        // One signing key for every token. Defaults to DEFAULT_JWT_SECRET so tokens already issued stay valid.
+        let secret = std::env::var("JWT_SECRET").map(String::into_bytes).unwrap_or_else(|_| DEFAULT_JWT_SECRET.to_vec());
+        let encoding_key = jsonwebtoken::EncodingKey::from_secret(&secret);
+        let decoding_key = jsonwebtoken::DecodingKey::from_secret(&secret);
         Ok(Self { inner: Arc::new(Inner { 
             conn: Mutex::new(conn), 
             region: region.into(), 
@@ -71,6 +87,9 @@ impl DeviceManager {
         let dt = self.gen_device_token(device_id, device_desc, &user_id)?; let ut = self.gen_user_token(device_id, device_desc, &user_id)?;
         Ok((dt, ut))
     }
+    pub fn device_id_for_token(&self, device_token: &str) -> Result<String> {
+        Ok(self.decode_device_token(device_token)?.device_id)
+    }
     pub fn refresh_user_token(&self, device_token: &str) -> Result<String> {
         let claims = self.decode_device_token(device_token)?; let conn = self.inner.conn.lock();
         conn.execute("UPDATE devices SET last_refresh = ? WHERE device_id = ?", params![Utc::now().to_rfc3339(), claims.device_id]).ok();
@@ -85,47 +104,103 @@ impl DeviceManager {
     pub fn delete_device(&self, device_id: &str) -> Result<bool> { let conn = self.inner.conn.lock(); Ok(conn.execute("DELETE FROM devices WHERE device_id = ?", params![device_id])? > 0) }
     fn gen_device_token(&self, device_id: &str, device_desc: &str, user_id: &str) -> Result<String> {
         let now = Utc::now().timestamp();
-        encode(&Header::new(Algorithm::HS256), &DeviceTokenClaims { sub: "rM Device Token".into(), iss: self.inner.issuer.clone(), iat: now, nbf: now, jti: uuid::Uuid::new_v4().to_string(), device_id: device_id.into(), device_desc: device_desc.into(), auth0_userid: user_id.into() }, &EncodingKey::from_secret(JWT_SECRET)).map_err(|e| ServerError::TokenError(e.to_string()))
+        encode(&Header::new(Algorithm::HS256), &DeviceTokenClaims { sub: "rM Device Token".into(), iss: self.inner.issuer.clone(), iat: now, nbf: now, jti: uuid::Uuid::new_v4().to_string(), device_id: device_id.into(), device_desc: device_desc.into(), auth0_userid: user_id.into() }, &self.inner.encoding_key).map_err(|e| ServerError::TokenError(e.to_string()))
     }
     fn gen_user_token(&self, device_id: &str, device_desc: &str, user_id: &str) -> Result<String> {
         let now = Utc::now().timestamp();
-        encode(&Header::new(Algorithm::HS256), &UserTokenClaims { sub: user_id.into(), iss: self.inner.issuer.clone(), iat: now, exp: now + USER_TOKEN_LIFETIME, nbf: now, jti: uuid::Uuid::new_v4().to_string(), tectonic: self.inner.region.clone(), scopes: "intgr hwcmail:-1 hwc sync:fox screenshare mail:-1".into(), auth0_profile: Auth0Profile { user_id: user_id.into(), email: format!("local@{}", self.inner.issuer), is_connected: true, is_beta: false }, device_id: device_id.into(), device_desc: device_desc.into(), subscription: SubscriptionClaim { status: "active".into(), plan: "connect".into() } }, &EncodingKey::from_secret(JWT_SECRET)).map_err(|e| ServerError::TokenError(e.to_string()))
+        encode(&Header::new(Algorithm::HS256), &UserTokenClaims { sub: user_id.into(), iss: self.inner.issuer.clone(), iat: now, exp: now + USER_TOKEN_LIFETIME, nbf: now, jti: uuid::Uuid::new_v4().to_string(), tectonic: self.inner.region.clone(), scopes: "intgr hwcmail:-1 hwc sync:fox screenshare mail:-1".into(), auth0_profile: Auth0Profile { user_id: user_id.into(), email: format!("local@{}", self.inner.issuer), is_connected: true, is_beta: false }, device_id: device_id.into(), device_desc: device_desc.into(), subscription: SubscriptionClaim { status: "active".into(), plan: "connect".into() } }, &self.inner.encoding_key).map_err(|e| ServerError::TokenError(e.to_string()))
     }
     fn decode_device_token(&self, token: &str) -> Result<DeviceTokenClaims> {
         let mut val = Validation::new(Algorithm::HS256); val.validate_exp = false; val.set_required_spec_claims(&["sub", "iss", "iat"]);
-        decode::<DeviceTokenClaims>(token, &DecodingKey::from_secret(JWT_SECRET), &val).map(|d| d.claims).map_err(|_| ServerError::InvalidToken)
+        decode::<DeviceTokenClaims>(token, &self.inner.decoding_key, &val).map(|d| d.claims).map_err(|_| ServerError::InvalidToken)
     }
     pub fn validate_token(&self, auth: &str) -> Result<String> {
         let token = auth.strip_prefix("Bearer ").ok_or(ServerError::Unauthorized)?;
         if let Ok(c) = self.decode_device_token(token) { return Ok(c.auth0_userid); }
         let mut val = Validation::new(Algorithm::HS256); val.set_required_spec_claims(&["sub", "exp"]);
-        if let Ok(d) = decode::<UserTokenClaims>(token, &DecodingKey::from_secret(JWT_SECRET), &val) { return Ok(d.claims.sub); }
+        if let Ok(d) = decode::<UserTokenClaims>(token, &self.inner.decoding_key, &val) { return Ok(d.claims.sub); }
         Err(ServerError::InvalidToken)
     }
+    /// Resolve a bearer header to (user id, device id, device description).
+    pub fn caller(&self, auth: &str) -> Result<(String, String, String)> {
+        let token = auth.strip_prefix("Bearer ").ok_or(ServerError::Unauthorized)?;
+        if let Ok(c) = self.decode_device_token(token) { return Ok((c.auth0_userid, c.device_id, c.device_desc)); }
+        let mut val = Validation::new(Algorithm::HS256); val.set_required_spec_claims(&["sub", "exp"]);
+        let c = decode::<UserTokenClaims>(token, &self.inner.decoding_key, &val).map_err(|_| ServerError::InvalidToken)?.claims;
+        Ok((c.sub, c.device_id, c.device_desc))
+    }
+
+    /// Record a passcode (PIN) reset request from a device. Idempotent per request id.
+    /// Returns true if a new request was stored, false if `request_id` already existed.
+    pub fn create_passcode_reset(&self, reset: &PasscodeReset, user_id: &str) -> Result<bool> {
+        let inserted = self.inner.conn.lock().execute(
+            "INSERT OR IGNORE INTO passcode_resets (request_id, user_id, device_id, device_name, created, expires, approved) VALUES (?, ?, ?, ?, ?, ?, 0)",
+            params![reset.request_id, user_id, reset.device_id, reset.device_name, reset.created.to_rfc3339(), reset.expires.to_rfc3339()],
+        )?;
+        Ok(inserted > 0)
+    }
+
+    /// Look up a reset request owned by `user_id` (expired ones count as missing).
+    pub fn get_passcode_reset(&self, request_id: &str, user_id: &str) -> Result<PasscodeReset> {
+        let conn = self.inner.conn.lock();
+        let row = conn.query_row(
+            "SELECT device_id, device_name, created, expires, approved FROM passcode_resets WHERE request_id = ? AND user_id = ?",
+            params![request_id, user_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, bool>(4)?)),
+        ).map_err(|_| ServerError::NotFound(request_id.into()))?;
+        let parse = |s: &str| DateTime::parse_from_rfc3339(s).map(|d| d.with_timezone(&Utc)).map_err(|e| ServerError::Internal(e.to_string()));
+        let reset = PasscodeReset { device_id: row.0, device_name: row.1, request_id: request_id.into(), created: parse(&row.2)?, expires: parse(&row.3)?, approved: row.4 };
+        if reset.expires < Utc::now() { return Err(ServerError::NotFound(request_id.into())); }
+        Ok(reset)
+    }
+
+    /// Approve a pending reset; returns (user id, reset) so the caller can notify the device.
+    pub fn approve_passcode_reset(&self, request_id: &str, owner: Option<&str>) -> Result<(String, PasscodeReset)> {
+        let user_id: String = self.inner.conn.lock()
+            .query_row("SELECT user_id FROM passcode_resets WHERE request_id = ?", params![request_id], |r| r.get(0))
+            .map_err(|_| ServerError::NotFound(request_id.into()))?;
+        if owner.is_some_and(|o| o != user_id) { return Err(ServerError::NotFound(request_id.into())); }
+        let reset = self.get_passcode_reset(request_id, &user_id)?;
+        self.inner.conn.lock().execute("UPDATE passcode_resets SET approved = 1 WHERE request_id = ?", params![request_id])?;
+        Ok((user_id, PasscodeReset { approved: true, ..reset }))
+    }
+
+    /// Drop a reset request owned by `user_id` (deny). Returns whether one existed.
+    pub fn delete_passcode_reset(&self, request_id: &str, user_id: &str) -> Result<bool> {
+        Ok(self.inner.conn.lock().execute("DELETE FROM passcode_resets WHERE request_id = ? AND user_id = ?", params![request_id, user_id])? > 0)
+    }
+
     /// Get the endpoint URL for this server
     pub fn get_endpoint(&self) -> String {
         self.inner.issuer.clone()
     }
+
+    /// Sign a short-lived token granting read or write access to one blob (sync 1.5 signed URLs).
+    pub fn sign_blob(&self, blob: &str, write: bool) -> Result<(String, DateTime<Utc>)> {
+        let exp = Utc::now() + Duration::minutes(BLOB_URL_LIFETIME_MINUTES);
+        let claims = BlobClaims { blob: blob.into(), write, exp: exp.timestamp() };
+        let token = encode(&Header::new(Algorithm::HS256), &claims, &self.inner.encoding_key).map_err(|e| ServerError::TokenError(e.to_string()))?;
+        Ok((token, exp))
+    }
+
+    /// Check a blob token grants `write` (or read) access to `blob`.
+    pub fn verify_blob(&self, token: &str, blob: &str, write: bool) -> Result<()> {
+        let claims = decode::<BlobClaims>(token, &self.inner.decoding_key, &Validation::new(Algorithm::HS256)).map_err(|_| ServerError::InvalidToken)?.claims;
+        if claims.blob != blob || claims.write != write { return Err(ServerError::Unauthorized); }
+        Ok(())
+    }
     
     /// Create a user token for admin/test purposes
     pub fn create_user_token(&self, user_id: &str) -> Result<String> {
-        let claims = serde_json::json!({
-            "sub": user_id,
-            "iat": chrono::Utc::now().timestamp(),
-            "exp": (chrono::Utc::now() + chrono::Duration::hours(24)).timestamp(),
-            "iss": &self.inner.issuer,
-        });
-        
-        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
-        jsonwebtoken::encode(&header, &claims, &self.inner.encoding_key)
-            .map_err(|e| ServerError::TokenError(e.to_string()))
+        // Same claims as a device-issued user token, so validate_token accepts it.
+        self.gen_user_token("admin", "admin", user_id)
     }
     
     /// Get a device by ID
     pub fn get_device(&self, device_id: &str) -> Result<Option<Device>> {
         let conn = self.inner.conn.lock();
         match conn.query_row(
-            "SELECT device_id, device_desc, registered_at, last_refresh, user_id FROM devices WHERE device_id = ?",
+            "SELECT device_id, device_desc, registered_at, last_refresh, user_id FROM devices WHERE device_id = ? COLLATE NOCASE",
             params![device_id],
             |row| {
                 Ok(Device {

@@ -599,7 +599,7 @@ pub fn firmware_router(state: FirmwareState) -> axum::Router {
     
     axum::Router::new()
         .route("/check", get(check_update))
-        .route("/download/:version", get(download_firmware))
+        .route("/download/{version}", get(download_firmware))
         .route("/changelog", get(get_changelog))
         .route("/versions", get(list_versions))
         .route("/devices", get(list_devices))

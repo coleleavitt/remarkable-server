@@ -6,7 +6,7 @@ description = "Local reMarkable sync server"
 license = "MIT"
 
 [dependencies]
-axum = { version = "0.8", features = ["macros", "ws"] }
+axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 tower = { version = "0.5" }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
@@ -46,9 +46,14 @@ lettre = { version = "0.11", default-features = false, features = ["builder", "s
 tempfile = "3"
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 rustls = { version = "0.23.45", features = ["aws-lc-rs"] }
+tiny-skia = "0.11"
+rumqttc = { version = "0.24", default-features = false }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
+bytes = "1"
+remarkable-lines = { version = "0.1.0", path = "../remarkable/crates/remarkable-lines" }
+remarkable-core = { version = "0.1.0", path = "../remarkable/crates/remarkable-core" }
 
 [dev-dependencies]
 tokio-test = "0.4"
 
 # MQTT broker for device notifications
-rumqttc = "0.24"

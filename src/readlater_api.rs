@@ -446,18 +446,18 @@ pub fn readlater_router(state: ReadLaterState) -> Router {
         // Accounts
         .route("/accounts", get(list_accounts))
         .route("/accounts", post(add_account))
-        .route("/accounts/:id", get(get_account))
-        .route("/accounts/:id", put(update_account))
-        .route("/accounts/:id", delete(delete_account_handler))
-        .route("/accounts/:id/sync", post(sync_account))
+        .route("/accounts/{id}", get(get_account))
+        .route("/accounts/{id}", put(update_account))
+        .route("/accounts/{id}", delete(delete_account_handler))
+        .route("/accounts/{id}/sync", post(sync_account))
         // OAuth
         .route("/oauth/start", post(start_oauth))
         .route("/oauth/complete", post(complete_oauth))
         // Articles
         .route("/articles", get(list_articles))
-        .route("/articles/:id", get(get_article))
-        .route("/articles/:id", put(update_article))
-        .route("/articles/:id", delete(delete_article_handler))
+        .route("/articles/{id}", get(get_article))
+        .route("/articles/{id}", put(update_article))
+        .route("/articles/{id}", delete(delete_article_handler))
         // Sync
         .route("/sync", post(sync_all))
         .with_state(state)

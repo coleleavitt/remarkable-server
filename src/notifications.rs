@@ -76,6 +76,12 @@ pub struct NotificationAttributes {
     
     #[serde(rename = "sourceDeviceID")]
     pub source_device_id: String,
+
+    #[serde(rename = "deviceID", skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+
+    #[serde(rename = "deviceName", skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
     
     #[serde(rename = "sourceDeviceDesc", skip_serializing_if = "Option::is_none")]
     pub source_device_desc: Option<String>,
@@ -97,6 +103,20 @@ pub struct NotificationAttributes {
 }
 
 impl WsMessage {
+    /// Tell the device its passcode reset request was approved (rmfakecloud `NotifyPasscodeReset`).
+    pub fn passcode_reset_approved(auth0_user_id: &str, device_id: &str, device_name: &str, request_id: &str) -> Self {
+        use base64::Engine;
+        let mut msg = Self::sync_complete(0, "local-server", auth0_user_id);
+        let attrs = &mut msg.message.attributes;
+        attrs.event = "PasscodeResetApproved".into();
+        attrs.device_id = Some(device_id.into());
+        attrs.device_name = Some(device_name.into());
+        attrs.id = Some(request_id.into());
+        attrs.version = Some("1".into());
+        msg.message.data = Some(base64::engine::general_purpose::STANDARD.encode("PasscodeResetApproved"));
+        msg
+    }
+
     pub fn sync_complete(generation: u64, source_device_id: &str, auth0_user_id: &str) -> Self {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -113,6 +133,8 @@ impl WsMessage {
                     event: "SyncComplete".to_string(),
                     source_device_id: source_device_id.to_string(),
                     source_device_desc: Some("local-server".to_string()),
+                    device_id: None,
+                    device_name: None,
                     id: None,
                     parent: None,
                     doc_type: None,
@@ -145,9 +167,12 @@ pub struct ClientMessage {
 pub async fn notifications_ws(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
-) -> impl IntoResponse {
+    headers: axum::http::HeaderMap,
+) -> crate::error::Result<impl IntoResponse> {
+    // Same as the cloud: only authenticated devices/clients may subscribe.
+    state.auth_user(&headers)?;
     info!("WebSocket upgrade request for notifications");
-    ws.on_upgrade(move |socket| handle_notifications_socket(socket, state))
+    Ok(ws.on_upgrade(move |socket| handle_notifications_socket(socket, state)))
 }
 
 /// Handle an individual WebSocket connection

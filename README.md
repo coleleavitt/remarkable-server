@@ -191,23 +191,66 @@ Supported services: Pocket, Instapaper, Wallabag, Omnivore
 
 ## Device Configuration
 
-To point your device at this server:
+The device talks to the server directly over HTTPS on port 443; no proxy runs on the device.
 
-1. Generate SSL certificates (see tools/ssl_certs.py)
-2. Install CA cert on device
-3. Redirect traffic via /etc/hosts or mitmproxy
-4. Start server with generated certificates
+1. Give the host a static IP on the USB network (the device's DHCP lease is 60s and the address drifts):
+   ```bash
+   nmcli con modify "<usb connection>" ipv4.method manual ipv4.addresses 10.11.99.2/29 ipv4.never-default yes
+   nmcli con up "<usb connection>"
+   ```
+2. Install a local CA on the device (`/usr/local/share/ca-certificates/`, then `update-ca-certificates`) and sign a server cert with it covering `*.remarkable.com`, `*.cloud.remarkable.com`, `*.tectonic.remarkable.com`, `*.internal.cloud.remarkable.com`, `*.appspot.com`. Put it in `certs/server.crt` / `certs/server.key` (git-ignored).
+3. Map each cloud hostname to the host in the device's `/etc/hosts` (no wildcards — one line per name):
+   ```
+   10.11.99.2 my.remarkable.com
+   10.11.99.2 internal.cloud.remarkable.com
+   10.11.99.2 local.tectonic.remarkable.com
+   10.11.99.2 eu.tectonic.remarkable.com
+   ...
+   ```
+4. Allow unprivileged binding to 443 on the host (once):
+   ```bash
+   echo 'net.ipv4.ip_unprivileged_port_start=443' | sudo tee /etc/sysctl.d/50-remarkable-server.conf
+   sudo sysctl --system
+   ```
+5. Run:
+   ```bash
+   remarkable-server --bind 10.11.99.2:443 --cert certs/server.crt --key certs/server.key
+   ```
+
+`--host` (default `local.tectonic.remarkable.com`) is what discovery hands back to the device; it must be in the device's `/etc/hosts` and covered by the cert.
+
+### Pairing a device
 
 ```bash
-# Generate certs
-python tools/ssl_certs.py --domain your-server.local
-
-# Redirect on device (SSH required)
-echo "192.168.1.100 *.remarkable.com" >> /etc/hosts
-
-# Or use mitmproxy
-mitmproxy --mode transparent --ssl-insecure
+remarkable-server --storage ./remarkable-storage --pair   # prints a one-time code (valid 10 min)
 ```
+
+Enter the code on the tablet under Settings → General → Account → Connect.
+
+### Admin endpoints
+
+Admin endpoints are disabled unless `ADMIN_TOKEN` is set; requests must send it as `x-admin-token`.
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /admin/create-user` | Mint a user token (testing / desktop clients) |
+| `POST /admin/passcode/resets/{id}/approve` | Approve a tablet's passcode (PIN) reset request; the id is logged when the tablet asks |
+
+`JWT_SECRET` sets the token signing key (default is a built-in constant; changing it invalidates paired devices).
+
+### Optional features (environment)
+
+| Variable | Enables |
+|----------|---------|
+| `SMTP_HOST`, `SMTP_PORT` (587), `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM` | Tablet "Send by email" (`POST /share/v1/email`, STARTTLS) |
+| `SCREENSHARE_BIND` (e.g. `10.11.99.3:443`) | Screenshare signaling broker: MQTT 3.1.1 over TLS. Firmware dials `vernemq-prod.cloud.remarkable.engineering:443`, so give it its own address and point that name at it in the tablet's `/etc/hosts`. Screen data itself is peer-to-peer WebRTC. |
+| `SCREENSHARE_ICE_SERVERS` | JSON list of ICE servers for `room-joined` (default `[]`; entries use a singular `url` key) |
+| `EMAIL_INBOUND_BIND` (e.g. `127.0.0.1:2525`) | Inbound SMTP: mail PDF/EPUB attachments to `send@{device-id}.remarkable.local` and they appear on the tablet |
+| `HWR_CAPTURE_DIR` | Save every handwriting request/response pair |
+
+Handwriting conversion (`POST /convert/v1/handwriting`) runs the local `tesseract` binary: fine for neat print, poor for cursive/maths.
+
+Authenticated feature APIs (Bearer token): `/search/v1/*`, `/versions/v1/*`, `/feeds/v1/*` (RSS/Atom to EPUB), `/integrations/v2/{calendars,readlater,cloud}/*`, `/email/v1/*` (when inbound email is on).
 
 See [remarkable-research](https://github.com/coleleavitt/remarkable-research) for device configuration tools.
 
