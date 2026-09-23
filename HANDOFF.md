@@ -83,10 +83,10 @@ Based on xochitl binary analysis (via `strings`), the server now implements
 ✓ Integrations: Calendar, ReadLater, Cloud storage (GDrive/Dropbox/OneDrive)
 
 **Remaining gaps** (see GAP_ANALYSIS.md):
-1. `/integrations/v2/messaging/{}/message` — Messaging integration not implemented
-2. `/integrations/v2/storage/` vs `/cloud/` — Possible path naming mismatch
+1. ~~Messaging integration~~ — DONE (4c1cbfe)
+2. ~~Storage path alias~~ — DONE (4c1cbfe)
 
-**Status:** Should work for sync/pairing. Messaging integrations won't work.
+**Status:** Should work for sync/pairing. All 3.29 endpoints covered.
 Full verification against live tablet pending.
 
 ## Known open items
