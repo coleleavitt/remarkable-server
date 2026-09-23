@@ -9,6 +9,11 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install crypto provider for rustls
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to install crypto provider");
+
     let config = parse_args();
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "remarkable_server=debug,tower_http=debug".into()))
@@ -33,10 +38,25 @@ async fn main() -> Result<()> {
     // Create router
     let app = create_router(state);
     
-    // Start server
-    let listener = tokio::net::TcpListener::bind(&config.bind).await?;
-    tracing::info!("Listening on {}", config.bind);
-    axum::serve(listener, app).await?;
+    // Start server - TLS or plain
+    if let (Some(cert_path), Some(key_path)) = (&config.cert_path, &config.key_path) {
+        // TLS mode
+        use axum_server::tls_rustls::RustlsConfig;
+        use std::net::SocketAddr;
+        
+        let tls_config = RustlsConfig::from_pem_file(cert_path, key_path).await?;
+        let addr: SocketAddr = config.bind.parse()?;
+        
+        tracing::info!("Listening on {} (HTTPS)", config.bind);
+        axum_server::bind_rustls(addr, tls_config)
+            .serve(app.into_make_service())
+            .await?;
+    } else {
+        // Plain HTTP mode
+        let listener = tokio::net::TcpListener::bind(&config.bind).await?;
+        tracing::info!("Listening on {} (HTTP)", config.bind);
+        axum::serve(listener, app).await?;
+    }
     
     Ok(())
 }
@@ -66,6 +86,18 @@ fn parse_args() -> ServerConfig {
                     config.region = args[i].clone();
                 }
             }
+            "--cert" | "-c" => {
+                i += 1;
+                if i < args.len() {
+                    config.cert_path = Some(args[i].clone());
+                }
+            }
+            "--key" | "-k" => {
+                i += 1;
+                if i < args.len() {
+                    config.key_path = Some(args[i].clone());
+                }
+            }
             "--help" | "-h" => {
                 println!("remarkable-server - Local reMarkable sync server");
                 println!();
@@ -75,6 +107,8 @@ fn parse_args() -> ServerConfig {
                 println!("  -b, --bind <ADDR>     Address to bind (default: 127.0.0.1:8080)");
                 println!("  -s, --storage <PATH>  Storage directory (default: ./remarkable-storage)");
                 println!("  -r, --region <NAME>   Region name (default: local)");
+                println!("  -c, --cert <PATH>     TLS certificate file (PEM)");
+                println!("  -k, --key <PATH>      TLS private key file (PEM)");
                 println!("  -h, --help            Show this help");
                 std::process::exit(0);
             }

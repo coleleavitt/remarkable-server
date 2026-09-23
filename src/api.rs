@@ -4,10 +4,17 @@ use crate::types::{DeviceInfo, DeviceRegisterRequest, PairingCodeResponse, SyncR
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
-pub struct AppState { pub storage: Storage, pub devices: DeviceManager }
+pub struct AppState { 
+    pub storage: Storage, 
+    pub devices: DeviceManager,
+    pub notification_tx: tokio::sync::broadcast::Sender<crate::notifications::WsMessage>,
+}
 
 impl AppState {
-    pub fn new(storage: Storage, devices: DeviceManager) -> Self { Self { storage, devices } }
+    pub fn new(storage: Storage, devices: DeviceManager) -> Self { 
+        let (notification_tx, _) = tokio::sync::broadcast::channel(16);
+        Self { storage, devices, notification_tx } 
+    }
     fn auth_user(&self, headers: &HeaderMap) -> Result<String> {
         self.devices.validate_token(headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).ok_or(ServerError::Unauthorized)?)
     }
@@ -71,11 +78,12 @@ pub async fn delete_device_token(State(state): State<AppState>, headers: HeaderM
 
 pub async fn discovery(State(state): State<AppState>) -> Json<DiscoveryResponse> {
     let host = state.devices.get_endpoint();
+    // Return just hostnames - device constructs full URLs
+    // Device reads 'notifications' and builds wss://{notifications}/notifications/ws/json/1
     Json(DiscoveryResponse {
-        status: "OK".into(),
-        sync: format!("https://{}", host),
-        device: format!("https://{}", host),
-        mqtt: format!("wss://{}/notifications/ws/json/1", host),
+        notifications: host.clone(),
+        webapp: host.clone(),
+        mqttbroker: host,
     })
 }
 
@@ -107,5 +115,28 @@ pub struct TokenResponse { pub token: String }
 #[derive(Serialize)]
 pub struct RegisterResponse { pub device_token: String, pub user_token: String }
 
+/// Discovery response format matching real reMarkable API
+/// Device reads 'notifications' field to construct wss://{host}/notifications/ws/json/1
 #[derive(Serialize)]
-pub struct DiscoveryResponse { pub status: String, pub sync: String, pub device: String, pub mqtt: String }
+pub struct DiscoveryResponse {
+    /// Notifications/sync host (device constructs WebSocket URL from this)
+    pub notifications: String,
+    /// Webapp host
+    pub webapp: String,
+    /// MQTT broker host (VerneMQ)
+    pub mqttbroker: String,
+}
+
+
+pub async fn get_settings() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "beta_features": [],
+        "features": []
+    }))
+}
+
+pub async fn check_updates() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "available": false
+    }))
+}

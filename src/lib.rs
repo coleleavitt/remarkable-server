@@ -1,5 +1,7 @@
 pub mod api;
 pub mod calendar;
+pub mod mqtt_ws;
+pub mod notifications;
 pub mod calendar_api;
 pub mod checksum;
 pub mod device;
@@ -72,6 +74,13 @@ pub fn create_router(state: AppState) -> Router {
         .route("/health", get(api::health))
         .route("/debug/files", get(api::list_files))
         .route("/debug/clear", delete(api::clear_storage))
+        // Notifications (MQTT over WebSocket)
+        .route("/notifications/ws/json/1", get(notifications::notifications_ws))
+        // Settings and updates
+        .route("/settings/v1/beta", get(api::get_settings))
+        .route("/settings/v1/features", get(api::get_settings))
+        .route("/updates/v1/check", get(api::check_updates))
+        .route("/updates/check", get(api::check_updates))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
@@ -212,6 +221,8 @@ pub struct ServerConfig {
     pub region: String,
     pub enable_calendar: bool,
     pub enable_cloud_integrations: bool,
+    pub cert_path: Option<String>,
+    pub key_path: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -223,6 +234,8 @@ impl Default for ServerConfig {
             region: "local".into(),
             enable_calendar: true,
             enable_cloud_integrations: true,
+            cert_path: None,
+            key_path: None,
         }
     }
 }

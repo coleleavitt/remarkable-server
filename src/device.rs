@@ -29,7 +29,7 @@ pub struct Device { pub device_id: String, pub device_desc: String, pub register
 struct DeviceTokenClaims { sub: String, iss: String, iat: i64, nbf: i64, jti: String, #[serde(rename = "device-id")] device_id: String, #[serde(rename = "device-desc")] device_desc: String, #[serde(rename = "auth0-userid")] auth0_userid: String }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct UserTokenClaims { sub: String, iss: String, iat: i64, exp: i64, nbf: i64, jti: String, tectonic: String, scopes: String, #[serde(rename = "auth0-profile")] auth0_profile: Auth0Profile, #[serde(rename = "device-id")] device_id: String, #[serde(rename = "device-desc")] device_desc: String, #[serde(rename = "https://auth.remarkable.com/subscription")] subscription: SubscriptionClaim }
+struct UserTokenClaims { sub: String, iss: String, iat: i64, exp: i64, nbf: i64, jti: String, #[serde(rename = "https://auth.remarkable.com/tectonic")] tectonic: String, scopes: String, #[serde(rename = "auth0-profile")] auth0_profile: Auth0Profile, #[serde(rename = "device-id")] device_id: String, #[serde(rename = "device-desc")] device_desc: String, #[serde(rename = "https://auth.remarkable.com/subscription")] subscription: SubscriptionClaim }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Auth0Profile { #[serde(rename = "UserID")] user_id: String, #[serde(rename = "Email")] email: String, #[serde(rename = "IsConnected")] is_connected: bool, #[serde(rename = "IsBeta")] is_beta: bool }
