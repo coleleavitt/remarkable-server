@@ -297,7 +297,12 @@ async fn handle_notifications_socket(socket: WebSocket, state: AppState) {
                 debug!(session_id = %session_id, "Received binary: {} bytes", data.len());
             }
             Err(e) => {
-                warn!(session_id = %session_id, "WebSocket error: {}", e);
+                let msg = e.to_string();
+                if msg.contains("close_notify") {
+                    debug!(session_id = %session_id, "WebSocket closed without TLS close_notify");
+                } else {
+                    warn!(session_id = %session_id, "WebSocket error: {}", e);
+                }
                 break;
             }
         }
