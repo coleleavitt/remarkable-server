@@ -8,7 +8,8 @@ use std::path::Path;
 use std::sync::Arc;
 use parking_lot::Mutex;
 
-const DEFAULT_JWT_SECRET: &[u8] = b"remarkable-local-server-secret-key-v1";
+const MIN_JWT_SECRET_LEN: usize = 32;
+const JWT_SECRET_FILENAME: &str = "jwt_secret";
 const USER_TOKEN_LIFETIME: i64 = 3 * 60 * 60;
 const CODE_LIFETIME: i64 = 10 * 60;
 const BLOB_URL_LIFETIME_MINUTES: i64 = 60;
@@ -66,12 +67,55 @@ struct IdTokenClaims {
     #[serde(rename = "https://auth.remarkable.com/created_at")] created_at: String,
 }
 
+/// Load the JWT signing secret. Precedence:
+/// 1. `JWT_SECRET_FILE` -- path to a file holding the secret (e.g. a systemd credential).
+/// 2. `JWT_SECRET` -- the secret itself.
+/// 3. `<storage>/jwt_secret` -- created with 64 random bytes (hex, mode 0600) on first start.
+/// There is no built-in default: a shared default would let anyone forge tokens.
+fn load_jwt_secret(storage_dir: &Path) -> Result<Vec<u8>> {
+    let check = |secret: Vec<u8>, source: &str| -> Result<Vec<u8>> {
+        if secret.len() < MIN_JWT_SECRET_LEN {
+            return Err(ServerError::Config(format!("JWT secret from {source} is {} bytes; need at least {MIN_JWT_SECRET_LEN}", secret.len())));
+        }
+        Ok(secret)
+    };
+    let read_file = |path: &Path| -> Result<Vec<u8>> {
+        let raw = std::fs::read_to_string(path).map_err(|e| ServerError::Config(format!("reading JWT secret {}: {e}", path.display())))?;
+        Ok(raw.trim().as_bytes().to_vec())
+    };
+    if let Ok(path) = std::env::var("JWT_SECRET_FILE") {
+        return check(read_file(Path::new(&path))?, "JWT_SECRET_FILE");
+    }
+    if let Ok(secret) = std::env::var("JWT_SECRET") {
+        return check(secret.trim().as_bytes().to_vec(), "JWT_SECRET");
+    }
+    let path = storage_dir.join(JWT_SECRET_FILENAME);
+    if path.exists() {
+        return check(read_file(&path)?, &path.display().to_string());
+    }
+    let mut bytes = [0u8; 64];
+    rand::thread_rng().fill(&mut bytes[..]);
+    let secret = hex::encode(bytes);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&path).map_err(|e| ServerError::Config(format!("creating JWT secret {}: {e}", path.display())))?;
+    std::io::Write::write_all(&mut file, secret.as_bytes())?;
+    file.sync_all()?;
+    tracing::info!("Generated new JWT signing secret at {}", path.display());
+    Ok(secret.into_bytes())
+}
+
 impl DeviceManager {
     pub fn new<P: AsRef<Path>>(db_path: P, region: &str, issuer: &str) -> Result<Self> {
-        let conn = Connection::open(db_path)?;
+        let conn = Connection::open(db_path.as_ref())?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS devices (device_id TEXT PRIMARY KEY, device_desc TEXT NOT NULL, registered_at TEXT NOT NULL, last_refresh TEXT NOT NULL, user_id TEXT NOT NULL); CREATE TABLE IF NOT EXISTS pending_codes (code TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS passcode_resets (request_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, device_id TEXT NOT NULL, device_name TEXT NOT NULL, created TEXT NOT NULL, expires TEXT NOT NULL, approved INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS mdm_instructions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, data_key TEXT, data_value TEXT, status TEXT NOT NULL DEFAULT 'pending', detail TEXT, created TEXT NOT NULL);")?;
-        // One signing key for every token. Defaults to DEFAULT_JWT_SECRET so tokens already issued stay valid.
-        let secret = std::env::var("JWT_SECRET").map(String::into_bytes).unwrap_or_else(|_| DEFAULT_JWT_SECRET.to_vec());
+        // One HS256 signing key for every token; see load_jwt_secret for where it comes from.
+        let secret = load_jwt_secret(db_path.as_ref().parent().unwrap_or_else(|| Path::new(".")))?;
         let encoding_key = jsonwebtoken::EncodingKey::from_secret(&secret);
         let decoding_key = jsonwebtoken::DecodingKey::from_secret(&secret);
         Ok(Self { inner: Arc::new(Inner { 
@@ -321,4 +365,38 @@ impl DeviceManager {
         }
     }
 
+}
+
+#[cfg(test)]
+mod jwt_secret_tests {
+    use super::*;
+
+    #[test]
+    fn generated_secret_is_persisted_and_reused() {
+        if std::env::var_os("JWT_SECRET").is_some() || std::env::var_os("JWT_SECRET_FILE").is_some() {
+            return; // env override would bypass the file path under test
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let first = load_jwt_secret(dir.path()).unwrap();
+        assert_eq!(first.len(), 128, "64 random bytes, hex-encoded");
+        let second = load_jwt_secret(dir.path()).unwrap();
+        assert_eq!(first, second, "second start must reuse the stored secret");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join(JWT_SECRET_FILENAME)).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let other = tempfile::tempdir().unwrap();
+        assert_ne!(first, load_jwt_secret(other.path()).unwrap(), "each install gets its own secret");
+    }
+
+    #[test]
+    fn short_secret_file_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(JWT_SECRET_FILENAME), "too-short").unwrap();
+        if std::env::var_os("JWT_SECRET").is_none() && std::env::var_os("JWT_SECRET_FILE").is_none() {
+            assert!(load_jwt_secret(dir.path()).is_err());
+        }
+    }
 }

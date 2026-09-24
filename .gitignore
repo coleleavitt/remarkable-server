@@ -21,3 +21,9 @@ Cargo.lock
 /test-storage/
 /remarkable-storage/
 /crash-dumps/
+
+# Auth-token signing secret (generated on first start) - never commit
+jwt_secret
+
+# Cross-compile output
+/target-linode/
