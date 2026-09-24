@@ -60,3 +60,7 @@ diffy = "0.5.2"
 tokio-test = "0.4"
 
 # MQTT broker for device notifications
+
+[features]
+# Statically link OpenSSL (for cross-compiling to hosts with a different libssl)
+vendored-openssl = ["native-tls/vendored"]
