@@ -271,12 +271,16 @@ pub enum MergeResult {
     Unsupported,
 }
 
-/// Attempt to merge two versions of a file
-/// Currently only supports text-based files
+/// Attempt to merge two versions of a file.
+///
+/// Performs a line-based 3-way (diff3) merge of `local_content` and
+/// `cloud_content` against their common ancestor `base_content`. Only
+/// text-like MIME types are merged. Without a base version a true 3-way
+/// merge is impossible, so divergent content is reported as `CannotMerge`.
 pub fn attempt_merge(
-    _local_content: &[u8],
-    _cloud_content: &[u8],
-    _base_content: Option<&[u8]>,
+    local_content: &[u8],
+    cloud_content: &[u8],
+    base_content: Option<&[u8]>,
     mime_type: Option<&str>,
 ) -> MergeResult {
     // Only attempt text merges
@@ -293,14 +297,77 @@ pub fn attempt_merge(
         return MergeResult::Unsupported;
     }
 
-    // TODO: Implement actual text merge using diff3 algorithm
-    // For now, just report that we can't merge
-    MergeResult::CannotMerge
+    // Identical content: nothing to merge.
+    if local_content == cloud_content {
+        return MergeResult::Success(local_content.to_vec());
+    }
+
+    let Some(base) = base_content else {
+        // No common ancestor: cannot tell which side changed what.
+        return MergeResult::CannotMerge;
+    };
+
+    // Only one side changed relative to the base: take that side.
+    if base == local_content {
+        return MergeResult::Success(cloud_content.to_vec());
+    }
+    if base == cloud_content {
+        return MergeResult::Success(local_content.to_vec());
+    }
+
+    // Both sides changed: line-based diff3. `Err` carries conflict markers,
+    // which we never write back automatically.
+    match diffy::merge_bytes(base, local_content, cloud_content) {
+        Ok(merged) => MergeResult::Success(merged),
+        Err(_) => MergeResult::CannotMerge,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_non_overlapping_text_edits() {
+        let base = b"line1\nline2\nline3\nline4\n";
+        let local = b"LINE1\nline2\nline3\nline4\n";
+        let cloud = b"line1\nline2\nline3\nLINE4\n";
+        match attempt_merge(local, cloud, Some(base), Some("text/plain")) {
+            MergeResult::Success(m) => assert_eq!(m, b"LINE1\nline2\nline3\nLINE4\n"),
+            other => panic!("expected Success, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn merge_overlapping_text_edits_conflicts() {
+        let base = b"a\nb\nc\n";
+        let local = b"a\nLOCAL\nc\n";
+        let cloud = b"a\nCLOUD\nc\n";
+        assert!(matches!(
+            attempt_merge(local, cloud, Some(base), Some("text/plain")),
+            MergeResult::CannotMerge
+        ));
+    }
+
+    #[test]
+    fn merge_one_side_changed_and_edge_cases() {
+        let base = b"x\n";
+        let changed = b"y\n";
+        match attempt_merge(base, changed, Some(base), Some("application/json")) {
+            MergeResult::Success(m) => assert_eq!(m, changed),
+            other => panic!("expected Success, got {:?}", other),
+        }
+        // No base and divergent content -> cannot merge
+        assert!(matches!(
+            attempt_merge(b"a\n", b"b\n", None, Some("text/plain")),
+            MergeResult::CannotMerge
+        ));
+        // Binary types are never merged
+        assert!(matches!(
+            attempt_merge(b"a", b"b", Some(b"c"), Some("application/pdf")),
+            MergeResult::Unsupported
+        ));
+    }
 
     #[test]
     fn test_conflict_resolution_newer_wins() {

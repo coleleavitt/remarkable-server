@@ -162,6 +162,7 @@ pub struct DeltaUpdate {
     pub to_version: FirmwareVersion,
     pub filename: String,
     pub size: u64,
+    pub download_url: String,
 }
 
 /// Firmware manager - scans and serves firmware files
@@ -193,7 +194,12 @@ impl FirmwareManager {
 
         let mut firmware = HashMap::new();
         let mut versions_map: HashMap<DeviceType, Vec<FirmwareVersion>> = HashMap::new();
-        let deltas = HashMap::new(); // TODO: Scan for delta files
+        let mut deltas = HashMap::new();
+        // Delta payloads (opt-in naming convention, see HANDOFF.md):
+        // remarkable-{type}-delta-{from}-to-{to}-{device}-public.{swu|bin|delta}
+        let delta_re = regex::Regex::new(
+            r"^remarkable-\w+(?:-\w+)?-delta-(\d+\.\d+\.\d+\.\d+)-to-(\d+\.\d+\.\d+\.\d+)-(\w+)-public\.(?:swu|bin|delta)$"
+        ).unwrap();
 
         // Scan for .swu files
         // Pattern: remarkable-{type}-image-{version}-{device}-public.swu
@@ -206,6 +212,32 @@ impl FirmwareManager {
             let path = entry.path();
             
             if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                if let Some(caps) = delta_re.captures(filename) {
+                    if let (Some(from), Some(to), Some(device)) = (
+                        FirmwareVersion::parse(&caps[1]),
+                        FirmwareVersion::parse(&caps[2]),
+                        DeviceType::from_str(&caps[3]),
+                    ) {
+                        if to.is_newer_than(&from) {
+                            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                            let download_url = format!(
+                                "{}/firmware/v1/delta/{}/{}/{}",
+                                base_url, device.as_str(), from.to_string(), to.to_string()
+                            );
+                            deltas.insert(
+                                (device, from.to_string(), to.to_string()),
+                                DeltaUpdate {
+                                    from_version: from,
+                                    to_version: to,
+                                    filename: filename.to_string(),
+                                    size,
+                                    download_url,
+                                },
+                            );
+                        }
+                    }
+                    continue;
+                }
                 if let Some(caps) = re.captures(filename) {
                     let release_type = ReleaseType::from_str(&caps[1]);
                     let version_str = &caps[2];
@@ -247,9 +279,13 @@ impl FirmwareManager {
             }
         }
 
+        // Deltas whose endpoints we don't actually serve are useless; drop them.
+        deltas.retain(|(device, _, to), _| firmware.contains_key(&(*device, to.clone())));
+
         tracing::info!(
-            "Firmware manager initialized: {} images across {} devices",
+            "Firmware manager initialized: {} images, {} deltas across {} devices",
             firmware.len(),
+            deltas.len(),
             latest.len()
         );
         for (device, version) in &latest {
@@ -354,6 +390,12 @@ impl FirmwareManager {
         }
     }
 
+    /// Resolve the on-disk path and filename of a delta update
+    pub fn get_delta_path(&self, device: DeviceType, from: &str, to: &str) -> Option<(PathBuf, String)> {
+        let d = self.deltas.get(&(device, from.to_string(), to.to_string()))?;
+        Some((self.archive_path.join(&d.filename), d.filename.clone()))
+    }
+
     /// Get path to firmware file
     pub fn get_firmware_path(&self, device: DeviceType, version: &str) -> Option<PathBuf> {
         self.firmware
@@ -384,8 +426,8 @@ impl FirmwareManager {
                 version: info.version.to_string(),
                 release_type: info.release_type,
                 size: info.size,
-                // TODO: Read actual changelog from firmware metadata
-                changes: generate_synthetic_changelog(&info.version),
+                changes: read_changelog(&self.archive_path, device, &info.version)
+                    .unwrap_or_else(|| generate_synthetic_changelog(&info.version)),
             })
             .collect();
 
@@ -397,6 +439,32 @@ impl FirmwareManager {
 }
 
 /// Generate synthetic changelog (in production, extract from firmware metadata)
+/// Read real release notes for `version` from the archive, if present.
+///
+/// Looks for (first match wins):
+///   <archive>/changelogs/<device>/<version>.md|.txt
+///   <archive>/changelogs/<version>.md|.txt
+/// Each non-empty line becomes one entry; leading `-`, `*`, `•` bullets and
+/// markdown headings (`#`) are stripped.
+fn read_changelog(archive: &std::path::Path, device: DeviceType, version: &FirmwareVersion) -> Option<Vec<String>> {
+    let v = version.to_string();
+    let base = archive.join("changelogs");
+    let candidates = [
+        base.join(device.as_str()).join(format!("{v}.md")),
+        base.join(device.as_str()).join(format!("{v}.txt")),
+        base.join(format!("{v}.md")),
+        base.join(format!("{v}.txt")),
+    ];
+    let text = candidates.iter().find_map(|p| std::fs::read_to_string(p).ok())?;
+    let lines: Vec<String> = text
+        .lines()
+        .map(|l| l.trim().trim_start_matches(['#', '-', '*', '•']).trim())
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    (!lines.is_empty()).then_some(lines)
+}
+
 fn generate_synthetic_changelog(version: &FirmwareVersion) -> Vec<String> {
     // This would ideally be extracted from the firmware's embedded changelog
     vec![
@@ -496,7 +564,6 @@ pub async fn download_firmware(
     // Find the firmware
     let mut firmware_path = None;
     let mut filename = String::new();
-    let mut size = 0u64;
     
     for device in devices {
         if let Some(info) = state.manager.get_version(device, &version) {
@@ -504,7 +571,6 @@ pub async fn download_firmware(
                 if path.exists() {
                     firmware_path = Some(path);
                     filename = info.filename.clone();
-                    size = info.size;
                     break;
                 }
             }
@@ -514,13 +580,31 @@ pub async fn download_firmware(
     let path = firmware_path
         .ok_or_else(|| ServerError::NotFound(format!("Firmware version not found: {}", version)))?;
 
-    // Stream the file, honouring a single `Range: bytes=` request so interrupted
-    // update downloads can resume.
-    let mut file = File::open(&path).await.map_err(ServerError::Storage)?;
-    let total = file.metadata().await.map_err(ServerError::Storage)?.len();
-    let _ = size; // index size may be stale; trust the file on disk
-    let disposition = format!("attachment; filename=\"{}\"", filename);
+    serve_file(&path, &filename, &headers).await
+}
 
+/// GET /firmware/v1/delta/{device}/{from}/{to} - download a delta update
+pub async fn download_delta(
+    State(state): State<FirmwareState>,
+    Path((device, from, to)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let device = DeviceType::from_str(&device)
+        .ok_or_else(|| ServerError::NotFound(format!("Unknown device: {}", device)))?;
+    let (path, filename) = state
+        .manager
+        .get_delta_path(device, &from, &to)
+        .filter(|(p, _)| p.exists())
+        .ok_or_else(|| ServerError::NotFound(format!("No delta {} -> {}", from, to)))?;
+    serve_file(&path, &filename, &headers).await
+}
+
+/// Stream a file as an attachment, honouring a single `Range: bytes=` request so
+/// interrupted update downloads can resume.
+async fn serve_file(path: &std::path::Path, filename: &str, headers: &HeaderMap) -> Result<Response> {
+    let mut file = File::open(path).await.map_err(ServerError::Storage)?;
+    let total = file.metadata().await.map_err(ServerError::Storage)?.len();
+    let disposition = format!("attachment; filename=\"{}\"", filename);
     let range = headers
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok())
@@ -662,6 +746,7 @@ pub fn firmware_router(state: FirmwareState) -> axum::Router {
     axum::Router::new()
         .route("/check", get(check_update))
         .route("/download/{version}", get(download_firmware))
+        .route("/delta/{device}/{from}/{to}", get(download_delta))
         .route("/changelog", get(get_changelog))
         .route("/versions", get(list_versions))
         .route("/devices", get(list_devices))
@@ -712,5 +797,59 @@ mod tests {
         assert_eq!(DeviceType::from_str("remarkable2"), Some(DeviceType::Rm2));
         assert_eq!(DeviceType::from_str("ferrari"), Some(DeviceType::Ferrari));
         assert_eq!(DeviceType::from_str("unknown"), None);
+    }
+    fn temp_archive(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rm-firmware-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "remarkable-production-image-3.20.0.92-rm2-public.swu",
+            "remarkable-production-image-3.22.0.64-rm2-public.swu",
+            "remarkable-production-delta-3.20.0.92-to-3.22.0.64-rm2-public.swu",
+            // downgrade deltas are ignored
+            "remarkable-production-delta-3.22.0.64-to-3.20.0.92-rm2-public.swu",
+        ] {
+            fs::write(dir.join(name), b"payload").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn delta_discovered_and_offered() {
+        let dir = temp_archive("delta");
+        let mgr = FirmwareManager::new(&dir, "http://h").unwrap();
+        let r = mgr.check_update(DeviceType::Rm2, "3.20.0.92");
+        assert!(r.update_available);
+        let d = r.delta.expect("delta offered");
+        assert_eq!(d.download_url, "http://h/firmware/v1/delta/rm2/3.20.0.92/3.22.0.64");
+        assert!(mgr.get_delta_path(DeviceType::Rm2, "3.20.0.92", "3.22.0.64").is_some());
+        assert!(mgr.get_delta_path(DeviceType::Rm2, "3.22.0.64", "3.20.0.92").is_none());
+        // no delta from an unrelated version
+        assert!(mgr.check_update(DeviceType::Rm2, "3.21.0.1").delta.is_none());
+        // delta files are not listed as full images
+        assert_eq!(mgr.get_versions(DeviceType::Rm2).len(), 2);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn changelog_prefers_real_notes() {
+        let dir = temp_archive("changelog");
+        fs::create_dir_all(dir.join("changelogs/rm2")).unwrap();
+        fs::write(dir.join("changelogs/rm2/3.22.0.64.md"), "- Real note A\n* Real note B\n\n").unwrap();
+        let mgr = FirmwareManager::new(&dir, "http://h").unwrap();
+        let cl = mgr.get_changelog(DeviceType::Rm2, None, None);
+        let e22 = cl.entries.iter().find(|e| e.version == "3.22.0.64").unwrap();
+        assert_eq!(e22.changes, vec!["Real note A".to_string(), "Real note B".to_string()]);
+        // version without notes falls back to synthetic text
+        let e20 = cl.entries.iter().find(|e| e.version == "3.20.0.92").unwrap();
+        assert!(!e20.changes.is_empty());
+        fs::remove_dir_all(dir).ok();
     }
 }

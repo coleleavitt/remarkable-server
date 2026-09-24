@@ -1,0 +1,41 @@
+#!/sbin/openrc-run
+# OpenRC service for remarkable-server (Gentoo etc.).
+# Install:
+#   cp contrib/openrc/remarkable-server /etc/init.d/
+#   cp contrib/systemd/remarkable-server.env.example /etc/conf.d/remarkable-server
+#   (edit conf.d: set RMS_USER, RMS_BIN, RMS_STORAGE, JWT_SECRET, ...)
+#   rc-update add remarkable-server default && rc-service remarkable-server start
+# conf.d is sourced by openrc-run; exported vars reach the daemon's env.
+
+name="remarkable-server"
+description="Self-hosted reMarkable cloud server"
+
+: "${RMS_USER:=nobody}"
+: "${RMS_BIND:=127.0.0.1:8080}"
+: "${RMS_BIN:=/usr/local/bin/remarkable-server}"
+: "${RMS_STORAGE:=/var/lib/remarkable-server}"
+
+command="${RMS_BIN}"
+command_args="--bind ${RMS_BIND} --storage ${RMS_STORAGE}"
+[ -n "${RMS_HOST}" ] && command_args="${command_args} --host ${RMS_HOST}"
+[ -n "${RMS_CERT}" ] && command_args="${command_args} --cert ${RMS_CERT} --key ${RMS_KEY}"
+command_user="${RMS_USER}"
+command_background=yes
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/${RC_SVCNAME}.log"
+error_log="/var/log/${RC_SVCNAME}.log"
+
+depend() {
+	need net
+	after firewall
+}
+
+start_pre() {
+	# Export conf.d settings (JWT_SECRET, ADMIN_TOKEN, archive path, SMTP_*...)
+	# so the daemon sees them; openrc-run sources conf.d but doesn't export.
+	set -a
+	[ -r "/etc/conf.d/${RC_SVCNAME}" ] && . "/etc/conf.d/${RC_SVCNAME}"
+	set +a
+	checkpath -d -o "${RMS_USER}" -m 0750 "${RMS_STORAGE}"
+	checkpath -f -o "${RMS_USER}" -m 0640 "${output_log}"
+}

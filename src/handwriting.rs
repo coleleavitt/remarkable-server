@@ -5,7 +5,8 @@
 //! the local `tesseract` binary, so no MyScript keys are needed. Tesseract is a print OCR
 //! engine: neat print works, cursive is poor.
 //!
-//! Set `HWR_CAPTURE_DIR` to save every request/response pair (we have no real captures yet).
+//! Set `HWR_COMMAND` to use a different recogniser (see `tesseract()` below and
+//! contrib/hwr/trocr_hwr.py). Set `HWR_CAPTURE_DIR` to save every request/response pair (we have no real captures yet).
 
 use std::{path::PathBuf, process::Stdio, time::Duration};
 
@@ -92,19 +93,32 @@ fn render(strokes: &[Points]) -> Result<(Vec<u8>, Frame)> {
 const TESSERACT_LANG: &str = "eng";
 
 async fn tesseract(png: &[u8], lang: &str) -> Result<String> {
-    let mut child = tokio::process::Command::new("tesseract")
-        .args(["stdin", "stdout", "-l", lang, "--psm", "6", "tsv"])
+    // `HWR_COMMAND` swaps in another recogniser (e.g. contrib/hwr/trocr_hwr.py). It is run
+    // via `sh -c`, gets the PNG on stdin and must print Tesseract-format TSV on stdout.
+    let mut cmd = match std::env::var("HWR_COMMAND").ok().filter(|c| !c.trim().is_empty()) {
+        Some(c) => {
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-c").arg(c).env("HWR_LANG", lang);
+            cmd
+        }
+        None => {
+            let mut cmd = tokio::process::Command::new("tesseract");
+            cmd.args(["stdin", "stdout", "-l", lang, "--psm", "6", "tsv"]);
+            cmd
+        }
+    };
+    let mut child = cmd
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| ServerError::Internal(format!("tesseract not available: {e}")))?;
+        .map_err(|e| ServerError::Internal(format!("recogniser not available: {e}")))?;
     let mut stdin = child.stdin.take().expect("piped stdin");
     stdin.write_all(png).await?;
     drop(stdin);
     let out = tokio::time::timeout(TESSERACT_TIMEOUT, child.wait_with_output()).await
-        .map_err(|_| ServerError::Internal("tesseract timed out".into()))??;
+        .map_err(|_| ServerError::Internal("recogniser timed out".into()))??;
     if !out.status.success() {
-        return Err(ServerError::Internal(format!("tesseract exited with {}", out.status)));
+        return Err(ServerError::Internal(format!("recogniser exited with {}", out.status)));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }

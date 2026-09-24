@@ -91,12 +91,21 @@ Based on xochitl binary analysis (via `strings`), the server now implements
    Download supports HTTP Range (206/416) for resumable fetches. Verified live against
    the local archive (5 device types, rm2 3.20→3.29 check, byte-exact ranges).
 
+4. ~~Deltas / changelog / diff3 merge / service files / TrOCR hook~~ — DONE (this commit)
+
 **Status:** Should work for sync/pairing. All 3.29 endpoints covered.
 Full verification against live tablet pending.
 
 ## Known open items
-- Server runs from a shell/session; no systemd unit yet (stops when session ends).
-- Handwriting recognition uses Tesseract (weak on cursive/maths). TrOCR (~300 MB)
-  would improve convert + search.
+- Service files: `contrib/openrc/remarkable-server` (Gentoo/OpenRC, this box) and
+  `contrib/systemd/remarkable-server.service` + `contrib/remarkable-server.env.example`.
+  Not installed — see contrib/README.md.
+- Handwriting: pluggable. Set `HANDWRITING_OCR_CMD="python3 contrib/trocr_ocr.py"` to use
+  TrOCR (needs `pip install transformers torch pillow`; falls back to tesseract otherwise).
+  Default remains built-in tesseract.
+- OTA deltas: served only if files named `<from>_to_<to>.delta|.bin` exist under
+  `<archive>/<device>/deltas/`. No real deltas in the local archive (reMarkable ships full .swu).
+- OTA changelogs: read from `<archive>/changelogs/[<device>/]<version>.md|.txt`; synthetic
+  text if absent. Local archive has none.
 - Wi-Fi sync blocked by "Shibam Guest" client isolation; USB only for now.
-- MQTT broker uses simple self-hosted vernemq; no clustering.
+- Real-tablet end-to-end verification still pending (needs the device).

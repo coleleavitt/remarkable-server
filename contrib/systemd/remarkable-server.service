@@ -1,0 +1,35 @@
+# systemd user unit for remarkable-server.
+#
+# Install:
+#   cargo build --release
+#   mkdir -p ~/.config/systemd/user ~/.config/remarkable-server
+#   cp contrib/systemd/remarkable-server.service ~/.config/systemd/user/
+#   cp contrib/systemd/remarkable-server.env.example ~/.config/remarkable-server/env
+#   $EDITOR ~/.config/remarkable-server/env      # set paths, bind address, secrets
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now remarkable-server
+#   loginctl enable-linger "$USER"               # keep running after logout
+#
+# Logs: journalctl --user -u remarkable-server -f
+
+[Unit]
+Description=Local reMarkable sync server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/remarkable-server/env
+# $$ passes a literal $ to sh (systemd would otherwise expand it itself).
+# --host/--cert/--key are only passed when set, so plain-HTTP setups work too.
+ExecStart=/bin/sh -c 'set -- --bind "$${RMS_BIND:-127.0.0.1:8080}" --storage "$$RMS_STORAGE"; \
+  [ -n "$$RMS_HOST" ] && set -- "$$@" --host "$$RMS_HOST"; \
+  [ -n "$$RMS_CERT" ] && set -- "$$@" --cert "$$RMS_CERT" --key "$$RMS_KEY"; \
+  exec "$$RMS_BIN" "$$@"'
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
