@@ -19,7 +19,7 @@ async fn main() -> Result<()> {
 
     let config = parse_args();
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "remarkable_server=debug,tower_http=debug".into()))
+        .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "remarkable_server=debug,tower_http=debug,rustls=error,tokio_rustls=error".into()))
         .with(tracing_subscriber::fmt::layer())
         .init();
     
