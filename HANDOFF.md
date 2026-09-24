@@ -109,3 +109,47 @@ Full verification against live tablet pending.
   text if absent. Local archive has none.
 - Wi-Fi sync blocked by "Shibam Guest" client isolation; USB only for now.
 - Real-tablet end-to-end verification still pending (needs the device).
+
+## Recent Fixes (2026-09-24)
+
+### TLS close_notify Warning Fix
+- **Server-side**: Added `rustls=error,tokio_rustls=error` to tracing filter
+  (src/main.rs) to suppress rustls warnings.
+- **notifications.rs**: Close_notify errors are detected and logged as DEBUG
+  instead of WARN. Clean closes remain INFO.
+- xochitl binary patching was attempted but failed (disk space, crashes) —
+  server-side fix is the correct approach.
+
+### Commit History
+- `9c4da7f`: Downgrade close_notify to DEBUG in notifications
+- `e34c02c`: Suppress rustls TLS warnings, add xochitl patch script
+
+## Tablet Setup (Quick Reference)
+
+1. **hosts file** — Edit `/etc/hosts` on tablet:
+   ```
+   10.11.99.2 local.tectonic.remarkable.com
+   10.11.99.2 my.remarkable.com
+   10.11.99.2 webapp-production-dot-remarkable-production.appspot.com
+   10.11.99.3 vernemq-prod.us-west-2.remarkable.engineering
+   ```
+
+2. **CA Certificate** — Copy your CA to tablet:
+   ```bash
+   scp certs/ca.crt root@10.11.99.1:/usr/local/share/ca-certificates/remarkable-local-ca.crt
+   # Then append to bundle:
+   ssh root@10.11.99.1 'cat /usr/local/share/ca-certificates/remarkable-local-ca.crt >> /etc/ssl/certs/ca-certificates.crt'
+   ```
+
+3. **Pair device** — Run server with `--pair`, enter code on tablet.
+
+4. **Verify** — After xochitl restart, check:
+   ```bash
+   ss -tnp | grep 10.11.99  # Should show ESTAB connections
+   ```
+
+## Current Status
+- Generation: 11
+- Files: 613
+- Storage: ~122 MB
+- Server: mon5 on 10.11.99.2:443 + 10.11.99.3:443
