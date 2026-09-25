@@ -85,8 +85,9 @@ async fn main() -> Result<()> {
     remarkable_server::hw_search::spawn_indexer(state.storage.clone());
 
     let features = remarkable_server::feature_routes(state.clone(), std::path::Path::new(&config.storage_path), email_server)?;
+    let viewer = screenshare_viewer(screenshare_broker, &state)?;
     let mut app = create_router(state).merge(features);
-    if let Some(viewer) = screenshare_viewer(screenshare_broker)? {
+    if let Some(viewer) = viewer {
         app = app.merge(remarkable_server::screenshare_viewer::router(viewer));
     }
     
@@ -182,15 +183,13 @@ fn parse_args() -> ServerConfig {
 }
 
 /// Browser viewer for the tablet's screen share (`/screenshare/view`), when
-/// `SCREENSHARE_VIEWER=1`. Needs the broker and `ADMIN_TOKEN`, which guards it.
-fn screenshare_viewer(broker: Option<remarkable_server::screenshare::Broker>) -> Result<Option<remarkable_server::screenshare_viewer::ScreenViewer>> {
-    use remarkable_server::screenshare_viewer::{ScreenViewer, ViewerConfig};
+/// `SCREENSHARE_VIEWER=1`. Needs `ADMIN_TOKEN`, which guards it. Watches tablets
+/// on the MQTT broker (when `SCREENSHARE_BIND` is set) and on the REST rooms.
+fn screenshare_viewer(broker: Option<remarkable_server::screenshare::Broker>, state: &AppState) -> Result<Option<remarkable_server::screenshare_viewer::ScreenViewer>> {
+    use remarkable_server::screenshare_viewer::{RestRooms, ScreenViewer, Signaling, ViewerConfig};
     if !matches!(env::var("SCREENSHARE_VIEWER").as_deref(), Ok("1" | "true" | "on")) {
         return Ok(None);
     }
-    let Some(broker) = broker else {
-        anyhow::bail!("SCREENSHARE_VIEWER needs the screenshare broker (SCREENSHARE_BIND)");
-    };
     if env::var("ADMIN_TOKEN").map_or(true, |t| t.is_empty()) {
         anyhow::bail!("SCREENSHARE_VIEWER needs ADMIN_TOKEN, which protects the viewer page");
     }
@@ -205,7 +204,11 @@ fn screenshare_viewer(broker: Option<remarkable_server::screenshare::Broker>) ->
         .split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
     let user_id = env::var("SCREENSHARE_VIEWER_USER").ok().filter(|u| !u.is_empty()).unwrap_or_else(|| PAIRING_USER.into());
     tracing::info!(user = %user_id, ?udp_ports, "screenshare browser viewer enabled at /screenshare/view");
-    Ok(Some(ScreenViewer::new(broker, ViewerConfig {
+    let signaling = Signaling {
+        mqtt: broker,
+        rest: Some(RestRooms { rooms: state.screenshare.clone(), notifications: state.notification_tx.clone() }),
+    };
+    Ok(Some(ScreenViewer::new(signaling, ViewerConfig {
         user_id,
         transport: remarkable_screenshare::TransportConfig { ice_servers, udp_ports },
     })))
