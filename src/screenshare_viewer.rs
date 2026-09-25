@@ -66,12 +66,15 @@ pub struct ViewerConfig {
     pub transport: TransportConfig,
     /// Keep the tablet session this long after the last browser leaves.
     pub idle_grace: Duration,
+    /// Where the tablet's telemetry is kept (see [`crate::reports`]), for
+    /// `/screenshare/view/usage`.
+    pub reports_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for ViewerConfig {
     /// The paired account, host candidates only, 20 s idle grace.
     fn default() -> Self {
-        Self { user_id: "local-user".into(), transport: TransportConfig::default(), idle_grace: IDLE_GRACE }
+        Self { user_id: "local-user".into(), transport: TransportConfig::default(), idle_grace: IDLE_GRACE, reports_dir: None }
     }
 }
 
@@ -137,6 +140,22 @@ impl Shot {
     }
 }
 
+/// A finished viewer session, for `/screenshare/view/usage`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionRecord {
+    pub started: chrono::DateTime<chrono::Utc>,
+    pub ended: chrono::DateTime<chrono::Utc>,
+    /// "mqtt" or "rest".
+    pub via: &'static str,
+    pub room_id: String,
+    pub frames: u64,
+    /// How it ended: "tablet stopped sharing", "no watchers", or the error.
+    pub outcome: String,
+}
+
+/// Sessions kept for `/screenshare/view/usage`.
+const SESSION_HISTORY: usize = 50;
+
 /// Shared viewer; clone freely.
 #[derive(Clone)]
 pub struct ScreenViewer {
@@ -154,6 +173,7 @@ struct Inner {
     /// can't miss the last one leaving between checking and waiting.
     watchers: watch::Sender<usize>,
     running: Mutex<bool>,
+    sessions: Mutex<std::collections::VecDeque<SessionRecord>>,
 }
 
 /// A browser watching the screen; the session stops some time after the last
@@ -203,6 +223,7 @@ impl ScreenViewer {
                 cursor,
                 watchers: watch::channel(0).0,
                 running: Mutex::new(false),
+                sessions: Mutex::default(),
             }),
         }
     }
@@ -398,6 +419,8 @@ impl ScreenViewer {
         }
         tracing::info!(room = %channel.room_id(), tablet = %tablet, via = channel.kind(), "screenshare viewer answered tablet offer");
         let channel_room = channel.room_id().to_owned();
+        let started = chrono::Utc::now();
+        let via = channel.kind();
 
         let png = &self.inner.png;
         let seq = std::sync::atomic::AtomicU64::new(0);
@@ -419,7 +442,7 @@ impl ScreenViewer {
                     r.map_err(|e| tracing::warn!("screenshare viewer: PNG encode failed: {e}")).ok()
                 });
                 let shot = Shot {
-                    seq: seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    seq: seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
                     patch: patch.map(|bytes| (frame.changed, bytes)),
                     frame,
                     full: std::sync::OnceLock::new(),
@@ -459,6 +482,8 @@ impl ScreenViewer {
                 }
             }
         };
+        // Recorded even when the session is cancelled (everyone left).
+        let record = SessionRecorder { viewer: self, started, via, room_id: channel_room.clone(), seq: &seq, outcome: "no watchers".into() };
         let end = tokio::select! {
             r = frames => match r {
                 Ok(()) => SessionEnd::Stopped { room_id: channel_room.clone() },
@@ -467,8 +492,50 @@ impl ScreenViewer {
             _ = trickle => SessionEnd::Failed { message: "signaling ended".into(), streamed: connected.load(std::sync::atomic::Ordering::Relaxed) },
             _ = deadline => failed("tablet did not connect in time"),
         };
+        let mut record = record;
+        record.outcome = match &end {
+            SessionEnd::Stopped { .. } => "tablet stopped sharing".into(),
+            SessionEnd::Failed { message, .. } => message.clone(),
+            other => format!("{other:?}"),
+        };
+        drop(record);
         let _ = webrtc.close().await;
         end
+    }
+}
+
+/// Adds a [`SessionRecord`] when dropped, so cancelled sessions count too.
+struct SessionRecorder<'a> {
+    viewer: &'a ScreenViewer,
+    started: chrono::DateTime<chrono::Utc>,
+    via: &'static str,
+    room_id: String,
+    seq: &'a std::sync::atomic::AtomicU64,
+    outcome: String,
+}
+
+impl Drop for SessionRecorder<'_> {
+    fn drop(&mut self) {
+        let record = SessionRecord {
+            started: self.started,
+            ended: chrono::Utc::now(),
+            via: self.via,
+            room_id: std::mem::take(&mut self.room_id),
+            frames: self.seq.load(std::sync::atomic::Ordering::Relaxed),
+            outcome: std::mem::take(&mut self.outcome),
+        };
+        let mut sessions = self.viewer.inner.sessions.lock();
+        if sessions.len() == SESSION_HISTORY {
+            sessions.pop_front();
+        }
+        sessions.push_back(record);
+    }
+}
+
+impl ScreenViewer {
+    /// The latest finished sessions, oldest first.
+    pub fn sessions(&self) -> Vec<SessionRecord> {
+        self.inner.sessions.lock().iter().cloned().collect()
     }
 }
 
@@ -646,6 +713,7 @@ pub fn router(viewer: ScreenViewer) -> Router {
         .route("/screenshare/view/login", post(login))
         .route("/screenshare/view/ws", get(ws))
         .route("/screenshare/view/frame.png", get(frame))
+        .route("/screenshare/view/usage", get(usage))
         .with_state(viewer)
 }
 
@@ -709,6 +777,23 @@ async fn frame(State(viewer): State<ScreenViewer>, headers: HeaderMap) -> Respon
         Some(shot) => ([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "no-store")], shot.full_png().to_vec()).into_response(),
         None => (StatusCode::SERVICE_UNAVAILABLE, format!("{:?}", *watcher.status.borrow())).into_response(),
     }
+}
+
+/// `GET /screenshare/view/usage`: the viewer's recent sessions and the
+/// tablet's own screen share telemetry.
+async fn usage(State(viewer): State<ScreenViewer>, headers: HeaderMap) -> Response {
+    if !authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let tablet = viewer.inner.config.reports_dir.as_deref()
+        .map(|dir| crate::reports::recent(dir, 50, Some("screenshare")))
+        .unwrap_or_default();
+    axum::Json(serde_json::json!({
+        "status": *viewer.inner.status.borrow(),
+        "sessions": viewer.sessions(),
+        "tablet_events": tablet,
+    }))
+    .into_response()
 }
 
 async fn ws(State(viewer): State<ScreenViewer>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Response {

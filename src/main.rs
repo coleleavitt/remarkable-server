@@ -212,6 +212,7 @@ fn screenshare_viewer(broker: Option<remarkable_server::screenshare::Broker>, st
         user_id,
         transport: remarkable_screenshare::TransportConfig { ice_servers, udp_ports },
         idle_grace: remarkable_server::screenshare_viewer::IDLE_GRACE,
+        reports_dir: Some(state.storage.base_path().to_path_buf()),
     })))
 }
 

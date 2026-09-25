@@ -6,12 +6,7 @@ use serde_json::{json, Value};
 
 use crate::{api::AppState, error::Result};
 
-/// Telemetry / crash / analytics reports (`ping.remarkable.com`). Accepted and dropped.
-pub async fn null_report() -> StatusCode { StatusCode::OK }
 
-pub async fn analytics_report() -> (StatusCode, Json<Value>) {
-    (StatusCode::CREATED, Json(json!({ "message": "Success" })))
-}
 
 /// Beta program state. xochitl 3.28 requires exactly 200 with `enrolled`; POST (enroll)
 /// and DELETE (un-enroll) replies go through the same parser. There is no local beta
