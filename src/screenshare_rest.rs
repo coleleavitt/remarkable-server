@@ -141,7 +141,11 @@ impl RoomManager {
     pub fn active_room_age(&self, user_id: &str) -> Option<(String, std::time::Duration)> {
         let id = self.find_active(user_id)?;
         let created = self.rooms.lock().get(&id)?.created_at;
-        Some((id, (chrono::Utc::now() - created).to_std().unwrap_or_default()))
+        // A future `created_at` (clock skew / backward clock jump) makes the age
+        // negative; `to_std()` errors on that. Treat it as very old rather than
+        // age 0, so a skewed room can't masquerade as "just created" and always
+        // win newest-room selection.
+        Some((id, (chrono::Utc::now() - created).to_std().unwrap_or(std::time::Duration::MAX)))
     }
 
     /// Join `room_id` of `user_id`'s account; false if the room is gone or

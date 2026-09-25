@@ -191,13 +191,14 @@ pub fn create_router(state: AppState) -> Router {
         .route("/admin/mdm/instructions", get(mdm::admin_list))
         .route("/post", post(crash::upload).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)))
         .route("/settings/v1/features", get(service::get_beta))
-        // Telemetry / analytics (ping.remarkable.com), kept in reports.jsonl
-        .route("/v1/reports", post(reports::store))
-        .route("/v2/reports", post(reports::store))
-        .route("/report/v1", post(reports::store))
-        .route("/v2/events", post(reports::store))
-        .route("/sync/reports/v1", post(reports::store))
-        .route("/analytics/v2/events", post(reports::store_analytics))
+        // Telemetry / analytics (ping.remarkable.com), kept in reports.jsonl.
+        // Bounded to what we would store (Axum's 2 MiB default otherwise applies).
+        .route("/v1/reports", post(reports::store).layer(DefaultBodyLimit::max(reports::MAX_BODY)))
+        .route("/v2/reports", post(reports::store).layer(DefaultBodyLimit::max(reports::MAX_BODY)))
+        .route("/report/v1", post(reports::store).layer(DefaultBodyLimit::max(reports::MAX_BODY)))
+        .route("/v2/events", post(reports::store).layer(DefaultBodyLimit::max(reports::MAX_BODY)))
+        .route("/sync/reports/v1", post(reports::store).layer(DefaultBodyLimit::max(reports::MAX_BODY)))
+        .route("/analytics/v2/events", post(reports::store_analytics).layer(DefaultBodyLimit::max(reports::MAX_BODY)))
         .route("/admin/reports", get(reports::list))
         // Third-party integrations (none configured)
         .route("/integrations/v1/", get(service::list_integrations))

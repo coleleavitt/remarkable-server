@@ -3,7 +3,7 @@
 //! usage (screen share sessions included) can be looked at, instead of being
 //! dropped. Bounded: bodies are capped and the file rotates once.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use axum::body::Bytes;
@@ -16,14 +16,20 @@ use serde_json::{json, Value};
 use crate::api::{require_admin, AppState};
 use crate::error::Result;
 
-/// Largest body kept per report.
-const MAX_BODY: usize = 64 * 1024;
+/// Largest body kept per report. Also the request body limit on the telemetry
+/// routes (see `lib.rs`), so nothing larger than we would store is accepted.
+pub(crate) const MAX_BODY: usize = 64 * 1024;
 /// `reports.jsonl` is moved to `reports.jsonl.1` past this size.
 const MAX_FILE: u64 = 8 * 1024 * 1024;
 static WRITE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 fn log_path(base: &Path) -> PathBuf {
     base.join("reports.jsonl")
+}
+
+/// Where `log_path` is moved on rotation; also read back by `recent`.
+fn rotated_path(base: &Path) -> PathBuf {
+    log_path(base).with_extension("jsonl.1")
 }
 
 /// Append one report. Failures are logged, never returned: telemetry must
@@ -35,7 +41,7 @@ fn append(base: &Path, path: &str, body: &[u8]) {
     let file = log_path(base);
     let _guard = WRITE.lock();
     if std::fs::metadata(&file).is_ok_and(|m| m.len() > MAX_FILE) {
-        let _ = std::fs::rename(&file, file.with_extension("jsonl.1"));
+        let _ = std::fs::rename(&file, rotated_path(base));
     }
     let result = std::fs::OpenOptions::new().create(true).append(true).open(&file).and_then(|mut f| writeln!(f, "{line}"));
     if let Err(e) = result {
@@ -64,16 +70,42 @@ pub struct ListQuery {
 }
 
 /// Newest `limit` entries (optionally only those containing `contains`,
-/// case-insensitive) from `reports.jsonl`, oldest first.
+/// case-insensitive) from `reports.jsonl` and its rotated `reports.jsonl.1`,
+/// oldest first.
 pub fn recent(base: &Path, limit: usize, contains: Option<&str>) -> Vec<Value> {
     let needle = contains.map(str::to_lowercase);
-    let text = std::fs::read_to_string(log_path(base)).unwrap_or_default();
-    let mut hits: Vec<Value> = text
+    // The current file holds the newest entries; the rotated `.1` (if present)
+    // holds the older ones. Walk both newest-first so rotation doesn't drop
+    // history, and parse before `take` so unparseable/torn lines don't eat the
+    // quota.
+    //
+    // Snapshot both files consistently with rotation *without* holding up
+    // telemetry for the (potentially ~16 MiB) read: open the two handles under
+    // the same lock `append` rotates with, then read them once the lock is
+    // released. An open fd keeps pointing at its file across `append`'s rename,
+    // so the two handles still capture distinct pre-rotation files — no entry
+    // read twice (the duplication race), none missed — while the lock is held
+    // only for the two cheap opens. The blocking reads run off the async runtime
+    // via `spawn_blocking` at the call sites.
+    let (current, rotated) = {
+        let _guard = WRITE.lock();
+        (std::fs::File::open(log_path(base)).ok(), std::fs::File::open(rotated_path(base)).ok())
+    };
+    let read = |file: Option<std::fs::File>| -> String {
+        let mut buf = String::new();
+        if let Some(mut f) = file {
+            let _ = f.read_to_string(&mut buf);
+        }
+        buf
+    };
+    let (current, rotated) = (read(current), read(rotated));
+    let mut hits: Vec<Value> = current
         .lines()
         .rev()
+        .chain(rotated.lines().rev())
         .filter(|l| needle.as_deref().is_none_or(|n| l.to_lowercase().contains(n)))
-        .take(limit)
         .filter_map(|l| serde_json::from_str(l).ok())
+        .take(limit)
         .collect();
     hits.reverse();
     hits
@@ -82,7 +114,12 @@ pub fn recent(base: &Path, limit: usize, contains: Option<&str>) -> Vec<Value> {
 /// `GET /admin/reports?limit=&contains=` (requires `x-admin-token`).
 pub async fn list(State(state): State<AppState>, headers: HeaderMap, Query(q): Query<ListQuery>) -> Result<Json<Vec<Value>>> {
     require_admin(&headers)?;
-    Ok(Json(recent(state.storage.base_path(), q.limit.unwrap_or(100).min(1000), q.contains.as_deref())))
+    // recent() does blocking file I/O; keep it off the async worker.
+    let base = state.storage.base_path().to_path_buf();
+    let limit = q.limit.unwrap_or(100).min(1000);
+    let contains = q.contains;
+    let reports = tokio::task::spawn_blocking(move || recent(&base, limit, contains.as_deref())).await.unwrap_or_default();
+    Ok(Json(reports))
 }
 
 #[cfg(test)]
@@ -110,5 +147,46 @@ mod tests {
         append(tmp.path(), "/v1/reports", &vec![b'x'; MAX_BODY * 2]);
         let kept = recent(tmp.path(), 1, None);
         assert_eq!(kept[0]["body"].as_str().unwrap().len(), MAX_BODY);
+    }
+
+    #[test]
+    fn rotated_file_is_still_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        append(tmp.path(), "/v1/reports", br#"{"n":1}"#);
+        append(tmp.path(), "/v1/reports", br#"{"n":2}"#);
+        // Simulate rotation: the current file becomes the older `.1`.
+        std::fs::rename(log_path(tmp.path()), rotated_path(tmp.path())).unwrap();
+        append(tmp.path(), "/v1/reports", br#"{"n":3}"#);
+        // History across both files, oldest first.
+        let all = recent(tmp.path(), 10, None);
+        assert_eq!(all.len(), 3);
+        assert_eq!([&all[0]["body"]["n"], &all[1]["body"]["n"], &all[2]["body"]["n"]], [&json!(1), &json!(2), &json!(3)]);
+        // The limit spans both files and keeps the newest.
+        let newest = recent(tmp.path(), 2, None);
+        assert_eq!(newest.len(), 2);
+        assert_eq!([&newest[0]["body"]["n"], &newest[1]["body"]["n"]], [&json!(2), &json!(3)]);
+    }
+
+    #[test]
+    fn torn_lines_do_not_consume_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        append(tmp.path(), "/v1/reports", br#"{"a":1}"#);
+        // A write torn BEFORE its newline (a crash mid-write): note there is no
+        // trailing '\n', so the next appended report is concatenated onto it and
+        // the two become a single invalid-JSON line.
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(log_path(tmp.path())).unwrap();
+            write!(f, "{{\"at\":\"x\",\"pa").unwrap();
+        }
+        append(tmp.path(), "/v1/reports", br#"{"b":2}"#);
+        // The corrupted joined line is skipped (its swallowed report is lost),
+        // but the intact earlier report still comes back...
+        let all = recent(tmp.path(), 10, None);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0]["body"]["a"], json!(1));
+        // ...and the skipped line never crowds the valid one out of the limit.
+        let one = recent(tmp.path(), 1, None);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0]["body"]["a"], json!(1));
     }
 }
