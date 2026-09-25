@@ -219,3 +219,7 @@ Each document is a tree of blobs referenced by SHA-256 hash. The `root.json` poi
 - The server stores your notebooks in plain files. **Back up `remarkable-storage/`**.
 - The admin token protects device pairing. Keep `certs/admin-token` secret.
 - TLS certificates are self-signed but trusted by your tablet only.
+
+## Remote deployment
+
+For running the server on a VPS (remarkable.unwrap.rs) and the two ways to point the tablet at it (on-tablet `rm-proxy` vs. direct `/etc/hosts`), see [DEPLOYMENT.md](DEPLOYMENT.md).

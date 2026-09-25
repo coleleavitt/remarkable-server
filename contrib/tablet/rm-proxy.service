@@ -1,0 +1,13 @@
+[Unit]
+Description=rm-proxy: relay reMarkable cloud traffic to remarkable.unwrap.rs
+After=network-online.target
+Wants=network-online.target
+Before=xochitl.service
+
+[Service]
+ExecStart=/home/root/rm-proxy/rm-proxy --cert /home/root/rm-proxy/server.crt --key /home/root/rm-proxy/server.key --route 127.0.0.1:443=remarkable.unwrap.rs:443 --route 127.0.0.2:443=remarkable.unwrap.rs:8883
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -64,10 +64,14 @@ async fn main() -> Result<()> {
     // Screenshare signaling broker (MQTT over TLS). The tablet dials
     // vernemq-prod.cloud.remarkable.engineering:443, so bind it on its own address.
     if let Some(bind) = env::var("SCREENSHARE_BIND").ok().filter(|b| !b.is_empty()) {
-        let (Some(cert), Some(key)) = (&config.cert_path, &config.key_path) else {
-            anyhow::bail!("SCREENSHARE_BIND needs --cert and --key (the broker is TLS-only)");
+        // The broker is TLS-only. SCREENSHARE_CERT/SCREENSHARE_KEY let it use its own
+        // cert when the HTTP listener runs plain behind a reverse proxy.
+        let cert = env::var("SCREENSHARE_CERT").ok().filter(|v| !v.is_empty()).or_else(|| config.cert_path.clone());
+        let key = env::var("SCREENSHARE_KEY").ok().filter(|v| !v.is_empty()).or_else(|| config.key_path.clone());
+        let (Some(cert), Some(key)) = (cert, key) else {
+            anyhow::bail!("SCREENSHARE_BIND needs a cert: set SCREENSHARE_CERT/SCREENSHARE_KEY or pass --cert/--key");
         };
-        let tls = screenshare_tls(cert, key)?;
+        let tls = screenshare_tls(&cert, &key)?;
         let broker = remarkable_server::screenshare::Broker::new(state.devices.clone(), (*state.ice_servers).clone());
         let addr: std::net::SocketAddr = bind.parse()?;
         tokio::spawn(async move {

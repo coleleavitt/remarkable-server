@@ -1,0 +1,20 @@
+[package]
+name = "rm-proxy"
+version = "0.1.0"
+edition = "2021"
+description = "Tablet-side TLS relay: terminates *.remarkable.com locally and forwards to a self-hosted remarkable-server"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "time", "signal"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[workspace]

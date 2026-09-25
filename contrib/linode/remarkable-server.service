@@ -1,0 +1,25 @@
+[Unit]
+Description=reMarkable cloud replacement server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=remarkable
+Group=remarkable
+EnvironmentFile=/etc/remarkable-server/env
+# Plain HTTP on loopback only; nginx terminates public TLS in front of it.
+ExecStart=/opt/remarkable-server/bin/remarkable-server --bind ${RMS_BIND} --storage ${RMS_STORAGE}
+Restart=on-failure
+RestartSec=3
+
+# The screenshare broker (MQTT over TLS) binds 0.0.0.0:8883 directly, no nginx.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/remarkable-server
+ReadOnlyPaths=/etc/remarkable-server
+
+[Install]
+WantedBy=multi-user.target

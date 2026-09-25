@@ -27,3 +27,4 @@ jwt_secret
 
 # Cross-compile output
 /target-linode/
+rm-proxy/target/
