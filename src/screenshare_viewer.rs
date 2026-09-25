@@ -39,8 +39,8 @@ use crate::screenshare::{Broker, LocalClient};
 use crate::screenshare_rest::RoomManager;
 
 const COOKIE: &str = "rm_screen";
-/// Keep the tablet session this long after the last browser leaves.
-const IDLE_GRACE: Duration = Duration::from_secs(20);
+/// Default for [`ViewerConfig::idle_grace`].
+pub const IDLE_GRACE: Duration = Duration::from_secs(20);
 /// Wait between attempts while screen share is off on the tablet.
 const RETRY_NOT_SHARING: Duration = Duration::from_secs(3);
 const RETRY_ERROR: Duration = Duration::from_secs(5);
@@ -56,6 +56,8 @@ pub struct ViewerConfig {
     pub user_id: String,
     /// Local WebRTC setup; `udp_ports` should match the firewall.
     pub transport: TransportConfig,
+    /// Keep the tablet session this long after the last browser leaves.
+    pub idle_grace: Duration,
 }
 
 /// The brokers a tablet may be using; at least one must be present.
@@ -169,7 +171,7 @@ impl ScreenViewer {
                 return;
             }
             tokio::select! {
-                _ = tokio::time::sleep(IDLE_GRACE) => return,
+                _ = tokio::time::sleep(self.inner.config.idle_grace) => return,
                 _ = watchers.wait_for(|n| *n > 0) => {}
             }
         }
