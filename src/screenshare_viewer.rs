@@ -30,7 +30,7 @@ use base64::Engine;
 use parking_lot::Mutex;
 use remarkable_mqtt::screenshare::{signaling_topic, subscriptions};
 use remarkable_mqtt::{PeerMessage, SignalingEvent, SignalingRequest, WebRtcMessage};
-use remarkable_screenshare::{pump_frames, Frame, PixelFormat, TransportConfig, Update, WebRtcHandler};
+use remarkable_screenshare::{pump_frames, Area, Frame, PixelFormat, TransportConfig, Update, WebRtcHandler};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
 
@@ -115,6 +115,28 @@ fn retry_delay(attempt: u32) -> Duration {
     RETRY_BASE.saturating_mul(2u32.saturating_pow(attempt)).min(RETRY_CAP)
 }
 
+/// One published frame: the picture, and what changed since the previous one.
+pub struct Shot {
+    /// Increases by one per frame, so a browser can tell it missed some.
+    pub seq: u64,
+    pub frame: Frame,
+    /// PNG of just the changed area, when that's less than the whole frame.
+    pub patch: Option<(Area, Vec<u8>)>,
+    full: std::sync::OnceLock<Vec<u8>>,
+}
+
+impl Shot {
+    /// PNG of the whole frame, encoded on first use.
+    pub fn full_png(&self) -> &[u8] {
+        self.full.get_or_init(|| {
+            encode_png(&self.frame, self.frame.full_area()).unwrap_or_else(|e| {
+                tracing::warn!("screenshare viewer: PNG encode failed: {e}");
+                Vec::new()
+            })
+        })
+    }
+}
+
 /// Shared viewer; clone freely.
 #[derive(Clone)]
 pub struct ScreenViewer {
@@ -124,7 +146,7 @@ pub struct ScreenViewer {
 struct Inner {
     signaling: Signaling,
     config: ViewerConfig,
-    png: watch::Sender<Option<Arc<Vec<u8>>>>,
+    png: watch::Sender<Option<Arc<Shot>>>,
     status: watch::Sender<Status>,
     /// Pen position in the current frame's pixels; `None` hides the cursor.
     cursor: watch::Sender<Option<(u32, u32)>>,
@@ -138,7 +160,7 @@ struct Inner {
 /// one is dropped.
 pub struct Watcher {
     viewer: ScreenViewer,
-    pub png: watch::Receiver<Option<Arc<Vec<u8>>>>,
+    pub png: watch::Receiver<Option<Arc<Shot>>>,
     pub status: watch::Receiver<Status>,
     pub cursor: watch::Receiver<Option<(u32, u32)>>,
 }
@@ -378,6 +400,7 @@ impl ScreenViewer {
         let channel_room = channel.room_id().to_owned();
 
         let png = &self.inner.png;
+        let seq = std::sync::atomic::AtomicU64::new(0);
         let status = &self.inner.status;
         let cursor = &self.inner.cursor;
         let connected = std::sync::atomic::AtomicBool::new(false);
@@ -391,12 +414,17 @@ impl ScreenViewer {
                     let streaming = Status::Streaming { width: frame.width, height: frame.height };
                     (*s != streaming).then(|| *s = streaming).is_some()
                 });
-                match encode_png(&frame) {
-                    Ok(bytes) => {
-                        png.send_replace(Some(Arc::new(bytes)));
-                    }
-                    Err(e) => tracing::warn!("screenshare viewer: PNG encode failed: {e}"),
-                }
+                let partial = frame.changed != frame.full_area();
+                let patch = partial.then(|| encode_png(&frame, frame.changed)).and_then(|r| {
+                    r.map_err(|e| tracing::warn!("screenshare viewer: PNG encode failed: {e}")).ok()
+                });
+                let shot = Shot {
+                    seq: seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    patch: patch.map(|bytes| (frame.changed, bytes)),
+                    frame,
+                    full: std::sync::OnceLock::new(),
+                };
+                png.send_replace(Some(Arc::new(shot)));
             }
             Update::Cursor(point) => {
                 cursor.send_replace(point);
@@ -585,16 +613,27 @@ impl Drop for Channel {
     }
 }
 
-fn encode_png(frame: &Frame) -> Result<Vec<u8>, png::EncodingError> {
-    let mut out = Vec::with_capacity(frame.data.len() / 8);
-    let mut encoder = png::Encoder::new(&mut out, frame.width, frame.height);
+/// PNG of `area` of `frame`.
+fn encode_png(frame: &Frame, area: Area) -> Result<Vec<u8>, png::EncodingError> {
+    let bpp = match frame.format {
+        PixelFormat::Gray8 => 1,
+        PixelFormat::Rgb8 => 3,
+    };
+    let (stride, row) = (frame.width as usize * bpp, area.width as usize * bpp);
+    let mut pixels = Vec::with_capacity(row * area.height as usize);
+    for y in area.y as usize..(area.y + area.height) as usize {
+        let start = y * stride + area.x as usize * bpp;
+        pixels.extend_from_slice(&frame.data[start..start + row]);
+    }
+    let mut out = Vec::with_capacity(pixels.len() / 8);
+    let mut encoder = png::Encoder::new(&mut out, area.width, area.height);
     encoder.set_color(match frame.format {
         PixelFormat::Gray8 => png::ColorType::Grayscale,
         PixelFormat::Rgb8 => png::ColorType::Rgb,
     });
     encoder.set_depth(png::BitDepth::Eight);
     encoder.set_compression(png::Compression::Fast);
-    encoder.write_header()?.write_image_data(&frame.data)?;
+    encoder.write_header()?.write_image_data(&pixels)?;
     Ok(out)
 }
 
@@ -667,7 +706,7 @@ async fn frame(State(viewer): State<ScreenViewer>, headers: HeaderMap) -> Respon
     let mut watcher = viewer.watch();
     let latest = tokio::time::timeout(Duration::from_secs(20), watcher.png.wait_for(Option::is_some)).await;
     match latest.ok().and_then(|r| r.ok()).and_then(|p| p.clone()) {
-        Some(png) => ([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "no-store")], png.to_vec()).into_response(),
+        Some(shot) => ([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "no-store")], shot.full_png().to_vec()).into_response(),
         None => (StatusCode::SERVICE_UNAVAILABLE, format!("{:?}", *watcher.status.borrow())).into_response(),
     }
 }
@@ -679,10 +718,29 @@ async fn ws(State(viewer): State<ScreenViewer>, headers: HeaderMap, upgrade: Web
     upgrade.on_upgrade(move |socket| stream(socket, viewer))
 }
 
-/// Send status changes and cursor moves as JSON text and each new frame as a
-/// binary PNG. Cursor messages are `{"cursor":[x,y]}` or `{"cursor":null}`.
+/// A binary frame message: a 25-byte header (kind: 0 full frame, 1 patch;
+/// then x, y, width, height of the PNG and the full frame's width, height,
+/// all big-endian u32) followed by the PNG.
+fn frame_message(shot: &Shot, previous: Option<u64>) -> Vec<u8> {
+    let (kind, area, png) = match &shot.patch {
+        // Patches only apply on top of the frame right before them.
+        Some((area, png)) if previous == Some(shot.seq.wrapping_sub(1)) => (1u8, *area, png.as_slice()),
+        _ => (0u8, shot.frame.full_area(), shot.full_png()),
+    };
+    let mut msg = Vec::with_capacity(25 + png.len());
+    msg.push(kind);
+    for v in [area.x, area.y, area.width, area.height, shot.frame.width, shot.frame.height] {
+        msg.extend(v.to_be_bytes());
+    }
+    msg.extend_from_slice(png);
+    msg
+}
+
+/// Send status changes and cursor moves as JSON text and frames as binary
+/// [`frame_message`]s. Cursor messages are `{"cursor":[x,y]}` or `{"cursor":null}`.
 async fn stream(mut socket: WebSocket, viewer: ScreenViewer) {
     let mut watcher = viewer.watch();
+    let mut last_seq = None;
     watcher.png.mark_changed();
     watcher.status.mark_changed();
     watcher.cursor.mark_changed();
@@ -701,8 +759,10 @@ async fn stream(mut socket: WebSocket, viewer: ScreenViewer) {
             }
             changed = watcher.png.changed() => {
                 if changed.is_err() { break }
-                let Some(png) = watcher.png.borrow_and_update().clone() else { continue };
-                if socket.send(Message::Binary(png.to_vec().into())).await.is_err() { break }
+                let Some(shot) = watcher.png.borrow_and_update().clone() else { last_seq = None; continue };
+                let msg = frame_message(&shot, last_seq);
+                last_seq = Some(shot.seq);
+                if socket.send(Message::Binary(msg.into())).await.is_err() { break }
             }
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
@@ -728,23 +788,35 @@ const VIEWER_HTML: &str = r#"<!doctype html><html lang=en><meta charset=utf-8>
 <style>html,body{margin:0;height:100%;background:#1b1b1b;color:#ddd;font:14px system-ui}
 #stage{position:relative;width:fit-content;margin:auto}
 #screen{display:block;max-width:100vw;max-height:calc(100vh - 2.2rem);background:#fff}
-#pen{position:absolute;border-radius:50%;background:#e33;pointer-events:none;display:none;transform:translate(-50%,-50%)}
+#pen{position:absolute;border-radius:50%;background:rgba(244,21,21,.8);pointer-events:none;display:none;transform:translate(-50%,-50%)}
 #bar{height:2.2rem;display:flex;align-items:center;gap:1rem;padding:0 1rem}
 #dot{width:.6rem;height:.6rem;border-radius:50%;background:#888}#dot.live{background:#3c3}#dot.warn{background:#d93}#dot.bad{background:#d33}
 button{margin-left:auto;background:none;color:inherit;border:1px solid #555;border-radius:6px;padding:.2rem .6rem;font:inherit}</style>
 <div id=bar><span id=dot></span><span id=status>Connecting…</span><button onclick="document.documentElement.requestFullscreen()">Full screen</button></div>
-<div id=stage><img id=screen alt="Tablet screen"><div id=pen></div></div>
+<div id=stage><canvas id=screen width=0 height=0></canvas><div id=pen></div></div>
 <script>
-const img=document.getElementById('screen'),pen=document.getElementById('pen'),status=document.getElementById('status'),dot=document.getElementById('dot');
-// Pen marker: a 15 px filled circle in tablet pixels, as the desktop app draws it.
+const canvas=document.getElementById('screen'),ctx=canvas.getContext('2d'),pen=document.getElementById('pen'),status=document.getElementById('status'),dot=document.getElementById('dot');
+// Pen marker: a 15 px circle in tablet pixels, colour #CCF41515, as in the desktop app.
 const PEN=15;let cursor=null;
 function drawPen(){
-  if(!cursor||!img.naturalWidth){pen.style.display='none';return}
-  const k=img.clientWidth/img.naturalWidth;
+  if(!cursor||!canvas.width){pen.style.display='none';return}
+  const k=canvas.clientWidth/canvas.width;
   pen.style.display='block';pen.style.width=pen.style.height=Math.max(4,PEN*k)+'px';
   pen.style.left=cursor[0]*k+'px';pen.style.top=cursor[1]*k+'px';
 }
-new ResizeObserver(drawPen).observe(img);img.addEventListener('load',drawPen);
+new ResizeObserver(drawPen).observe(canvas);
+// Frames: 25-byte header (kind 0 full / 1 patch, then x y w h fw fh as u32) + PNG.
+let painting=Promise.resolve();
+function paint(buf){
+  const v=new DataView(buf),kind=v.getUint8(0),u=i=>v.getUint32(1+4*i);
+  const [x,y,fw,fh]=[u(0),u(1),u(4),u(5)];
+  const png=new Blob([buf.slice(25)],{type:'image/png'});
+  // Keep patches in order: each waits for the previous paint.
+  painting=painting.then(()=>createImageBitmap(png)).then(bmp=>{
+    if(kind===0&&(canvas.width!==fw||canvas.height!==fh)){canvas.width=fw;canvas.height=fh}
+    ctx.drawImage(bmp,x,y);bmp.close();drawPen();
+  }).catch(()=>{});
+}
 function describe(s){
   switch(s.state){
     case 'idle':return['Idle',''];
@@ -760,14 +832,14 @@ function describe(s){
 }
 function connect(){
   const ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/screenshare/view/ws');
-  ws.binaryType='blob';
+  ws.binaryType='arraybuffer';
   ws.onmessage=e=>{
     if(typeof e.data==='string'){const m=JSON.parse(e.data);
       if('cursor' in m){cursor=m.cursor;drawPen();return}
       const [t,c]=describe(m);status.textContent=t;dot.className=c;
       if(m.state!=='streaming'){cursor=null;drawPen()}
       return}
-    const url=URL.createObjectURL(e.data);const old=img.src;img.src=url;if(old)URL.revokeObjectURL(old)};
+    paint(e.data)};
   ws.onclose=()=>{status.textContent='Disconnected, retrying…';dot.className='warn';setTimeout(connect,2000)};
 }
 connect();
@@ -783,6 +855,29 @@ mod tests {
         assert_eq!(delays, [2, 4, 8, 16, 30]);
     }
 
+    fn shot(seq: u64, patch: bool) -> Shot {
+        let frame = Frame {
+            data: (0..16u8).collect(), width: 4, height: 4, format: PixelFormat::Gray8,
+            changed: Area { x: 1, y: 1, width: 2, height: 2 }, timestamp: std::time::Instant::now(),
+        };
+        let patch = patch.then(|| (frame.changed, encode_png(&frame, frame.changed).unwrap()));
+        Shot { seq, frame, patch, full: std::sync::OnceLock::new() }
+    }
+
+    #[test]
+    fn patches_only_follow_their_predecessor() {
+        let s = shot(5, true);
+        let msg = frame_message(&s, Some(4));
+        assert_eq!(msg[0], 1, "next in sequence: patch");
+        assert_eq!(&msg[1..17], &[0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 2]);
+        let reader = png::Decoder::new(std::io::Cursor::new(msg[25..].to_vec())).read_info().unwrap();
+        assert_eq!((reader.info().width, reader.info().height), (2, 2));
+        // A gap (or a first message) needs the whole picture.
+        assert_eq!(frame_message(&s, Some(2))[0], 0);
+        assert_eq!(frame_message(&s, None)[0], 0);
+        assert_eq!(frame_message(&shot(6, false), Some(5))[0], 0);
+    }
+
     #[test]
     fn token_comparison() {
         assert!(token_matches("abc", "abc"));
@@ -793,8 +888,11 @@ mod tests {
     #[test]
     fn png_round_trip_size() {
         for (format, bytes, color) in [(PixelFormat::Gray8, 1, png::ColorType::Grayscale), (PixelFormat::Rgb8, 3, png::ColorType::Rgb)] {
-            let frame = Frame { data: vec![255; 4 * 3 * bytes], width: 4, height: 3, format, timestamp: std::time::Instant::now() };
-            let png = encode_png(&frame).unwrap();
+            let frame = Frame {
+                data: vec![255; 4 * 3 * bytes], width: 4, height: 3, format,
+                changed: Area { x: 0, y: 0, width: 4, height: 3 }, timestamp: std::time::Instant::now(),
+            };
+            let png = encode_png(&frame, frame.full_area()).unwrap();
             let reader = png::Decoder::new(std::io::Cursor::new(png)).read_info().unwrap();
             assert_eq!((reader.info().width, reader.info().height, reader.info().color_type), (4, 3, color));
         }

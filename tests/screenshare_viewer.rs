@@ -155,7 +155,7 @@ async fn viewer_streams_frames_from_tablet() {
         .clone()
         .unwrap();
 
-    let info = png::Decoder::new(std::io::Cursor::new(png.to_vec())).read_info().unwrap().info().clone();
+    let info = png::Decoder::new(std::io::Cursor::new(png.full_png().to_vec())).read_info().unwrap().info().clone();
     assert_eq!((info.width, info.height), (u32::from(W), u32::from(H)));
     assert_eq!(*watcher.status.borrow(), Status::Streaming { width: u32::from(W), height: u32::from(H) });
 
@@ -299,7 +299,7 @@ async fn viewer_streams_frames_from_rest_tablet() {
         .unwrap()
         .clone()
         .unwrap();
-    let info = png::Decoder::new(std::io::Cursor::new(png.to_vec())).read_info().unwrap().info().clone();
+    let info = png::Decoder::new(std::io::Cursor::new(png.full_png().to_vec())).read_info().unwrap().info().clone();
     assert_eq!((info.width, info.height), (u32::from(W), u32::from(H)));
     tablet.abort();
 }
