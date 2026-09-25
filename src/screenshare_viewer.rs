@@ -90,6 +90,10 @@ pub enum Status {
     Connecting,
     /// Screen share is off on the tablet.
     NotSharing,
+    /// The tablet answered the handshake but hasn't sent a picture yet. On
+    /// connect it sends the whole current screen image (xochitl 3.29
+    /// 0x459250 marks QImage::rect() dirty); with no image, only pings come.
+    Connected,
     Streaming { width: u32, height: u32 },
     /// The last session failed; trying again in `in_secs`.
     Reconnecting { attempt: u32, max: u32, in_secs: u64, message: String },
@@ -362,7 +366,10 @@ impl ScreenViewer {
         let cursor = &self.inner.cursor;
         let connected = std::sync::atomic::AtomicBool::new(false);
         let frames = pump_frames(&mut data_rx, |update| match update {
-            Update::Connected { .. } => connected.store(true, std::sync::atomic::Ordering::Relaxed),
+            Update::Connected { .. } => {
+                connected.store(true, std::sync::atomic::Ordering::Relaxed);
+                status.send_replace(Status::Connected);
+            }
             Update::Frame(frame) => {
                 status.send_if_modified(|s| {
                     let streaming = Status::Streaming { width: frame.width, height: frame.height };
@@ -724,6 +731,7 @@ function describe(s){
     case 'idle':return['Idle',''];
     case 'connecting':return['Connecting to tablet…',''];
     case 'not-sharing':return['Screen share is off on the tablet','warn'];
+    case 'connected':return['Connected, waiting for the tablet\'s picture (open a document on the tablet if nothing appears)','live'];
     case 'streaming':return['Live','live'];
     case 'reconnecting':return[`Reconnecting (${s.attempt}/${s.max}) in ${s.in_secs}s: ${s.message}`,'warn'];
     case 'stopped':return['The tablet stopped sharing; waiting for a new share','warn'];

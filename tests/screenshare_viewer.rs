@@ -315,7 +315,12 @@ async fn idle_session_ends_when_tablet_sends_no_frames() {
     let mut status = watcher.status.clone();
     tokio::time::timeout(Duration::from_secs(5), status.wait_for(|s| *s == Status::NotSharing)).await.unwrap().unwrap();
     let tablet = tokio::spawn(fake_tablet_sending(broker.clone(), handshake));
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    // Handshake but no picture: reported as connected, not streaming.
+    tokio::time::timeout(Duration::from_secs(15), status.wait_for(|s| *s == Status::Connected))
+        .await
+        .expect("never reported connected")
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
     drop(watcher);
     tokio::time::timeout(Duration::from_secs(5), status.wait_for(|s| *s == Status::Idle))
         .await
