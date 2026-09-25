@@ -89,9 +89,23 @@ impl RoomManager {
         self.rooms.lock().get(room_id).map(|r| r.participants.values().cloned().collect()).unwrap_or_default()
     }
 
-    /// Refresh `room_id`'s activity so it isn't swept.
-    pub fn keepalive(&self, room_id: &str) {
-        if let Some(r) = self.rooms.lock().get_mut(room_id) { r.last_activity = Instant::now(); }
+    /// Refresh `room_id`'s activity so it isn't swept, if `user_id` owns it.
+    /// Checked and refreshed under one lock; false if the room is gone or
+    /// belongs to another account.
+    pub fn keepalive(&self, room_id: &str, user_id: &str) -> bool {
+        let mut rooms = self.rooms.lock();
+        Self::sweep(&mut rooms);
+        match rooms.get_mut(room_id) {
+            Some(r) if r.owner_user_id == user_id => { r.last_activity = Instant::now(); true }
+            _ => false,
+        }
+    }
+
+    /// Whether `room_id` exists and belongs to `user_id`.
+    fn owned_by(&self, room_id: &str, user_id: &str) -> bool {
+        let mut rooms = self.rooms.lock();
+        Self::sweep(&mut rooms);
+        rooms.get(room_id).is_some_and(|r| r.owner_user_id == user_id)
     }
 
     /// `device_id` leaves `room_id`; the room goes away only when its owner
@@ -123,11 +137,23 @@ impl RoomManager {
         self.find_active(user_id)
     }
 
-    /// Join `room_id` as an in-process participant; false if the room is gone.
+    /// Like [`active_room`](Self::active_room), with how long ago it was created.
+    pub fn active_room_age(&self, user_id: &str) -> Option<(String, std::time::Duration)> {
+        let id = self.find_active(user_id)?;
+        let created = self.rooms.lock().get(&id)?.created_at;
+        Some((id, (chrono::Utc::now() - created).to_std().unwrap_or_default()))
+    }
+
+    /// Join `room_id` of `user_id`'s account; false if the room is gone or
+    /// belongs to another account. Checked and joined under one lock.
     pub fn join(&self, room_id: &str, client_id: &str, user_id: &str) -> bool {
-        if !self.exists(room_id) { return false; }
-        self.add_participant(room_id, client_id, user_id);
-        self.keepalive(room_id);
+        let mut rooms = self.rooms.lock();
+        Self::sweep(&mut rooms);
+        let Some(r) = rooms.get_mut(room_id).filter(|r| r.owner_user_id == user_id) else { return false };
+        r.participants.entry(client_id.to_string()).or_insert(RoomClient {
+            client_id: client_id.to_string(), user_id: user_id.to_string(), is_owner: false,
+        });
+        r.last_activity = Instant::now();
         true
     }
 
@@ -166,7 +192,10 @@ pub async fn join_active(State(state): State<AppState>, headers: HeaderMap) -> R
 
 /// `GET /screenshare/v1/rooms/{roomId}` -> 200 `{roomId, createdAt, clients}` or 404 (viewer use).
 pub async fn get_room(State(state): State<AppState>, headers: HeaderMap, Path(room_id): Path<String>) -> Result<(StatusCode, Json<Value>)> {
-    state.auth_user(&headers)?;
+    let user_id = state.auth_user(&headers)?;
+    if !state.screenshare.owned_by(&room_id, &user_id) {
+        return Ok((StatusCode::NOT_FOUND, Json(json!({"error": "room not found"}))));
+    }
     match state.screenshare.room_meta(&room_id) {
         Some(created_at) => Ok((StatusCode::OK, Json(json!({
             "roomId": room_id, "createdAt": created_at, "clients": state.screenshare.clients(&room_id),
@@ -180,9 +209,8 @@ pub async fn get_room(State(state): State<AppState>, headers: HeaderMap, Path(ro
 /// sharing into nothing; the desktop treats a failed keepalive as
 /// `connectionRefused`.
 pub async fn keepalive(State(state): State<AppState>, headers: HeaderMap, Path(room_id): Path<String>) -> Result<StatusCode> {
-    state.auth_user(&headers)?;
-    if !state.screenshare.exists(&room_id) { return Err(ServerError::NotFound("room not found".into())); }
-    state.screenshare.keepalive(&room_id);
+    let user_id = state.auth_user(&headers)?;
+    if !state.screenshare.keepalive(&room_id, &user_id) { return Err(ServerError::NotFound("room not found".into())); }
     Ok(StatusCode::OK)
 }
 
@@ -329,5 +357,22 @@ mod tests {
         assert!(keepalive(State(state.clone()), hdrs(&tk), Path("gone".into())).await.is_err());
         let (code, _) = join_room(State(state.clone()), hdrs(&tk), Path("gone".into())).await.unwrap();
         assert_eq!(code, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn other_accounts_cannot_use_a_room() {
+        let (state, owner, _tmp) = state_and_auth();
+        let stranger = state.devices.create_user_token("someone-else@test").unwrap();
+        let (_, Json(body)) = create_room(State(state.clone()), hdrs(&owner)).await.unwrap();
+        let room_id = body["roomId"].as_str().unwrap().to_string();
+
+        let (code, _) = join_room(State(state.clone()), hdrs(&stranger), Path(room_id.clone())).await.unwrap();
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        let (code, _) = get_room(State(state.clone()), hdrs(&stranger), Path(room_id.clone())).await.unwrap();
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        assert!(keepalive(State(state.clone()), hdrs(&stranger), Path(room_id.clone())).await.is_err());
+        assert_eq!(state.screenshare.clients(&room_id).len(), 1);
+        // The owner still can.
+        assert_eq!(keepalive(State(state.clone()), hdrs(&owner), Path(room_id.clone())).await.unwrap(), StatusCode::OK);
     }
 }

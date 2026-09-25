@@ -68,6 +68,13 @@ pub struct ViewerConfig {
     pub idle_grace: Duration,
 }
 
+impl Default for ViewerConfig {
+    /// The paired account, host candidates only, 20 s idle grace.
+    fn default() -> Self {
+        Self { user_id: "local-user".into(), transport: TransportConfig::default(), idle_grace: IDLE_GRACE }
+    }
+}
+
 /// The brokers a tablet may be using; at least one must be present.
 #[derive(Clone, Default)]
 pub struct Signaling {
@@ -292,29 +299,38 @@ impl ScreenViewer {
         }
     }
 
-    /// The tablet's current room on either broker, without joining it.
-    fn active_room(&self) -> Option<String> {
+    /// The tablet's current room, without joining it: the newest one across
+    /// both brokers, with whether it's on the REST rooms.
+    fn newest_room(&self) -> Option<(String, bool)> {
         let uid = &self.inner.config.user_id;
         let signaling = &self.inner.signaling;
-        signaling.mqtt.as_ref().and_then(|b| b.active_room(uid))
-            .or_else(|| signaling.rest.as_ref().and_then(|r| r.rooms.active_room(uid)))
+        let mqtt = signaling.mqtt.as_ref().and_then(|b| b.active_room_age(uid)).map(|(id, age)| (id, age, false));
+        let rest = signaling.rest.as_ref().and_then(|r| r.rooms.active_room_age(uid)).map(|(id, age)| (id, age, true));
+        // A stale room on one broker mustn't hide a fresh one on the other.
+        [mqtt, rest].into_iter().flatten().min_by_key(|(_, age, _)| *age).map(|(id, _, rest)| (id, rest))
+    }
+
+    fn active_room(&self) -> Option<String> {
+        self.newest_room().map(|(id, _)| id)
     }
 
     /// Find the tablet's room on whichever broker has one.
     async fn open_channel(&self, cid: &str) -> Result<Channel, SessionEnd> {
         let uid = &self.inner.config.user_id;
+        let prefer_rest = self.newest_room().is_some_and(|(_, rest)| rest);
+        let try_rest = || self.inner.signaling.rest.as_ref().and_then(|rest| Channel::join_rest(rest, uid, cid));
+        if prefer_rest {
+            if let Some(channel) = try_rest() {
+                return Ok(channel);
+            }
+        }
         if let Some(broker) = &self.inner.signaling.mqtt {
             match Channel::join_mqtt(broker, uid, cid).await {
                 Err(SessionEnd::NotSharing) => {}
                 joined => return joined,
             }
         }
-        if let Some(rest) = &self.inner.signaling.rest {
-            if let Some(channel) = Channel::join_rest(rest, uid, cid) {
-                return Ok(channel);
-            }
-        }
-        Err(SessionEnd::NotSharing)
+        try_rest().ok_or(SessionEnd::NotSharing)
     }
 
     /// One negotiation and stream with the tablet.
@@ -472,8 +488,8 @@ impl Channel {
     /// Keep a REST room alive while we are in it (MQTT rooms live as long as
     /// the tablet's session).
     fn keepalive(&self) {
-        if let Channel::Rest { rest, room_id, .. } = self {
-            rest.rooms.keepalive(room_id);
+        if let Channel::Rest { rest, room_id, user_id, .. } = self {
+            rest.rooms.keepalive(room_id, user_id);
         }
     }
 

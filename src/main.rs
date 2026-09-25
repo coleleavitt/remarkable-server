@@ -190,7 +190,7 @@ fn screenshare_viewer(broker: Option<remarkable_server::screenshare::Broker>, st
     if !matches!(env::var("SCREENSHARE_VIEWER").as_deref(), Ok("1" | "true" | "on")) {
         return Ok(None);
     }
-    if env::var("ADMIN_TOKEN").map_or(true, |t| t.is_empty()) {
+    if env::var("ADMIN_TOKEN").map_or(true, |t| t.trim().is_empty()) {
         anyhow::bail!("SCREENSHARE_VIEWER needs ADMIN_TOKEN, which protects the viewer page");
     }
     let udp_ports = match env::var("SCREENSHARE_VIEWER_UDP_PORTS").ok().filter(|v| !v.is_empty()) {
