@@ -78,8 +78,15 @@ pub fn recent(base: &Path, limit: usize, contains: Option<&str>) -> Vec<Value> {
     // holds the older ones. Walk both newest-first so rotation doesn't drop
     // history, and parse before `take` so unparseable/torn lines don't eat the
     // quota.
-    let current = std::fs::read_to_string(log_path(base)).unwrap_or_default();
-    let rotated = std::fs::read_to_string(rotated_path(base)).unwrap_or_default();
+    //
+    // Both files are read under the same lock `append` takes for rotation, so
+    // the two-file snapshot is consistent: without it, a rotation landing
+    // between the reads could show the pre-rotation current file as both the
+    // current and the `.1` (duplicated entries) while the new current is missed.
+    let (current, rotated) = {
+        let _guard = WRITE.lock();
+        (std::fs::read_to_string(log_path(base)).unwrap_or_default(), std::fs::read_to_string(rotated_path(base)).unwrap_or_default())
+    };
     let mut hits: Vec<Value> = current
         .lines()
         .rev()
@@ -147,14 +154,22 @@ mod tests {
     fn torn_lines_do_not_consume_limit() {
         let tmp = tempfile::tempdir().unwrap();
         append(tmp.path(), "/v1/reports", br#"{"a":1}"#);
-        // A partial line, e.g. a crash mid-write, must not eat a slot.
+        // A write torn BEFORE its newline (a crash mid-write): note there is no
+        // trailing '\n', so the next appended report is concatenated onto it and
+        // the two become a single invalid-JSON line.
         {
             let mut f = std::fs::OpenOptions::new().append(true).open(log_path(tmp.path())).unwrap();
-            writeln!(f, "{{\"at\":\"x\",\"pa").unwrap();
+            write!(f, "{{\"at\":\"x\",\"pa").unwrap();
         }
         append(tmp.path(), "/v1/reports", br#"{"b":2}"#);
-        let two = recent(tmp.path(), 2, None);
-        assert_eq!(two.len(), 2);
-        assert_eq!([&two[0]["body"]["a"], &two[1]["body"]["b"]], [&json!(1), &json!(2)]);
+        // The corrupted joined line is skipped (its swallowed report is lost),
+        // but the intact earlier report still comes back...
+        let all = recent(tmp.path(), 10, None);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0]["body"]["a"], json!(1));
+        // ...and the skipped line never crowds the valid one out of the limit.
+        let one = recent(tmp.path(), 1, None);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0]["body"]["a"], json!(1));
     }
 }
