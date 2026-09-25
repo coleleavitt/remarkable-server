@@ -104,6 +104,24 @@ impl RoomManager {
     fn room_meta(&self, room_id: &str) -> Option<String> {
         self.rooms.lock().get(room_id).map(|r| r.created_at.to_rfc3339())
     }
+
+    /// Newest live room owned by `user_id`, for in-process participants such
+    /// as the server's screen share viewer.
+    pub fn active_room(&self, user_id: &str) -> Option<String> {
+        self.find_active(user_id)
+    }
+
+    /// Join `room_id` as an in-process participant; false if the room is gone.
+    pub fn join(&self, room_id: &str, client_id: &str, user_id: &str) -> bool {
+        if !self.exists(room_id) { return false; }
+        self.add_participant(room_id, client_id, user_id);
+        true
+    }
+
+    /// Leave `room_id`.
+    pub fn leave(&self, room_id: &str, client_id: &str) {
+        if let Some(r) = self.rooms.lock().get_mut(room_id) { r.participants.remove(client_id); }
+    }
 }
 
 fn authz(headers: &HeaderMap) -> Result<&str> {

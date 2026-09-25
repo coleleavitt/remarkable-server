@@ -213,8 +213,8 @@ SCREENSHARE_VIEWER_UDP_PORTS=50000-50100
 sudo ufw allow 50000:50100/udp comment 'screenshare viewer WebRTC'
 ```
 
-It needs the MQTT broker (`SCREENSHARE_BIND`); tablets that signal over the
-REST broker (`/screenshare/v1`, xochitl 3.27+/3.28) aren't supported yet.
+It follows the tablet on either broker: the MQTT one (`SCREENSHARE_BIND`) or
+the REST rooms (`/screenshare/v1`, xochitl 3.27+/3.28).
 
 Pairing code on the Linode:
 

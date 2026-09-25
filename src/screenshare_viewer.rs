@@ -1,9 +1,17 @@
 //! Watch the tablet's screen share in a browser, served by this server.
 //!
-//! The server joins the tablet's screen share room as a participant of its own
-//! MQTT broker (through [`Broker::local_client`], no network hop), negotiates
-//! WebRTC with the tablet, and decodes the frames with `remarkable-screenshare`.
-//! Browsers then get the latest frame from `/screenshare/view`.
+//! The server joins the tablet's screen share room as an in-process
+//! participant of whichever broker the tablet uses, negotiates WebRTC with the
+//! tablet, and decodes the frames with `remarkable-screenshare`. Browsers then
+//! get the latest frame from `/screenshare/view`.
+//!
+//! Two signaling paths, carrying the same `PeerMessage`s:
+//! - MQTT broker ([`Broker::local_client`]): xochitl up to 3.2x.
+//! - REST rooms (`/screenshare/v1`, xochitl 3.27+/3.28): the tablet owns a room
+//!   in [`RoomManager`] and exchanges `ScreenshareMessage` notifications whose
+//!   base64 `data` is the peer message; the sender is `sourceDeviceID` and a
+//!   direct message names its `targetClientId` (as the desktop app's
+//!   `restbroker.cpp`/`roombroker.cpp` do).
 //!
 //! A session runs only while at least one browser is watching and ends shortly
 //! after the last one leaves. The pages are protected by `ADMIN_TOKEN` (login
@@ -19,14 +27,17 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
+use base64::Engine;
 use parking_lot::Mutex;
 use remarkable_mqtt::screenshare::{signaling_topic, subscriptions};
 use remarkable_mqtt::{PeerMessage, SignalingEvent, SignalingRequest, WebRtcMessage};
 use remarkable_screenshare::{pump_frames, Frame, TransportConfig, WebRtcHandler};
 use serde::{Deserialize, Serialize};
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 
+use crate::notifications::WsMessage;
 use crate::screenshare::{Broker, LocalClient};
+use crate::screenshare_rest::RoomManager;
 
 const COOKIE: &str = "rm_screen";
 /// Keep the tablet session this long after the last browser leaves.
@@ -44,6 +55,20 @@ pub struct ViewerConfig {
     pub user_id: String,
     /// Local WebRTC setup; `udp_ports` should match the firewall.
     pub transport: TransportConfig,
+}
+
+/// The brokers a tablet may be using; at least one must be present.
+#[derive(Clone, Default)]
+pub struct Signaling {
+    pub mqtt: Option<Broker>,
+    pub rest: Option<RestRooms>,
+}
+
+/// The REST room broker's state (`AppState::screenshare` and `notification_tx`).
+#[derive(Clone)]
+pub struct RestRooms {
+    pub rooms: RoomManager,
+    pub notifications: broadcast::Sender<WsMessage>,
 }
 
 /// What the viewer is doing, sent to browsers as JSON.
@@ -65,7 +90,7 @@ pub struct ScreenViewer {
 }
 
 struct Inner {
-    broker: Broker,
+    signaling: Signaling,
     config: ViewerConfig,
     png: watch::Sender<Option<Arc<Vec<u8>>>>,
     status: watch::Sender<Status>,
@@ -102,12 +127,12 @@ enum SessionEnd {
 }
 
 impl ScreenViewer {
-    pub fn new(broker: Broker, config: ViewerConfig) -> Self {
+    pub fn new(signaling: Signaling, config: ViewerConfig) -> Self {
         let (png, _) = watch::channel(None);
         let (status, _) = watch::channel(Status::Idle);
         Self {
             inner: Arc::new(Inner {
-                broker,
+                signaling,
                 config,
                 png,
                 status,
@@ -187,16 +212,47 @@ impl ScreenViewer {
         }
     }
 
+    /// Find the tablet's room on whichever broker has one.
+    async fn open_channel(&self, cid: &str) -> Result<Channel, SessionEnd> {
+        let uid = &self.inner.config.user_id;
+        if let Some(broker) = &self.inner.signaling.mqtt {
+            match Channel::join_mqtt(broker, uid, cid).await {
+                Err(SessionEnd::NotSharing) => {}
+                joined => return joined,
+            }
+        }
+        if let Some(rest) = &self.inner.signaling.rest {
+            if let Some(channel) = Channel::join_rest(rest, uid, cid) {
+                return Ok(channel);
+            }
+        }
+        Err(SessionEnd::NotSharing)
+    }
+
     /// One negotiation and stream with the tablet.
     async fn session(&self) -> SessionEnd {
-        let uid = &self.inner.config.user_id;
         let cid = format!("server-viewer-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
-        let mut client = self.inner.broker.local_client(uid, &cid, &subscriptions(uid, &cid));
-        let signal = Signal { topic: signaling_topic(uid, &cid) };
-
-        let (room_id, tablet, offer, early) = match negotiate(&mut client, &signal, &cid).await {
-            Ok(n) => n,
+        let mut channel = match self.open_channel(&cid).await {
+            Ok(c) => c,
             Err(end) => return end,
+        };
+        if let Err(e) = channel.broadcast(PeerMessage::RequestOffer { id: cid.clone() }) {
+            return SessionEnd::Failed(e.to_string());
+        }
+
+        // Wait for the tablet's offer, keeping any candidates that arrive first.
+        let mut early = Vec::new();
+        let (tablet, offer) = loop {
+            match tokio::time::timeout(SIGNALING_TIMEOUT, channel.recv()).await {
+                Ok(Some((from, PeerMessage::WebRtc { payload }))) => match payload {
+                    WebRtcMessage::Offer { description } => break (from, description),
+                    WebRtcMessage::Candidate { candidate, mid } => early.push((candidate, mid)),
+                    WebRtcMessage::Answer { .. } => {}
+                },
+                Ok(Some(_)) => {}
+                Ok(None) => return SessionEnd::Failed("signaling closed".into()),
+                Err(_) => return SessionEnd::Failed("tablet did not send an offer in time".into()),
+            }
         };
 
         let (webrtc, mut ice_rx, mut data_rx) = match WebRtcHandler::new(self.inner.config.transport.clone()).await {
@@ -207,18 +263,13 @@ impl ScreenViewer {
             Ok(a) => a,
             Err(e) => return SessionEnd::Failed(format!("bad offer from tablet: {e}")),
         };
-        let direct = |msg: WebRtcMessage| SignalingRequest::Direct {
-            room_id: room_id.clone(),
-            client_id: tablet.clone(),
-            payload: PeerMessage::WebRtc { payload: msg },
-        };
-        if let Err(e) = signal.send(&client, &direct(WebRtcMessage::Answer { description: answer })) {
+        if let Err(e) = channel.direct(&tablet, WebRtcMessage::Answer { description: answer }) {
             return SessionEnd::Failed(e.to_string());
         }
         for (candidate, mid) in early {
             let _ = webrtc.add_ice_candidate(&candidate, mid.as_deref(), Some(0)).await;
         }
-        tracing::info!(room = %room_id, tablet = %tablet, "screenshare viewer answered tablet offer");
+        tracing::info!(room = %channel.room_id(), tablet = %tablet, via = channel.kind(), "screenshare viewer answered tablet offer");
 
         let png = &self.inner.png;
         let status = &self.inner.status;
@@ -238,20 +289,18 @@ impl ScreenViewer {
             loop {
                 tokio::select! {
                     Some(c) = ice_rx.recv() => {
-                        let msg = direct(WebRtcMessage::Candidate {
+                        let _ = channel.direct(&tablet, WebRtcMessage::Candidate {
                             candidate: c.candidate,
                             mid: Some(c.sdp_mid.unwrap_or_else(|| "0".into())),
                         });
-                        let _ = signal.send(&client, &msg);
                     }
-                    Some(p) = client.recv() => {
-                        if let Some(SignalingEvent::Direct {
-                            payload: PeerMessage::WebRtc { payload: WebRtcMessage::Candidate { candidate, mid } }, ..
-                        }) = SignalingEvent::from_bytes(&p.payload) {
+                    msg = channel.recv() => match msg {
+                        Some((_, PeerMessage::WebRtc { payload: WebRtcMessage::Candidate { candidate, mid } })) => {
                             let _ = webrtc.add_ice_candidate(&candidate, mid.as_deref(), Some(0)).await;
                         }
-                    }
-                    else => break,
+                        Some(_) => {}
+                        None => break,
+                    },
                 }
             }
         };
@@ -267,55 +316,135 @@ impl ScreenViewer {
     }
 }
 
-struct Signal {
-    topic: String,
+/// The viewer's membership of the tablet's room on one broker.
+enum Channel {
+    Mqtt { client: LocalClient, topic: String, room_id: String },
+    Rest { rest: RestRooms, rx: broadcast::Receiver<WsMessage>, user_id: String, client_id: String, room_id: String },
 }
 
-impl Signal {
-    fn send(&self, client: &LocalClient, request: &SignalingRequest) -> anyhow::Result<()> {
-        client.publish(&self.topic, serde_json::to_vec(request)?)
+impl Channel {
+    async fn join_mqtt(broker: &Broker, uid: &str, cid: &str) -> Result<Channel, SessionEnd> {
+        let mut client = broker.local_client(uid, cid, &subscriptions(uid, cid));
+        let topic = signaling_topic(uid, cid);
+        let join = SignalingRequest::JoinActiveRoom { room: String::new(), room_id: String::new() };
+        client
+            .publish(&topic, serde_json::to_vec(&join).unwrap_or_default())
+            .map_err(|e| SessionEnd::Failed(e.to_string()))?;
+        loop {
+            let p = match tokio::time::timeout(SIGNALING_TIMEOUT, client.recv()).await {
+                Ok(Some(p)) => p,
+                Ok(None) => return Err(SessionEnd::Failed("broker dropped the viewer".into())),
+                Err(_) => return Err(SessionEnd::Failed("broker did not answer join-active-room".into())),
+            };
+            match SignalingEvent::from_bytes(&p.payload) {
+                Some(SignalingEvent::RoomNotFound) => return Err(SessionEnd::NotSharing),
+                Some(SignalingEvent::RoomJoined { room_id, .. }) => return Ok(Channel::Mqtt { client, topic, room_id }),
+                _ => {}
+            }
+        }
+    }
+
+    fn join_rest(rest: &RestRooms, uid: &str, cid: &str) -> Option<Channel> {
+        let room_id = rest.rooms.active_room(uid)?;
+        // Subscribe before announcing ourselves so no reply is missed.
+        let rx = rest.notifications.subscribe();
+        rest.rooms.join(&room_id, cid, uid).then(|| Channel::Rest {
+            rest: rest.clone(),
+            rx,
+            user_id: uid.into(),
+            client_id: cid.into(),
+            room_id,
+        })
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Channel::Mqtt { .. } => "mqtt",
+            Channel::Rest { .. } => "rest",
+        }
+    }
+
+    fn room_id(&self) -> &str {
+        match self {
+            Channel::Mqtt { room_id, .. } | Channel::Rest { room_id, .. } => room_id,
+        }
+    }
+
+    fn broadcast(&self, payload: PeerMessage) -> anyhow::Result<()> {
+        match self {
+            Channel::Mqtt { client, topic, room_id } => {
+                let req = SignalingRequest::Broadcast { room_id: room_id.clone(), payload };
+                client.publish(topic, serde_json::to_vec(&req)?)
+            }
+            Channel::Rest { rest, user_id, client_id, room_id, .. } => {
+                rest_send(rest, user_id, client_id, room_id, None, &payload)
+            }
+        }
+    }
+
+    fn direct(&self, target: &str, msg: WebRtcMessage) -> anyhow::Result<()> {
+        let payload = PeerMessage::WebRtc { payload: msg };
+        match self {
+            Channel::Mqtt { client, topic, room_id } => {
+                let req = SignalingRequest::Direct { room_id: room_id.clone(), client_id: target.into(), payload };
+                client.publish(topic, serde_json::to_vec(&req)?)
+            }
+            Channel::Rest { rest, user_id, client_id, room_id, .. } => {
+                rest_send(rest, user_id, client_id, room_id, Some(target), &payload)
+            }
+        }
+    }
+
+    /// Next peer message addressed to us, with its sender's client id.
+    async fn recv(&mut self) -> Option<(String, PeerMessage)> {
+        match self {
+            Channel::Mqtt { client, .. } => loop {
+                let p = client.recv().await?;
+                match SignalingEvent::from_bytes(&p.payload) {
+                    Some(SignalingEvent::Direct { client_id, payload }) => return Some((client_id, payload)),
+                    Some(SignalingEvent::Broadcast { client_id, payload }) => return Some((client_id, payload)),
+                    _ => {}
+                }
+            },
+            Channel::Rest { rx, client_id, room_id, .. } => loop {
+                let msg = match rx.recv().await {
+                    Ok(msg) => msg,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("screenshare viewer: skipped {n} notifications");
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                };
+                let a = &msg.message.attributes;
+                let for_us = a.target_client_id.as_deref().is_none_or(|t| t == client_id.as_str());
+                if a.event != "ScreenshareMessage" || a.source_device_id == *client_id || !for_us
+                    || a.room_id.as_deref() != Some(room_id.as_str())
+                {
+                    continue;
+                }
+                let Some(data) = msg.message.data.as_deref() else { continue };
+                let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) else { continue };
+                if let Ok(payload) = serde_json::from_slice::<PeerMessage>(&bytes) {
+                    return Some((a.source_device_id.clone(), payload));
+                }
+            },
+        }
     }
 }
 
-type Negotiated = (String, String, String, Vec<(String, Option<String>)>);
+/// Relay like `POST /screenshare/v1/rooms/{id}/messages/{broadcast,direct}`.
+fn rest_send(rest: &RestRooms, user_id: &str, client_id: &str, room_id: &str, target: Option<&str>, payload: &PeerMessage) -> anyhow::Result<()> {
+    let data = base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(payload)?);
+    rest.notifications
+        .send(WsMessage::screenshare_message(user_id, client_id, room_id, target, &data))
+        .map_err(|_| anyhow::anyhow!("no notification subscribers"))?;
+    Ok(())
+}
 
-/// Join the active room and wait for the tablet's offer.
-async fn negotiate(client: &mut LocalClient, signal: &Signal, cid: &str) -> Result<Negotiated, SessionEnd> {
-    let fail = |e: anyhow::Error| SessionEnd::Failed(e.to_string());
-    signal
-        .send(client, &SignalingRequest::JoinActiveRoom { room: String::new(), room_id: String::new() })
-        .map_err(fail)?;
-    let mut room_id = None;
-    let mut early = Vec::new();
-    loop {
-        let p = match tokio::time::timeout(SIGNALING_TIMEOUT, client.recv()).await {
-            Ok(Some(p)) => p,
-            Ok(None) => return Err(SessionEnd::Failed("broker dropped the viewer".into())),
-            Err(_) => {
-                let step = if room_id.is_some() { "an offer" } else { "a room" };
-                return Err(SessionEnd::Failed(format!("tablet did not send {step} in time")));
-            }
-        };
-        match SignalingEvent::from_bytes(&p.payload) {
-            Some(SignalingEvent::RoomNotFound) => return Err(SessionEnd::NotSharing),
-            Some(SignalingEvent::RoomJoined { room_id: r, .. }) if room_id.is_none() => {
-                signal
-                    .send(client, &SignalingRequest::Broadcast {
-                        room_id: r.clone(),
-                        payload: PeerMessage::RequestOffer { id: cid.into() },
-                    })
-                    .map_err(fail)?;
-                room_id = Some(r);
-            }
-            Some(SignalingEvent::Direct { client_id, payload: PeerMessage::WebRtc { payload } }) => match payload {
-                WebRtcMessage::Offer { description } => {
-                    let room = room_id.ok_or_else(|| SessionEnd::Failed("offer before room".into()))?;
-                    return Ok((room, client_id, description, early));
-                }
-                WebRtcMessage::Candidate { candidate, mid } => early.push((candidate, mid)),
-                WebRtcMessage::Answer { .. } => {}
-            },
-            _ => {}
+impl Drop for Channel {
+    fn drop(&mut self) {
+        if let Channel::Rest { rest, client_id, room_id, .. } = self {
+            rest.rooms.leave(room_id, client_id);
         }
     }
 }
