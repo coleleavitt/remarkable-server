@@ -218,9 +218,14 @@ impl Broker {
         LocalClient { broker: self.clone(), user_id: user_id.into(), client_id: client_id.into(), rx }
     }
 
+    /// Drop rooms that have been idle for [`ROOM_TIMEOUT`] and have nobody
+    /// connected. A sharing tablet can stay quiet for longer than that between
+    /// viewers; its room lives as long as its MQTT session (`remove_client`
+    /// closes rooms whose participants have all left).
     fn sweep_rooms(&self) {
+        let connected: std::collections::HashSet<String> = self.inner.clients.lock().keys().cloned().collect();
         self.inner.rooms.lock().retain(|id, r| {
-            let keep = r.last_activity.elapsed() < ROOM_TIMEOUT;
+            let keep = r.participants.iter().any(|p| connected.contains(p)) || r.last_activity.elapsed() < ROOM_TIMEOUT;
             if !keep { tracing::info!(room = %id, "screenshare room expired"); }
             keep
         });
@@ -392,5 +397,48 @@ impl LocalClient {
 impl Drop for LocalClient {
     fn drop(&mut self) {
         self.broker.remove_client(&self.client_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn broker() -> (Broker, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let devices = DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        (Broker::new(devices, json!([])), tmp)
+    }
+
+    fn age_all_rooms(broker: &Broker) {
+        let old = Instant::now().checked_sub(ROOM_TIMEOUT * 2).unwrap();
+        for r in broker.inner.rooms.lock().values_mut() { r.last_activity = old; }
+    }
+
+    #[tokio::test]
+    async fn sharing_tablets_room_survives_idle_sweeps() {
+        let (broker, _tmp) = broker();
+        let tablet = broker.local_client("u", "tablet", &["user/u/signaling".into()]);
+        tablet.publish("remarkable/screenshare/signaling/user/u/client/tablet", br#"{"type":"create-room"}"#.to_vec()).unwrap();
+        assert!(broker.active_room("u").is_some());
+
+        // Idle for longer than ROOM_TIMEOUT, but the tablet is still connected.
+        age_all_rooms(&broker);
+        broker.sweep_rooms();
+        assert!(broker.active_room("u").is_some(), "room of a connected tablet was expired");
+
+        // The tablet disconnects: its room goes with it.
+        drop(tablet);
+        assert!(broker.active_room("u").is_none());
+    }
+
+    #[test]
+    fn orphaned_idle_rooms_are_swept() {
+        let (broker, _tmp) = broker();
+        let now = Instant::now();
+        broker.inner.rooms.lock().insert("r".into(), Room { user_id: "u".into(), participants: vec!["gone".into()], created: now, last_activity: now });
+        age_all_rooms(&broker);
+        broker.sweep_rooms();
+        assert!(broker.active_room("u").is_none());
     }
 }
