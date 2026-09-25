@@ -63,6 +63,8 @@ struct Room {
 }
 
 struct Client {
+    /// Tells a registration apart from a later one reusing its client id.
+    session: u64,
     user_id: String,
     subscriptions: Vec<(String, QoS)>,
     tx: mpsc::Sender<Publish>,
@@ -79,6 +81,7 @@ struct Inner {
     ice_servers: Value,
     clients: Mutex<HashMap<String, Client>>,
     rooms: Mutex<HashMap<String, Room>>,
+    next_session: std::sync::atomic::AtomicU64,
 }
 
 fn acl_allows(user_id: &str, topic: &str, write: bool) -> bool {
@@ -90,7 +93,7 @@ fn acl_allows(user_id: &str, topic: &str, write: bool) -> bool {
 impl Broker {
     /// `ice_servers`: list for `room-joined` (xochitl wants each entry's key as singular `url`).
     pub fn new(devices: DeviceManager, ice_servers: Value) -> Self {
-        Self { inner: Arc::new(Inner { devices, ice_servers, clients: Mutex::default(), rooms: Mutex::default() }) }
+        Self { inner: Arc::new(Inner { devices, ice_servers, clients: Mutex::default(), rooms: Mutex::default(), next_session: Default::default() }) }
     }
 
     /// Deliver to every subscribed, authorised client (QoS = min(publish, subscription)).
@@ -193,8 +196,19 @@ impl Broker {
         self.publish(&p.topic, p.payload.to_vec(), p.qos);
     }
 
-    fn remove_client(&self, client_id: &str) {
-        self.inner.clients.lock().remove(client_id);
+    fn new_session(&self) -> u64 {
+        self.inner.next_session.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Unregister `client_id` if it is still registration `session`. A client
+    /// that reconnected with the same id has replaced it, and keeps its
+    /// registration and room memberships.
+    fn remove_client(&self, client_id: &str, session: u64) {
+        {
+            let mut clients = self.inner.clients.lock();
+            if clients.get(client_id).is_none_or(|c| c.session != session) { return; }
+            clients.remove(client_id);
+        }
         let mut rooms = self.inner.rooms.lock();
         for r in rooms.values_mut() { r.participants.retain(|p| p != client_id); }
         rooms.retain(|id, r| {
@@ -214,8 +228,9 @@ impl Broker {
             .filter(|f| acl_allows(user_id, &f.replace(['+', '#'], "x"), false) || f.starts_with(&format!("user/{user_id}/")))
             .map(|f| (f.clone(), QoS::AtLeastOnce))
             .collect();
-        self.inner.clients.lock().insert(client_id.into(), Client { user_id: user_id.into(), subscriptions, tx });
-        LocalClient { broker: self.clone(), user_id: user_id.into(), client_id: client_id.into(), rx }
+        let session = self.new_session();
+        self.inner.clients.lock().insert(client_id.into(), Client { session, user_id: user_id.into(), subscriptions, tx });
+        LocalClient { broker: self.clone(), session, user_id: user_id.into(), client_id: client_id.into(), rx }
     }
 
     /// Drop rooms that have been idle for [`ROOM_TIMEOUT`] and have nobody
@@ -278,7 +293,8 @@ impl Broker {
         let client_id = if connect.client_id.is_empty() { uuid::Uuid::new_v4().to_string() } else { connect.client_id.clone() };
         let (tx, mut rx) = mpsc::channel::<Publish>(CLIENT_QUEUE);
         // A reconnect with the same client id replaces the old session.
-        self.inner.clients.lock().insert(client_id.clone(), Client { user_id: user_id.clone(), subscriptions: Vec::new(), tx });
+        let session = self.new_session();
+        self.inner.clients.lock().insert(client_id.clone(), Client { session, user_id: user_id.clone(), subscriptions: Vec::new(), tx });
         ConnAck::new(ConnectReturnCode::Success, false).write(&mut out)?;
         stream.write_all(&out).await?;
         tracing::info!(client = %client_id, user = %user_id, "mqtt client connected");
@@ -360,7 +376,7 @@ impl Broker {
             }
         }.await;
 
-        self.remove_client(&client_id);
+        self.remove_client(&client_id, session);
         tracing::info!(client = %client_id, "mqtt client disconnected");
         result
     }
@@ -369,6 +385,7 @@ impl Broker {
 /// An in-process broker client; see [`Broker::local_client`].
 pub struct LocalClient {
     broker: Broker,
+    session: u64,
     user_id: String,
     client_id: String,
     rx: mpsc::Receiver<Publish>,
@@ -396,7 +413,7 @@ impl LocalClient {
 
 impl Drop for LocalClient {
     fn drop(&mut self) {
-        self.broker.remove_client(&self.client_id);
+        self.broker.remove_client(&self.client_id, self.session);
     }
 }
 
@@ -429,6 +446,20 @@ mod tests {
 
         // The tablet disconnects: its room goes with it.
         drop(tablet);
+        assert!(broker.active_room("u").is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_session_does_not_remove_its_replacement() {
+        let (broker, _tmp) = broker();
+        let old = broker.local_client("u", "tablet", &["user/u/signaling".into()]);
+        // The tablet reconnects with the same client id before the old session ends.
+        let new = broker.local_client("u", "tablet", &["user/u/signaling".into()]);
+        new.publish("remarkable/screenshare/signaling/user/u/client/tablet", br#"{"type":"create-room"}"#.to_vec()).unwrap();
+        drop(old);
+        assert!(broker.inner.clients.lock().contains_key("tablet"), "old session removed the new registration");
+        assert!(broker.active_room("u").is_some(), "old session closed the new session's room");
+        drop(new);
         assert!(broker.active_room("u").is_none());
     }
 

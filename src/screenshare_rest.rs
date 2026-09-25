@@ -89,7 +89,8 @@ impl RoomManager {
         self.rooms.lock().get(room_id).map(|r| r.participants.values().cloned().collect()).unwrap_or_default()
     }
 
-    fn keepalive(&self, room_id: &str) {
+    /// Refresh `room_id`'s activity so it isn't swept.
+    pub fn keepalive(&self, room_id: &str) {
         if let Some(r) = self.rooms.lock().get_mut(room_id) { r.last_activity = Instant::now(); }
     }
 
@@ -115,6 +116,7 @@ impl RoomManager {
     pub fn join(&self, room_id: &str, client_id: &str, user_id: &str) -> bool {
         if !self.exists(room_id) { return false; }
         self.add_participant(room_id, client_id, user_id);
+        self.keepalive(room_id);
         true
     }
 

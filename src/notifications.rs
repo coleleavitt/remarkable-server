@@ -241,14 +241,17 @@ async fn handle_notifications_socket(socket: WebSocket, state: AppState) {
     
     // Spawn task to forward broadcasts to this client
     let session_id_clone = session_id.clone();
+    let storage = state.storage.clone();
     let forward_task = tokio::spawn(async move {
         loop {
             let msg = match rx.recv().await {
                 Ok(msg) => msg,
                 // Missing a few events beats ending notifications for this client.
+                // A skipped SyncComplete would leave it out of date, so send a
+                // fresh one in place of whatever was lost.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     warn!(session_id = %session_id_clone, "notification client lagged, skipped {n} events");
-                    continue;
+                    WsMessage::sync_complete(storage.get_root().generation, "local-server", "local-user")
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
