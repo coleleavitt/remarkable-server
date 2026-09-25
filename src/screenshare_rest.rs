@@ -94,7 +94,18 @@ impl RoomManager {
         if let Some(r) = self.rooms.lock().get_mut(room_id) { r.last_activity = Instant::now(); }
     }
 
-    fn delete(&self, room_id: &str) { self.rooms.lock().remove(room_id); }
+    /// `device_id` leaves `room_id`; the room goes away only when its owner
+    /// leaves. (The desktop viewer DELETEs rooms it merely joined when it
+    /// disconnects, which must not end the tablet's share.)
+    fn leave_or_close(&self, room_id: &str, device_id: &str) {
+        let mut rooms = self.rooms.lock();
+        let Some(room) = rooms.get_mut(room_id) else { return };
+        if room.participants.get(device_id).is_some_and(|c| c.is_owner) {
+            rooms.remove(room_id);
+        } else {
+            room.participants.remove(device_id);
+        }
+    }
 
     fn exists(&self, room_id: &str) -> bool {
         let mut rooms = self.rooms.lock();
@@ -164,17 +175,34 @@ pub async fn get_room(State(state): State<AppState>, headers: HeaderMap, Path(ro
     }
 }
 
-/// `POST /screenshare/v1/rooms/{roomId}/keepalive` -> 200.
+/// `POST /screenshare/v1/rooms/{roomId}/keepalive` -> 200, or 404 when the
+/// room is gone (swept, or lost in a restart) so the tablet notices instead of
+/// sharing into nothing; the desktop treats a failed keepalive as
+/// `connectionRefused`.
 pub async fn keepalive(State(state): State<AppState>, headers: HeaderMap, Path(room_id): Path<String>) -> Result<StatusCode> {
     state.auth_user(&headers)?;
+    if !state.screenshare.exists(&room_id) { return Err(ServerError::NotFound("room not found".into())); }
     state.screenshare.keepalive(&room_id);
     Ok(StatusCode::OK)
 }
 
-/// `DELETE /screenshare/v1/rooms/{roomId}` -> 204.
+/// `POST /screenshare/v1/rooms/{roomId}/join` -> 200 `{roomId, clients, iceServers}` or 404.
+/// RoomBroker::joinRoom in desktop 3.28 (unused there so far).
+pub async fn join_room(State(state): State<AppState>, headers: HeaderMap, Path(room_id): Path<String>) -> Result<(StatusCode, Json<Value>)> {
+    let (user_id, device_id, _) = state.devices.caller(authz(&headers)?)?;
+    if !state.screenshare.join(&room_id, &device_id, &user_id) {
+        return Ok((StatusCode::NOT_FOUND, Json(json!({"error": "room not found"}))));
+    }
+    Ok((StatusCode::OK, Json(json!({
+        "roomId": room_id, "clients": state.screenshare.clients(&room_id), "iceServers": &*state.ice_servers,
+    }))))
+}
+
+/// `DELETE /screenshare/v1/rooms/{roomId}` -> 204. Closes the room for its
+/// owner; anyone else just leaves it.
 pub async fn delete_room(State(state): State<AppState>, headers: HeaderMap, Path(room_id): Path<String>) -> Result<StatusCode> {
-    state.auth_user(&headers)?;
-    state.screenshare.delete(&room_id);
+    let (_, device_id, _) = state.devices.caller(authz(&headers)?)?;
+    state.screenshare.leave_or_close(&room_id, &device_id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -274,5 +302,32 @@ mod tests {
         // relay into a missing room errors; missing auth is rejected
         assert!(broadcast(State(state.clone()), hdrs(&tk), Path("nope".into()), Json(serde_json::json!({}))).await.is_err());
         assert!(create_room(State(state.clone()), HeaderMap::new()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn only_the_owner_closes_a_room() {
+        let (state, owner, _tmp) = state_and_auth();
+        let (viewer, _, _) = state.devices.oauth_bundle("u@test", "viewer-device", "desktop").unwrap();
+        let (_, Json(body)) = create_room(State(state.clone()), hdrs(&owner)).await.unwrap();
+        let room_id = body["roomId"].as_str().unwrap().to_string();
+
+        // The viewer joins by id, then DELETEs as the desktop does on disconnect.
+        let (code, Json(body)) = join_room(State(state.clone()), hdrs(&viewer), Path(room_id.clone())).await.unwrap();
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["clients"].as_array().unwrap().len(), 2);
+        delete_room(State(state.clone()), hdrs(&viewer), Path(room_id.clone())).await.unwrap();
+        assert!(state.screenshare.exists(&room_id), "a viewer's DELETE closed the tablet's room");
+        assert_eq!(state.screenshare.clients(&room_id).len(), 1);
+
+        delete_room(State(state.clone()), hdrs(&owner), Path(room_id.clone())).await.unwrap();
+        assert!(!state.screenshare.exists(&room_id));
+    }
+
+    #[tokio::test]
+    async fn keepalive_and_join_report_missing_rooms() {
+        let (state, tk, _tmp) = state_and_auth();
+        assert!(keepalive(State(state.clone()), hdrs(&tk), Path("gone".into())).await.is_err());
+        let (code, _) = join_room(State(state.clone()), hdrs(&tk), Path("gone".into())).await.unwrap();
+        assert_eq!(code, StatusCode::NOT_FOUND);
     }
 }

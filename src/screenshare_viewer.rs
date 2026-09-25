@@ -30,7 +30,7 @@ use base64::Engine;
 use parking_lot::Mutex;
 use remarkable_mqtt::screenshare::{signaling_topic, subscriptions};
 use remarkable_mqtt::{PeerMessage, SignalingEvent, SignalingRequest, WebRtcMessage};
-use remarkable_screenshare::{pump_frames, Frame, TransportConfig, WebRtcHandler};
+use remarkable_screenshare::{pump_frames, Frame, TransportConfig, Update, WebRtcHandler};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
 
@@ -41,9 +41,17 @@ use crate::screenshare_rest::RoomManager;
 const COOKIE: &str = "rm_screen";
 /// Default for [`ViewerConfig::idle_grace`].
 pub const IDLE_GRACE: Duration = Duration::from_secs(20);
-/// Wait between attempts while screen share is off on the tablet.
-const RETRY_NOT_SHARING: Duration = Duration::from_secs(3);
-const RETRY_ERROR: Duration = Duration::from_secs(5);
+/// How often to look for a (new) room while screen share is off. This is an
+/// in-process lookup, not a connection to the tablet.
+const POLL_NOT_SHARING: Duration = Duration::from_secs(3);
+/// Reconnect policy of the desktop app's Reconnector (Client ctor
+/// 0x140169E50): delay min(1 s * 2^attempt, 30 s), at most 5 attempts.
+const RETRY_BASE: Duration = Duration::from_secs(1);
+const RETRY_CAP: Duration = Duration::from_secs(30);
+pub const MAX_RETRIES: u32 = 5;
+/// The desktop gives up if the channel isn't active this long after joining
+/// (handleNegotiationTimerEvent 0x14016F3D0).
+const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the viewer refreshes a REST room it is in, as the desktop app does.
 const REST_KEEPALIVE: Duration = Duration::from_secs(20);
 /// How long the tablet gets to answer each signaling step.
@@ -83,7 +91,17 @@ pub enum Status {
     /// Screen share is off on the tablet.
     NotSharing,
     Streaming { width: u32, height: u32 },
+    /// The last session failed; trying again in `in_secs`.
+    Reconnecting { attempt: u32, max: u32, in_secs: u64, message: String },
+    /// The tablet ended its screen share; waiting for it to start a new one.
+    Stopped,
+    /// Gave up after [`MAX_RETRIES`] failed attempts.
     Error { message: String },
+}
+
+/// Delay before retry `attempt` (1-based): 2, 4, 8, 16, 30 s.
+fn retry_delay(attempt: u32) -> Duration {
+    RETRY_BASE.saturating_mul(2u32.saturating_pow(attempt)).min(RETRY_CAP)
 }
 
 /// Shared viewer; clone freely.
@@ -97,6 +115,8 @@ struct Inner {
     config: ViewerConfig,
     png: watch::Sender<Option<Arc<Vec<u8>>>>,
     status: watch::Sender<Status>,
+    /// Pen position in the current frame's pixels; `None` hides the cursor.
+    cursor: watch::Sender<Option<(u32, u32)>>,
     /// How many browsers are watching. A watch channel, so the supervisor
     /// can't miss the last one leaving between checking and waiting.
     watchers: watch::Sender<usize>,
@@ -109,6 +129,7 @@ pub struct Watcher {
     viewer: ScreenViewer,
     pub png: watch::Receiver<Option<Arc<Vec<u8>>>>,
     pub status: watch::Receiver<Status>,
+    pub cursor: watch::Receiver<Option<(u32, u32)>>,
 }
 
 impl Drop for Watcher {
@@ -123,21 +144,30 @@ enum SessionEnd {
     NotSharing,
     /// Everyone left.
     NoWatchers,
-    /// The tablet stopped sharing.
-    Stopped,
-    Failed(String),
+    /// The tablet ended its share (message 0x65): don't retry this room.
+    Stopped { room_id: String },
+    /// Worth retrying (the desktop's PingTimeout, NegotiationTimeout,
+    /// ProtocolError, WebRtcFailure). `streamed` says whether it got as far
+    /// as a live stream, which resets the retry budget.
+    Failed { message: String, streamed: bool },
+}
+
+fn failed(message: impl Into<String>) -> SessionEnd {
+    SessionEnd::Failed { message: message.into(), streamed: false }
 }
 
 impl ScreenViewer {
     pub fn new(signaling: Signaling, config: ViewerConfig) -> Self {
         let (png, _) = watch::channel(None);
         let (status, _) = watch::channel(Status::Idle);
+        let (cursor, _) = watch::channel(None);
         Self {
             inner: Arc::new(Inner {
                 signaling,
                 config,
                 png,
                 status,
+                cursor,
                 watchers: watch::channel(0).0,
                 running: Mutex::new(false),
             }),
@@ -155,7 +185,12 @@ impl ScreenViewer {
             let viewer = self.clone();
             tokio::spawn(async move { viewer.supervise().await });
         }
-        Watcher { viewer: self.clone(), png: self.inner.png.subscribe(), status: self.inner.status.subscribe() }
+        Watcher {
+            viewer: self.clone(),
+            png: self.inner.png.subscribe(),
+            status: self.inner.status.subscribe(),
+            cursor: self.inner.cursor.subscribe(),
+        }
     }
 
     fn watchers(&self) -> usize {
@@ -177,24 +212,62 @@ impl ScreenViewer {
         }
     }
 
-    /// Keep a session up while anyone is watching.
+    /// Keep a session up while anyone is watching, retrying like the desktop
+    /// app: failures back off (2, 4, 8, 16, 30 s, then give up), a stopped
+    /// share waits for a new room, and screen share being off is polled.
     async fn supervise(self) {
+        let mut attempt = 0;
+        // Room of a share the tablet ended; not rejoined.
+        let mut ended_room: Option<String> = None;
         loop {
-            self.inner.status.send_replace(Status::Connecting);
-            let end = tokio::select! {
-                end = self.session() => end,
-                _ = self.idle() => SessionEnd::NoWatchers,
-            };
-            tracing::info!("screenshare viewer session ended: {end:?}");
-            let wait = match end {
-                SessionEnd::NoWatchers => break,
-                SessionEnd::NotSharing | SessionEnd::Stopped => {
-                    self.inner.status.send_replace(Status::NotSharing);
-                    RETRY_NOT_SHARING
+            let wait = if let Some(room) = &ended_room {
+                if self.active_room().is_some_and(|r| r != *room) {
+                    ended_room = None;
+                    continue;
                 }
-                SessionEnd::Failed(message) => {
-                    self.inner.status.send_replace(Status::Error { message });
-                    RETRY_ERROR
+                POLL_NOT_SHARING
+            } else {
+                if attempt == 0 {
+                    self.inner.status.send_replace(Status::Connecting);
+                }
+                let end = tokio::select! {
+                    end = self.session() => end,
+                    _ = self.idle() => SessionEnd::NoWatchers,
+                };
+                tracing::info!("screenshare viewer session ended: {end:?}");
+                self.inner.cursor.send_replace(None);
+                match end {
+                    SessionEnd::NoWatchers => break,
+                    SessionEnd::NotSharing => {
+                        attempt = 0;
+                        self.inner.status.send_replace(Status::NotSharing);
+                        POLL_NOT_SHARING
+                    }
+                    SessionEnd::Stopped { room_id } => {
+                        attempt = 0;
+                        self.inner.status.send_replace(Status::Stopped);
+                        ended_room = Some(room_id);
+                        POLL_NOT_SHARING
+                    }
+                    SessionEnd::Failed { message, streamed } => {
+                        attempt = if streamed { 1 } else { attempt + 1 };
+                        if attempt > MAX_RETRIES {
+                            self.inner.status.send_replace(Status::Error {
+                                message: format!("gave up after {MAX_RETRIES} attempts: {message}"),
+                            });
+                            // Like the desktop, stop until someone opens the viewer again.
+                            self.idle().await;
+                            break;
+                        }
+                        let delay = retry_delay(attempt);
+                        self.inner.status.send_replace(Status::Reconnecting {
+                            attempt,
+                            max: MAX_RETRIES,
+                            in_secs: delay.as_secs(),
+                            message,
+                        });
+                        delay
+                    }
                 }
             };
             tokio::select! {
@@ -207,11 +280,20 @@ impl ScreenViewer {
         *running = false;
         self.inner.status.send_replace(Status::Idle);
         self.inner.png.send_replace(None);
+        self.inner.cursor.send_replace(None);
         if self.watchers() > 0 {
             *running = true;
             let viewer = self.clone();
             tokio::spawn(async move { viewer.supervise().await });
         }
+    }
+
+    /// The tablet's current room on either broker, without joining it.
+    fn active_room(&self) -> Option<String> {
+        let uid = &self.inner.config.user_id;
+        let signaling = &self.inner.signaling;
+        signaling.mqtt.as_ref().and_then(|b| b.active_room(uid))
+            .or_else(|| signaling.rest.as_ref().and_then(|r| r.rooms.active_room(uid)))
     }
 
     /// Find the tablet's room on whichever broker has one.
@@ -238,8 +320,8 @@ impl ScreenViewer {
             Ok(c) => c,
             Err(end) => return end,
         };
-        if let Err(e) = channel.broadcast(PeerMessage::RequestOffer { id: cid.clone() }) {
-            return SessionEnd::Failed(e.to_string());
+        if let Err(e) = channel.broadcast(PeerMessage::RequestOffer { id: Some(cid.clone()) }) {
+            return failed(e.to_string());
         }
 
         // Wait for the tablet's offer, keeping any candidates that arrive first
@@ -253,41 +335,57 @@ impl ScreenViewer {
                     WebRtcMessage::Answer { .. } => {}
                 },
                 Ok(Some(_)) => {}
-                Ok(None) => return SessionEnd::Failed("signaling closed".into()),
-                Err(_) => return SessionEnd::Failed("tablet did not send an offer in time".into()),
+                Ok(None) => return failed("signaling closed"),
+                Err(_) => return failed("tablet did not send an offer in time"),
             }
         };
 
         let (webrtc, mut ice_rx, mut data_rx) = match WebRtcHandler::new(self.inner.config.transport.clone()).await {
             Ok(w) => w,
-            Err(e) => return SessionEnd::Failed(format!("WebRTC setup failed: {e}")),
+            Err(e) => return failed(format!("WebRTC setup failed: {e}")),
         };
         let answer = match webrtc.accept_offer(&offer).await {
             Ok(a) => a,
-            Err(e) => return SessionEnd::Failed(format!("bad offer from tablet: {e}")),
+            Err(e) => return failed(format!("bad offer from tablet: {e}")),
         };
         if let Err(e) = channel.direct(&tablet, WebRtcMessage::Answer { description: answer }) {
-            return SessionEnd::Failed(e.to_string());
+            return failed(e.to_string());
         }
         for (_, candidate, mid) in early.into_iter().filter(|(from, ..)| *from == tablet) {
             let _ = webrtc.add_ice_candidate(&candidate, mid.as_deref(), Some(0)).await;
         }
         tracing::info!(room = %channel.room_id(), tablet = %tablet, via = channel.kind(), "screenshare viewer answered tablet offer");
+        let channel_room = channel.room_id().to_owned();
 
         let png = &self.inner.png;
         let status = &self.inner.status;
-        let frames = pump_frames(&mut data_rx, |frame| {
-            status.send_if_modified(|s| {
-                let streaming = Status::Streaming { width: frame.width, height: frame.height };
-                (*s != streaming).then(|| *s = streaming).is_some()
-            });
-            match encode_png(&frame) {
-                Ok(bytes) => {
-                    png.send_replace(Some(Arc::new(bytes)));
+        let cursor = &self.inner.cursor;
+        let connected = std::sync::atomic::AtomicBool::new(false);
+        let frames = pump_frames(&mut data_rx, |update| match update {
+            Update::Connected { .. } => connected.store(true, std::sync::atomic::Ordering::Relaxed),
+            Update::Frame(frame) => {
+                status.send_if_modified(|s| {
+                    let streaming = Status::Streaming { width: frame.width, height: frame.height };
+                    (*s != streaming).then(|| *s = streaming).is_some()
+                });
+                match encode_png(&frame) {
+                    Ok(bytes) => {
+                        png.send_replace(Some(Arc::new(bytes)));
+                    }
+                    Err(e) => tracing::warn!("screenshare viewer: PNG encode failed: {e}"),
                 }
-                Err(e) => tracing::warn!("screenshare viewer: PNG encode failed: {e}"),
+            }
+            Update::Cursor(point) => {
+                cursor.send_replace(point);
             }
         });
+        // The channel must be up and handshaken within NEGOTIATION_TIMEOUT.
+        let deadline = async {
+            tokio::time::sleep(NEGOTIATION_TIMEOUT).await;
+            if connected.load(std::sync::atomic::Ordering::Relaxed) {
+                std::future::pending::<()>().await;
+            }
+        };
         let trickle = async {
             let mut keepalive = tokio::time::interval(REST_KEEPALIVE);
             loop {
@@ -312,10 +410,11 @@ impl ScreenViewer {
         };
         let end = tokio::select! {
             r = frames => match r {
-                Ok(()) => SessionEnd::Stopped,
-                Err(e) => SessionEnd::Failed(format!("stream ended: {e}")),
+                Ok(()) => SessionEnd::Stopped { room_id: channel_room.clone() },
+                Err(e) => SessionEnd::Failed { message: format!("stream ended: {e}"), streamed: connected.load(std::sync::atomic::Ordering::Relaxed) },
             },
-            _ = trickle => SessionEnd::Failed("signaling ended".into()),
+            _ = trickle => SessionEnd::Failed { message: "signaling ended".into(), streamed: connected.load(std::sync::atomic::Ordering::Relaxed) },
+            _ = deadline => failed("tablet did not connect in time"),
         };
         let _ = webrtc.close().await;
         end
@@ -335,12 +434,12 @@ impl Channel {
         let join = SignalingRequest::JoinActiveRoom { room: String::new(), room_id: String::new() };
         client
             .publish(&topic, serde_json::to_vec(&join).unwrap_or_default())
-            .map_err(|e| SessionEnd::Failed(e.to_string()))?;
+            .map_err(|e| failed(e.to_string()))?;
         loop {
             let p = match tokio::time::timeout(SIGNALING_TIMEOUT, client.recv()).await {
                 Ok(Some(p)) => p,
-                Ok(None) => return Err(SessionEnd::Failed("broker dropped the viewer".into())),
-                Err(_) => return Err(SessionEnd::Failed("broker did not answer join-active-room".into())),
+                Ok(None) => return Err(failed("broker dropped the viewer")),
+                Err(_) => return Err(failed("broker did not answer join-active-room")),
             };
             match SignalingEvent::from_bytes(&p.payload) {
                 Some(SignalingEvent::RoomNotFound) => return Err(SessionEnd::NotSharing),
@@ -554,13 +653,21 @@ async fn ws(State(viewer): State<ScreenViewer>, headers: HeaderMap, upgrade: Web
     upgrade.on_upgrade(move |socket| stream(socket, viewer))
 }
 
-/// Send status changes as JSON text and each new frame as a binary PNG.
+/// Send status changes and cursor moves as JSON text and each new frame as a
+/// binary PNG. Cursor messages are `{"cursor":[x,y]}` or `{"cursor":null}`.
 async fn stream(mut socket: WebSocket, viewer: ScreenViewer) {
     let mut watcher = viewer.watch();
     watcher.png.mark_changed();
     watcher.status.mark_changed();
+    watcher.cursor.mark_changed();
     loop {
         tokio::select! {
+            changed = watcher.cursor.changed() => {
+                if changed.is_err() { break }
+                let point = *watcher.cursor.borrow_and_update();
+                let msg = serde_json::json!({ "cursor": point.map(|(x, y)| [x, y]) }).to_string();
+                if socket.send(Message::Text(msg.into())).await.is_err() { break }
+            }
             changed = watcher.status.changed() => {
                 if changed.is_err() { break }
                 let status = serde_json::to_string(&*watcher.status.borrow_and_update()).unwrap_or_default();
@@ -593,22 +700,46 @@ const VIEWER_HTML: &str = r#"<!doctype html><html lang=en><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>Tablet screen</title>
 <style>html,body{margin:0;height:100%;background:#1b1b1b;color:#ddd;font:14px system-ui}
-#screen{display:block;margin:auto;max-width:100vw;max-height:calc(100vh - 2.2rem);background:#fff}
+#stage{position:relative;width:fit-content;margin:auto}
+#screen{display:block;max-width:100vw;max-height:calc(100vh - 2.2rem);background:#fff}
+#pen{position:absolute;border-radius:50%;background:#e33;pointer-events:none;display:none;transform:translate(-50%,-50%)}
 #bar{height:2.2rem;display:flex;align-items:center;gap:1rem;padding:0 1rem}
-#dot{width:.6rem;height:.6rem;border-radius:50%;background:#888}#dot.live{background:#3c3}#dot.warn{background:#d93}
+#dot{width:.6rem;height:.6rem;border-radius:50%;background:#888}#dot.live{background:#3c3}#dot.warn{background:#d93}#dot.bad{background:#d33}
 button{margin-left:auto;background:none;color:inherit;border:1px solid #555;border-radius:6px;padding:.2rem .6rem;font:inherit}</style>
 <div id=bar><span id=dot></span><span id=status>Connecting…</span><button onclick="document.documentElement.requestFullscreen()">Full screen</button></div>
-<img id=screen alt="Tablet screen">
+<div id=stage><img id=screen alt="Tablet screen"><div id=pen></div></div>
 <script>
-const img=document.getElementById('screen'),status=document.getElementById('status'),dot=document.getElementById('dot');
-const text={idle:'Idle',connecting:'Connecting to tablet…','not-sharing':'Screen share is off on the tablet',streaming:'Live',error:'Error'};
+const img=document.getElementById('screen'),pen=document.getElementById('pen'),status=document.getElementById('status'),dot=document.getElementById('dot');
+// Pen marker: a 15 px filled circle in tablet pixels, as the desktop app draws it.
+const PEN=15;let cursor=null;
+function drawPen(){
+  if(!cursor||!img.naturalWidth){pen.style.display='none';return}
+  const k=img.clientWidth/img.naturalWidth;
+  pen.style.display='block';pen.style.width=pen.style.height=Math.max(4,PEN*k)+'px';
+  pen.style.left=cursor[0]*k+'px';pen.style.top=cursor[1]*k+'px';
+}
+new ResizeObserver(drawPen).observe(img);img.addEventListener('load',drawPen);
+function describe(s){
+  switch(s.state){
+    case 'idle':return['Idle',''];
+    case 'connecting':return['Connecting to tablet…',''];
+    case 'not-sharing':return['Screen share is off on the tablet','warn'];
+    case 'streaming':return['Live','live'];
+    case 'reconnecting':return[`Reconnecting (${s.attempt}/${s.max}) in ${s.in_secs}s: ${s.message}`,'warn'];
+    case 'stopped':return['The tablet stopped sharing; waiting for a new share','warn'];
+    case 'error':return['Stopped: '+s.message+' (reload to try again)','bad'];
+    default:return[s.state,''];
+  }
+}
 function connect(){
   const ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/screenshare/view/ws');
   ws.binaryType='blob';
   ws.onmessage=e=>{
-    if(typeof e.data==='string'){const s=JSON.parse(e.data);
-      status.textContent=(text[s.state]||s.state)+(s.message?': '+s.message:'');
-      dot.className=s.state==='streaming'?'live':(s.state==='error'||s.state==='not-sharing'?'warn':'');return}
+    if(typeof e.data==='string'){const m=JSON.parse(e.data);
+      if('cursor' in m){cursor=m.cursor;drawPen();return}
+      const [t,c]=describe(m);status.textContent=t;dot.className=c;
+      if(m.state!=='streaming'){cursor=null;drawPen()}
+      return}
     const url=URL.createObjectURL(e.data);const old=img.src;img.src=url;if(old)URL.revokeObjectURL(old)};
   ws.onclose=()=>{status.textContent='Disconnected, retrying…';dot.className='warn';setTimeout(connect,2000)};
 }
@@ -618,6 +749,12 @@ connect();
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_delays_match_the_desktop() {
+        let delays: Vec<u64> = (1..=5).map(|n| retry_delay(n).as_secs()).collect();
+        assert_eq!(delays, [2, 4, 8, 16, 30]);
+    }
 
     #[test]
     fn token_comparison() {

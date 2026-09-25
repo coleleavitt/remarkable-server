@@ -213,13 +213,31 @@ pub async fn notifications_ws(
     headers: axum::http::HeaderMap,
 ) -> crate::error::Result<impl IntoResponse> {
     // Same as the cloud: only authenticated devices/clients may subscribe.
-    state.auth_user(&headers)?;
+    let user_id = state.auth_user(&headers)?;
+    // For filtering direct screen share messages; unknown means no filtering.
+    let auth = headers.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or_default();
+    let device_id = state.devices.caller(auth).ok().map(|(_, device, _)| device);
     info!("WebSocket upgrade request for notifications");
-    Ok(ws.on_upgrade(move |socket| handle_notifications_socket(socket, state)))
+    Ok(ws.on_upgrade(move |socket| handle_notifications_socket(socket, state, user_id, device_id)))
 }
 
 /// Handle an individual WebSocket connection
-async fn handle_notifications_socket(socket: WebSocket, state: AppState) {
+/// Whether a notification belongs on the socket of `device_id` / `user_id`.
+/// Screen share events are per account, and a direct screen share message
+/// only goes to its `targetClientId`; everything else goes everywhere.
+fn delivers_to(msg: &WsMessage, user_id: &str, device_id: Option<&str>) -> bool {
+    let a = &msg.message.attributes;
+    if !a.event.starts_with("Screenshare") {
+        return true;
+    }
+    let for_device = match (a.target_client_id.as_deref(), device_id) {
+        (Some(target), Some(device)) => target == device,
+        _ => true,
+    };
+    a.auth0_user_id == user_id && for_device
+}
+
+async fn handle_notifications_socket(socket: WebSocket, state: AppState, user_id: String, device_id: Option<String>) {
     let session_id = uuid::Uuid::new_v4().to_string();
     info!(session_id = %session_id, "New notifications WebSocket connection");
     
@@ -255,6 +273,9 @@ async fn handle_notifications_socket(socket: WebSocket, state: AppState) {
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
+            if !delivers_to(&msg, &user_id, device_id.as_deref()) {
+                continue;
+            }
             if let Ok(json) = serde_json::to_string(&msg) {
                 debug!(session_id = %session_id_clone, "Sending notification: {}", json);
                 if sender.send(Message::Text(json.into())).await.is_err() {
@@ -322,4 +343,22 @@ async fn handle_notifications_socket(socket: WebSocket, state: AppState) {
     
     forward_task.abort();
     info!(session_id = %session_id, "WebSocket connection closed");
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+
+    #[test]
+    fn screenshare_messages_reach_only_their_target() {
+        let direct = WsMessage::screenshare_message("u", "tablet", "r", Some("viewer-a"), "e30=");
+        assert!(delivers_to(&direct, "u", Some("viewer-a")));
+        assert!(!delivers_to(&direct, "u", Some("viewer-b")));
+        assert!(!delivers_to(&direct, "other-user", Some("viewer-a")));
+        assert!(delivers_to(&direct, "u", None), "unknown device keeps the old behaviour");
+        let broadcast = WsMessage::screenshare_message("u", "viewer-a", "r", None, "e30=");
+        assert!(delivers_to(&broadcast, "u", Some("tablet")));
+        let sync = WsMessage::sync_complete(1, "local-server", "local-user");
+        assert!(delivers_to(&sync, "someone-else", Some("x")));
+    }
 }

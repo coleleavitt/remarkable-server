@@ -166,6 +166,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/screenshare/v1/rooms", post(screenshare_rest::create_room))
         .route("/screenshare/v1/rooms/join-active", post(screenshare_rest::join_active))
         .route("/screenshare/v1/rooms/{roomId}", get(screenshare_rest::get_room).delete(screenshare_rest::delete_room))
+        .route("/screenshare/v1/rooms/{roomId}/join", post(screenshare_rest::join_room))
         .route("/screenshare/v1/rooms/{roomId}/keepalive", post(screenshare_rest::keepalive))
         .route("/screenshare/v1/rooms/{roomId}/messages/broadcast", post(screenshare_rest::broadcast))
         .route("/screenshare/v1/rooms/{roomId}/messages/direct", post(screenshare_rest::direct))
