@@ -3,7 +3,7 @@
 //! usage (screen share sessions included) can be looked at, instead of being
 //! dropped. Bounded: bodies are capped and the file rotates once.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use axum::body::Bytes;
@@ -79,14 +79,26 @@ pub fn recent(base: &Path, limit: usize, contains: Option<&str>) -> Vec<Value> {
     // history, and parse before `take` so unparseable/torn lines don't eat the
     // quota.
     //
-    // Both files are read under the same lock `append` takes for rotation, so
-    // the two-file snapshot is consistent: without it, a rotation landing
-    // between the reads could show the pre-rotation current file as both the
-    // current and the `.1` (duplicated entries) while the new current is missed.
+    // Snapshot both files consistently with rotation *without* holding up
+    // telemetry for the (potentially ~16 MiB) read: open the two handles under
+    // the same lock `append` rotates with, then read them once the lock is
+    // released. An open fd keeps pointing at its file across `append`'s rename,
+    // so the two handles still capture distinct pre-rotation files — no entry
+    // read twice (the duplication race), none missed — while the lock is held
+    // only for the two cheap opens. The blocking reads run off the async runtime
+    // via `spawn_blocking` at the call sites.
     let (current, rotated) = {
         let _guard = WRITE.lock();
-        (std::fs::read_to_string(log_path(base)).unwrap_or_default(), std::fs::read_to_string(rotated_path(base)).unwrap_or_default())
+        (std::fs::File::open(log_path(base)).ok(), std::fs::File::open(rotated_path(base)).ok())
     };
+    let read = |file: Option<std::fs::File>| -> String {
+        let mut buf = String::new();
+        if let Some(mut f) = file {
+            let _ = f.read_to_string(&mut buf);
+        }
+        buf
+    };
+    let (current, rotated) = (read(current), read(rotated));
     let mut hits: Vec<Value> = current
         .lines()
         .rev()
@@ -102,7 +114,12 @@ pub fn recent(base: &Path, limit: usize, contains: Option<&str>) -> Vec<Value> {
 /// `GET /admin/reports?limit=&contains=` (requires `x-admin-token`).
 pub async fn list(State(state): State<AppState>, headers: HeaderMap, Query(q): Query<ListQuery>) -> Result<Json<Vec<Value>>> {
     require_admin(&headers)?;
-    Ok(Json(recent(state.storage.base_path(), q.limit.unwrap_or(100).min(1000), q.contains.as_deref())))
+    // recent() does blocking file I/O; keep it off the async worker.
+    let base = state.storage.base_path().to_path_buf();
+    let limit = q.limit.unwrap_or(100).min(1000);
+    let contains = q.contains;
+    let reports = tokio::task::spawn_blocking(move || recent(&base, limit, contains.as_deref())).await.unwrap_or_default();
+    Ok(Json(reports))
 }
 
 #[cfg(test)]

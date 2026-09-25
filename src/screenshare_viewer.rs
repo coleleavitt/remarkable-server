@@ -790,9 +790,14 @@ async fn usage(State(viewer): State<ScreenViewer>, headers: HeaderMap) -> Respon
     if !authorized(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let tablet = viewer.inner.config.reports_dir.as_deref()
-        .map(|dir| crate::reports::recent(dir, 50, Some("screenshare")))
-        .unwrap_or_default();
+    // reports::recent does blocking file I/O; keep it off the async worker.
+    let tablet = match viewer.inner.config.reports_dir.as_deref() {
+        Some(dir) => {
+            let dir = dir.to_path_buf();
+            tokio::task::spawn_blocking(move || crate::reports::recent(&dir, 50, Some("screenshare"))).await.unwrap_or_default()
+        }
+        None => Vec::new(),
+    };
     axum::Json(serde_json::json!({
         "status": *viewer.inner.status.borrow(),
         "sessions": viewer.sessions(),
