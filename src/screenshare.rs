@@ -116,6 +116,13 @@ impl Broker {
         if let Ok(body) = serde_json::to_vec(reply) { self.publish(&topic, body, qos); }
     }
 
+    /// Like [`active_room`](Self::active_room), with how long ago it was created.
+    pub fn active_room_age(&self, user_id: &str) -> Option<(String, Duration)> {
+        let id = self.active_room(user_id)?;
+        let created = self.inner.rooms.lock().get(&id)?.created;
+        Some((id, created.elapsed()))
+    }
+
     /// Newest room of `user_id`, if any.
     pub fn active_room(&self, user_id: &str) -> Option<String> {
         self.inner.rooms.lock().iter().filter(|(_, r)| r.user_id == user_id)
@@ -208,11 +215,12 @@ impl Broker {
     /// that reconnected with the same id has replaced it, and keeps its
     /// registration and room memberships.
     fn remove_client(&self, client_id: &str, session: u64) {
-        {
-            let mut clients = self.inner.clients.lock();
-            if clients.get(client_id).is_none_or(|c| c.session != session) { return; }
-            clients.remove(client_id);
-        }
+        // Hold the clients lock through the room cleanup, so a replacement
+        // can't register in between and lose its memberships. (Lock order is
+        // always clients, then rooms.)
+        let mut clients = self.inner.clients.lock();
+        if clients.get(client_id).is_none_or(|c| c.session != session) { return; }
+        clients.remove(client_id);
         let mut rooms = self.inner.rooms.lock();
         for r in rooms.values_mut() { r.participants.retain(|p| p != client_id); }
         rooms.retain(|id, r| {
@@ -329,7 +337,7 @@ impl Broker {
                             let codes = s.filters.iter().map(|f| {
                                 if acl_allows(&user_id, &f.path.replace(['+', '#'], "x"), false) || f.path.starts_with(&format!("user/{user_id}/")) {
                                     let qos = if f.qos == QoS::ExactlyOnce { QoS::AtLeastOnce } else { f.qos };
-                                    if let Some(c) = self.inner.clients.lock().get_mut(&client_id) {
+                                    if let Some(c) = self.inner.clients.lock().get_mut(&client_id).filter(|c| c.session == session) {
                                         c.subscriptions.retain(|(p, _)| p != &f.path);
                                         c.subscriptions.push((f.path.clone(), qos));
                                     }
@@ -342,7 +350,7 @@ impl Broker {
                             SubAck::new(s.pkid, codes).write(&mut out)?;
                         }
                         Packet::Unsubscribe(u) => {
-                            if let Some(c) = self.inner.clients.lock().get_mut(&client_id) {
+                            if let Some(c) = self.inner.clients.lock().get_mut(&client_id).filter(|c| c.session == session) {
                                 c.subscriptions.retain(|(p, _)| !u.topics.contains(p));
                             }
                             UnsubAck::new(u.pkid).write(&mut out)?;

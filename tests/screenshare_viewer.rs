@@ -398,3 +398,34 @@ async fn tablet_that_never_handshakes_is_retried_with_backoff() {
     assert!(message.contains("in time"), "{message}");
     tablet.abort();
 }
+
+#[tokio::test]
+async fn newest_room_wins_across_brokers() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let (broker, _tmp2) = broker();
+    // A stale MQTT room: a tablet that shared earlier and never answers.
+    let stale = broker.local_client(USER, "old-tablet", &subscriptions(USER, "old-tablet"));
+    send(&stale, &SignalingRequest::CreateRoom { room: String::new() });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // A fresh share on the REST rooms.
+    let tmp = tempfile::tempdir().unwrap();
+    let devices = DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+    let token = devices.create_user_token(USER).unwrap();
+    let state = AppState::new(Storage::new(tmp.path()).unwrap(), devices);
+    let tablet = tokio::spawn(fake_rest_tablet(state.clone(), token));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let signaling = Signaling {
+        mqtt: Some(broker),
+        rest: Some(RestRooms { rooms: state.screenshare.clone(), notifications: state.notification_tx.clone() }),
+    };
+    let viewer = ScreenViewer::new(signaling, ViewerConfig { idle_grace: Duration::from_millis(500), ..Default::default() });
+    let mut watcher = viewer.watch();
+    tokio::time::timeout(Duration::from_secs(20), watcher.png.wait_for(Option::is_some))
+        .await
+        .expect("viewer stuck on the stale MQTT room")
+        .unwrap();
+    drop(stale);
+    tablet.abort();
+}
