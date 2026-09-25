@@ -16,14 +16,20 @@ use serde_json::{json, Value};
 use crate::api::{require_admin, AppState};
 use crate::error::Result;
 
-/// Largest body kept per report.
-const MAX_BODY: usize = 64 * 1024;
+/// Largest body kept per report. Also the request body limit on the telemetry
+/// routes (see `lib.rs`), so nothing larger than we would store is accepted.
+pub(crate) const MAX_BODY: usize = 64 * 1024;
 /// `reports.jsonl` is moved to `reports.jsonl.1` past this size.
 const MAX_FILE: u64 = 8 * 1024 * 1024;
 static WRITE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 fn log_path(base: &Path) -> PathBuf {
     base.join("reports.jsonl")
+}
+
+/// Where `log_path` is moved on rotation; also read back by `recent`.
+fn rotated_path(base: &Path) -> PathBuf {
+    log_path(base).with_extension("jsonl.1")
 }
 
 /// Append one report. Failures are logged, never returned: telemetry must
@@ -35,7 +41,7 @@ fn append(base: &Path, path: &str, body: &[u8]) {
     let file = log_path(base);
     let _guard = WRITE.lock();
     if std::fs::metadata(&file).is_ok_and(|m| m.len() > MAX_FILE) {
-        let _ = std::fs::rename(&file, file.with_extension("jsonl.1"));
+        let _ = std::fs::rename(&file, rotated_path(base));
     }
     let result = std::fs::OpenOptions::new().create(true).append(true).open(&file).and_then(|mut f| writeln!(f, "{line}"));
     if let Err(e) = result {
@@ -64,16 +70,23 @@ pub struct ListQuery {
 }
 
 /// Newest `limit` entries (optionally only those containing `contains`,
-/// case-insensitive) from `reports.jsonl`, oldest first.
+/// case-insensitive) from `reports.jsonl` and its rotated `reports.jsonl.1`,
+/// oldest first.
 pub fn recent(base: &Path, limit: usize, contains: Option<&str>) -> Vec<Value> {
     let needle = contains.map(str::to_lowercase);
-    let text = std::fs::read_to_string(log_path(base)).unwrap_or_default();
-    let mut hits: Vec<Value> = text
+    // The current file holds the newest entries; the rotated `.1` (if present)
+    // holds the older ones. Walk both newest-first so rotation doesn't drop
+    // history, and parse before `take` so unparseable/torn lines don't eat the
+    // quota.
+    let current = std::fs::read_to_string(log_path(base)).unwrap_or_default();
+    let rotated = std::fs::read_to_string(rotated_path(base)).unwrap_or_default();
+    let mut hits: Vec<Value> = current
         .lines()
         .rev()
+        .chain(rotated.lines().rev())
         .filter(|l| needle.as_deref().is_none_or(|n| l.to_lowercase().contains(n)))
-        .take(limit)
         .filter_map(|l| serde_json::from_str(l).ok())
+        .take(limit)
         .collect();
     hits.reverse();
     hits
@@ -110,5 +123,38 @@ mod tests {
         append(tmp.path(), "/v1/reports", &vec![b'x'; MAX_BODY * 2]);
         let kept = recent(tmp.path(), 1, None);
         assert_eq!(kept[0]["body"].as_str().unwrap().len(), MAX_BODY);
+    }
+
+    #[test]
+    fn rotated_file_is_still_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        append(tmp.path(), "/v1/reports", br#"{"n":1}"#);
+        append(tmp.path(), "/v1/reports", br#"{"n":2}"#);
+        // Simulate rotation: the current file becomes the older `.1`.
+        std::fs::rename(log_path(tmp.path()), rotated_path(tmp.path())).unwrap();
+        append(tmp.path(), "/v1/reports", br#"{"n":3}"#);
+        // History across both files, oldest first.
+        let all = recent(tmp.path(), 10, None);
+        assert_eq!(all.len(), 3);
+        assert_eq!([&all[0]["body"]["n"], &all[1]["body"]["n"], &all[2]["body"]["n"]], [&json!(1), &json!(2), &json!(3)]);
+        // The limit spans both files and keeps the newest.
+        let newest = recent(tmp.path(), 2, None);
+        assert_eq!(newest.len(), 2);
+        assert_eq!([&newest[0]["body"]["n"], &newest[1]["body"]["n"]], [&json!(2), &json!(3)]);
+    }
+
+    #[test]
+    fn torn_lines_do_not_consume_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        append(tmp.path(), "/v1/reports", br#"{"a":1}"#);
+        // A partial line, e.g. a crash mid-write, must not eat a slot.
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(log_path(tmp.path())).unwrap();
+            writeln!(f, "{{\"at\":\"x\",\"pa").unwrap();
+        }
+        append(tmp.path(), "/v1/reports", br#"{"b":2}"#);
+        let two = recent(tmp.path(), 2, None);
+        assert_eq!(two.len(), 2);
+        assert_eq!([&two[0]["body"]["a"], &two[1]["body"]["b"]], [&json!(1), &json!(2)]);
     }
 }

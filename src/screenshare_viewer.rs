@@ -464,7 +464,9 @@ impl ScreenViewer {
             let mut keepalive = tokio::time::interval(REST_KEEPALIVE);
             loop {
                 tokio::select! {
-                    _ = keepalive.tick() => channel.keepalive(),
+                    // A dead REST room ends the session, like the broker
+                    // dropping the channel does below.
+                    _ = keepalive.tick() => if !channel.keepalive() { break },
                     Some(c) = ice_rx.recv() => {
                         let _ = channel.direct(&tablet, WebRtcMessage::Candidate {
                             candidate: c.candidate,
@@ -581,10 +583,13 @@ impl Channel {
     }
 
     /// Keep a REST room alive while we are in it (MQTT rooms live as long as
-    /// the tablet's session).
-    fn keepalive(&self) {
-        if let Channel::Rest { rest, room_id, user_id, .. } = self {
-            rest.rooms.keepalive(room_id, user_id);
+    /// the tablet's session). Returns false when the REST room is gone or has
+    /// expired, so the caller can end the session instead of streaming into a
+    /// room that no longer exists.
+    fn keepalive(&self) -> bool {
+        match self {
+            Channel::Rest { rest, room_id, user_id, .. } => rest.rooms.keepalive(room_id, user_id),
+            Channel::Mqtt { .. } => true,
         }
     }
 
@@ -971,15 +976,23 @@ mod tests {
     }
 
     #[test]
-    fn png_round_trip_size() {
-        for (format, bytes, color) in [(PixelFormat::Gray8, 1, png::ColorType::Grayscale), (PixelFormat::Rgb8, 3, png::ColorType::Rgb)] {
+    fn png_round_trips_pixels() {
+        for (format, bpp, color) in [(PixelFormat::Gray8, 1usize, png::ColorType::Grayscale), (PixelFormat::Rgb8, 3, png::ColorType::Rgb)] {
+            let (w, h) = (4u32, 3u32);
+            // Distinct per-pixel, per-channel values so a swapped or dropped
+            // channel (or wrong pixel order) fails the round trip, not just the
+            // metadata.
+            let data: Vec<u8> = (0..(w * h) as usize).flat_map(|p| (0..bpp).map(move |c| (p * 7 + c * 3 + 1) as u8)).collect();
             let frame = Frame {
-                data: vec![255; 4 * 3 * bytes], width: 4, height: 3, format,
-                changed: Area { x: 0, y: 0, width: 4, height: 3 }, timestamp: std::time::Instant::now(),
+                data: data.clone(), width: w, height: h, format: format.clone(),
+                changed: Area { x: 0, y: 0, width: w, height: h }, timestamp: std::time::Instant::now(),
             };
             let png = encode_png(&frame, frame.full_area()).unwrap();
-            let reader = png::Decoder::new(std::io::Cursor::new(png)).read_info().unwrap();
-            assert_eq!((reader.info().width, reader.info().height, reader.info().color_type), (4, 3, color));
+            let mut reader = png::Decoder::new(std::io::Cursor::new(png)).read_info().unwrap();
+            let mut buf = vec![0u8; data.len()];
+            let info = reader.next_frame(&mut buf).unwrap();
+            assert_eq!((info.width, info.height, info.color_type), (w, h, color));
+            assert_eq!(&buf[..info.buffer_size()], &data[..], "pixels must round-trip for {format:?}");
         }
     }
 }
