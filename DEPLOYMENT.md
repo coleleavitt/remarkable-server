@@ -213,6 +213,13 @@ SCREENSHARE_VIEWER_UDP_PORTS=50000-50100
 sudo ufw allow 50000:50100/udp comment 'screenshare viewer WebRTC'
 ```
 
+Usage: `GET /screenshare/view/usage` (signed in) lists the viewer's recent
+sessions and the tablet's own screen share telemetry. All telemetry the
+tablet posts (`/v1/reports`, `/analytics/v2/events`, …) is kept in
+`reports.jsonl` in the storage directory (bodies capped at 64 KiB, rotated
+at 8 MiB); `GET /admin/reports?contains=…&limit=…` with `x-admin-token`
+lists it.
+
 It follows the tablet on either broker: the MQTT one (`SCREENSHARE_BIND`) or
 the REST rooms (`/screenshare/v1`, xochitl 3.27+/3.28).
 

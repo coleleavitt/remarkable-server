@@ -12,6 +12,7 @@ pub mod hw_search;
 pub mod integrations;
 pub mod passcode;
 pub mod protocol;
+pub mod reports;
 pub mod screenshare;
 pub mod screenshare_viewer;
 pub mod screenshare_rest;
@@ -190,13 +191,14 @@ pub fn create_router(state: AppState) -> Router {
         .route("/admin/mdm/instructions", get(mdm::admin_list))
         .route("/post", post(crash::upload).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)))
         .route("/settings/v1/features", get(service::get_beta))
-        // Telemetry / analytics (ping.remarkable.com) - accepted and dropped
-        .route("/v1/reports", post(service::null_report))
-        .route("/v2/reports", post(service::null_report))
-        .route("/report/v1", post(service::null_report))
-        .route("/v2/events", post(service::null_report))
-        .route("/sync/reports/v1", post(service::null_report))
-        .route("/analytics/v2/events", post(service::analytics_report))
+        // Telemetry / analytics (ping.remarkable.com), kept in reports.jsonl
+        .route("/v1/reports", post(reports::store))
+        .route("/v2/reports", post(reports::store))
+        .route("/report/v1", post(reports::store))
+        .route("/v2/events", post(reports::store))
+        .route("/sync/reports/v1", post(reports::store))
+        .route("/analytics/v2/events", post(reports::store_analytics))
+        .route("/admin/reports", get(reports::list))
         // Third-party integrations (none configured)
         .route("/integrations/v1/", get(service::list_integrations))
         .route("/integrations/v2/instances", get(service::list_integrations))

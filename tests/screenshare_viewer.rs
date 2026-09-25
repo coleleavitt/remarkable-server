@@ -146,7 +146,7 @@ async fn viewer_streams_frames_from_tablet() {
     // Let the tablet create its room first.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let viewer = ScreenViewer::new(Signaling { mqtt: Some(broker), rest: None }, ViewerConfig { user_id: USER.into(), transport: Default::default(), idle_grace: Duration::from_millis(500) });
+    let viewer = ScreenViewer::new(Signaling { mqtt: Some(broker), rest: None }, ViewerConfig { user_id: USER.into(), idle_grace: Duration::from_millis(500), ..Default::default() });
     let mut watcher = viewer.watch();
     let png = tokio::time::timeout(Duration::from_secs(20), watcher.png.wait_for(Option::is_some))
         .await
@@ -172,7 +172,7 @@ async fn viewer_streams_frames_from_tablet() {
 #[tokio::test]
 async fn viewer_reports_when_screen_share_is_off() {
     let (broker, _tmp) = broker();
-    let viewer = ScreenViewer::new(Signaling { mqtt: Some(broker), rest: None }, ViewerConfig { user_id: USER.into(), transport: Default::default(), idle_grace: Duration::from_millis(500) });
+    let viewer = ScreenViewer::new(Signaling { mqtt: Some(broker), rest: None }, ViewerConfig { user_id: USER.into(), idle_grace: Duration::from_millis(500), ..Default::default() });
     let mut watcher = viewer.watch();
     tokio::time::timeout(Duration::from_secs(10), watcher.status.wait_for(|s| *s == Status::NotSharing))
         .await
@@ -291,7 +291,7 @@ async fn viewer_streams_frames_from_rest_tablet() {
         mqtt: Some(broker),
         rest: Some(RestRooms { rooms: state.screenshare.clone(), notifications: state.notification_tx.clone() }),
     };
-    let viewer = ScreenViewer::new(signaling, ViewerConfig { user_id: USER.into(), transport: Default::default(), idle_grace: Duration::from_millis(500) });
+    let viewer = ScreenViewer::new(signaling, ViewerConfig { user_id: USER.into(), idle_grace: Duration::from_millis(500), ..Default::default() });
     let mut watcher = viewer.watch();
     let png = tokio::time::timeout(Duration::from_secs(20), watcher.png.wait_for(Option::is_some))
         .await
@@ -310,7 +310,7 @@ async fn idle_session_ends_when_tablet_sends_no_frames() {
     // Handshake only, like a tablet whose screen hasn't changed.
     let handshake = tablet_stream()[..7].to_vec();
     // The browser arrives first (not sharing yet), then the tablet shares.
-    let viewer = ScreenViewer::new(Signaling { mqtt: Some(broker.clone()), rest: None }, ViewerConfig { user_id: USER.into(), transport: Default::default(), idle_grace: Duration::from_millis(500) });
+    let viewer = ScreenViewer::new(Signaling { mqtt: Some(broker.clone()), rest: None }, ViewerConfig { user_id: USER.into(), idle_grace: Duration::from_millis(500), ..Default::default() });
     let watcher = viewer.watch();
     let mut status = watcher.status.clone();
     tokio::time::timeout(Duration::from_secs(5), status.wait_for(|s| *s == Status::NotSharing)).await.unwrap().unwrap();
@@ -332,7 +332,7 @@ async fn idle_session_ends_when_tablet_sends_no_frames() {
 fn viewer_for(broker: Broker) -> ScreenViewer {
     ScreenViewer::new(
         Signaling { mqtt: Some(broker), rest: None },
-        ViewerConfig { user_id: USER.into(), transport: Default::default(), idle_grace: Duration::from_millis(500) },
+        ViewerConfig { user_id: USER.into(), idle_grace: Duration::from_millis(500), ..Default::default() },
     )
 }
 
@@ -370,6 +370,10 @@ async fn tablet_shutdown_stops_instead_of_retrying() {
         .await
         .expect("viewer did not report the stopped share")
         .unwrap();
+    // The finished session is in the usage history.
+    let sessions = viewer.sessions();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!((sessions[0].via, sessions[0].frames, sessions[0].outcome.as_str()), ("mqtt", 1, "tablet stopped sharing"));
     // It waits for a new room rather than reconnecting to the ended one.
     tokio::time::sleep(Duration::from_secs(4)).await;
     assert_eq!(*watcher.status.borrow(), Status::Stopped);
