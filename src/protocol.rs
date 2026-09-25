@@ -83,7 +83,9 @@ pub struct V1Document {
 /// GET /document-storage/json/2/docs - List all documents (V1)
 pub async fn v1_list_docs(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<V1Document>>, StatusCode> {
+    state.auth_user(&headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
     // Convert storage files to V1 document format
     let files = state.storage.list();
     
@@ -136,9 +138,11 @@ pub struct V1UploadResponse {
 
 /// PUT /document-storage/json/2/upload/request - Request upload URL (V1)
 pub async fn v1_upload_request(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
     Json(docs): Json<Vec<V1UploadRequest>>,
 ) -> Result<Json<Vec<V1UploadResponse>>, StatusCode> {
+    state.auth_user(&headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
     let responses: Vec<V1UploadResponse> = docs.iter().map(|d| V1UploadResponse {
         id: d.id.clone(),
         version: d.version,
@@ -173,9 +177,11 @@ pub struct V1StatusResponse {
 
 /// PUT /document-storage/json/2/upload/update-status - Update upload status (V1)
 pub async fn v1_update_status(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
     Json(updates): Json<Vec<V1StatusUpdate>>,
 ) -> Result<Json<Vec<V1StatusResponse>>, StatusCode> {
+    state.auth_user(&headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
     let responses: Vec<V1StatusResponse> = updates.iter().map(|u| V1StatusResponse {
         id: u.id.clone(),
         version: u.version,
@@ -197,8 +203,10 @@ pub struct V1DeleteRequest {
 /// DELETE /document-storage/json/2/delete - Delete documents (V1)
 pub async fn v1_delete(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(ids): Json<Vec<V1DeleteRequest>>,
 ) -> Result<Json<Vec<V1StatusResponse>>, StatusCode> {
+    state.auth_user(&headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
     for req in &ids {
         let _ = state.storage.delete(&req.id);
     }
@@ -252,8 +260,10 @@ pub struct V15BatchResponse {
 /// POST /sync/v1.5/batch - Batch sync (V1.5)
 pub async fn v15_batch_sync(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(_batch): Json<V15BatchRequest>,
 ) -> Result<Json<V15BatchResponse>, StatusCode> {
+    state.auth_user(&headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
     let files = state.storage.list();
     let root = state.storage.get_root();
     
@@ -288,21 +298,25 @@ pub struct V2Root {
 /// GET /sync/v2/root - Get sync root (V2)
 pub async fn v2_get_root(
     State(state): State<AppState>,
-) -> Json<V2Root> {
+    headers: HeaderMap,
+) -> Result<Json<V2Root>, StatusCode> {
+    state.auth_user(&headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
     let root = state.storage.get_root();
     
-    Json(V2Root {
+    Ok(Json(V2Root {
         hash: root.hash,
         generation: root.generation as i64,
         schema_version: 2,
-    })
+    }))
 }
 
 /// GET /sync/v2/files/{hash} - Get file (V2)
 pub async fn v2_get_file(
     State(state): State<AppState>,
     Path(hash): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Bytes, StatusCode> {
+    state.auth_user(&headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
     state.storage.get(&hash)
         .map(Bytes::from)
         .map_err(|_| StatusCode::NOT_FOUND)
@@ -315,6 +329,7 @@ pub async fn v2_put_file(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, StatusCode> {
+    state.auth_user(&headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
     let filename = headers.get("rm-filename")
         .and_then(|v| v.to_str().ok())
         .unwrap_or(&hash)
@@ -350,10 +365,12 @@ pub struct V4Capabilities {
 /// GET /sync/v4/root - Get sync root with extended metadata (V4)
 pub async fn v4_get_root(
     State(state): State<AppState>,
-) -> Json<V4Root> {
+    headers: HeaderMap,
+) -> Result<Json<V4Root>, StatusCode> {
+    state.auth_user(&headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
     let root = state.storage.get_root();
     
-    Json(V4Root {
+    Ok(Json(V4Root {
         hash: root.hash,
         generation: root.generation as i64,
         schema_version: 4,
@@ -371,14 +388,16 @@ pub async fn v4_get_root(
             search: true,
             calendar: true,
         },
-    })
+    }))
 }
 
 /// GET /sync/v4/files/{hash} - Get file with metadata (V4)
 pub async fn v4_get_file(
     State(state): State<AppState>,
     Path(hash): Path<String>,
+    headers: HeaderMap,
 ) -> Result<(HeaderMap, Bytes), StatusCode> {
+    state.auth_user(&headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
     let content = state.storage.get(&hash)
         .map_err(|_| StatusCode::NOT_FOUND)?;
     
@@ -396,6 +415,7 @@ pub async fn v4_put_file(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, StatusCode> {
+    state.auth_user(&headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
     let filename = headers.get("rm-filename")
         .and_then(|v| v.to_str().ok())
         .unwrap_or(&hash)
