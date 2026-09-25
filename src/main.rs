@@ -63,6 +63,7 @@ async fn main() -> Result<()> {
 
     // Screenshare signaling broker (MQTT over TLS). The tablet dials
     // vernemq-prod.cloud.remarkable.engineering:443, so bind it on its own address.
+    let mut screenshare_broker = None;
     if let Some(bind) = env::var("SCREENSHARE_BIND").ok().filter(|b| !b.is_empty()) {
         // The broker is TLS-only. SCREENSHARE_CERT/SCREENSHARE_KEY let it use its own
         // cert when the HTTP listener runs plain behind a reverse proxy.
@@ -73,6 +74,7 @@ async fn main() -> Result<()> {
         };
         let tls = screenshare_tls(&cert, &key)?;
         let broker = remarkable_server::screenshare::Broker::new(state.devices.clone(), (*state.ice_servers).clone());
+        screenshare_broker = Some(broker.clone());
         let addr: std::net::SocketAddr = bind.parse()?;
         tokio::spawn(async move {
             if let Err(e) = broker.serve(addr, tls).await { tracing::error!("screenshare broker stopped: {e}"); }
@@ -83,7 +85,10 @@ async fn main() -> Result<()> {
     remarkable_server::hw_search::spawn_indexer(state.storage.clone());
 
     let features = remarkable_server::feature_routes(state.clone(), std::path::Path::new(&config.storage_path), email_server)?;
-    let app = create_router(state).merge(features);
+    let mut app = create_router(state).merge(features);
+    if let Some(viewer) = screenshare_viewer(screenshare_broker)? {
+        app = app.merge(remarkable_server::screenshare_viewer::router(viewer));
+    }
     
     // Start server - TLS or plain
     if let (Some(cert_path), Some(key_path)) = (&config.cert_path, &config.key_path) {
@@ -174,6 +179,36 @@ fn parse_args() -> ServerConfig {
     }
     
     config
+}
+
+/// Browser viewer for the tablet's screen share (`/screenshare/view`), when
+/// `SCREENSHARE_VIEWER=1`. Needs the broker and `ADMIN_TOKEN`, which guards it.
+fn screenshare_viewer(broker: Option<remarkable_server::screenshare::Broker>) -> Result<Option<remarkable_server::screenshare_viewer::ScreenViewer>> {
+    use remarkable_server::screenshare_viewer::{ScreenViewer, ViewerConfig};
+    if !matches!(env::var("SCREENSHARE_VIEWER").as_deref(), Ok("1" | "true" | "on")) {
+        return Ok(None);
+    }
+    let Some(broker) = broker else {
+        anyhow::bail!("SCREENSHARE_VIEWER needs the screenshare broker (SCREENSHARE_BIND)");
+    };
+    if env::var("ADMIN_TOKEN").map_or(true, |t| t.is_empty()) {
+        anyhow::bail!("SCREENSHARE_VIEWER needs ADMIN_TOKEN, which protects the viewer page");
+    }
+    let udp_ports = match env::var("SCREENSHARE_VIEWER_UDP_PORTS").ok().filter(|v| !v.is_empty()) {
+        Some(range) => {
+            let (min, max) = range.split_once('-').ok_or_else(|| anyhow::anyhow!("SCREENSHARE_VIEWER_UDP_PORTS must look like 50000-50100"))?;
+            Some((min.trim().parse()?, max.trim().parse()?))
+        }
+        None => None,
+    };
+    let ice_servers = env::var("SCREENSHARE_VIEWER_ICE").unwrap_or_default()
+        .split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+    let user_id = env::var("SCREENSHARE_VIEWER_USER").ok().filter(|u| !u.is_empty()).unwrap_or_else(|| PAIRING_USER.into());
+    tracing::info!(user = %user_id, ?udp_ports, "screenshare browser viewer enabled at /screenshare/view");
+    Ok(Some(ScreenViewer::new(broker, ViewerConfig {
+        user_id,
+        transport: remarkable_screenshare::TransportConfig { ice_servers, udp_ports },
+    })))
 }
 
 /// TLS acceptor for the screenshare broker, from the same PEM cert/key as HTTPS.

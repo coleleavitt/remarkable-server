@@ -197,6 +197,25 @@ Migrating storage from a local server: stop both, `rsync -a test-storage/ linode
 `chown -R remarkable:remarkable`, start. `jwt_secret` + `devices.db` must go
 together or the tablet's identifiers stop validating (re-pair with `--pair`).
 
+Browser screen share viewer (optional):
+
+The server can join the tablet's screen share itself and show it at
+`https://remarkable.unwrap.rs/screenshare/view` (sign in with `ADMIN_TOKEN`;
+the cookie is HttpOnly/Secure/SameSite=Strict). A session with the tablet only
+runs while a browser is watching. Frames come straight from the tablet to the
+Linode over WebRTC, so the Linode must accept UDP on the viewer's port range:
+
+```sh
+# /etc/remarkable-server/env
+SCREENSHARE_VIEWER=1
+SCREENSHARE_VIEWER_UDP_PORTS=50000-50100
+
+sudo ufw allow 50000:50100/udp comment 'screenshare viewer WebRTC'
+```
+
+It needs the MQTT broker (`SCREENSHARE_BIND`); tablets that signal over the
+REST broker (`/screenshare/v1`, xochitl 3.27+/3.28) aren't supported yet.
+
 Pairing code on the Linode:
 
 ```sh
