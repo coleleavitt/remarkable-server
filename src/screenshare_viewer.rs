@@ -30,7 +30,7 @@ use base64::Engine;
 use parking_lot::Mutex;
 use remarkable_mqtt::screenshare::{signaling_topic, subscriptions};
 use remarkable_mqtt::{PeerMessage, SignalingEvent, SignalingRequest, WebRtcMessage};
-use remarkable_screenshare::{pump_frames, Frame, TransportConfig, Update, WebRtcHandler};
+use remarkable_screenshare::{pump_frames, Frame, PixelFormat, TransportConfig, Update, WebRtcHandler};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
 
@@ -588,7 +588,10 @@ impl Drop for Channel {
 fn encode_png(frame: &Frame) -> Result<Vec<u8>, png::EncodingError> {
     let mut out = Vec::with_capacity(frame.data.len() / 8);
     let mut encoder = png::Encoder::new(&mut out, frame.width, frame.height);
-    encoder.set_color(png::ColorType::Grayscale);
+    encoder.set_color(match frame.format {
+        PixelFormat::Gray8 => png::ColorType::Grayscale,
+        PixelFormat::Rgb8 => png::ColorType::Rgb,
+    });
     encoder.set_depth(png::BitDepth::Eight);
     encoder.set_compression(png::Compression::Fast);
     encoder.write_header()?.write_image_data(&frame.data)?;
@@ -789,10 +792,11 @@ mod tests {
 
     #[test]
     fn png_round_trip_size() {
-        let frame = Frame { data: vec![255; 4 * 3], width: 4, height: 3, timestamp: std::time::Instant::now() };
-        let png = encode_png(&frame).unwrap();
-        let decoder = png::Decoder::new(std::io::Cursor::new(png));
-        let reader = decoder.read_info().unwrap();
-        assert_eq!((reader.info().width, reader.info().height), (4, 3));
+        for (format, bytes, color) in [(PixelFormat::Gray8, 1, png::ColorType::Grayscale), (PixelFormat::Rgb8, 3, png::ColorType::Rgb)] {
+            let frame = Frame { data: vec![255; 4 * 3 * bytes], width: 4, height: 3, format, timestamp: std::time::Instant::now() };
+            let png = encode_png(&frame).unwrap();
+            let reader = png::Decoder::new(std::io::Cursor::new(png)).read_info().unwrap();
+            assert_eq!((reader.info().width, reader.info().height, reader.info().color_type), (4, 3, color));
+        }
     }
 }
