@@ -242,7 +242,16 @@ async fn handle_notifications_socket(socket: WebSocket, state: AppState) {
     // Spawn task to forward broadcasts to this client
     let session_id_clone = session_id.clone();
     let forward_task = tokio::spawn(async move {
-        while let Ok(msg) = rx.recv().await {
+        loop {
+            let msg = match rx.recv().await {
+                Ok(msg) => msg,
+                // Missing a few events beats ending notifications for this client.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(session_id = %session_id_clone, "notification client lagged, skipped {n} events");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
             if let Ok(json) = serde_json::to_string(&msg) {
                 debug!(session_id = %session_id_clone, "Sending notification: {}", json);
                 if sender.send(Message::Text(json.into())).await.is_err() {
