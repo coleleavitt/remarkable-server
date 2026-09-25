@@ -15,6 +15,75 @@ redirect those names to our server. Two supported ways:
 
 This is the same model rmfakecloud uses (`rmfakecloud-proxy`).
 
+## Current live state (as of 2026-09-25)
+
+**Approach A is live.** The tablet syncs over WiFi to the Linode; USB and the
+local dev server are no longer involved.
+
+```
+xochitl ──/etc/hosts──▶ 127.0.0.1:443 / 127.0.0.2:443  (rm-proxy on tablet, self-signed *.remarkable.com cert)
+        ──verified TLS──▶ remarkable.unwrap.rs:443  (nginx, Let's Encrypt) ──▶ 127.0.0.1:3100 remarkable-server (HTTP)
+                     └──▶ remarkable.unwrap.rs:8883 (screenshare MQTT broker, Let's Encrypt, direct)
+```
+
+- **The Linode is the single source of truth.** Storage was migrated from the
+  local `test-storage/` at generation 21 together with `devices.db` and
+  `jwt_secret`, so the tablet's existing pairing kept working (no re-pair).
+- **Do not run the local server against a copy of the same storage while the
+  tablet points at the Linode.** Two servers moving `root.json` independently =
+  split-brain. To go back to local, copy Linode storage back first (reverse
+  rsync), then revert the tablet's hosts file.
+- DNS: Cloudflare `remarkable.unwrap.rs` A `172.232.15.166`, AAAA
+  `2600:3c06::f03c:95ff:fe86:3ab6`, **DNS-only (grey cloud)**.
+- Cert: Let's Encrypt via certbot `dns-cloudflare`, auto-renews (certbot timer);
+  the deploy hook copies it for the MQTT broker and restarts the service.
+- Tablet: `/home/root/rm-proxy/{rm-proxy,server.crt,server.key,hosts.usb-backup}`,
+  `/etc/systemd/system/rm-proxy.service` (enabled).
+
+## Security model
+
+- Every API route requires a valid device JWT except health, discovery,
+  and pairing (which needs a one-time code from `--pair`). The legacy v1/v2
+  blob handlers in `protocol.rs` were unauthenticated until commit `a59cf70`
+  ("protocol: require device auth on legacy … handlers"); they now use the same `auth_user`
+  check as v3.
+- JWTs are signed with a per-install random secret in `<storage>/jwt_secret`
+  (created 0600 on first start), not a hardcoded default. Deleting it
+  invalidates every token → re-pair the tablet.
+- `ADMIN_TOKEN` (64 hex, only in `/etc/remarkable-server/env`, 0640 root:remarkable)
+  guards admin endpoints.
+- Upstream TLS from the tablet relay is verified against webpki roots, so a
+  MITM on the WiFi can't impersonate the Linode.
+
+## Operations cheat sheet
+
+```sh
+# health / status
+curl https://remarkable.unwrap.rs/health
+ssh linode 'systemctl status remarkable-server; journalctl -u remarkable-server -n 50 --no-pager'
+ssh linode 'grep generation /var/lib/remarkable-server/root.json'
+ssh root@<tablet> 'systemctl status rm-proxy; journalctl -u rm-proxy -n 30 --no-pager'
+ssh root@<tablet> 'journalctl -u xochitl --since -10min | grep -iE "sync|401|notif"'
+
+# backup Linode storage
+ssh linode 'tar -C /var/lib -czf - remarkable-server' > rms-backup-$(date +%F).tgz
+
+# after a tablet software update (/etc may be reset)
+#   re-check /etc/hosts entries and that the local CA is still trusted,
+#   then re-apply the hosts edit above and `systemctl enable --now rm-proxy`.
+```
+
+### Troubleshooting
+
+- **"Not syncing" after switch-over**: check that rm-proxy is running and that a
+  `curl --resolve … 127.0.0.1` from the tablet returns 200. If it returns 401 for
+  authed calls, `jwt_secret`/`devices.db` weren't migrated together → re-pair.
+- **Tablet asleep = no traffic**: normal; it reconnects on wake.
+- **BusyBox gotchas** on the tablet: no `cp -n`, no `ss`, no `timeout`; the stock
+  `wget` can't do modern TLS (use `curl`).
+- **Building for the Linode**: native `cargo build` on Arch links glibc
+  newer than 2.39 and won't run there; always use the zigbuild command above.
+
 ## Linode side (shared by both)
 
 Layout:
@@ -70,14 +139,26 @@ Install on tablet:
 
 ```sh
 T=root@10.11.99.1
-ssh $T 'mkdir -p /home/root/rm-proxy && cp -n /etc/hosts /home/root/rm-proxy/hosts.usb-backup'
+# BusyBox cp has no -n; only back up if no backup exists yet
+ssh $T 'mkdir -p /home/root/rm-proxy && [ -e /home/root/rm-proxy/hosts.usb-backup ] || cp /etc/hosts /home/root/rm-proxy/hosts.usb-backup'
 scp rm-proxy/target/armv7-unknown-linux-musleabihf/release/rm-proxy certs/server.crt certs/server.key $T:/home/root/rm-proxy/
 scp contrib/tablet/rm-proxy.service $T:/etc/systemd/system/
 ssh $T 'chmod 600 /home/root/rm-proxy/server.key && systemctl daemon-reload && systemctl enable --now rm-proxy'
 ```
 
-Then in the tablet's `/etc/hosts` replace `10.11.99.2` → `127.0.0.1` and
-`10.11.99.3` (vernemq) → `127.0.0.2`, and `systemctl restart xochitl`.
+Test the relay before touching `/etc/hosts` (from the tablet):
+
+```sh
+curl -sk --resolve internal.cloud.remarkable.com:443:127.0.0.1 https://internal.cloud.remarkable.com/health   # 200
+```
+
+Then repoint `/etc/hosts` and restart xochitl:
+
+```sh
+sed -i -e 's/^10\.11\.99\.2\([[:space:]]\)/127.0.0.1\1/' \
+       -e 's/^10\.11\.99\.3\([[:space:]]\)/127.0.0.2\1/' /etc/hosts
+systemctl restart xochitl
+```
 
 Routes in the unit:
 - `127.0.0.1:443 → remarkable.unwrap.rs:443` (HTTP API via nginx)
