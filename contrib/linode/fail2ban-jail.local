@@ -1,0 +1,41 @@
+# /etc/fail2ban/jail.d/unwrap.local
+# ignoreip MUST include: your admin/home IPs and all Cloudflare ranges
+# (unwrap.rs is Cloudflare-proxied, so its remote_addr is a CF edge; banning one breaks the site).
+# Regenerate CF ranges from https://www.cloudflare.com/ips-v4 and /ips-v6.
+[DEFAULT]
+ignoreip = 127.0.0.1/8 ::1 <ADMIN_IPS> <CLOUDFLARE_RANGES>
+banaction = iptables-multiport
+banaction_allports = iptables-allports
+backend = auto
+
+[sshd]
+enabled  = true
+port     = ssh
+logpath  = /var/log/auth.log
+maxretry = 5
+findtime = 10m
+bantime  = 1h
+
+[nginx-probe]
+enabled  = true
+port     = http,https,8883
+logpath  = /var/log/nginx/access.log
+maxretry = 3
+findtime = 10m
+bantime  = 24h
+
+[nginx-4xx-flood]
+enabled  = true
+port     = http,https,8883
+logpath  = /var/log/nginx/access.log
+maxretry = 40
+findtime = 10m
+bantime  = 1h
+
+[recidive]
+enabled  = true
+logpath  = /var/log/fail2ban.log
+banaction = iptables-allports
+maxretry = 3
+findtime = 1d
+bantime  = 1w

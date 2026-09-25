@@ -84,6 +84,87 @@ ssh linode 'tar -C /var/lib -czf - remarkable-server' > rms-backup-$(date +%F).t
 - **Building for the Linode**: native `cargo build` on Arch links glibc
   newer than 2.39 and won't run there; always use the zigbuild command above.
 
+## Hardening (nginx probe blocking + fail2ban)
+
+The Linode is on the public internet, so it gets a constant stream of scanners.
+Checked on 2026-09-25: ~5.3k probe requests from ~100 IPs in one day, none of which got through
+(every reMarkable endpoint returned 401 without a valid device identifier). The layers below cut the noise and ban repeat offenders.
+
+### 1. nginx drops probe paths (`contrib/linode/nginx-block-probes.conf`)
+
+Installed as `/etc/nginx/snippets/block-probes.conf` and `include`d in every
+`server {}` block (both :80 and :443) of `unwrap.rs` and `remarkable.unwrap.rs`.
+Requests for `/.env`, `/.git/…`, `wp-*`, `phpmyadmin`, `*.php`, etc. get
+`return 444`: nginx closes the connection without replying.
+
+- `/.well-known/` is **not** blocked (certbot HTTP-01 and other tools need it).
+- No real reMarkable endpoint matches any of these patterns (checked against the
+  full access log before enabling).
+
+```sh
+sudo cp contrib/linode/nginx-block-probes.conf /etc/nginx/snippets/block-probes.conf
+# add inside each server {} block:
+#   include /etc/nginx/snippets/block-probes.conf;
+sudo nginx -t && sudo systemctl reload nginx
+curl -s -o /dev/null -w '%{http_code}\n' https://remarkable.unwrap.rs/.env    # 000 (dropped)
+curl -s -o /dev/null -w '%{http_code}\n' https://remarkable.unwrap.rs/health  # 200
+```
+
+### 2. fail2ban
+
+Files:
+
+| repo | installed as |
+|---|---|
+| `contrib/linode/fail2ban-jail.local` | `/etc/fail2ban/jail.d/unwrap.local` |
+| `contrib/linode/fail2ban-filter-nginx-probe.conf` | `/etc/fail2ban/filter.d/nginx-probe.conf` |
+| `contrib/linode/fail2ban-filter-nginx-4xx-flood.conf` | `/etc/fail2ban/filter.d/nginx-4xx-flood.conf` |
+
+Jails:
+
+| jail | triggers on | threshold | ban |
+|---|---|---|---|
+| `sshd` | failed SSH auth | 5 / 10 min | 1 h |
+| `nginx-probe` | requests for probe paths (the 444s above) | 3 / 10 min | 24 h |
+| `nginx-4xx-flood` | any 401/403/404 | 40 / 10 min | 1 h |
+| `recidive` | IPs banned repeatedly | 3 bans / 1 day | 1 week, all ports |
+
+Why these thresholds: the tablet produces at most ~2 4xx responses per 10 minutes
+(a 401 when its auth data expires, right before it refreshes). Scanners do 60–700.
+40 leaves a wide margin.
+
+**`ignoreip` must list:**
+- your own admin/home IPs, and
+- **all Cloudflare ranges**. `unwrap.rs` is Cloudflare-proxied, so nginx sees a Cloudflare
+  edge IP as the client for it. Banning one of those takes the site down for everyone.
+  Get the current list from https://www.cloudflare.com/ips-v4 and `/ips-v6`.
+
+`remarkable.unwrap.rs` is DNS-only (not proxied), so bans on it hit the real client IP.
+
+```sh
+sudo apt install fail2ban
+sudo cp contrib/linode/fail2ban-jail.local /etc/fail2ban/jail.d/unwrap.local   # then fill in ignoreip
+sudo cp contrib/linode/fail2ban-filter-nginx-probe.conf /etc/fail2ban/filter.d/nginx-probe.conf
+sudo cp contrib/linode/fail2ban-filter-nginx-4xx-flood.conf /etc/fail2ban/filter.d/nginx-4xx-flood.conf
+sudo fail2ban-client -t && sudo systemctl enable --now fail2ban
+
+# check filters against the real log before trusting them
+sudo fail2ban-regex /var/log/nginx/access.log /etc/fail2ban/filter.d/nginx-probe.conf
+# status / unban
+sudo fail2ban-client status nginx-probe
+sudo fail2ban-client set nginx-probe unbanip 1.2.3.4
+```
+
+If you lock yourself out of SSH: use the Linode web console (Lish) and run
+`fail2ban-client unban --all`.
+
+### Not changed (on purpose)
+
+sshd still has `PasswordAuthentication yes` and `PermitRootLogin yes`. Every successful
+login in the logs used a key, so switching to `PasswordAuthentication no` and
+`PermitRootLogin prohibit-password` would be a safe next step. It was left alone
+to avoid locking anyone out without an explicit decision.
+
 ## Linode side (shared by both)
 
 Layout:
