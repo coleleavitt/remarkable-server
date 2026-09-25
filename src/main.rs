@@ -211,6 +211,7 @@ fn screenshare_viewer(broker: Option<remarkable_server::screenshare::Broker>, st
     Ok(Some(ScreenViewer::new(signaling, ViewerConfig {
         user_id,
         transport: remarkable_screenshare::TransportConfig { ice_servers, udp_ports },
+        idle_grace: remarkable_server::screenshare_viewer::IDLE_GRACE,
     })))
 }
 

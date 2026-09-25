@@ -68,6 +68,11 @@ fn tablet_stream() -> Vec<u8> {
 /// Plays the tablet: owns the room, answers request-offer with a WebRTC offer
 /// and streams one frame once the viewer's handshake arrives.
 async fn fake_tablet(broker: Broker) {
+    fake_tablet_sending(broker, tablet_stream()).await
+}
+
+/// Like [`fake_tablet`], but answers the viewer's handshake with `stream`.
+async fn fake_tablet_sending(broker: Broker, stream: Vec<u8>) {
     let mut client = broker.local_client(USER, TABLET, &subscriptions(USER, TABLET));
     send(&client, &SignalingRequest::CreateRoom { room: String::new() });
     let room_id = match next_event(&mut client).await {
@@ -85,11 +90,20 @@ async fn fake_tablet(broker: Broker) {
     let pc = Arc::new(APIBuilder::new().build().new_peer_connection(RTCConfiguration::default()).await.unwrap());
     let dc = pc.create_data_channel("screenshare", None).await.unwrap();
     let dc2 = Arc::clone(&dc);
+    let stream = bytes::Bytes::from(stream);
     dc.on_message(Box::new(move |msg: DataChannelMessage| {
         let dc = Arc::clone(&dc2);
+        let stream = stream.clone();
         Box::pin(async move {
             assert_eq!(&msg.data[..], b"reMarkable\x00\x02", "viewer handshake");
-            dc.send(&bytes::Bytes::from(tablet_stream())).await.unwrap();
+            dc.send(&stream).await.unwrap();
+            // Ping every second like xochitl, until the channel goes away.
+            let dc = Arc::clone(&dc);
+            tokio::spawn(async move {
+                while dc.send(&bytes::Bytes::from_static(&[0x67])).await.is_ok() {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            });
         })
     }));
 
@@ -132,7 +146,7 @@ async fn viewer_streams_frames_from_tablet() {
     // Let the tablet create its room first.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let viewer = ScreenViewer::new(Signaling { mqtt: Some(broker), rest: None }, ViewerConfig { user_id: USER.into(), transport: Default::default() });
+    let viewer = ScreenViewer::new(Signaling { mqtt: Some(broker), rest: None }, ViewerConfig { user_id: USER.into(), transport: Default::default(), idle_grace: Duration::from_millis(500) });
     let mut watcher = viewer.watch();
     let png = tokio::time::timeout(Duration::from_secs(20), watcher.png.wait_for(Option::is_some))
         .await
@@ -144,13 +158,21 @@ async fn viewer_streams_frames_from_tablet() {
     let info = png::Decoder::new(std::io::Cursor::new(png.to_vec())).read_info().unwrap().info().clone();
     assert_eq!((info.width, info.height), (u32::from(W), u32::from(H)));
     assert_eq!(*watcher.status.borrow(), Status::Streaming { width: u32::from(W), height: u32::from(H) });
+
+    // The last watcher leaving ends the session after the grace period.
+    let mut status = watcher.status.clone();
+    drop(watcher);
+    tokio::time::timeout(Duration::from_secs(5), status.wait_for(|s| *s == Status::Idle))
+        .await
+        .expect("session kept running after the last watcher left")
+        .unwrap();
     tablet.abort();
 }
 
 #[tokio::test]
 async fn viewer_reports_when_screen_share_is_off() {
     let (broker, _tmp) = broker();
-    let viewer = ScreenViewer::new(Signaling { mqtt: Some(broker), rest: None }, ViewerConfig { user_id: USER.into(), transport: Default::default() });
+    let viewer = ScreenViewer::new(Signaling { mqtt: Some(broker), rest: None }, ViewerConfig { user_id: USER.into(), transport: Default::default(), idle_grace: Duration::from_millis(500) });
     let mut watcher = viewer.watch();
     tokio::time::timeout(Duration::from_secs(10), watcher.status.wait_for(|s| *s == Status::NotSharing))
         .await
@@ -270,7 +292,7 @@ async fn viewer_streams_frames_from_rest_tablet() {
         mqtt: Some(broker),
         rest: Some(RestRooms { rooms: state.screenshare.clone(), notifications: state.notification_tx.clone() }),
     };
-    let viewer = ScreenViewer::new(signaling, ViewerConfig { user_id: USER.into(), transport: Default::default() });
+    let viewer = ScreenViewer::new(signaling, ViewerConfig { user_id: USER.into(), transport: Default::default(), idle_grace: Duration::from_millis(500) });
     let mut watcher = viewer.watch();
     let png = tokio::time::timeout(Duration::from_secs(20), watcher.png.wait_for(Option::is_some))
         .await
@@ -280,5 +302,25 @@ async fn viewer_streams_frames_from_rest_tablet() {
         .unwrap();
     let info = png::Decoder::new(std::io::Cursor::new(png.to_vec())).read_info().unwrap().info().clone();
     assert_eq!((info.width, info.height), (u32::from(W), u32::from(H)));
+    tablet.abort();
+}
+
+#[tokio::test]
+async fn idle_session_ends_when_tablet_sends_no_frames() {
+    let (broker, _tmp) = broker();
+    // Handshake only, like a tablet whose screen hasn't changed.
+    let handshake = tablet_stream()[..7].to_vec();
+    // The browser arrives first (not sharing yet), then the tablet shares.
+    let viewer = ScreenViewer::new(Signaling { mqtt: Some(broker.clone()), rest: None }, ViewerConfig { user_id: USER.into(), transport: Default::default(), idle_grace: Duration::from_millis(500) });
+    let watcher = viewer.watch();
+    let mut status = watcher.status.clone();
+    tokio::time::timeout(Duration::from_secs(5), status.wait_for(|s| *s == Status::NotSharing)).await.unwrap().unwrap();
+    let tablet = tokio::spawn(fake_tablet_sending(broker.clone(), handshake));
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    drop(watcher);
+    tokio::time::timeout(Duration::from_secs(5), status.wait_for(|s| *s == Status::Idle))
+        .await
+        .expect("session kept running after the last watcher left")
+        .unwrap();
     tablet.abort();
 }
