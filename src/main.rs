@@ -201,7 +201,7 @@ fn screenshare_viewer(broker: Option<remarkable_server::screenshare::Broker>, st
         None => None,
     };
     let ice_servers = env::var("SCREENSHARE_VIEWER_ICE").unwrap_or_default()
-        .split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+        .split(',').map(str::trim).filter(|s| !s.is_empty()).map(remarkable_screenshare::IceServer::url).collect();
     let user_id = env::var("SCREENSHARE_VIEWER_USER").ok().filter(|u| !u.is_empty()).unwrap_or_else(|| PAIRING_USER.into());
     tracing::info!(user = %user_id, ?udp_ports, "screenshare browser viewer enabled at /screenshare/view");
     let signaling = Signaling {

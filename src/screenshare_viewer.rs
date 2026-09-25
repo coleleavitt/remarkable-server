@@ -17,7 +17,6 @@
 //! after the last one leaves. The pages are protected by `ADMIN_TOKEN` (login
 //! form → HttpOnly cookie, or an `x-admin-token` header).
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +44,8 @@ const IDLE_GRACE: Duration = Duration::from_secs(20);
 /// Wait between attempts while screen share is off on the tablet.
 const RETRY_NOT_SHARING: Duration = Duration::from_secs(3);
 const RETRY_ERROR: Duration = Duration::from_secs(5);
+/// How often the viewer refreshes a REST room it is in, as the desktop app does.
+const REST_KEEPALIVE: Duration = Duration::from_secs(20);
 /// How long the tablet gets to answer each signaling step.
 const SIGNALING_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -94,9 +95,9 @@ struct Inner {
     config: ViewerConfig,
     png: watch::Sender<Option<Arc<Vec<u8>>>>,
     status: watch::Sender<Status>,
-    watchers: AtomicUsize,
-    /// Wakes the supervisor when watchers come and go.
-    watchers_changed: tokio::sync::Notify,
+    /// How many browsers are watching. A watch channel, so the supervisor
+    /// can't miss the last one leaving between checking and waiting.
+    watchers: watch::Sender<usize>,
     running: Mutex<bool>,
 }
 
@@ -110,8 +111,7 @@ pub struct Watcher {
 
 impl Drop for Watcher {
     fn drop(&mut self) {
-        self.viewer.inner.watchers.fetch_sub(1, Ordering::SeqCst);
-        self.viewer.inner.watchers_changed.notify_waiters();
+        self.viewer.inner.watchers.send_modify(|n| *n -= 1);
     }
 }
 
@@ -136,8 +136,7 @@ impl ScreenViewer {
                 config,
                 png,
                 status,
-                watchers: AtomicUsize::new(0),
-                watchers_changed: tokio::sync::Notify::new(),
+                watchers: watch::channel(0).0,
                 running: Mutex::new(false),
             }),
         }
@@ -145,8 +144,7 @@ impl ScreenViewer {
 
     /// Start watching; starts a tablet session if none is running.
     pub fn watch(&self) -> Watcher {
-        self.inner.watchers.fetch_add(1, Ordering::SeqCst);
-        self.inner.watchers_changed.notify_waiters();
+        self.inner.watchers.send_modify(|n| *n += 1);
         let start = {
             let mut running = self.inner.running.lock();
             !std::mem::replace(&mut *running, true)
@@ -159,18 +157,20 @@ impl ScreenViewer {
     }
 
     fn watchers(&self) -> usize {
-        self.inner.watchers.load(Ordering::SeqCst)
+        *self.inner.watchers.borrow()
     }
 
     /// Resolves once nobody has been watching for [`IDLE_GRACE`].
     async fn idle(&self) {
+        let mut watchers = self.inner.watchers.subscribe();
         loop {
-            while self.watchers() > 0 {
-                self.inner.watchers_changed.notified().await;
+            // `wait_for` checks the current value first, so no change is missed.
+            if watchers.wait_for(|n| *n == 0).await.is_err() {
+                return;
             }
             tokio::select! {
-                _ = tokio::time::sleep(IDLE_GRACE) => if self.watchers() == 0 { return },
-                _ = self.inner.watchers_changed.notified() => {}
+                _ = tokio::time::sleep(IDLE_GRACE) => return,
+                _ = watchers.wait_for(|n| *n > 0) => {}
             }
         }
     }
@@ -240,13 +240,14 @@ impl ScreenViewer {
             return SessionEnd::Failed(e.to_string());
         }
 
-        // Wait for the tablet's offer, keeping any candidates that arrive first.
+        // Wait for the tablet's offer, keeping any candidates that arrive first
+        // along with their sender.
         let mut early = Vec::new();
         let (tablet, offer) = loop {
             match tokio::time::timeout(SIGNALING_TIMEOUT, channel.recv()).await {
                 Ok(Some((from, PeerMessage::WebRtc { payload }))) => match payload {
                     WebRtcMessage::Offer { description } => break (from, description),
-                    WebRtcMessage::Candidate { candidate, mid } => early.push((candidate, mid)),
+                    WebRtcMessage::Candidate { candidate, mid } => early.push((from, candidate, mid)),
                     WebRtcMessage::Answer { .. } => {}
                 },
                 Ok(Some(_)) => {}
@@ -266,7 +267,7 @@ impl ScreenViewer {
         if let Err(e) = channel.direct(&tablet, WebRtcMessage::Answer { description: answer }) {
             return SessionEnd::Failed(e.to_string());
         }
-        for (candidate, mid) in early {
+        for (_, candidate, mid) in early.into_iter().filter(|(from, ..)| *from == tablet) {
             let _ = webrtc.add_ice_candidate(&candidate, mid.as_deref(), Some(0)).await;
         }
         tracing::info!(room = %channel.room_id(), tablet = %tablet, via = channel.kind(), "screenshare viewer answered tablet offer");
@@ -286,8 +287,10 @@ impl ScreenViewer {
             }
         });
         let trickle = async {
+            let mut keepalive = tokio::time::interval(REST_KEEPALIVE);
             loop {
                 tokio::select! {
+                    _ = keepalive.tick() => channel.keepalive(),
                     Some(c) = ice_rx.recv() => {
                         let _ = channel.direct(&tablet, WebRtcMessage::Candidate {
                             candidate: c.candidate,
@@ -295,7 +298,8 @@ impl ScreenViewer {
                         });
                     }
                     msg = channel.recv() => match msg {
-                        Some((_, PeerMessage::WebRtc { payload: WebRtcMessage::Candidate { candidate, mid } })) => {
+                        // Only the peer that made the offer is part of this session.
+                        Some((from, PeerMessage::WebRtc { payload: WebRtcMessage::Candidate { candidate, mid } })) if from == tablet => {
                             let _ = webrtc.add_ice_candidate(&candidate, mid.as_deref(), Some(0)).await;
                         }
                         Some(_) => {}
@@ -355,6 +359,14 @@ impl Channel {
             client_id: cid.into(),
             room_id,
         })
+    }
+
+    /// Keep a REST room alive while we are in it (MQTT rooms live as long as
+    /// the tablet's session).
+    fn keepalive(&self) {
+        if let Channel::Rest { rest, room_id, .. } = self {
+            rest.rooms.keepalive(room_id);
+        }
     }
 
     fn kind(&self) -> &'static str {
@@ -472,7 +484,7 @@ pub fn router(viewer: ScreenViewer) -> Router {
 }
 
 fn admin_token() -> Option<String> {
-    std::env::var("ADMIN_TOKEN").ok().filter(|t| !t.is_empty())
+    std::env::var("ADMIN_TOKEN").ok().map(|t| t.trim().to_owned()).filter(|t| !t.is_empty())
 }
 
 /// Constant-time comparison, so response timing leaks nothing about the token.
