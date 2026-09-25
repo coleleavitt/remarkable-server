@@ -53,6 +53,9 @@ struct Reply<'a> {
     room_id: &'a str,
     #[serde(rename = "iceServers", skip_serializing_if = "Option::is_none")]
     ice_servers: Option<Value>,
+    /// Reason for room-not-found; the desktop's broker reads it (broker.cpp).
+    #[serde(skip_serializing_if = "str::is_empty")]
+    message: &'a str,
 }
 
 struct Room {
@@ -113,7 +116,8 @@ impl Broker {
         if let Ok(body) = serde_json::to_vec(reply) { self.publish(&topic, body, qos); }
     }
 
-    fn active_room(&self, user_id: &str) -> Option<String> {
+    /// Newest room of `user_id`, if any.
+    pub fn active_room(&self, user_id: &str) -> Option<String> {
         self.inner.rooms.lock().iter().filter(|(_, r)| r.user_id == user_id)
             .max_by_key(|(_, r)| r.created).map(|(id, _)| id.clone())
     }
@@ -150,16 +154,16 @@ impl Broker {
                         id
                     }
                 };
-                self.reply(format!("user/{user_id}/signaling"), &Reply { kind: "room-created", room: &msg.room, room_id: &room_id, ice_servers: None }, qos);
+                self.reply(format!("user/{user_id}/signaling"), &Reply { kind: "room-created", room: &msg.room, room_id: &room_id, ice_servers: None, message: "" }, qos);
             }
             "join-auth-room" | "join-active-room" => {
                 let room_id = if msg.room_id.is_empty() { self.active_room(user_id).unwrap_or_default() } else { msg.room_id };
                 if room_id.is_empty() || !self.join(&room_id, sender) {
-                    self.reply(format!("user/{user_id}/client/{sender}/signaling/{room_id}"), &Reply { kind: "room-not-found", room: "", room_id: "", ice_servers: None }, qos);
+                    self.reply(format!("user/{user_id}/client/{sender}/signaling/{room_id}"), &Reply { kind: "room-not-found", room: "", room_id: "", ice_servers: None, message: "no active screen share room" }, qos);
                     return;
                 }
                 let ice = json!({ "ice_servers": self.inner.ice_servers });
-                self.reply(format!("user/{user_id}/client/{sender}/signaling/room/{room_id}"), &Reply { kind: "room-joined", room: "", room_id: &room_id, ice_servers: Some(ice) }, qos);
+                self.reply(format!("user/{user_id}/client/{sender}/signaling/room/{room_id}"), &Reply { kind: "room-joined", room: "", room_id: &room_id, ice_servers: Some(ice), message: "" }, qos);
             }
             "broadcast" => {
                 let room_id = if msg.room_id.is_empty() { self.active_room(user_id).unwrap_or_default() } else { msg.room_id };

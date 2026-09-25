@@ -82,7 +82,7 @@ async fn fake_tablet_sending(broker: Broker, stream: Vec<u8>) {
 
     let viewer = loop {
         match next_event(&mut client).await {
-            SignalingEvent::Broadcast { payload: PeerMessage::RequestOffer { id }, .. } => break id,
+            SignalingEvent::Broadcast { client_id, payload: PeerMessage::RequestOffer { .. } } => break client_id,
             _ => {}
         }
     };
@@ -96,7 +96,7 @@ async fn fake_tablet_sending(broker: Broker, stream: Vec<u8>) {
         let stream = stream.clone();
         Box::pin(async move {
             assert_eq!(&msg.data[..], b"reMarkable\x00\x02", "viewer handshake");
-            dc.send(&stream).await.unwrap();
+            if !stream.is_empty() { dc.send(&stream).await.unwrap(); }
             // Ping every second like xochitl, until the channel goes away.
             let dc = Arc::clone(&dc);
             tokio::spawn(async move {
@@ -193,7 +193,7 @@ async fn broadcast_is_not_echoed_to_sender() {
     send(&viewer, &SignalingRequest::JoinActiveRoom { room: String::new(), room_id: String::new() });
     assert!(matches!(next_event(&mut viewer).await, SignalingEvent::RoomJoined { .. }));
 
-    send(&viewer, &SignalingRequest::Broadcast { room_id, payload: PeerMessage::RequestOffer { id: "viewer-1".into() } });
+    send(&viewer, &SignalingRequest::Broadcast { room_id, payload: PeerMessage::RequestOffer { id: Some("viewer-1".into()) } });
     assert!(matches!(next_event(&mut tablet).await, SignalingEvent::Broadcast { .. }));
     let echo = tokio::time::timeout(Duration::from_millis(300), viewer.recv()).await;
     assert!(echo.is_err(), "viewer received its own broadcast: {echo:?}");
@@ -248,9 +248,8 @@ async fn fake_rest_tablet(state: AppState, token: String) {
     let room_id = body["roomId"].as_str().unwrap().to_string();
 
     let viewer = loop {
-        if let Some((from, _, PeerMessage::RequestOffer { id })) = rest_message(&rx.recv().await.unwrap()) {
-            assert_eq!(from, id);
-            break id;
+        if let Some((from, _, PeerMessage::RequestOffer { .. })) = rest_message(&rx.recv().await.unwrap()) {
+            break from;
         }
     };
     let (pc, description) = tablet_peer().await;
@@ -322,5 +321,75 @@ async fn idle_session_ends_when_tablet_sends_no_frames() {
         .await
         .expect("session kept running after the last watcher left")
         .unwrap();
+    tablet.abort();
+}
+
+fn viewer_for(broker: Broker) -> ScreenViewer {
+    ScreenViewer::new(
+        Signaling { mqtt: Some(broker), rest: None },
+        ViewerConfig { user_id: USER.into(), transport: Default::default(), idle_grace: Duration::from_millis(500) },
+    )
+}
+
+#[tokio::test]
+async fn cursor_moves_reach_watchers() {
+    let (broker, _tmp) = broker();
+    // Frame, then the pen at (3, 2). (Hiding at (0, 0) is covered by the
+    // decoder's display_point test; a watch channel only keeps the latest
+    // value, so two moves in one message can't both be observed here.)
+    let mut stream = tablet_stream();
+    stream.extend([0x64, 0, 3, 0, 2]);
+    let tablet = tokio::spawn(fake_tablet_sending(broker.clone(), stream));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let viewer = viewer_for(broker);
+    let mut watcher = viewer.watch();
+    tokio::time::timeout(Duration::from_secs(20), watcher.cursor.wait_for(|c| *c == Some((3, 2))))
+        .await
+        .expect("cursor never arrived")
+        .unwrap();
+    tablet.abort();
+}
+
+#[tokio::test]
+async fn tablet_shutdown_stops_instead_of_retrying() {
+    let (broker, _tmp) = broker();
+    let mut stream = tablet_stream();
+    stream.push(0x65); // shutdown
+    let tablet = tokio::spawn(fake_tablet_sending(broker.clone(), stream));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let viewer = viewer_for(broker);
+    let mut watcher = viewer.watch();
+    tokio::time::timeout(Duration::from_secs(20), watcher.status.wait_for(|s| *s == Status::Stopped))
+        .await
+        .expect("viewer did not report the stopped share")
+        .unwrap();
+    // It waits for a new room rather than reconnecting to the ended one.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(*watcher.status.borrow(), Status::Stopped);
+    tablet.abort();
+}
+
+#[tokio::test]
+async fn tablet_that_never_handshakes_is_retried_with_backoff() {
+    let (broker, _tmp) = broker();
+    // Channel opens but the tablet never answers the handshake.
+    let tablet = tokio::spawn(fake_tablet_sending(broker.clone(), Vec::new()));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let viewer = viewer_for(broker);
+    let mut watcher = viewer.watch();
+    let status = tokio::time::timeout(
+        Duration::from_secs(20),
+        watcher.status.wait_for(|s| matches!(s, Status::Reconnecting { .. })),
+    )
+    .await
+    .expect("no retry after the negotiation deadline")
+    .unwrap()
+    .clone();
+    let Status::Reconnecting { attempt, max, in_secs, message } = status else { unreachable!() };
+    assert_eq!((attempt, max, in_secs), (1, 5, 2));
+    assert!(message.contains("in time"), "{message}");
     tablet.abort();
 }
