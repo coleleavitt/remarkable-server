@@ -204,6 +204,20 @@ impl Broker {
         });
     }
 
+    /// Attach a client that lives in this process rather than on an MQTT
+    /// connection, e.g. the server's own screen share viewer. It is subject to
+    /// the same ACL as a remote client of `user_id`, and leaves the broker
+    /// (and any rooms) when dropped.
+    pub fn local_client(&self, user_id: &str, client_id: &str, filters: &[String]) -> LocalClient {
+        let (tx, rx) = mpsc::channel::<Publish>(CLIENT_QUEUE);
+        let subscriptions = filters.iter()
+            .filter(|f| acl_allows(user_id, &f.replace(['+', '#'], "x"), false) || f.starts_with(&format!("user/{user_id}/")))
+            .map(|f| (f.clone(), QoS::AtLeastOnce))
+            .collect();
+        self.inner.clients.lock().insert(client_id.into(), Client { user_id: user_id.into(), subscriptions, tx });
+        LocalClient { broker: self.clone(), user_id: user_id.into(), client_id: client_id.into(), rx }
+    }
+
     fn sweep_rooms(&self) {
         self.inner.rooms.lock().retain(|id, r| {
             let keep = r.last_activity.elapsed() < ROOM_TIMEOUT;
@@ -344,5 +358,39 @@ impl Broker {
         self.remove_client(&client_id);
         tracing::info!(client = %client_id, "mqtt client disconnected");
         result
+    }
+}
+
+/// An in-process broker client; see [`Broker::local_client`].
+pub struct LocalClient {
+    broker: Broker,
+    user_id: String,
+    client_id: String,
+    rx: mpsc::Receiver<Publish>,
+}
+
+impl LocalClient {
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    /// Publish as this client, exactly as if it had arrived over MQTT.
+    pub fn publish(&self, topic: &str, payload: Vec<u8>) -> anyhow::Result<()> {
+        if !acl_allows(&self.user_id, topic, true) {
+            anyhow::bail!("publish to {topic} not allowed");
+        }
+        self.broker.on_publish(&self.user_id, &Publish::new(topic, QoS::AtLeastOnce, payload));
+        Ok(())
+    }
+
+    /// Next message delivered to this client's subscriptions.
+    pub async fn recv(&mut self) -> Option<Publish> {
+        self.rx.recv().await
+    }
+}
+
+impl Drop for LocalClient {
+    fn drop(&mut self) {
+        self.broker.remove_client(&self.client_id);
     }
 }

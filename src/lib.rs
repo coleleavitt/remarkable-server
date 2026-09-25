@@ -13,6 +13,7 @@ pub mod integrations;
 pub mod passcode;
 pub mod protocol;
 pub mod screenshare;
+pub mod screenshare_viewer;
 pub mod screenshare_rest;
 pub mod gentree;
 pub mod oauth;
