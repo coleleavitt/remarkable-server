@@ -269,6 +269,7 @@ Admin endpoints are disabled unless `ADMIN_TOKEN` is set; requests must send it 
 | `POST /devices/v1[?user=<id>]` | Mint a one-time pairing code for `local-user` (same as `--pair`), or for `<id>` |
 | `POST /admin/passcode/resets/{id}/approve` | Approve a tablet's passcode (PIN) reset request; the id is logged when the tablet asks |
 | `GET /admin/storage/unreachable?grace_secs=86400` | Read-only JSON list of blobs not reachable from the current root and older than the grace period (default 24 h). Never deletes; returns 500 with a reason if part of the tree couldn't be parsed |
+| `POST /admin/storage/gc?grace_secs=604800&dry_run=true` | Delete the blobs the unreachable report lists (default grace 7 days). A dry run unless `dry_run=false`; refuses (500) if the tree isn't fully parsed; stops with 409 if a sync commits mid-run. See DEPLOYMENT.md before using |
 
 `JWT_SECRET` sets the token signing key (default is a built-in constant; changing it invalidates paired devices).
 
