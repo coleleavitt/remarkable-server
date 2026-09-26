@@ -162,6 +162,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/debug/clear", delete(api::clear_storage))
         // Notifications (MQTT over WebSocket)
         .route("/notifications/ws/json/1", get(notifications::notifications_ws))
+        // Same notifications as MQTT 3.1.1 over WebSocket; path and auth: see mqtt_ws.rs.
+        .route("/mqtt", get(mqtt_ws::mqtt_notifications_ws))
 
         // Screenshare REST room broker (xochitl 3.27+/3.28)
         .route("/screenshare/v1/rooms", post(screenshare_rest::create_room))
@@ -454,5 +456,53 @@ mod router_tests {
         let state = AppState::new(storage, devices);
         let _ = create_router(state.clone());
         let _ = feature_routes(state, tmp.path(), None).unwrap();
+    }
+
+    /// `/mqtt` is served, refuses clients without a valid token, and pushes an
+    /// authenticated client its own user's SyncComplete but not another user's.
+    #[tokio::test]
+    async fn mqtt_ws_route_requires_auth_and_filters_by_user() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let devices = DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        let token = devices.create_user_token("u1@test").unwrap();
+        let state = AppState::new(Storage::new(tmp.path().join("storage")).unwrap(), devices);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/mqtt", listener.local_addr().unwrap());
+        let router = create_router(state.clone());
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let connect = |auth: Option<&str>| {
+            let mut req = url.as_str().into_client_request().unwrap();
+            if let Some(a) = auth { req.headers_mut().insert("authorization", a.parse().unwrap()); }
+            tokio_tungstenite::connect_async(req)
+        };
+        async fn recv<S: futures_util::Stream<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin>(ws: &mut S) -> Option<Vec<u8>> {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await.expect("timed out") { Some(Ok(Message::Binary(b))) => Some(b.to_vec()), _ => None }
+        }
+        const CONNECT: [u8; 15] = [0x10, 13, 0, 4, b'M', b'Q', b'T', b'T', 4, 2, 0, 60, 0, 1, b'c'];
+
+        match connect(Some("Bearer not-a-token")).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(r)) => assert_eq!(r.status(), 401),
+            other => panic!("bad token must be refused, got {:?}", other.map(|_| ())),
+        }
+        let (mut anon, _) = connect(None).await.unwrap();
+        anon.send(Message::Binary(CONNECT.to_vec().into())).await.unwrap();
+        assert_eq!(recv(&mut anon).await, Some(vec![0x20, 2, 0, 5]), "CONNACK not authorized");
+        let _ = state.notification_tx.send(notifications::WsMessage::sync_complete(1, "d", "u1@test"));
+        assert_eq!(recv(&mut anon).await, None, "closed, nothing published");
+
+        let (mut ws, _) = connect(Some(&format!("Bearer {token}"))).await.unwrap();
+        ws.send(Message::Binary(CONNECT.to_vec().into())).await.unwrap();
+        assert_eq!(recv(&mut ws).await, Some(vec![0x20, 2, 0, 0]));
+        ws.send(Message::Binary(vec![0x82, 6, 0, 1, 0, 1, b't', 0].into())).await.unwrap(); // SUBSCRIBE "t"
+        assert_eq!(recv(&mut ws).await.unwrap()[0], 0x90);
+        assert_eq!(recv(&mut ws).await.unwrap()[0], 0x30, "catch-up SyncComplete");
+        state.notification_tx.send(notifications::WsMessage::sync_complete(2, "d", "other@test")).unwrap();
+        state.notification_tx.send(notifications::WsMessage::sync_complete(3, "d", "u1@test")).unwrap();
+        let publish = recv(&mut ws).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&publish[publish.iter().position(|&b| b == b'{').unwrap()..]).unwrap(); // after topic "t"
+        assert_eq!(body["message"]["attributes"]["auth0UserID"], "u1@test", "other user's SyncComplete was not forwarded");
+        assert_eq!(body["message"]["attributes"]["event"], "SyncComplete");
     }
 }

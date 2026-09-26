@@ -2,12 +2,18 @@
 //! 
 //! Implements MQTT 3.1.1 protocol over WebSocket for device notifications.
 //! The device expects full MQTT protocol, not plain JSON.
+//!
+//! Served at `/mqtt`. Nothing in the firmware notes or discovery pins a path
+//! (`mqttbroker` in discovery is a bare host, and `/notifications/ws/json/1` is
+//! the JSON endpoint), so this uses the conventional MQTT-over-WebSocket path
+//! (VerneMQ's and Paho's default).
 
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
+    http::{header::AUTHORIZATION, HeaderMap},
     response::IntoResponse,
 };
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
@@ -86,8 +92,8 @@ fn parse_remaining_length(data: &[u8]) -> Option<(usize, usize)> {
     Some((value, idx))
 }
 
-/// Parse MQTT string (2-byte length prefix + UTF-8)
-fn parse_mqtt_string(data: &[u8]) -> Option<(&str, usize)> {
+/// Parse MQTT binary data (2-byte length prefix)
+fn parse_mqtt_bytes(data: &[u8]) -> Option<(&[u8], usize)> {
     if data.len() < 2 {
         return None;
     }
@@ -95,8 +101,35 @@ fn parse_mqtt_string(data: &[u8]) -> Option<(&str, usize)> {
     if data.len() < 2 + len {
         return None;
     }
-    let s = std::str::from_utf8(&data[2..2+len]).ok()?;
-    Some((s, 2 + len))
+    Some((&data[2..2+len], 2 + len))
+}
+
+/// Parse MQTT string (2-byte length prefix + UTF-8)
+fn parse_mqtt_string(data: &[u8]) -> Option<(&str, usize)> {
+    let (b, n) = parse_mqtt_bytes(data)?;
+    Some((std::str::from_utf8(b).ok()?, n))
+}
+
+/// The token a CONNECT (variable header + payload) carries: its password, or its
+/// username when the password is empty or absent, as the screenshare broker reads it.
+/// `None` when it has no credentials or is malformed.
+fn connect_token(body: &[u8]) -> Option<String> {
+    let (_, mut at) = parse_mqtt_string(body)?; // protocol name
+    let flags = *body.get(at + 1)?; // after the protocol level
+    at += 4; // level, flags, keep alive
+    at += parse_mqtt_bytes(body.get(at..)?)?.1; // client id
+    if flags & 0x04 != 0 {
+        for _ in 0..2 { at += parse_mqtt_bytes(body.get(at..)?)?.1; } // will topic, will message
+    }
+    let mut username = None;
+    if flags & 0x80 != 0 {
+        let (u, n) = parse_mqtt_bytes(body.get(at..)?)?;
+        username = Some(u);
+        at += n;
+    }
+    let password = if flags & 0x40 != 0 { Some(parse_mqtt_bytes(body.get(at..)?)?.0) } else { None };
+    let token = password.filter(|p| !p.is_empty()).or(username)?;
+    String::from_utf8(token.to_vec()).ok()
 }
 
 /// Build CONNACK packet
@@ -172,35 +205,51 @@ fn build_publish(topic: &str, payload: &[u8], qos: u8, packet_id: Option<u16>) -
     packet
 }
 
-/// WebSocket upgrade handler for MQTT notifications endpoint
+/// WebSocket upgrade handler for MQTT notifications endpoint (`/mqtt`).
+///
+/// Authenticated with the same tokens as `/notifications/ws/json/1`: a bearer
+/// `Authorization` header on the upgrade (an invalid one is rejected with 401),
+/// or, when there is no such header, the token as the MQTT CONNECT password (or
+/// username), as the screenshare broker accepts. A CONNECT without a valid token
+/// gets CONNACK "not authorized" and the socket is closed.
 pub async fn mqtt_notifications_ws(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
-) -> impl IntoResponse {
+    headers: HeaderMap,
+) -> crate::error::Result<impl IntoResponse> {
+    let header_user = match headers.get(AUTHORIZATION) { Some(_) => Some(state.auth_user(&headers)?), None => None };
     info!("MQTT WebSocket upgrade request for notifications");
-    ws.on_upgrade(move |socket| handle_mqtt_socket(socket, state))
+    Ok(ws.protocols(["mqtt"]).on_upgrade(move |socket| handle_mqtt_socket(socket, state, header_user)))
 }
 
 /// Handle an individual MQTT WebSocket connection
-async fn handle_mqtt_socket(socket: WebSocket, state: AppState) {
+async fn handle_mqtt_socket(socket: WebSocket, state: AppState, header_user: Option<String>) {
     let (sender, receiver) = socket.split();
     // Subscribe to broadcast channel for sync notifications
     let rx = state.notification_tx.subscribe();
     let storage = state.storage.clone();
-    run_mqtt_session(sender, receiver, rx, move || storage.get_root().generation).await;
+    let devices = state.devices.clone();
+    let authenticate = move |token: Option<&str>| header_user.clone()
+        .or_else(|| devices.validate_token(&format!("Bearer {}", token?)).ok());
+    run_mqtt_session(sender, receiver, rx, move || storage.get_root().generation, authenticate).await;
 }
 
-/// MQTT PUBLISH packets (QoS 0) carrying `msg` for this session.
+/// `auth0UserID` of server-originated events not tied to an account (feed EPUBs
+/// landing in the single shared sync tree); every authenticated user gets those.
+const SERVER_USER: &str = "local-user";
+
+/// MQTT PUBLISH packets (QoS 0) carrying `msg` for the session of `user_id`.
 ///
 /// Assumption: nothing in this codebase pins the topic xochitl expects for
 /// sync pushes over MQTT-over-WebSocket, so the notification goes out on each
 /// concrete (wildcard-free) topic the client SUBSCRIBEd to. Filters with `+`/`#`
 /// have no single concrete topic and are skipped. The payload is the same
-/// `WsMessage` JSON the `/notifications/ws/json/1` endpoint sends. Screenshare
-/// events are per account and this endpoint is unauthenticated, so they are
-/// never forwarded here.
-fn notification_publishes(msg: &WsMessage, subscriptions: &[String]) -> Vec<Vec<u8>> {
-    if msg.message.attributes.event.starts_with("Screenshare") {
+/// `WsMessage` JSON the `/notifications/ws/json/1` endpoint sends. Only events
+/// for `user_id` (or [`SERVER_USER`]) are forwarded; screenshare events have
+/// their own broker and are never forwarded here.
+fn notification_publishes(msg: &WsMessage, subscriptions: &[String], user_id: &str) -> Vec<Vec<u8>> {
+    let a = &msg.message.attributes;
+    if a.event.starts_with("Screenshare") || (a.auth0_user_id != user_id && a.auth0_user_id != SERVER_USER) {
         return Vec::new();
     }
     let Ok(payload) = serde_json::to_vec(msg) else { return Vec::new() };
@@ -215,7 +264,9 @@ fn notification_publishes(msg: &WsMessage, subscriptions: &[String]) -> Vec<Vec<
 /// The MQTT session loop: answers the client's packets and pushes broadcast
 /// notifications to it once it has CONNECTed. `generation` supplies the current
 /// root generation for the catch-up SyncComplete sent after a lagged receiver.
-async fn run_mqtt_session<S, R>(mut sender: S, mut receiver: R, mut rx: broadcast::Receiver<WsMessage>, generation: impl Fn() -> u64)
+/// `authenticate` maps the CONNECT's token (if any) to the session's user id;
+/// `None` refuses the CONNECT and ends the session.
+async fn run_mqtt_session<S, R>(mut sender: S, mut receiver: R, mut rx: broadcast::Receiver<WsMessage>, generation: impl Fn() -> u64, authenticate: impl Fn(Option<&str>) -> Option<String>)
 where
     S: Sink<Message> + Unpin,
     R: Stream<Item = Result<Message, axum::Error>> + Unpin,
@@ -224,6 +275,7 @@ where
     info!(session_id = %session_id, "New MQTT WebSocket connection");
     
     let mut connected = false;
+    let mut user_id = String::new();
     let mut subscriptions: Vec<String> = Vec::new();
     let mut notifications_open = true;
     
@@ -236,12 +288,12 @@ where
                     // A skipped SyncComplete would leave the client stale; send a fresh one instead.
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!(session_id = %session_id, "MQTT notification client lagged, skipped {n} events");
-                        WsMessage::sync_complete(generation(), "local-server", "local-user")
+                        WsMessage::sync_complete(generation(), "local-server", &user_id)
                     }
                     Err(broadcast::error::RecvError::Closed) => { notifications_open = false; continue }
                 };
                 if !connected { continue }
-                for packet in notification_publishes(&msg, &subscriptions) {
+                for packet in notification_publishes(&msg, &subscriptions, &user_id) {
                     if sender.send(Message::Binary(packet.into())).await.is_err() {
                         info!(session_id = %session_id, "MQTT WebSocket connection closed");
                         return;
@@ -271,12 +323,22 @@ where
                 
                 match packet_type {
                     PacketType::Connect => {
+                        if connected {
+                            warn!(session_id = %session_id, "second MQTT CONNECT, closing");
+                            break;
+                        }
                         // Parse CONNECT packet
                         if let Some((remaining_len, len_bytes)) = parse_remaining_length(&data[1..]) {
                             let payload_start = 1 + len_bytes;
                             if data.len() >= payload_start + remaining_len {
-                                // Skip protocol name and version for now
                                 info!(session_id = %session_id, "MQTT CONNECT received");
+                                let token = connect_token(&data[payload_start..payload_start + remaining_len]);
+                                let Some(user) = authenticate(token.as_deref()) else {
+                                    warn!(session_id = %session_id, "MQTT CONNECT without a valid token, refusing");
+                                    let _ = sender.send(Message::Binary(build_connack(false, 5).into())).await; // not authorized
+                                    break;
+                                };
+                                user_id = user;
                                 connected = true;
                                 
                                 // Send CONNACK
@@ -334,8 +396,8 @@ where
                                 // Like /notifications/ws/json/1's initial SyncComplete: anything
                                 // broadcast before this subscription had nowhere to go.
                                 let fresh: Vec<String> = subscriptions[known..].iter().filter(|t| !subscriptions[..known].contains(t)).cloned().collect();
-                                let catch_up = WsMessage::sync_complete(generation(), "local-server", "local-user");
-                                for packet in notification_publishes(&catch_up, &fresh) {
+                                let catch_up = WsMessage::sync_complete(generation(), "local-server", &user_id);
+                                for packet in notification_publishes(&catch_up, &fresh, &user_id) {
                                     if sender.send(Message::Binary(packet.into())).await.is_err() {
                                         return;
                                     }
@@ -428,7 +490,10 @@ mod tests {
     type Harness = (mpsc::UnboundedSender<Message>, mpsc::UnboundedReceiver<Vec<u8>>, broadcast::Sender<WsMessage>, tokio::task::JoinHandle<()>);
 
     /// In-process MQTT client: feed packets in, read what the server wrote back.
-    fn start() -> Harness {
+    /// Every CONNECT is accepted as user `u1`.
+    fn start() -> Harness { start_with(|_| Some("u1".into())) }
+
+    fn start_with(authenticate: impl Fn(Option<&str>) -> Option<String> + Send + 'static) -> Harness {
         let (in_tx, in_rx) = mpsc::unbounded_channel::<Message>();
         let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (notif_tx, notif_rx) = broadcast::channel(4);
@@ -437,7 +502,7 @@ mod tests {
             if let Message::Binary(b) = m { let _ = tx.send(b.to_vec()); }
             Ok::<_, std::convert::Infallible>(tx)
         }));
-        let task = tokio::spawn(run_mqtt_session(sink, incoming, notif_rx, || 42));
+        let task = tokio::spawn(run_mqtt_session(sink, incoming, notif_rx, || 42, authenticate));
         (in_tx, out_rx, notif_tx, task)
     }
 
@@ -448,6 +513,13 @@ mod tests {
     fn connect() -> Message {
         // CONNECT, MQTT 3.1.1, clean session, keepalive 60, client id "c"
         Message::Binary(vec![0x10, 13, 0, 4, b'M', b'Q', b'T', b'T', 4, 2, 0, 60, 0, 1, b'c'].into())
+    }
+
+    /// CONNECT with username "dev" and `password`.
+    fn connect_with_password(password: &str) -> Message {
+        let mut p = vec![0x10, (10 + 3 + 5 + 2 + password.len()) as u8, 0, 4, b'M', b'Q', b'T', b'T', 4, 0xC2, 0, 60, 0, 1, b'c', 0, 3, b'd', b'e', b'v', 0, password.len() as u8];
+        p.extend_from_slice(password.as_bytes());
+        Message::Binary(p.into())
     }
 
     fn subscribe(topic: &str) -> Message {
@@ -525,8 +597,55 @@ mod tests {
     fn publish_topics_are_deduplicated_and_concrete() {
         let subs = vec!["a".to_string(), "a".to_string(), "#".to_string(), "b/+".to_string(), String::new()];
         let msg = WsMessage::sync_complete(1, "local-server", "u");
-        let packets = notification_publishes(&msg, &subs);
+        let packets = notification_publishes(&msg, &subs, "u");
         assert_eq!(packets.len(), 1);
         assert_eq!(parse_publish(&packets[0]).0, "a");
+        assert!(notification_publishes(&msg, &subs, "someone-else").is_empty(), "another user's event");
+        assert_eq!(notification_publishes(&WsMessage::sync_complete(1, "local-server", SERVER_USER), &subs, "u").len(), 1, "server-wide event");
+    }
+
+    #[test]
+    fn connect_token_reads_password_else_username() {
+        let body = |m: Message| { let Message::Binary(b) = m else { unreachable!() }; b[2..].to_vec() };
+        assert_eq!(connect_token(&body(connect_with_password("tok"))).as_deref(), Some("tok"));
+        assert_eq!(connect_token(&body(connect_with_password(""))).as_deref(), Some("dev"), "empty password falls back to username");
+        assert_eq!(connect_token(&body(connect())), None, "no credentials");
+        // Will flag set: will topic and message come before the username/password.
+        let will = [0, 4, b'M', b'Q', b'T', b'T', 4, 0xC6, 0, 60, 0, 1, b'c', 0, 1, b'w', 0, 2, 1, 2, 0, 1, b'u', 0, 2, b'p', b'w'];
+        assert_eq!(connect_token(&will).as_deref(), Some("pw"));
+        assert_eq!(connect_token(&will[..will.len() - 1]), None, "truncated");
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_connect_is_refused_and_gets_nothing() {
+        let (in_tx, mut out, notif, task) = start_with(|t| (t == Some("good")).then(|| "u1".to_string()));
+        in_tx.send(connect()).unwrap();
+        assert_eq!(next(&mut out).await, build_connack(false, 5), "not authorized");
+        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        let _ = notif.send(WsMessage::sync_complete(1, "local-server", "u1"));
+        assert!(out.recv().await.is_none(), "session closed without publishing");
+
+        let (in_tx, mut out, _notif, task) = start_with(|t| (t == Some("good")).then(|| "u1".to_string()));
+        in_tx.send(connect_with_password("bad")).unwrap();
+        assert_eq!(next(&mut out).await, build_connack(false, 5));
+        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_client_only_gets_its_users_notifications() {
+        let (in_tx, mut out, notif, _task) = start_with(|t| (t == Some("good")).then(|| "u1".to_string()));
+        in_tx.send(connect_with_password("good")).unwrap();
+        assert_eq!(next(&mut out).await, build_connack(false, 0));
+        in_tx.send(subscribe("t")).unwrap();
+        assert_eq!(next(&mut out).await[0], 0x90);
+        let (_, body) = parse_publish(&next(&mut out).await);
+        assert_eq!(body["message"]["attributes"]["auth0UserID"], "u1", "catch-up carries the session's user");
+
+        notif.send(WsMessage::sync_complete(5, "dev", "u2")).unwrap();
+        notif.send(WsMessage::sync_complete(6, "dev", "u1")).unwrap();
+        let (_, body) = parse_publish(&next(&mut out).await);
+        assert_eq!((&body["message"]["attributes"]["event"], &body["message"]["attributes"]["auth0UserID"]), (&serde_json::json!("SyncComplete"), &serde_json::json!("u1")), "u2's event was skipped");
+        in_tx.send(Message::Binary(vec![0xC0, 0x00].into())).unwrap(); // PINGREQ
+        assert_eq!(next(&mut out).await, build_pingresp(), "nothing else was queued");
     }
 }

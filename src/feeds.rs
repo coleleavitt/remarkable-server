@@ -1454,14 +1454,17 @@ pub async fn sync_to_device(
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<serde_json::Value>> {
     let sub = state.manager.get_subscription(&id)?;
+    let before = state.manager.storage.get_root().generation;
     // Only this subscription's articles, so each lands in its own configured folder.
-    let synced = state.manager.sync_articles_to_folder(Some(&sub.id), &sub.folder)?;
-    if synced > 0 {
+    let result = state.manager.sync_articles_to_folder(Some(&sub.id), &sub.folder);
+    // Articles (and the folder) are committed one by one and marked synced, so a later
+    // failure must not swallow the push for what already landed: retries skip those.
+    let generation = state.manager.storage.get_root().generation;
+    if generation != before {
         // Tell connected devices to pull the new root, as document uploads do.
-        let generation = state.manager.storage.get_root().generation;
         let _ = state.notification_tx.send(crate::notifications::WsMessage::sync_complete(generation, "local-server", "local-user"));
     }
-    Ok(Json(serde_json::json!({ "synced": synced })))
+    Ok(Json(serde_json::json!({ "synced": result? })))
 }
 
 // ============================================================================
@@ -1554,5 +1557,26 @@ mod folder_sync_tests {
         assert_eq!(msg.message.attributes.event, "SyncComplete");
         sync_to_device(State(state), UrlPath("news".into())).await.unwrap();
         assert!(rx.try_recv().is_err(), "nothing new, no push");
+    }
+
+    #[tokio::test]
+    async fn sync_to_device_notifies_committed_articles_even_when_a_later_one_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path().join("storage")).unwrap();
+        let manager = Arc::new(FeedManager::new(&tmp.path().join("feeds.db"), storage.clone(), &tmp.path().join("epub")).unwrap());
+        manager.db.lock().execute("INSERT INTO subscriptions (id, name, url, feed_type, created_at, updated_at, folder) VALUES ('news', 'news', 'news', 'rss', ?1, ?1, 'News')", [Utc::now().to_rfc3339()]).unwrap();
+        // Newest first: a1 syncs, then a2's EPUB can't be read.
+        let mut ok = article("a1", "news"); ok.published_at = Some(Utc::now());
+        let mut bad = article("a2", "news"); bad.published_at = Some(Utc::now() - chrono::Duration::days(1));
+        bad.epub_path = Some(tmp.path().join("missing.epub").to_string_lossy().into());
+        manager.save_articles(&[ok, bad]).unwrap();
+        let (notification_tx, mut rx) = tokio::sync::broadcast::channel(4);
+        let state = FeedState { manager, scheduler: None, notification_tx };
+
+        assert!(sync_to_device(State(state.clone()), UrlPath("news".into())).await.is_err(), "the failure is still reported");
+        let msg = rx.try_recv().expect("SyncComplete for the article that did land");
+        assert_eq!(msg.message.attributes.event, "SyncComplete");
+        assert!(tree(&storage).iter().any(|n| n.1 == "Title a1"));
+        assert!(rx.try_recv().is_err());
     }
 }
