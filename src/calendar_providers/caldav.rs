@@ -734,13 +734,26 @@ fn href_key(href: &Url) -> String {
 /// Whether `href` names a resource inside `collection` (on its server, below its path): what a
 /// `calendar-multiget` on the collection may ask for. Not the collection itself, which would
 /// ask for all of it.
+///
+/// The paths are compared with their percent-encoding undone, as [`href_key`] does: Radicale
+/// encodes every href it sends (`@` as `%40`, `+` as `%2B`), while a collection URL configured
+/// by hand keeps them as typed, as for an email address user name. They are compared a segment
+/// at a time, so an encoded `/` stays inside its segment.
 fn inside(collection: &Url, href: &Url) -> bool {
-    let dir = collection.path().trim_end_matches('/');
-    href.origin() == collection.origin()
-        && href
-            .path()
-            .strip_prefix(dir)
-            .is_some_and(|rest| rest.len() > 1 && rest.starts_with('/'))
+    if href.origin() != collection.origin() {
+        return false;
+    }
+    let same = |a: &str, b: &str| {
+        urlencoding::decode_binary(a.as_bytes()) == urlencoding::decode_binary(b.as_bytes())
+    };
+    let mut path = href.path().split('/');
+    let below = collection
+        .path()
+        .trim_end_matches('/')
+        .split('/')
+        .all(|dir| path.next().is_some_and(|segment| same(segment, dir)));
+    // Something is left besides a trailing `/`.
+    below && !matches!((path.next(), path.next()), (None, _) | (Some(""), None))
 }
 
 /// The events of a REPORT's multistatus answer, expanded into their occurrences in `window`;
@@ -1404,6 +1417,53 @@ mod tests {
     }
 
     #[test]
+    fn series_of_rdates_are_fetched_whole_however_the_collection_path_is_encoded() {
+        // Radicale percent-encodes every href it sends (`@` as `%40`, `+` as `%2B`), while a
+        // collection URL configured by hand keeps them as typed; or the other way round.
+        for (collection, href) in [
+            (
+                "https://dav.example/alice@example.com/cal/",
+                "/alice%40example.com/cal/a.ics",
+            ),
+            (
+                "https://dav.example/alice%40example.com/cal/",
+                "/alice@example.com/cal/a.ics",
+            ),
+            ("https://dav.example/a+b/", "/a%2Bb/a.ics"),
+            ("https://dav.example/a%2bb/", "/a%2Bb/a.ics"),
+        ] {
+            let mut report = read_report(
+                &answer(collection, &with_data(href, "\"a1\"", &rdates("a"))),
+                "c",
+                march(),
+                true,
+            )
+            .unwrap();
+            assert_eq!(report.incomplete, None, "{} {}", collection, href);
+            // Asked for as the server named it.
+            let paths: Vec<_> = report.refetch.values().map(Url::path).collect();
+            assert_eq!(paths, [href], "{}", collection);
+            report.read_refetched(Ok(answer(
+                collection,
+                &with_data(href, "\"a2\"", &rdates("a")),
+            )));
+            let fetched = report.finish();
+            assert_eq!(fetched.incomplete, None, "{} {}", collection, href);
+            assert_eq!(
+                ids(&fetched.events),
+                [
+                    ("c:a:20260302T090000Z", Some("\"a2\"")),
+                    ("c:a:20260309T090000Z", Some("\"a2\"")),
+                    ("c:a:20260316T090000Z", Some("\"a2\"")),
+                ],
+                "{} {}",
+                collection,
+                href
+            );
+        }
+    }
+
+    #[test]
     fn series_of_rdates_that_cannot_be_fetched_whole_are_left_out() {
         let expanded = answer(
             "https://dav.example/cal/",
@@ -1513,13 +1573,17 @@ mod tests {
         }
 
         // One whose href is on another server, outside the collection, the collection itself
-        // or missing cannot be fetched from this collection.
+        // (however it is encoded) or missing cannot be fetched from this collection. An
+        // encoded `/` does not split a segment.
         for href in [
             "https://other.example/cal/x.ics",
             "/other/x.ics",
             "/calendar.ics",
+            "/cal%2Fx.ics",
             "/cal/",
             "/cal",
+            "/%63al/",
+            "/%63al",
             "",
         ] {
             let report = read_report(

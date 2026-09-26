@@ -1104,6 +1104,8 @@ async fn caldav_series_of_rdates_left_unexpanded_are_fetched_whole_and_keep_thei
     // master as is and drops the VEVENTs that move or cancel its occurrences. Expanding that
     // master here would show the moved occurrence at its old time and the cancelled one as
     // still on, so the resource is fetched whole with `calendar-multiget` and expanded here.
+    // Radicale also percent-encodes every href it sends, while the collection URL configured
+    // here spells out the `@` of an email address user name: the series is fetched still.
     let today = Utc::now().date_naive();
     let d = |n: i64| (today + Duration::days(n)).format("%Y%m%d").to_string();
     let master = format!(
@@ -1126,10 +1128,10 @@ async fn caldav_series_of_rdates_left_unexpanded_are_fetched_whole_and_keep_thei
         ))
     };
     let expanded_answer = format!(
-        r#"<d:response><d:href>/cal/physio.ics</d:href><d:propstat><d:prop>
+        r#"<d:response><d:href>/alice%40example.com/cal/physio.ics</d:href><d:propstat><d:prop>
             <d:getetag>"p1"</d:getetag><cal:calendar-data>{}</cal:calendar-data>
            </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
-           <d:response><d:href>/cal/review.ics</d:href><d:propstat><d:prop>
+           <d:response><d:href>/alice%40example.com/cal/review.ics</d:href><d:propstat><d:prop>
             <d:getetag>"r1"</d:getetag><cal:calendar-data>{}</cal:calendar-data>
            </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"#,
         calendar_data(&master),
@@ -1139,7 +1141,7 @@ async fn caldav_series_of_rdates_left_unexpanded_are_fetched_whole_and_keep_thei
         ))
     );
     let stored_answer = format!(
-        r#"<d:response><d:href>/cal/physio.ics</d:href><d:propstat><d:prop>
+        r#"<d:response><d:href>/alice%40example.com/cal/physio.ics</d:href><d:propstat><d:prop>
             <d:getetag>"p1"</d:getetag><cal:calendar-data>{}</cal:calendar-data>
            </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"#,
         calendar_data(&format!("{}{}", master, overrides))
@@ -1156,7 +1158,7 @@ async fn caldav_series_of_rdates_left_unexpanded_are_fetched_whole_and_keep_thei
                 async move {
                     match method.as_str() {
                         "PROPFIND" => multistatus(
-                            r#"<d:response><d:href>/cal/</d:href><d:propstat><d:prop>
+                            r#"<d:response><d:href>/alice%40example.com/cal/</d:href><d:propstat><d:prop>
                                 <d:resourcetype><d:collection/><cal:calendar/></d:resourcetype>
                                </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"#,
                         ),
@@ -1189,7 +1191,7 @@ async fn caldav_series_of_rdates_left_unexpanded_are_fetched_whole_and_keep_thei
         "Health",
         CalendarProvider::Caldav,
         CalendarConfig::Caldav {
-            url: format!("{}/cal/", base),
+            url: format!("{}/alice@example.com/cal/", base),
             username: String::new(),
             password: None,
             bearer_token: None,
@@ -1259,7 +1261,11 @@ async fn caldav_series_of_rdates_left_unexpanded_are_fetched_whole_and_keep_thei
         assert!(query.1.contains("<C:expand"));
         assert_eq!(multiget.0, None);
         assert!(multiget.1.contains("<C:calendar-multiget"));
-        assert!(multiget.1.contains("<D:href>/cal/physio.ics</D:href>"));
+        assert!(
+            multiget
+                .1
+                .contains("<D:href>/alice%40example.com/cal/physio.ics</D:href>")
+        );
         assert!(!multiget.1.contains("review.ics"));
         assert!(!multiget.1.contains("expand") && !multiget.1.contains("filter"));
     }
