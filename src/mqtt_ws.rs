@@ -15,10 +15,11 @@
 //! SUBSCRIBE filters are logged at debug there); if it does, sync pushes belong on
 //! that broker, not on this endpoint.
 //!
-//! Path and topic are unverified guesses kept for other clients: nothing pins a
-//! path (`mqttbroker` in discovery is a bare host), so this uses the conventional
-//! MQTT-over-WebSocket path (VerneMQ's and Paho's default), and publishes on each
-//! concrete topic the client subscribed to.
+//! Path and topic are unverified guesses kept for other clients: nothing verified
+//! pins a path (`mqttbroker` in discovery is a bare host; remarkable-rs only
+//! *expects* `wss://vernemq-.../mqtt`, on the broker host, not this API host), so
+//! this uses the conventional MQTT-over-WebSocket path (VerneMQ's and Paho's
+//! default), and publishes on each concrete topic the client subscribed to.
 
 use axum::Router;
 use axum::extract::State;

@@ -185,10 +185,30 @@ Whether it also subscribes to sync topics there is unconfirmed (see the SUBSCRIB
 - Other clients on :8883 are operator tooling, not the tablet (`viewer-<hex>`, `viewer-probe-<hex>`,
   `capture-local-us`), plus 107 failed TLS handshakes from internet scanners.
 
-remarkable-mqtt (remarkable-rs) comparison: its `topics.rs` sync topics (`user/{uid}/sync`,
-`user/{uid}/client/{cid}/{notifications,sync}`) describe reMarkable's cloud VerneMQ broker and are not
-marked as verified; its client uses raw MQTT over TLS, not WebSocket. Nothing there, and nothing in
-the logs above, points at an MQTT-over-WebSocket `/mqtt` endpoint.
+remarkable-rs comparison (at the pinned rev `9fe198a`). remarkable-rs does name an MQTT-over-WebSocket
+`/mqtt` endpoint, which is the likely origin of the `/mqtt` guess, but only as unverified expectations:
+- `TRAFFIC_CAPTURE.md` lists `Endpoint: wss://vernemq-prod.eu.remarkable.engineering/mqtt` under
+  "Expected Findings", a capture plan, not a capture.
+- `crates/remarkable-mqtt/src/lib.rs` documents the broker as
+  `vernemq-prod.cloud.remarkable.engineering`, `Port: 443 (WebSocket over TLS)`, and the
+  `remarkable-mqtt info` command prints `Broker: wss://{broker}:{port}`
+  (`src/bin/remarkable_mqtt.rs`).
+
+Its own client does not follow them: `client.rs` connects with `Transport::Tls` (raw MQTT over TLS)
+to `vernemq-prod.cloud.remarkable.engineering:443`. Its `topics.rs` sync topics (`user/{uid}/sync`,
+`user/{uid}/client/{cid}/{notifications,sync}`) describe reMarkable's cloud VerneMQ broker and are
+not marked as verified.
+
+Neither remarkable-rs nor the logs above support a WebSocket `/mqtt` on the API host:
+- The endpoint remarkable-rs expects is on the broker (vernemq) host, not the API host. Here the
+  tablet's `/etc/hosts` points the broker names at `127.0.0.2` (DEPLOYMENT.md), and rm-proxy routes
+  that to the :8883 broker (`contrib/tablet/rm-proxy.service`: `127.0.0.2:443=remarkable.unwrap.rs:8883`).
+  The API-host routes (`127.0.0.1:443`, nginx) saw 0 requests for `mqtt`.
+- The :8883 broker (`src/screenshare.rs`, `serve`/`session`) reads MQTT packets straight off the TLS
+  stream and has no WebSocket handling. So the tablet's 30 successful CONNECTs there show that
+  xochitl 3.3.2 speaks raw MQTT over TLS to the broker host, as remarkable-mqtt's client does, not WSS.
+- Even a firmware that did use WSS would dial the broker host, so an API-host `/mqtt` would be the
+  wrong host for it either way.
 
 Action taken: `/mqtt` is opt-in (`MQTT_WS_NOTIFICATIONS=1`), not served by default, which removes
 an authenticated but unused WebSocket endpoint from the public host. Its tests enable it explicitly.
