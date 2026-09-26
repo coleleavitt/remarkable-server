@@ -81,6 +81,19 @@ ssh linode 'tar -C /var/lib -czf - remarkable-server' > rms-backup-$(date +%F).t
 # 500 with a reason if part of the current tree couldn't be parsed
 curl -H "x-admin-token: $ADMIN_TOKEN" 'https://remarkable.unwrap.rs/admin/storage/unreachable?grace_secs=86400'
 
+# garbage-collect those blobs (storage otherwise only grows). Never automatic.
+# Storage is the tablet's only cloud copy: take the backup above first, then dry-run.
+# dry_run defaults to true and grace_secs to 604800 (7 days); a dry run lists the
+# candidates and their total bytes without deleting anything.
+curl -X POST -H "x-admin-token: $ADMIN_TOKEN" 'https://remarkable.unwrap.rs/admin/storage/gc'
+# after reviewing the dry run, delete for real (each deleted hash is logged: "gc: deleted unreachable blob")
+curl -X POST -H "x-admin-token: $ADMIN_TOKEN" 'https://remarkable.unwrap.rs/admin/storage/gc?dry_run=false&grace_secs=604800'
+# 500 = refused (no root, or part of the current tree missing/unparsed): nothing deleted.
+# 409 = a sync committed a new root mid-run: deletion stopped, body is the partial report;
+#       just run it again. Live = current + previous root trees, version history, and
+#       anything written or checked (check-files) within grace; each blob is re-checked
+#       under the sync.db write lock right before it is removed.
+
 # after a tablet software update (/etc may be reset)
 #   re-check /etc/hosts entries and that the local CA is still trusted,
 #   then re-apply the hosts edit above and `systemctl enable --now rm-proxy`.

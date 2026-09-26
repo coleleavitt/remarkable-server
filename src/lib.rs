@@ -330,6 +330,7 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/admin/reports", get(reports::list))
         .route("/admin/storage/unreachable", get(api::unreachable_blobs))
+        .route("/admin/storage/gc", post(api::storage_gc))
         // Third-party integrations (none configured)
         .route("/integrations/v1/", get(service::list_integrations))
         .route(
