@@ -79,7 +79,7 @@ CREATE INDEX IF NOT EXISTS entries_hash ON entries(hash);
 ///
 /// A crash may leave the old file or a stray temp file, but never a
 /// half-written `path`.
-fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
+pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("tmp");
     let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);

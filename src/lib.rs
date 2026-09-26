@@ -300,7 +300,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/admin/mdm/instructions", get(mdm::admin_list))
         .route(
             "/post",
-            post(crash::upload).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
+            post(crash::upload).layer(DefaultBodyLimit::max(crash::MAX_BODY)),
         )
         .route("/settings/v1/features", get(service::get_beta))
         // Telemetry / analytics (ping.remarkable.com), kept in reports.jsonl.
