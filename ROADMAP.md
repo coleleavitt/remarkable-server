@@ -56,6 +56,14 @@ These are done and, in several cases, ahead of rmfakecloud:
   Wallabag password) are stored in `readlater.db` apart from the config, survive
   restarts, refreshed tokens are saved at once, never returned by the API;
   Wallabag refreshes on 401, Instapaper xAuth login; Omnivore removed (#27).
+- ✅ **Remote calendar providers** — CalDAV (basic/bearer auth, collection
+  discovery, `calendar-query` REPORT with recurrence expansion), Google Calendar
+  API v3 and Microsoft Graph (Exchange Online / Microsoft 365) sync a
+  -30d..+365d window, removing events deleted upstream. Credentials persist in
+  `calendars.db` (mode 0600) apart from the config and never reach API
+  responses; OAuth tokens refresh on expiry or 401 and are saved even when the
+  sync fails or the client disconnects. On-premises Exchange (EWS) is not
+  supported and says so.
 - ✅ **Read-later sync runs** — a scheduler (per-account interval, backoff on
   account-wide failures, one sync per account at a time) and the `/sync`
   endpoints put new articles on the tablet as EPUB/PDF documents through the
@@ -145,8 +153,6 @@ The community's top *concrete* pains. Small, bounded, high-value.
   (the base64 blob is decoded to disk as it arrives); handwriting convert (64
   MiB, read after auth) and share-by-email (25 MiB, 413 over it) still read the
   request into memory, but with limits sized to what they carry instead of 1 GiB.
-- ⬜ **Remote calendar providers** — only local ICS files sync; CalDAV, Google
-  and Office 365 calendars answer "not implemented".
 - ✅ **`/mqtt` topic** — checked against the production logs: the tablet
   (xochitl 3.3.2) never requests `/mqtt` and gets sync pushes over
   `/notifications/ws/json/1`; its observed MQTT is screen share signalling on

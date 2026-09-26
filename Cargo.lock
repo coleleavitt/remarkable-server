@@ -2936,6 +2936,7 @@ dependencies = [
  "parking_lot",
  "png",
  "proptest",
+ "quick-xml",
  "rand 0.8.8",
  "readability",
  "regex",
