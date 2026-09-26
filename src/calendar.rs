@@ -14,7 +14,14 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub use self::ics::{Expansion, UNTITLED_EVENT, parse_ics_expanded, parse_ics_file, parse_ics_str};
+pub use self::ics::{
+    Expansion,
+    IcsEvents,
+    UNTITLED_EVENT,
+    parse_ics_expanded,
+    parse_ics_file,
+    parse_ics_str,
+};
 
 #[derive(Error, Debug)]
 pub enum CalendarError {
@@ -957,7 +964,8 @@ mod tests {
                     (base + Duration::days(days)).format("%Y%m%dT%H%M%SZ")
                 ),
                 "c",
-            );
+            )
+            .events;
             e.pop().unwrap()
         };
         for e in [event("kept", 1), event("gone", 2), event("outside", 100)] {

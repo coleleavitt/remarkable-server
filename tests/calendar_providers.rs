@@ -233,7 +233,8 @@ async fn google_refreshes_rejected_token_follows_pages_and_persists_it() {
                 (Utc::now() + Duration::days(days)).format("%Y%m%dT%H%M%SZ")
             ),
             "g1",
-        );
+        )
+        .events;
         e.pop().unwrap()
     };
     mgr.upsert_event(&stale("deleted-upstream", 1)).unwrap();

@@ -5,7 +5,7 @@
 
 use chrono::{Days, Duration, NaiveDateTime};
 
-use super::recurrence::{Exhausted, Rule};
+use super::recurrence::{Exhausted, Rule, charge};
 
 /// A STANDARD or DAYLIGHT observance: from each onset on, the zone is `offset_to` from UTC.
 #[derive(Debug, Default)]
@@ -57,8 +57,8 @@ impl Observance {
         }
     }
 
-    /// The latest onset at or before `local`. Each period an RRULE walks costs one unit of
-    /// `budget`.
+    /// The latest onset at or before `local`. Walking the RRULE is paid for from `budget`
+    /// (see [`Rule::walk`]).
     fn last_onset(
         &self,
         local: NaiveDateTime,
@@ -112,8 +112,8 @@ impl Zone {
 
     /// Seconds east of UTC at wall-clock time `local`: the offset of the latest onset at or
     /// before it, or the offset the earliest onset changes from when `local` precedes them
-    /// all. `None` when the zone has no usable observance. Each observance, and each period
-    /// its RRULE walks, costs one unit of `budget`.
+    /// all. `None` when the zone has no usable observance. Each observance costs one step of
+    /// `budget`, and walking its RRULE the steps [`Rule::walk`] charges.
     pub(super) fn offset_at(
         &self,
         local: NaiveDateTime,
@@ -121,7 +121,7 @@ impl Zone {
     ) -> Result<Option<i32>, Exhausted> {
         let mut latest: Option<(NaiveDateTime, i32)> = None;
         for o in &self.observances {
-            *budget = budget.checked_sub(1).ok_or(Exhausted)?;
+            charge(budget, 1)?;
             if let (Some(onset), Some(offset)) = (o.last_onset(local, budget)?, o.offset_to) {
                 if latest.is_none_or(|(at, _)| onset > at) {
                     latest = Some((onset, offset));
@@ -336,9 +336,10 @@ mod tests {
             zone.offset_at(at("20260706T090000"), &mut budget),
             Ok(Some(7200))
         );
-        // Two observances, each skipping ahead to a few yearly periods.
+        // Two observances, each skipping ahead to a few yearly periods (three steps for the
+        // period and its BYMONTH and BYDAY entries, one for its date).
         let cost = 1_000 - budget;
-        assert!((2..=16).contains(&cost), "{}", cost);
+        assert!((2..=48).contains(&cost), "{}", cost);
         assert_eq!(
             zone.offset_at(at("20260706T090000"), &mut 3),
             Err(Exhausted)

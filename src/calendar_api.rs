@@ -562,11 +562,19 @@ pub async fn sync_calendar_endpoint(
         .ok_or_else(|| ServerError::NotFound(id.clone()))?;
     let count = match &calendar.config {
         CalendarConfig::Ics { path, .. } => {
-            let events = parse_ics_file(path, &calendar.id).map_err(ServerError::from)?;
-            let count = events.len();
+            let parsed = parse_ics_file(path, &calendar.id).map_err(ServerError::from)?;
+            let count = parsed.events.len();
             let mut mgr = state.manager.lock();
-            for event in events {
-                mgr.upsert_event(&event)?;
+            for event in &parsed.events {
+                mgr.upsert_event(event)?;
+            }
+            // Like an incomplete remote answer: what came is stored, the sync time is not.
+            if parsed.incomplete {
+                return Ok(Json(SyncResponse::new(
+                    id,
+                    count,
+                    Some(ICS_ZONES_TOO_COSTLY.to_string()),
+                )));
             }
             mgr.set_last_sync(&id, Utc::now())?;
             count
@@ -670,39 +678,54 @@ async fn fetch_and_store(state: &CalendarState, id: &str) -> SyncResponse {
     }
 }
 
+/// Why an ICS sync is incomplete, see [`IcsEvents::incomplete`](crate::calendar::IcsEvents).
+const ICS_ZONES_TOO_COSTLY: &str = "too many time zone rules to go through: events whose \
+                                    times could not be converted were not stored";
+
 /// Load an ICS calendar's file; failures are reported in the result.
 fn sync_ics(state: &CalendarState, calendar: &Calendar, path: &std::path::Path) -> SyncResponse {
-    let (count, error) = match parse_ics_file(path, &calendar.id) {
-        Ok(events) => {
-            let total = events.len();
-            let mut mgr = state.manager.lock();
-            let failures: Vec<String> = events
-                .iter()
-                .filter_map(|e| {
-                    mgr.upsert_event(e)
-                        .err()
-                        .map(|err| format!("{}: {}", e.uid, err))
-                })
-                .collect();
-            let error = if failures.is_empty() {
-                // Reported like a remote sync's: a sync whose time was not saved did not
-                // fully succeed.
-                mgr.set_last_sync(&calendar.id, Utc::now())
-                    .err()
-                    .map(|e| format!("saving sync time failed: {}", e))
-            } else {
-                Some(format!(
-                    "{} of {} events failed to save: {}",
-                    failures.len(),
-                    total,
-                    failures.join("; ")
-                ))
-            };
-            (total - failures.len(), error)
+    let parsed = match parse_ics_file(path, &calendar.id) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            return SyncResponse::new(
+                calendar.id.clone(),
+                0,
+                Some(format!("ICS load failed: {}", e)),
+            );
         }
-        Err(e) => (0, Some(format!("ICS load failed: {}", e))),
     };
-    SyncResponse::new(calendar.id.clone(), count, error)
+    let total = parsed.events.len();
+    let mut mgr = state.manager.lock();
+    let failures: Vec<String> = parsed
+        .events
+        .iter()
+        .filter_map(|e| {
+            mgr.upsert_event(e)
+                .err()
+                .map(|err| format!("{}: {}", e.uid, err))
+        })
+        .collect();
+    let mut errors = Vec::new();
+    if parsed.incomplete {
+        errors.push(ICS_ZONES_TOO_COSTLY.to_string());
+    }
+    if !failures.is_empty() {
+        errors.push(format!(
+            "{} of {} events failed to save: {}",
+            failures.len(),
+            total,
+            failures.join("; ")
+        ));
+    }
+    // Reported like a remote sync's: a sync that missed events, or whose time was not saved,
+    // did not fully succeed.
+    if errors.is_empty() {
+        if let Err(e) = mgr.set_last_sync(&calendar.id, Utc::now()) {
+            errors.push(format!("saving sync time failed: {}", e));
+        }
+    }
+    let error = (!errors.is_empty()).then(|| errors.join("; "));
+    SyncResponse::new(calendar.id.clone(), total - failures.len(), error)
 }
 
 pub async fn sync_all_calendars(
@@ -872,6 +895,79 @@ mod tests {
                 .last_sync
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn an_ics_file_too_costly_to_convert_keeps_the_stored_times() {
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zones.ics");
+        let fixed = "BEGIN:VTIMEZONE\nTZID:Fixed\nBEGIN:STANDARD\nTZOFFSETFROM:+0100\nTZOFFSETTO:+0100\nDTSTART:19700101T000000\nEND:STANDARD\nEND:VTIMEZONE\n";
+        let late = "BEGIN:VEVENT\nUID:late\nDTSTART;TZID=Fixed:20260105T090000\nEND:VEVENT\n";
+        std::fs::write(&path, format!("{}{}", fixed, late)).unwrap();
+        let mut mgr = CalendarManager::new(&dir.path().join("cal.db")).unwrap();
+        mgr.add_calendar(ics_calendar("ics", path.clone())).unwrap();
+        let state = CalendarState::new(mgr);
+        let Json(first) = sync_calendar_endpoint(State(state.clone()), Path("ics".into()))
+            .await
+            .unwrap();
+        assert!(first.success, "{:?}", first.error);
+        let synced_at = state.manager.lock().get_calendar("ics").unwrap().last_sync;
+        assert!(synced_at.is_some());
+        // Now an event in a zone whose rules cost more than the whole budget comes first:
+        // observances with yearly COUNT rules, walked from year 1 on every lookup, whose long
+        // BYMONTHDAY and BYDAY lists never agree on a day.
+        let weekdays: Vec<String> = [2, 3, 4, -2, -3, -4]
+            .iter()
+            .flat_map(|n| ["MO", "TU", "WE", "TH", "FR", "SA", "SU"].map(|d| format!("{}{}", n, d)))
+            .collect();
+        let observance = format!(
+            "BEGIN:STANDARD\nTZOFFSETFROM:+0100\nTZOFFSETTO:+0100\nDTSTART:00010101T000000\nRRULE:FREQ=YEARLY;COUNT=4000000000;BYMONTH=1,2,3,4,5,6,7,8,9,10,11,12;BYMONTHDAY=29,30,31,-29,-30,-31;BYDAY={}\nEND:STANDARD\n",
+            weekdays.join(",")
+        );
+        let costly = format!(
+            "BEGIN:VTIMEZONE\nTZID:Costly\n{}END:VTIMEZONE\nBEGIN:VEVENT\nUID:costly\nDTSTART;TZID=Costly:20260105T090000\nEND:VEVENT\n",
+            observance.repeat(12)
+        );
+        let utc_event = "BEGIN:VEVENT\nUID:utc\nDTSTART:20260107T090000Z\nEND:VEVENT\n";
+        std::fs::write(&path, format!("{}{}{}{}", fixed, costly, late, utc_event)).unwrap();
+        let Json(single) = sync_calendar_endpoint(State(state.clone()), Path("ics".into()))
+            .await
+            .unwrap();
+        let Json(all) = sync_all_calendars(State(state.clone())).await.unwrap();
+        for result in [&single, &all[0]] {
+            assert!(!result.success);
+            // Only the UTC event could be stored.
+            assert_eq!(result.events_synced, 1);
+            let error = result.error.as_deref().unwrap();
+            assert!(error.contains("too many time zone rules"), "{}", error);
+        }
+        let mgr = state.manager.lock();
+        let stored = mgr
+            .get_events(
+                "ics",
+                &EventQuery {
+                    start: Some(at("2026-01-01T00:00:00Z")),
+                    end: Some(at("2026-02-01T00:00:00Z")),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // Still at 08:00 UTC, not moved to 09:00 by a time read as UTC; the costly event is
+        // not stored at a guessed time; the sync time is the complete sync's.
+        let starts: Vec<_> = stored.iter().map(|e| (e.uid.as_str(), e.start)).collect();
+        assert_eq!(
+            starts,
+            [
+                ("late", at("2026-01-05T08:00:00Z")),
+                ("utc", at("2026-01-07T09:00:00Z"))
+            ]
+        );
+        assert_eq!(mgr.get_calendar("ics").unwrap().last_sync, synced_at);
     }
 
     #[tokio::test]

@@ -2,9 +2,15 @@
 //! `DAILY`, `WEEKLY`, `MONTHLY` or `YEARLY` with `INTERVAL`, `COUNT`, `UNTIL`, `BYMONTH`,
 //! `BYMONTHDAY`, `BYDAY` and `WKST`.
 //!
-//! A rule with any other part (`BYSETPOS`, `BYWEEKNO`, `BYYEARDAY`, `BYHOUR`, ...) or a
-//! sub-daily frequency does not parse, and callers keep the event as its first occurrence.
-//! The same engine walks the onsets of VTIMEZONE observances.
+//! A rule with any other part (`BYSETPOS`, `BYWEEKNO`, `BYYEARDAY`, `BYHOUR`, ...), a
+//! sub-daily frequency or a `BYDAY` ordinal beyond 5 (no month has a sixth Monday) does not
+//! parse, and callers keep the event as its first occurrence. The same engine walks the onsets
+//! of VTIMEZONE observances.
+//!
+//! Walks are paid for in steps of a budget: each period costs one step plus one per `BY` list
+//! entry it goes through, and each date it yields one more. The lists are deduplicated when
+//! parsed (at most 12 months, 62 month days and 77 weekdays), so a step is a bounded amount of
+//! work whatever the rule says.
 
 use chrono::{Datelike, Days, Months, NaiveDate, NaiveDateTime, Weekday};
 
@@ -24,7 +30,7 @@ enum Until {
     Date(NaiveDate),
 }
 
-/// A parsed RRULE.
+/// A parsed RRULE. The `BY` lists are sorted and hold each value once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Rule {
     freq: Freq,
@@ -38,9 +44,23 @@ pub(super) struct Rule {
     wkst: Weekday,
 }
 
-/// The period budget ran out before the walk ended.
+/// The step budget ran out before the walk ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Exhausted;
+
+/// Take `steps` from `budget`. Once it cannot pay, the budget is spent for good.
+pub(super) fn charge(budget: &mut usize, steps: usize) -> Result<(), Exhausted> {
+    match budget.checked_sub(steps) {
+        Some(left) => {
+            *budget = left;
+            Ok(())
+        }
+        None => {
+            *budget = 0;
+            Err(Exhausted)
+        }
+    }
+}
 
 fn weekday(code: &str) -> Option<Weekday> {
     Some(match code {
@@ -55,8 +75,19 @@ fn weekday(code: &str) -> Option<Weekday> {
     })
 }
 
-fn list<T>(value: &str, item: impl Fn(&str) -> Option<T>) -> Option<Vec<T>> {
-    value.split(',').map(|v| item(v.trim())).collect()
+/// The items of a comma-separated list, sorted by `key` and each kept once.
+fn list<T, K: Ord>(
+    value: &str,
+    item: impl Fn(&str) -> Option<T>,
+    key: impl Fn(&T) -> K,
+) -> Option<Vec<T>> {
+    let mut items: Vec<T> = value
+        .split(',')
+        .map(|v| item(v.trim()))
+        .collect::<Option<_>>()?;
+    items.sort_unstable_by_key(&key);
+    items.dedup_by(|a, b| key(a) == key(b));
+    Some(items)
 }
 
 fn parse_until(value: &str) -> Option<Until> {
@@ -74,27 +105,68 @@ fn parse_until(value: &str) -> Option<Until> {
         .map(Until::Date)
 }
 
-fn days_in_month(year: i32, month: u32) -> u32 {
-    let first = NaiveDate::from_ymd_opt(year, month, 1);
-    let next = first.and_then(|d| d.checked_add_months(Months::new(1)));
-    match (first, next) {
-        (Some(first), Some(next)) => (next - first).num_days() as u32,
-        _ => 0,
-    }
+/// Days of a month as a bit set: bit `d` stands for day `d`.
+type DaySet = u32;
+
+/// The days in `set`, in order.
+fn days_in(set: DaySet) -> impl Iterator<Item = u32> {
+    (1..=31).filter(move |d| set & (1 << d) != 0)
 }
 
-/// Day of the month of the `n`th (from the end when negative) `weekday` of the month.
-fn nth_weekday(year: i32, month: u32, n: i32, weekday: Weekday) -> Option<u32> {
-    let len = days_in_month(year, month);
-    let first = NaiveDate::from_ymd_opt(year, month, 1)?.weekday();
-    let first_match = 1 + weekday.days_since(first);
-    let matches = (len.checked_sub(first_match)? / 7) + 1;
-    let index = match n {
-        1.. => u32::try_from(n).ok()?.checked_sub(1)?,
-        ..=-1 => matches.checked_sub(n.unsigned_abs())?,
-        0 => return None,
-    };
-    (index < matches).then(|| first_match + 7 * index)
+/// A month: how many days it has and the weekday it starts on.
+#[derive(Debug, Clone, Copy)]
+struct Month {
+    len: u32,
+    first: Weekday,
+}
+
+impl Month {
+    /// `None` when the month is outside chrono's range.
+    fn of(year: i32, month: u32) -> Option<Month> {
+        let first = NaiveDate::from_ymd_opt(year, month, 1)?.weekday();
+        let len = match month {
+            2 if NaiveDate::from_ymd_opt(year, 2, 29).is_some() => 29,
+            2 => 28,
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        Some(Month { len, first })
+    }
+
+    fn all(self) -> DaySet {
+        (u32::MAX >> (32 - self.len)) << 1
+    }
+
+    /// Day `d` of the month, counted from the end when negative.
+    fn day(self, d: i32) -> Option<u32> {
+        let day = if d < 0 { self.len as i32 + 1 + d } else { d };
+        u32::try_from(day)
+            .ok()
+            .filter(|day| (1..=self.len).contains(day))
+    }
+
+    /// The day of the `n`th (from the end when negative) `weekday` of the month.
+    fn nth_weekday(self, n: i32, weekday: Weekday) -> Option<u32> {
+        let first_match = 1 + weekday.days_since(self.first);
+        let matches = (self.len - first_match) / 7 + 1;
+        let index = match n {
+            1.. => u32::try_from(n).ok()? - 1,
+            ..=-1 => matches.checked_sub(n.unsigned_abs())?,
+            0 => return None,
+        };
+        (index < matches).then(|| first_match + 7 * index)
+    }
+
+    /// The days that fall on `weekday`.
+    fn weekdays(self, weekday: Weekday) -> DaySet {
+        let mut days = 0;
+        let mut day = 1 + weekday.days_since(self.first);
+        while day <= self.len {
+            days |= 1 << day;
+            day += 7;
+        }
+        days
+    }
 }
 
 impl Rule {
@@ -128,30 +200,43 @@ impl Rule {
                 "COUNT" => parsed.count = Some(value.parse().ok()?),
                 "UNTIL" => parsed.until = Some(parse_until(&value)?),
                 "BYMONTH" => {
-                    parsed.by_month =
-                        list(&value, |m| m.parse().ok().filter(|m| (1..=12).contains(m)))?
+                    parsed.by_month = list(
+                        &value,
+                        |m| m.parse().ok().filter(|m| (1..=12).contains(m)),
+                        |m| *m,
+                    )?
                 }
                 "BYMONTHDAY" => {
-                    parsed.by_month_day = list(&value, |d| {
-                        d.parse::<i32>()
-                            .ok()
-                            .filter(|d| *d != 0 && (-31..=31).contains(d))
-                    })?
-                }
-                "BYDAY" => {
-                    parsed.by_day = list(&value, |d| {
-                        let split = d.len().checked_sub(2)?;
-                        let (ordinal, day) = (d.get(..split)?, d.get(split..)?);
-                        let ordinal = match ordinal {
-                            "" => 0,
-                            n => n
-                                .trim_start_matches('+')
-                                .parse::<i32>()
+                    parsed.by_month_day = list(
+                        &value,
+                        |d| {
+                            d.parse::<i32>()
                                 .ok()
-                                .filter(|n| *n != 0 && (-53..=53).contains(n))?,
-                        };
-                        Some((ordinal, weekday(day)?))
-                    })?
+                                .filter(|d| *d != 0 && (-31..=31).contains(d))
+                        },
+                        |d| *d,
+                    )?
+                }
+                // Ordinals count within a month (see `supported` below), which has at most
+                // five of each weekday.
+                "BYDAY" => {
+                    parsed.by_day = list(
+                        &value,
+                        |d| {
+                            let split = d.len().checked_sub(2)?;
+                            let (ordinal, day) = (d.get(..split)?, d.get(split..)?);
+                            let ordinal = match ordinal {
+                                "" => 0,
+                                n => n
+                                    .trim_start_matches('+')
+                                    .parse::<i32>()
+                                    .ok()
+                                    .filter(|n| *n != 0 && (-5..=5).contains(n))?,
+                            };
+                            Some((ordinal, weekday(day)?))
+                        },
+                        |(n, wd)| (*n, wd.num_days_from_monday()),
+                    )?
                 }
                 "WKST" => parsed.wkst = weekday(&value)?,
                 _ => return None,
@@ -192,43 +277,50 @@ impl Rule {
         }
     }
 
-    fn month_matches(&self, date: NaiveDate) -> bool {
-        self.by_month.is_empty() || self.by_month.contains(&date.month())
+    fn month_matches(&self, month: u32) -> bool {
+        self.by_month.is_empty() || self.by_month.contains(&month)
     }
 
-    /// Days of `year`-`month` the rule selects; `default_day` when it names none.
-    fn days_of_month(&self, year: i32, month: u32, default_day: u32) -> Vec<u32> {
-        let len = days_in_month(year, month) as i32;
-        let month_days = (!self.by_month_day.is_empty()).then(|| {
-            self.by_month_day
-                .iter()
-                .map(|d| if *d < 0 { len + 1 + d } else { *d })
-                .filter(|d| (1..=len).contains(d))
-                .map(|d| d as u32)
-                .collect::<Vec<_>>()
-        });
-        let weekdays = (!self.by_day.is_empty()).then(|| {
-            let mut days = Vec::new();
-            for (n, wd) in &self.by_day {
-                if *n != 0 {
-                    days.extend(nth_weekday(year, month, *n, *wd));
-                } else {
-                    days.extend((1..=5).filter_map(|n| nth_weekday(year, month, n, *wd)));
-                }
-            }
-            days
-        });
-        let mut days = match (month_days, weekdays) {
-            (None, None) => vec![default_day]
-                .into_iter()
-                .filter(|d| *d as i32 <= len)
-                .collect(),
-            (Some(days), None) | (None, Some(days)) => days,
-            (Some(a), Some(b)) => a.into_iter().filter(|d| b.contains(d)).collect(),
+    /// Days of `month` the rule selects; `default_day` when it names none.
+    fn days_of_month(&self, month: Month, default_day: u32) -> DaySet {
+        if self.by_month_day.is_empty() && self.by_day.is_empty() {
+            return if (1..=month.len).contains(&default_day) {
+                1 << default_day
+            } else {
+                0
+            };
+        }
+        let mut month_days = if self.by_month_day.is_empty() {
+            month.all()
+        } else {
+            0
         };
-        days.sort_unstable();
-        days.dedup();
-        days
+        for d in &self.by_month_day {
+            month_days |= month.day(*d).map_or(0, |day| 1 << day);
+        }
+        let mut weekdays = if self.by_day.is_empty() {
+            month.all()
+        } else {
+            0
+        };
+        for (n, wd) in &self.by_day {
+            weekdays |= match n {
+                0 => month.weekdays(*wd),
+                n => month.nth_weekday(*n, *wd).map_or(0, |day| 1 << day),
+            };
+        }
+        month_days & weekdays
+    }
+
+    /// Steps one period costs besides the dates it yields: one, plus each `BY` list entry it
+    /// goes through (in every month it looks at, for a yearly rule).
+    fn period_cost(&self) -> usize {
+        let months = match self.freq {
+            Freq::Yearly if !self.by_month.is_empty() => self.by_month.len(),
+            Freq::Yearly if !self.by_month_day.is_empty() => 12,
+            _ => 1,
+        };
+        1 + self.by_month.len() + months * (self.by_month_day.len() + self.by_day.len())
     }
 
     /// The first day of period `k` and the dates the rule selects in it, in order. `None` once
@@ -238,13 +330,9 @@ impl Rule {
         match self.freq {
             Freq::Daily => {
                 let day = anchor.checked_add_days(Days::new(step))?;
-                let selected = self.month_matches(day)
-                    && (self.by_month_day.is_empty()
-                        || self
-                            .days_of_month(day.year(), day.month(), 0)
-                            .contains(&day.day()))
-                    && (self.by_day.is_empty()
-                        || self.by_day.iter().any(|(_, wd)| *wd == day.weekday()));
+                let month = Month::of(day.year(), day.month())?;
+                let selected = self.month_matches(day.month())
+                    && self.days_of_month(month, day.day()) & (1 << day.day()) != 0;
                 Some((day, if selected { vec![day] } else { Vec::new() }))
             }
             Freq::Weekly => {
@@ -260,7 +348,7 @@ impl Rule {
                     .filter_map(|wd| {
                         week.checked_add_days(Days::new(wd.days_since(self.wkst).into()))
                     })
-                    .filter(|d| self.month_matches(*d))
+                    .filter(|d| self.month_matches(d.month()))
                     .collect();
                 dates.sort_unstable();
                 dates.dedup();
@@ -270,12 +358,11 @@ impl Rule {
                 let first = anchor
                     .with_day(1)?
                     .checked_add_months(Months::new(u32::try_from(step).ok()?))?;
-                if !self.month_matches(first) {
+                if !self.month_matches(first.month()) {
                     return Some((first, Vec::new()));
                 }
-                let dates = self
-                    .days_of_month(first.year(), first.month(), anchor.day())
-                    .into_iter()
+                let month = Month::of(first.year(), first.month())?;
+                let dates = days_in(self.days_of_month(month, anchor.day()))
                     .filter_map(|d| first.with_day(d))
                     .collect();
                 Some((first, dates))
@@ -284,23 +371,22 @@ impl Rule {
                 let year = anchor.year().checked_add(i32::try_from(step).ok()?)?;
                 let first = NaiveDate::from_ymd_opt(year, 1, 1)?;
                 let months: Vec<u32> = if !self.by_month.is_empty() {
-                    let mut months = self.by_month.clone();
-                    months.sort_unstable();
-                    months.dedup();
-                    months
+                    self.by_month.clone()
                 } else if !self.by_month_day.is_empty() {
                     (1..=12).collect()
                 } else {
                     vec![anchor.month()]
                 };
-                let dates = months
-                    .into_iter()
-                    .flat_map(|m| {
-                        self.days_of_month(year, m, anchor.day())
-                            .into_iter()
-                            .filter_map(move |d| NaiveDate::from_ymd_opt(year, m, d))
-                    })
-                    .collect();
+                let mut dates = Vec::new();
+                for m in months {
+                    let Some(month) = Month::of(year, m) else {
+                        continue;
+                    };
+                    dates.extend(
+                        days_in(self.days_of_month(month, anchor.day()))
+                            .filter_map(|d| NaiveDate::from_ymd_opt(year, m, d)),
+                    );
+                }
                 Some((first, dates))
             }
         }
@@ -325,7 +411,8 @@ impl Rule {
     /// (DTSTART, always the first occurrence), until `visit` returns false or the periods pass
     /// `end`. `UNTIL` is left to `visit` (see [`Rule::until_allows`]), as it may need the
     /// occurrence in UTC. Without `COUNT`, periods that end before `from` are skipped (and
-    /// `start` with them). Each period costs one unit of `budget`.
+    /// `start` with them). Each period walked costs [`Rule::period_cost`] steps of `budget`,
+    /// and each date it yields one more.
     pub(super) fn walk(
         &self,
         start: NaiveDateTime,
@@ -335,6 +422,7 @@ impl Rule {
         mut visit: impl FnMut(NaiveDateTime) -> bool,
     ) -> Result<(), Exhausted> {
         let (anchor, time) = (start.date(), start.time());
+        let cost = self.period_cost();
         let first = match (self.count, from) {
             (None, Some(from)) => self.periods_before(anchor, from),
             _ => 0,
@@ -351,13 +439,14 @@ impl Rule {
             if self.count.is_some_and(|count| produced >= count) {
                 return Ok(());
             }
-            *budget = budget.checked_sub(1).ok_or(Exhausted)?;
+            charge(budget, cost)?;
             let Some((period_start, dates)) = self.period(anchor, k) else {
                 return Ok(());
             };
             if period_start > end.date() {
                 return Ok(());
             }
+            charge(budget, dates.len())?;
             for date in dates {
                 let at = date.and_time(time);
                 if at <= start {
@@ -404,13 +493,106 @@ mod tests {
     #[test]
     fn nth_weekday_counts_from_either_end() {
         // March 2026 starts on a Sunday.
-        assert_eq!(nth_weekday(2026, 3, 1, Weekday::Sun), Some(1));
-        assert_eq!(nth_weekday(2026, 3, 2, Weekday::Sun), Some(8));
-        assert_eq!(nth_weekday(2026, 3, -1, Weekday::Sun), Some(29));
-        assert_eq!(nth_weekday(2026, 3, 5, Weekday::Sun), Some(29));
-        assert_eq!(nth_weekday(2026, 3, 6, Weekday::Sun), None);
-        assert_eq!(nth_weekday(2026, 2, -1, Weekday::Sat), Some(28));
-        assert_eq!(nth_weekday(2026, 2, 0, Weekday::Sat), None);
+        let march = Month::of(2026, 3).unwrap();
+        assert_eq!(march.nth_weekday(1, Weekday::Sun), Some(1));
+        assert_eq!(march.nth_weekday(2, Weekday::Sun), Some(8));
+        assert_eq!(march.nth_weekday(-1, Weekday::Sun), Some(29));
+        assert_eq!(march.nth_weekday(5, Weekday::Sun), Some(29));
+        assert_eq!(march.nth_weekday(6, Weekday::Sun), None);
+        assert_eq!(march.nth_weekday(-6, Weekday::Sun), None);
+        let february = Month::of(2026, 2).unwrap();
+        assert_eq!(february.nth_weekday(-1, Weekday::Sat), Some(28));
+        assert_eq!(february.nth_weekday(0, Weekday::Sat), None);
+        assert_eq!(
+            days_in(march.weekdays(Weekday::Sun)).collect::<Vec<_>>(),
+            [1, 8, 15, 22, 29]
+        );
+        assert_eq!(
+            (march.day(-1), march.day(31), march.day(-31)),
+            (Some(31), Some(31), Some(1))
+        );
+        // Leap years, and April's missing 31st counted from either end.
+        assert_eq!(Month::of(2024, 2).unwrap().len, 29);
+        assert_eq!(Month::of(1900, 2).unwrap().len, 28);
+        let april = Month::of(2026, 4).unwrap();
+        assert_eq!((april.day(31), april.day(-31)), (None, None));
+    }
+
+    #[test]
+    fn repeated_list_entries_are_kept_once() {
+        let repeated = |part: &str, value: &str| {
+            let values = vec![value; 200_000].join(",");
+            Rule::parse(&format!("FREQ=MONTHLY;{}={}", part, values))
+        };
+        assert_eq!(
+            repeated("BYMONTHDAY", "1"),
+            Rule::parse("FREQ=MONTHLY;BYMONTHDAY=1")
+        );
+        assert_eq!(
+            repeated("BYDAY", "-1SU"),
+            Rule::parse("FREQ=MONTHLY;BYDAY=-1SU")
+        );
+        assert_eq!(
+            repeated("BYMONTH", "3"),
+            Rule::parse("FREQ=MONTHLY;BYMONTH=3")
+        );
+        // Sorted too, so the order they are written in does not matter.
+        assert_eq!(
+            Rule::parse("FREQ=YEARLY;BYMONTH=10,3,10;BYDAY=SU,-1SU,1MO,SU"),
+            Rule::parse("FREQ=YEARLY;BYMONTH=3,10;BYDAY=-1SU,SU,1MO")
+        );
+        let all_days = Rule::parse(&format!(
+            "FREQ=MONTHLY;BYMONTHDAY={}",
+            (-31..=31)
+                .chain(-31..=31)
+                .filter(|d| *d != 0)
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ))
+        .unwrap();
+        assert_eq!(all_days.by_month_day.len(), 62);
+    }
+
+    /// Steps a walk from `start` to `end` takes, and the occurrences it visits.
+    fn cost(rule: &str, start: &str, end: &str) -> (usize, usize) {
+        let rule = Rule::parse(rule).unwrap();
+        let mut budget = usize::MAX;
+        let mut visited = 0;
+        rule.walk(at(start), None, at(end), &mut budget, |_| {
+            visited += 1;
+            true
+        })
+        .unwrap();
+        (usize::MAX - budget, visited)
+    }
+
+    #[test]
+    fn walks_are_charged_for_list_entries_and_dates() {
+        // Every day of a year from one yearly period: each date is paid for.
+        let every_day = (1..=31)
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let (steps, visited) = cost(
+            &format!("FREQ=YEARLY;BYMONTHDAY={}", every_day),
+            "20260101T090000",
+            "20261231T235959",
+        );
+        assert_eq!(visited, 365);
+        assert!(steps >= 365 + 12 * 31, "{}", steps);
+        // Long lists that select nothing still cost each entry in every period.
+        let (steps, visited) = cost(
+            "FREQ=MONTHLY;BYMONTHDAY=29,30,31,-29,-30,-31;BYDAY=2MO,2TU,2WE,3MO,3TU,3WE",
+            "20260101T090000",
+            "20261231T235959",
+        );
+        assert_eq!(visited, 1);
+        assert!(steps >= 12 * (1 + 6 + 6), "{}", steps);
+        // A plain daily rule costs a couple of steps a day.
+        let (steps, visited) = cost("FREQ=DAILY", "20260101T090000", "20261231T235959");
+        assert_eq!(visited, 365);
+        assert!((365..=3 * 366).contains(&steps), "{}", steps);
     }
 
     #[test]
@@ -585,7 +767,7 @@ mod tests {
         .unwrap();
         // DTSTART only: February never has a 30th, and the walk stops at `end`.
         assert_eq!(seen, 1);
-        assert!(budget > 9_900);
+        assert!(budget > 9_800);
         let mut tiny = 3;
         let daily = Rule::parse("FREQ=DAILY").unwrap();
         assert_eq!(
@@ -598,6 +780,11 @@ mod tests {
             ),
             Err(Exhausted)
         );
+        // A budget that ran out stays spent, even for a step it could have paid.
+        assert_eq!(tiny, 0);
+        let mut left = 5;
+        assert_eq!(charge(&mut left, 6), Err(Exhausted));
+        assert_eq!((left, charge(&mut left, 0)), (0, Ok(())));
     }
 
     #[test]
@@ -608,6 +795,8 @@ mod tests {
             "FREQ=YEARLY;BYWEEKNO=20",
             "FREQ=YEARLY;BYDAY=20MO",
             "FREQ=WEEKLY;BYDAY=1MO",
+            "FREQ=MONTHLY;BYDAY=6MO",
+            "FREQ=YEARLY;BYMONTH=3;BYDAY=-6SU",
             "FREQ=DAILY;INTERVAL=0",
             "FREQ=DAILY;BYMONTH=13",
             "BYDAY=MO",

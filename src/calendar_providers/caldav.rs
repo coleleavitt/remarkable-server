@@ -605,6 +605,18 @@ async fn report(
             &response.body,
         ));
     }
+    // Parsing and expanding a large answer is CPU work (bounded by the expansion budgets):
+    // it runs on a blocking thread, not on the async workers that also serve the tablet.
+    let calendar_id = calendar_id.to_string();
+    tokio::task::spawn_blocking(move || read_report(&response, &calendar_id, window))
+        .await
+        .map_err(|e| {
+            CalendarError::Backend(format!("caldav: reading a REPORT answer failed: {}", e))
+        })?
+}
+
+/// The events of a REPORT's multistatus answer, expanded into their occurrences in `window`.
+fn read_report(response: &DavResponse, calendar_id: &str, window: SyncWindow) -> Result<Fetched> {
     let resources = parse_resources(&response.url, &response.body)?;
     let incomplete = resources.iter().find_map(|r| {
         Some(format!(
@@ -638,8 +650,9 @@ async fn report(
     let incomplete = incomplete.or_else(|| {
         expansion.truncated().then(|| {
             format!(
-                "caldav: REPORT {}: too many recurring event occurrences or time zone rules \
-                 to go through in one sync, so stored events it did not list were kept",
+                "caldav: REPORT {}: too many recurring event occurrences (or too much text in \
+                 them) or time zone rules to go through in one sync, so stored events it did \
+                 not list were kept",
                 redact(&response.url)
             )
         })
