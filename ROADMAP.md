@@ -87,7 +87,13 @@ These are done and, in several cases, ahead of rmfakecloud:
   limited (5 per IP per 10 min, 20/min overall), polling too fast gets
   `slow_down`, and `PUBLIC_URL` sets the verification link (#24). Deleting a
   device revokes its user tokens too (not only its device tokens) and closes its
-  open `/notifications/ws` and `/mqtt` sessions (#25).
+  open `/notifications/ws` and `/mqtt` sessions (#25). `cargo audit` is clean:
+  JWTs are signed with jsonwebtoken's aws-lc-rs backend, which drops `rsa`
+  (RUSTSEC-2023-0071, no fixed release), and `/feeds/v1/extract` uses
+  dom_smoothie instead of readability 0.3, which drops h2 0.3
+  (RUSTSEC-2026-0258) and the unmaintained rustls-pemfile 1. Existing tokens
+  verify unchanged. Extraction runs off the async workers and refuses pages
+  nested more than 512 levels deep (#38).
 
 ---
 
