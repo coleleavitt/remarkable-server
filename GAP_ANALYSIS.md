@@ -117,7 +117,9 @@ Two MQTT endpoints exist:
   topic the client subscribed to (at most 64 distinct topics); a wildcard filter, or one past that
   cap, is refused in the SUBACK (`0x80`). A socket whose
   first packet is not a well-formed CONNECT (checked field by field before any token, a header one
-  included), or that sends none within 30 s, is closed without a CONNACK. **Off by default**; served
+  included), or that sends none within 30 s, is closed without a CONNACK. A text frame (MQTT is
+  binary only; close code 1003, contents not logged) or a message over 256 KiB closes the socket
+  at any point. **Off by default**; served
   only with `MQTT_WS_NOTIFICATIONS=1` (`true`/`on`), because the tablet never uses it (below).
 - The screenshare broker (`SCREENSHARE_BIND`, MQTT over TLS; :8883 on the Linode). Its sessions
   are not closed when a device is revoked.

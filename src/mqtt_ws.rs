@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::extract::State;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
 use axum::response::IntoResponse;
@@ -60,6 +60,14 @@ const SUBACK_FAILURE: u8 = 0x80;
 /// SUBACK. Every notification is published once per topic, so this bounds both the
 /// session's state and what one event costs to fan out.
 const MAX_SUBSCRIPTIONS: usize = 64;
+
+/// Largest WebSocket message, and frame, the endpoint reads; a bigger one closes the
+/// socket (a single frame at its header), so no more than this is buffered for a
+/// message. The packets it answers are small: a CONNECT is
+/// a client id, a token and at most a will, and a SUBSCRIBE of [`MAX_SUBSCRIPTIONS`]
+/// ordinary topics is a few KiB. Without this, tungstenite's defaults (64 MiB messages,
+/// 16 MiB frames) let any client, authenticated or not, have that much buffered per socket.
+pub(crate) const MAX_MESSAGE_SIZE: usize = 256 * 1024;
 
 /// The [`PATH`] route, to merge into [`crate::create_router`]'s router, when `flag`
 /// (the value of [`ENABLE_ENV`]) is `1`, `true` or `on`; `None` otherwise, including
@@ -324,7 +332,10 @@ fn build_publish(topic: &str, payload: &[u8], qos: u8, packet_id: Option<u16>) -
 /// 3.1.1 §3.1.0, §3.1.4); a protocol level other than 3.1.1 or 3.1 gets CONNACK 0x01.
 /// Each binary frame is read as one whole packet, as Paho and mqtt.js send them;
 /// packets split across frames or sharing one (which §6.0 allows) are not handled, so
-/// such a CONNECT counts as malformed. A connected
+/// such a CONNECT counts as malformed. A text frame, before or after CONNECT, closes the
+/// socket (close code 1003; [MQTT-6.0.0-1]: MQTT is carried only in binary frames), and
+/// its contents are not logged. A message or frame over [`MAX_MESSAGE_SIZE`] closes it
+/// too. A connected
 /// session is closed once the device its token belongs to is revoked (deleted or
 /// re-paired).
 pub async fn mqtt_notifications_ws(
@@ -343,6 +354,8 @@ pub async fn mqtt_notifications_ws(
     info!("MQTT WebSocket upgrade request for notifications");
     Ok(ws
         .protocols(["mqtt"])
+        .max_message_size(MAX_MESSAGE_SIZE)
+        .max_frame_size(MAX_MESSAGE_SIZE)
         .on_upgrade(move |socket| handle_mqtt_socket(socket, state, header_identity)))
 }
 
@@ -667,7 +680,16 @@ async fn run_mqtt_session<S, R>(
             }
 
             Ok(Message::Text(text)) => {
-                warn!(session_id = %session_id, "Unexpected text message: {}", text);
+                // [MQTT-6.0.0-1]: any non-binary data frame MUST close the connection. Only
+                // the length is logged, so the client can't write into the journal.
+                warn!(session_id = %session_id, "WebSocket text frame ({} bytes), closing", text.len());
+                let _ = sender
+                    .send(Message::Close(Some(CloseFrame {
+                        code: close_code::UNSUPPORTED,
+                        reason: "MQTT needs binary frames".into(),
+                    })))
+                    .await;
+                break;
             }
 
             Err(e) => {
@@ -1150,6 +1172,27 @@ mod tests {
             "unacceptable protocol version"
         );
         ended_silently("MQTT 5 CONNECT", out, task).await;
+    }
+
+    /// [MQTT-6.0.0-1]: MQTT is carried only in binary frames, and a text frame closes the
+    /// session whether or not it has CONNECTed; it isn't ignored while the socket stays open.
+    /// (The close code sent with it is checked on a real socket in `lib.rs`.)
+    #[tokio::test]
+    async fn a_text_frame_closes_the_session() {
+        let (in_tx, out, _notif, task) =
+            start_with(|_| unreachable!("nothing reaches authentication"));
+        in_tx.send(Message::Text("x".repeat(4096).into())).unwrap();
+        in_tx.send(connect()).unwrap(); // never read
+        ended_silently("text frame first", out, task).await;
+
+        let (in_tx, mut out, _notif, task) = start();
+        in_tx.send(connect()).unwrap();
+        assert_eq!(next(&mut out).await, build_connack(false, 0));
+        in_tx.send(Message::Text("{}".into())).unwrap();
+        in_tx
+            .send(Message::Binary(vec![0xC0, 0x00].into()))
+            .unwrap(); // PINGREQ, never answered
+        ended_silently("text frame after CONNECT", out, task).await;
     }
 
     /// Paused clock: `advance` and the runtime's auto-advance move time, nothing sleeps.

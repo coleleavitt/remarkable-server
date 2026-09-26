@@ -864,6 +864,109 @@ mod router_tests {
         assert_eq!(body["message"]["attributes"]["event"], "SyncComplete");
     }
 
+    /// On the real upgrade: a text frame, even from a client that has sent no token, is
+    /// answered with close code 1003 (MQTT is binary only, [MQTT-6.0.0-1]); and a message
+    /// of `MAX_MESSAGE_SIZE` bytes is read, one a byte longer closes the socket.
+    #[tokio::test]
+    async fn mqtt_ws_closes_on_text_frames_and_oversized_messages() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+        type Ws = tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >;
+        const FIVE_S: std::time::Duration = std::time::Duration::from_secs(5);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let devices =
+            DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        let token = devices.create_user_token("u1@test").unwrap();
+        let state = AppState::new(Storage::new(tmp.path().join("storage")).unwrap(), devices);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/mqtt", listener.local_addr().unwrap());
+        let router = with_mqtt_ws(&state);
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let open = |auth: Option<String>| {
+            let mut req = url.as_str().into_client_request().unwrap();
+            if let Some(a) = auth {
+                req.headers_mut()
+                    .insert("authorization", a.parse().unwrap());
+            }
+            async move { tokio_tungstenite::connect_async(req).await.unwrap().0 }
+        };
+        async fn next(ws: &mut Ws) -> Option<Message> {
+            match tokio::time::timeout(FIVE_S, ws.next())
+                .await
+                .expect("timed out")
+            {
+                Some(Ok(m)) => Some(m),
+                _ => None,
+            }
+        }
+        /// A QoS 0 PUBLISH on "t", `len` bytes long in all (a 3-byte remaining length).
+        fn publish_of_len(len: usize) -> Message {
+            let remaining = len - 4;
+            assert!((16_384..2_097_152).contains(&remaining), "3-byte length");
+            let mut p = vec![
+                0x30,
+                (remaining % 128) as u8 | 0x80,
+                (remaining / 128 % 128) as u8 | 0x80,
+                (remaining / 16_384) as u8,
+                0,
+                1,
+                b't',
+            ];
+            p.resize(len, 0);
+            Message::Binary(p.into())
+        }
+
+        let mut anon = open(None).await;
+        anon.send(Message::Text("x".repeat(4096).into()))
+            .await
+            .unwrap();
+        match next(&mut anon).await {
+            Some(Message::Close(Some(f))) => assert_eq!(f.code, CloseCode::Unsupported),
+            other => panic!("text frame must close with 1003, got {other:?}"),
+        }
+
+        let mut ws = open(Some(format!("Bearer {token}"))).await;
+        ws.send(Message::Binary(
+            vec![
+                0x10, 13, 0, 4, b'M', b'Q', b'T', b'T', 4, 2, 0, 60, 0, 1, b'c',
+            ]
+            .into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            next(&mut ws).await,
+            Some(Message::Binary(vec![0x20, 2, 0, 0].into())),
+            "CONNACK accepted"
+        );
+        ws.send(publish_of_len(mqtt_ws::MAX_MESSAGE_SIZE))
+            .await
+            .unwrap();
+        ws.send(Message::Binary(vec![0xC0, 0].into()))
+            .await
+            .unwrap(); // PINGREQ
+        assert_eq!(
+            next(&mut ws).await,
+            Some(Message::Binary(vec![0xD0, 0].into())),
+            "a message at the cap is read"
+        );
+        // The server stops reading at the frame header, so this send may fail midway.
+        let _ = tokio::time::timeout(
+            FIVE_S,
+            ws.send(publish_of_len(mqtt_ws::MAX_MESSAGE_SIZE + 1)),
+        )
+        .await;
+        let _ = ws.send(Message::Binary(vec![0xC0, 0].into())).await; // PINGREQ
+        match next(&mut ws).await {
+            None | Some(Message::Close(_)) => {}
+            other => panic!("one byte over the cap must close the socket, got {other:?}"),
+        }
+    }
+
     /// Open notification sessions (JSON WebSocket and, when enabled, `/mqtt`, token in the
     /// header or in the MQTT CONNECT) close when their device is deleted; another device's
     /// sessions stay open.
