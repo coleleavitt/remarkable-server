@@ -57,7 +57,10 @@ impl DeviceType {
         }
     }
 
-    /// Returns compatible device families (for firmware that works across models)
+    /// Returns compatible device families (for firmware that works across models).
+    /// Not used yet: downloads are pinned to the exact device model (#20); kept as the
+    /// record of which models share firmware.
+    #[allow(dead_code)]
     fn compatible_with(&self) -> Vec<DeviceType> {
         match self {
             Self::Rm1 => vec![Self::Rm1],
@@ -187,8 +190,6 @@ pub struct FirmwareManager {
     versions: Arc<HashMap<DeviceType, Vec<FirmwareVersion>>>,
     /// Delta updates indexed by (device, from_version, to_version)
     deltas: Arc<HashMap<(DeviceType, String, String), DeltaUpdate>>,
-    /// Base URL for downloads
-    base_url: String,
 }
 
 impl FirmwareManager {
@@ -320,7 +321,6 @@ impl FirmwareManager {
             latest: Arc::new(latest),
             versions: Arc::new(versions_map),
             deltas: Arc::new(deltas),
-            base_url: base_url.to_string(),
         })
     }
 

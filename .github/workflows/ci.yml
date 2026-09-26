@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # Cargo.toml depends on ../remarkable/crates/*, so check the sibling repo out next to this one.
+      - uses: actions/checkout@v4
+        with:
+          path: remarkable-server
+      - uses: actions/checkout@v4
+        with:
+          repository: coleleavitt/remarkable-rs
+          path: remarkable
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: remarkable-server
+      - name: Install PDF text and OCR tools used by tests
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils tesseract-ocr
+      - name: Format
+        working-directory: remarkable-server
+        run: cargo fmt --check
+      - name: No new warnings in this crate
+        working-directory: remarkable-server
+        # Warnings from the sibling crates (paths under ../remarkable) are not ours to gate on.
+        run: |
+          cargo build --all-targets --locked --message-format=short 2>&1 | tee build.log
+          if grep -E '^src/.*warning' build.log; then echo "::error::remarkable-server has compiler warnings"; exit 1; fi
+      - name: Test
+        working-directory: remarkable-server
+        run: cargo test --workspace --all-targets --locked

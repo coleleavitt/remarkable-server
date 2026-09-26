@@ -95,7 +95,7 @@ pub async fn v1_list_docs(
     let v1_docs: Vec<V1Document> = files
         .iter()
         .enumerate()
-        .map(|(i, (hash, filename, _size))| V1Document {
+        .map(|(_i, (hash, filename, _size))| V1Document {
             id: hash.clone(),
             version: 1,
             message: String::new(),

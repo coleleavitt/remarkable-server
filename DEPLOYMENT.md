@@ -46,7 +46,10 @@ xochitl ──/etc/hosts──▶ 127.0.0.1:443 / 127.0.0.2:443  (rm-proxy on ta
 
 - Every API route requires a valid device JWT except health, discovery,
   and pairing (which needs a one-time code from `--pair`, or from `POST /devices/v1`
-  with `x-admin-token`, optionally `?user=<id>` (default `local-user`); device/user tokens cannot mint codes). The legacy v1/v2
+  with `x-admin-token`, optionally `?user=<id>` (default `local-user`); device/user tokens cannot mint codes),
+  plus the sinks the tablet posts to without our credentials (telemetry reports, capped at 64 KiB;
+  the `/post` crash sink, 32 MiB per body and a disk quota), share-link downloads, and
+  `/oauth/device/code` (rate limited). The legacy v1/v2
   blob handlers in `protocol.rs` were unauthenticated until commit `a59cf70`
   ("protocol: require device auth on legacy … handlers"); they now use the same `auth_user`
   check as v3.
@@ -54,7 +57,15 @@ xochitl ──/etc/hosts──▶ 127.0.0.1:443 / 127.0.0.2:443  (rm-proxy on ta
   (created 0600 on first start), not a hardcoded default. Deleting it
   invalidates every token → re-pair the tablet.
 - `ADMIN_TOKEN` (64 hex, only in `/etc/remarkable-server/env`, 0640 root:remarkable)
-  guards admin endpoints.
+  is the only credential for `POST /admin/create-user`, `POST /devices/v1`,
+  `POST /admin/passcode/resets/{id}/approve`, `DELETE /debug/clear`, `GET /admin/reports`,
+  `/admin/mdm/*`, `GET /admin/storage/unreachable`, `POST /admin/storage/gc` and the
+  `/screenshare/view` viewer. OAuth approval (`POST /admin/oauth/approve`, `POST /oauth/verify`)
+  takes it **or** a paired device's device token. Unset = all of these are disabled (401).
+- Deleting a device (`DELETE /devices/v1/{id}` by its owner, or the tablet's own
+  `/token/json/{2,3}/device/delete`) revokes every device and user token it minted, even across a
+  later re-pair, and closes its open `/notifications/ws` and `/mqtt` sessions. Open sessions on the
+  screenshare broker (:8883) are **not** closed by a revocation.
 - Upstream TLS from the tablet relay is verified against webpki roots, so a
   MITM on the WiFi can't impersonate the Linode.
 
@@ -64,6 +75,7 @@ xochitl ──/etc/hosts──▶ 127.0.0.1:443 / 127.0.0.2:443  (rm-proxy on ta
 # health / status
 curl https://remarkable.unwrap.rs/health
 ssh linode 'systemctl status remarkable-server; journalctl -u remarkable-server -n 50 --no-pager'
+# the sqlite3 lines below need the sqlite3 CLI on the Linode (apt install sqlite3)
 ssh linode "sqlite3 /var/lib/remarkable-server/sync.db 'select generation, hash from root'"   # authoritative
 ssh linode 'grep generation /var/lib/remarkable-server/root.json'   # mirror, rewritten after every commit
 ssh root@<tablet> 'systemctl status rm-proxy; journalctl -u rm-proxy -n 30 --no-pager'
@@ -203,8 +215,20 @@ Layout:
 - `/var/lib/remarkable-server` — storage: blobs as `<2-char prefix>/<sha256>`,
   `sync.db` (+ `sync.db-wal`/`-shm`; root hash/generation, blob metadata, parsed
   index; the source of truth), `root.json` (human-readable mirror of the root,
-  kept for rollback), `devices.db`, `jwt_secret`. Legacy `meta/*.meta` files are
-  left in place but no longer written.
+  kept for rollback), `devices.db`, `jwt_secret`, `.uploads/` (staging for streamed
+  uploads; must be on the same filesystem as the blobs), `readlater.db` (read-later
+  accounts incl. their credentials), `integrations/` (the only directory cloud sync
+  reads/writes). Legacy `meta/*.meta` files are left in place but no longer written.
+- Host packages: `sqlite3` (the health/backup commands in the cheat sheet) and
+  `tesseract-ocr` (`apt install tesseract-ocr`), which handwriting convert
+  (`/convert/v1/handwriting`) and handwriting search run as the `tesseract` binary.
+  **The Linode currently lacks `tesseract`, so handwriting convert/search fail there**
+  until it is installed (or `HWR_COMMAND` points at another recogniser).
+- Crash reports (`POST /post`) go to `CRASH_DIR`, default `./crash-dumps` relative to the
+  working directory. The unit sets none (cwd `/`, `ProtectSystem=strict`), so set
+  `CRASH_DIR=/var/lib/remarkable-server/crash-dumps` in the env file to keep them; otherwise
+  they are dropped (the tablet still gets 200). The oldest are evicted past
+  `CRASH_MAX_TOTAL_BYTES` (512 MiB) / `CRASH_MAX_REPORTS` (200).
 - systemd: `contrib/linode/remarkable-server.service` (runs as `remarkable` user).
 - The HTTP API listens on `127.0.0.1:3100` in plain HTTP; **nginx terminates TLS** on :443.
 - The screenshare message queue broker listens directly on `0.0.0.0:8883` with TLS

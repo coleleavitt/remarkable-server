@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use parking_lot::{Mutex, RwLock};
-use rusqlite::{Connection, OptionalExtension, params};
+use parking_lot::Mutex;
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -206,7 +206,6 @@ pub struct FeedManager {
     storage: Storage,
     epub_dir: PathBuf,
     http_client: reqwest::Client,
-    scheduler_tx: Option<mpsc::Sender<SchedulerCommand>>,
 }
 
 /// Commands for the background refresh task. Dropping every sender stops the task,
@@ -235,7 +234,6 @@ impl FeedManager {
             storage,
             epub_dir: epub_dir.to_path_buf(),
             http_client,
-            scheduler_tx: None,
         })
     }
 
@@ -1356,7 +1354,7 @@ fn parse_feed_type(s: &str) -> FeedType {
 fn strip_html(html: &str) -> String {
     let mut result = String::with_capacity(html.len());
     let mut in_tag = false;
-    let mut in_script = false;
+    let in_script = false;
 
     for c in html.chars() {
         if c == '<' {
@@ -1826,12 +1824,12 @@ mod folder_sync_tests {
             notification_tx,
         };
 
-        sync_to_device(State(state.clone()), UrlPath("news".into()))
+        let _ = sync_to_device(State(state.clone()), UrlPath("news".into()))
             .await
             .unwrap();
         let msg = rx.try_recv().expect("SyncComplete after new EPUBs");
         assert_eq!(msg.message.attributes.event, "SyncComplete");
-        sync_to_device(State(state), UrlPath("news".into()))
+        let _ = sync_to_device(State(state), UrlPath("news".into()))
             .await
             .unwrap();
         assert!(rx.try_recv().is_err(), "nothing new, no push");

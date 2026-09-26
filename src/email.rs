@@ -13,16 +13,13 @@
 //! Attachment: report.pdf
 //! ```
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use parking_lot::RwLock;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio::io::{
     AsyncBufRead,
     AsyncBufReadExt,
@@ -126,15 +123,6 @@ struct EmailServerInner {
     storage: Storage,
     devices: DeviceManager,
     db: Mutex<Connection>,
-    /// Pending emails being received
-    pending: RwLock<HashMap<String, PendingEmail>>,
-}
-
-#[derive(Debug)]
-struct PendingEmail {
-    from: String,
-    to: Vec<String>,
-    data: Vec<u8>,
 }
 
 impl EmailServer {
@@ -177,7 +165,6 @@ impl EmailServer {
                 storage,
                 devices,
                 db: Mutex::new(conn),
-                pending: RwLock::new(HashMap::new()),
             }),
         })
     }
@@ -516,16 +503,10 @@ impl EmailServer {
                     .get_body_raw()
                     .map_err(|e| ServerError::Email(format!("Body decode error: {}", e)))?;
 
-                // Calculate hash
-                let mut hasher = Sha256::new();
-                hasher.update(&body);
-                let hash = hex::encode(hasher.finalize());
-
                 attachments.push(Attachment {
                     filename: name,
                     content_type: content_type.clone(),
                     data: body,
-                    hash,
                 });
             }
         }
@@ -742,7 +723,6 @@ struct Attachment {
     filename: String,
     content_type: String,
     data: Vec<u8>,
-    hash: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -960,16 +940,6 @@ fn extract_email_address(s: &str) -> String {
     }
 }
 
-/// Sanitize filename for filesystem use
-fn sanitize_filename(s: &str) -> String {
-    s.chars()
-        .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_')
-        .take(50)
-        .collect::<String>()
-        .trim()
-        .to_string()
-}
-
 /// Strip file extension
 fn strip_extension(filename: &str) -> String {
     Path::new(filename)
@@ -977,20 +947,6 @@ fn strip_extension(filename: &str) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or(filename)
         .to_string()
-}
-
-/// Detect file type from extension
-fn detect_file_type(filename: &str) -> &'static str {
-    match Path::new(filename)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_lowercase())
-        .as_deref()
-    {
-        Some("pdf") => "pdf",
-        Some("epub") => "epub",
-        _ => "pdf",
-    }
 }
 
 #[cfg(test)]
@@ -1011,16 +967,6 @@ mod tests {
             extract_email_address("<user@example.com> SIZE=1234"),
             "user@example.com"
         );
-    }
-
-    #[test]
-    fn test_sanitize_filename() {
-        assert_eq!(
-            sanitize_filename("Quarterly Report 2024"),
-            "Quarterly Report 2024"
-        );
-        assert_eq!(sanitize_filename("Report<>|:*?"), "Report");
-        assert_eq!(sanitize_filename("a".repeat(100).as_str()).len(), 50);
     }
 
     #[test]

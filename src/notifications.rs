@@ -170,7 +170,7 @@ impl WsMessage {
         msg
     }
 
-    pub fn sync_complete(generation: u64, source_device_id: &str, auth0_user_id: &str) -> Self {
+    pub fn sync_complete(_generation: u64, source_device_id: &str, auth0_user_id: &str) -> Self {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
