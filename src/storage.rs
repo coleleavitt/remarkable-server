@@ -617,6 +617,10 @@ impl Storage {
         if !is_valid_hash(hash) {
             return Err(ServerError::InvalidHash(hash.to_string()));
         }
+        // Same as put_with_hash: GC holds this for writing while it deletes, so a blob can't be
+        // committed (renamed + catalogued) between GC's last check and its delete. Taken only for
+        // the commit, never while the body streams; lock order blob_writes -> db, as in GC.
+        let _gc = self.inner.blob_writes.read();
         let size = fs::metadata(staged)?.len();
         let path = self.hash_path(hash);
         let dir = path.parent().unwrap_or(&self.inner.base_path).to_path_buf();
@@ -1872,6 +1876,29 @@ mod tests {
         age_all(&storage);
         assert!(storage.gc(Duration::ZERO, false).is_err());
         assert!(storage.exists(&orphan) && storage.exists(&index_hash));
+    }
+
+    #[test]
+    fn streamed_commit_waits_for_gc() {
+        let tmp = TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        let data = b"streamed blob";
+        let hash = hex::encode(Sha256::digest(data));
+        let staged = storage.staging_dir().join("t");
+        fs::create_dir_all(storage.staging_dir()).unwrap();
+        fs::write(&staged, data).unwrap();
+
+        // GC holds the write lock: the streamed commit must not land until it's released.
+        let gc = storage.inner.blob_writes.write();
+        let s = storage.clone();
+        let (h, st) = (hash.clone(), staged.clone());
+        let commit = std::thread::spawn(move || s.put_file_with_hash(&st, &h, "f.rm").unwrap());
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!commit.is_finished(), "commit ran while GC held the lock");
+        assert!(!storage.exists(&hash));
+        drop(gc);
+        commit.join().unwrap();
+        assert_eq!(storage.get(&hash).unwrap(), data);
     }
 
     #[test]

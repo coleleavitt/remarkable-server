@@ -216,6 +216,10 @@ pub async fn put_file(
     body: Body,
 ) -> Result<Json<UploadResponse>> {
     let _user_id = state.auth_user(&headers)?;
+    // Reject a bad hash before streaming up to MAX_BLOB_BYTES to disk for nothing.
+    if !crate::storage::is_valid_hash(&hash) {
+        return Err(ServerError::InvalidHash(hash));
+    }
     let filename = headers
         .get("rm-filename")
         .and_then(|v| v.to_str().ok())
