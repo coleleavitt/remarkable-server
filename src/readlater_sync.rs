@@ -65,6 +65,7 @@ use crate::readlater::{
     ReadLaterProviderTrait,
     RenderedArticle,
     SyncResult,
+    distinct_articles,
     provider_with_timeouts,
     select_articles_for_sync,
 };
@@ -547,7 +548,19 @@ impl Run<'_> {
         self.absorb_refreshed();
         match fetched {
             Ok(articles) => {
-                self.result.articles_fetched = u32::try_from(articles.len()).unwrap_or(u32::MAX);
+                // Before the count and `max_articles`: a repeat would take a distinct
+                // article's place, and that one might then never be synced.
+                let listed = articles.len();
+                let articles = distinct_articles(articles);
+                if articles.len() < listed {
+                    tracing::warn!(
+                        account = %self.account.name,
+                        repeats = listed - articles.len(),
+                        "read-later provider listed some articles more than once; each is \
+                         synced once"
+                    );
+                }
+                self.result.articles_fetched = count(articles.len());
                 self.deliver_new(articles).await;
             }
             Err(e) => return self.fail(format!("Fetch: {e}")),
@@ -1631,6 +1644,46 @@ mod tests {
         assert_eq!((r.articles_fetched, r.articles_synced), (3, 2));
         assert_eq!(f.document_names(), ["Article 2", "Article 3"]);
         assert!(tree(&f.storage).iter().all(|n| n.parent.is_empty()));
+    }
+
+    /// An entry the provider lists twice is one article: one row, one content fetch, one
+    /// document, and it takes one `max_articles` place, so the distinct article after it is
+    /// still delivered. The next sync adds nothing.
+    #[tokio::test]
+    async fn an_entry_listed_twice_is_delivered_once() {
+        let f = Fixture::new(vec![entry(1), entry(1)]).await;
+        f.add_account("wb", |_| {});
+        let r = f.syncer().sync_account("wb").await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(
+            (r.articles_fetched, r.articles_converted, r.articles_synced),
+            (1, 1, 1)
+        );
+        assert_eq!(f.document_names(), ["Article 1"]);
+        let article = f.article(1);
+        let doc = tree(&f.storage)
+            .into_iter()
+            .find(|n| n.kind == "DocumentType")
+            .unwrap();
+        assert!(article.synced_to_device);
+        assert_eq!(article.document_id, Some(doc.id));
+        assert_eq!(f.mock.content_calls.load(Ordering::SeqCst), 1);
+
+        // Capped at two, the repeat of 3 must not push 2 out.
+        let f = Fixture::new(vec![entry(3), entry(3), entry(2), entry(1)]).await;
+        f.add_account("wb", |s| s.max_articles = 2);
+        let r = f.syncer().sync_account("wb").await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!((r.articles_fetched, r.articles_synced), (3, 2));
+        assert_eq!(f.document_names(), ["Article 2", "Article 3"]);
+        assert_eq!(f.articles().len(), 2);
+        let again = f.syncer().sync_account("wb").await.unwrap();
+        assert!(again.errors.is_empty(), "{:?}", again.errors);
+        assert_eq!(
+            (again.articles_synced, again.articles_already_synced),
+            (0, 2)
+        );
+        assert_eq!(f.document_names(), ["Article 2", "Article 3"]);
     }
 
     /// A failed refresh or fetch changes nothing: no article, document or push, and

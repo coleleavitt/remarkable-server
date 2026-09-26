@@ -2,7 +2,7 @@
 //! Supports Pocket, Instapaper and Wallabag. Omnivore (shut down November 2024) is kept only
 //! as a discontinued marker so existing database rows still load.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -3210,7 +3210,9 @@ impl ReadLaterManager {
     /// and return each as it is now recorded (in order; `synced_to_device` tells whether it is
     /// already on the device). Articles are unique per account and provider id, so another
     /// account of the same provider (say a second Wallabag, numbering its entries alike) holds
-    /// its own rows and never gets in the way.
+    /// its own rows and never gets in the way. A provider id listed again later in `articles`
+    /// is ignored: each article is recorded and returned once, so it can't be delivered as two
+    /// documents.
     ///
     /// An article the account recorded before keeps its id and device state (`document_id`,
     /// `synced_to_device`), so it is never delivered twice. If its status was changed here and
@@ -3230,8 +3232,8 @@ impl ReadLaterManager {
         type Key = (ReadLaterProvider, String);
         let db_err = |e: rusqlite::Error| ReadLaterError::Database(e.to_string());
         let accounts = self.accounts.read();
-        let (mut own, mut orphans) = {
-            let wanted: std::collections::HashSet<(ReadLaterProvider, &str)> = articles
+        let (own, mut orphans) = {
+            let wanted: HashSet<(ReadLaterProvider, &str)> = articles
                 .iter()
                 .map(|a| (a.provider, a.provider_id.as_str()))
                 .collect();
@@ -3257,8 +3259,12 @@ impl ReadLaterManager {
         };
         let tx = self.db.unchecked_transaction().map_err(db_err)?;
         let mut recorded = Vec::with_capacity(articles.len());
+        let mut seen: HashSet<Key> = HashSet::new();
         for mut article in articles {
             let key = (article.provider, article.provider_id.clone());
+            if !seen.insert(key.clone()) {
+                continue; // listed twice: the first copy is the article
+            }
             if let Some(prev) = own.get(&key) {
                 article.id = prev.id.clone();
                 keep_device_state(&mut article, prev);
@@ -3280,7 +3286,6 @@ impl ReadLaterManager {
             }
             article.account_id = Some(account_id.to_owned());
             write_article(&tx, &article)?;
-            own.insert(key, article.clone());
             recorded.push(article);
         }
         tx.commit().map_err(db_err)?;
@@ -3515,6 +3520,18 @@ fn write_article(db: &Connection, article: &Article) -> Result<()> {
     )
     .map_err(|e| ReadLaterError::Database(e.to_string()))?;
     Ok(())
+}
+
+/// `articles` with each provider id once, in order, keeping the first copy. A provider may list
+/// an entry twice (a buggy or hostile server, or pages that overlap as entries are added
+/// meanwhile); it is still one article, to be counted, capped by `max_articles` and put on the
+/// device once.
+pub(crate) fn distinct_articles(articles: Vec<Article>) -> Vec<Article> {
+    let mut seen = HashSet::new();
+    articles
+        .into_iter()
+        .filter(|a| seen.insert((a.provider, a.provider_id.clone())))
+        .collect()
 }
 
 /// Apply the account's sync filters (tags, favorites, archived) and cap the result at
@@ -3867,6 +3884,37 @@ mod tests {
         let mgr = ReadLaterManager::new(&dir.path().join("rl.db")).unwrap();
         assert_eq!(mgr.articles.read().len(), 1);
         assert_eq!(mgr.get_article("id-1").unwrap().title, "Updated");
+    }
+
+    /// A provider id listed twice is one article, its first copy, in listed order; the same id
+    /// from another provider is another article.
+    #[test]
+    fn distinct_articles_keeps_the_first_copy_of_each() {
+        let mut repeat = article("second", "p1", 5);
+        repeat.title = "second copy".into();
+        let mut other_provider = article("wb", "p1", 0);
+        other_provider.provider = ReadLaterProvider::Wallabag;
+        let listed = vec![
+            article("first", "p1", 0),
+            article("p2", "p2", 0),
+            repeat,
+            other_provider,
+            article("p2-again", "p2", 0),
+        ];
+        let distinct = distinct_articles(listed);
+        let kept: Vec<(&str, ReadLaterProvider, &str)> = distinct
+            .iter()
+            .map(|a| (a.id.as_str(), a.provider, a.title.as_str()))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                ("first", ReadLaterProvider::Pocket, "T"),
+                ("p2", ReadLaterProvider::Pocket, "T"),
+                ("wb", ReadLaterProvider::Wallabag, "T"),
+            ]
+        );
+        assert!(distinct_articles(Vec::new()).is_empty());
     }
 
     #[test]
@@ -4396,7 +4444,8 @@ mod tests {
     /// its id and device state, and its status change not yet sent wins over the provider's
     /// (only if the account sends changes). Rows of no account or a deleted one are taken over
     /// without their pending change; another account's row of the same provider id is left
-    /// alone, next to this account's own; and a provider id listed twice is one row.
+    /// alone, next to this account's own; and a provider id listed twice is one row, recorded
+    /// and returned once as its first copy (so it can't be delivered as two documents).
     #[test]
     fn record_fetched_keeps_device_state_and_scopes_rows_to_accounts() {
         let dir = tempfile::tempdir().unwrap();
@@ -4430,8 +4479,12 @@ mod tests {
             (ReadStatus::Unread, false)
         );
 
-        let fetched_by_b = ["p1", "p2", "p3", "p4", "p4"].map(fetched).to_vec();
+        let mut fetched_by_b = ["p1", "p2", "p3", "p4", "p4"].map(fetched).to_vec();
+        fetched_by_b[3].title = "first copy".into();
+        fetched_by_b[4].id = "repeat-p4".into();
+        fetched_by_b[4].title = "second copy".into();
         let r = mgr.record_fetched("b", true, fetched_by_b).unwrap();
+        assert_eq!(r.len(), 4, "p4 is returned once: {r:?}");
         // b's own p1, not a's: nothing on the device yet.
         assert_eq!(
             (
@@ -4450,7 +4503,10 @@ mod tests {
                 (ReadStatus::Unread, false)
             );
         }
-        assert_eq!(r[3].id, r[4].id);
+        assert_eq!(
+            (r[3].id.as_str(), r[3].title.as_str()),
+            ("new-p4", "first copy")
+        );
         assert!(mgr.pending_read_status("b").is_empty());
         assert_eq!(mgr.articles.read().len(), 5);
 
@@ -4468,6 +4524,12 @@ mod tests {
         assert_eq!(a("id-p2").account_id.as_deref(), Some("b"));
         assert!(!a("id-p2").read_status_pending);
         assert_eq!(a("new-p4").account_id.as_deref(), Some("b"));
+        assert_eq!(
+            a("new-p4").title,
+            "first copy",
+            "the repeat didn't overwrite it"
+        );
+        assert!(mgr.get_article("repeat-p4").is_none());
     }
 
     /// The delivery columns: a planned document id is recorded only for an article not yet
