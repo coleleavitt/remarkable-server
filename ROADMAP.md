@@ -26,8 +26,8 @@ These are done and, in several cases, ahead of rmfakecloud:
   `jwt_secret`, device→user JWT bundle (software 3.28 OAuth device flow).
 - ✅ **Generation-guarded root writes** — optimistic concurrency
   (`set_root_if`, GCS `if-generation-match` semantics). Like GCS, a sync15
-  root write *without* the header is unconditional; rejecting a present but
-  malformed header is in PR `fix/sync-root-integrity`.
+  root write *without* the header is unconditional; a present but malformed
+  header (or `x-goog-hash`) is rejected with 400 (#19).
 - ✅ **WebSocket sync push** — `SyncComplete` on `/notifications/ws`, so a
   tablet learns about changes without polling. Sent on gentree commits,
   server-side uploads and `sync-complete`; a sync v3 root `PUT` only broadcasts
@@ -44,7 +44,15 @@ These are done and, in several cases, ahead of rmfakecloud:
 - ✅ **Telemetry / usage** — tablet reports kept (rotated), screen-share usage
   history.
 - ✅ **Cloud-storage OAuth** — Google Drive / Dropbox / OneDrive integration
-  scaffolding.
+  scaffolding; sync confined to `<storage>/integrations`, path-traversal and
+  symlink-safe, provider grants revoked on disconnect (#16).
+- ✅ **Security hardening (Sept 2026 review)** — OAuth device-code sign-ins need
+  owner approval (#18); deleting or re-pairing a device revokes its tokens, and
+  users only see and delete their own devices (#17); pairing codes are
+  admin-only (#20); a device can't approve its own passcode reset (#20);
+  firmware downloads are pinned to the device model (#20); `/debug/clear` is
+  admin-only (#14). Server-side uploads refuse to rewrite a root index they
+  can't fully parse, instead of dropping entries (#19).
 
 ---
 
@@ -52,18 +60,17 @@ These are done and, in several cases, ahead of rmfakecloud:
 
 The community's top *concrete* pains. Small, bounded, high-value.
 
-- 🔵 **Atomic durable writes** *(PR #12)* — `root.json` and blobs currently
-  persist with in-place `fs::write`; a crash mid-write can truncate `root.json`
-  (the server then fails to start until it's repaired) or leave a torn blob that
-  the tablet syncs as corrupt. The community's "corrupt root empties the cloud"
-  failure is this class of bug. Fix: write-temp → fsync → atomic rename.
-  *Effort: S.*
-- 🔵 **SQLite sync index (`sync.db`)** *(PR #13, stacked on #12)* — root
+- ✅ **Atomic durable writes** *(#12)* — `root.json` and blobs used to persist
+  with in-place `fs::write`; a crash mid-write could truncate `root.json` (the
+  server then fails to start until it's repaired) or leave a torn blob that the
+  tablet syncs as corrupt. The community's "corrupt root empties the cloud"
+  failure is this class of bug. Now: write-temp → fsync → atomic rename.
+- ✅ **SQLite sync index (`sync.db`)** *(#13)* — root
   hash/generation as a compare-and-swap in one SQLite transaction (safe across
   processes; `root.json` kept as a mirror and adopted if a rolled-back build
   moved it ahead), a `blobs` table replacing `meta/*.meta`, and a derived-only
   projection of the index files (the tablet is still served the stored bytes).
-  Adds a read-only unreachable-blob report. *Effort: M.*
+  Adds a read-only unreachable-blob report.
 - ⬜ **Large-file upload robustness** — stream uploads to disk instead of
   buffering the full body in memory: every upload route takes `Bytes` (whole
   file in RAM) — sync v3 `put_file`, sync15 `blob_put`, gentree `PutFile`, the
