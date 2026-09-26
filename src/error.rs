@@ -6,6 +6,7 @@ use thiserror::Error;
 pub enum ServerError {
     #[error("Not found: {0}")] NotFound(String),
     #[error("Missing header: {0}")] MissingHeader(String),
+    #[error("Invalid header: {0}")] InvalidHeader(String),
     #[error("Checksum mismatch: expected {expected}, actual {actual}")] ChecksumMismatch { expected: String, actual: String },
     #[error("Invalid hash: {0}")] InvalidHash(String),
     #[error("Generation mismatch: current {current}")] GenerationMismatch { current: u64 },
@@ -20,6 +21,8 @@ pub enum ServerError {
     #[error("Email error: {0}")] Email(String),
     #[error("IO error: {0}")] Io(String),
     #[error("Config error: {0}")] Config(String),
+    #[error("Forbidden: {0}")] Forbidden(String),
+    #[error("Bad request: {0}")] BadRequest(String),
 }
 
 impl From<rusqlite::Error> for ServerError {
@@ -33,6 +36,7 @@ impl IntoResponse for ServerError {
         let (status, err, det) = match &self {
             Self::NotFound(m) => (StatusCode::NOT_FOUND, "not_found", Some(m.clone())),
             Self::MissingHeader(h) => (StatusCode::BAD_REQUEST, "missing_header", Some(h.clone())),
+            Self::InvalidHeader(h) => (StatusCode::BAD_REQUEST, "invalid_header", Some(h.clone())),
             Self::ChecksumMismatch { expected, actual } => (StatusCode::BAD_REQUEST, "checksum_mismatch", Some(format!("expected={}, actual={}", expected, actual))),
             Self::InvalidHash(h) => (StatusCode::BAD_REQUEST, "invalid_hash", Some(h.clone())),
             Self::GenerationMismatch { current } => (StatusCode::PRECONDITION_FAILED, "generation_mismatch", Some(format!("current={current}"))),
@@ -47,6 +51,8 @@ impl IntoResponse for ServerError {
             Self::Email(m) => (StatusCode::INTERNAL_SERVER_ERROR, "email_error", Some(m.clone())),
             Self::Io(m) => (StatusCode::INTERNAL_SERVER_ERROR, "io_error", Some(m.clone())),
             Self::Config(m) => (StatusCode::BAD_REQUEST, "config_error", Some(m.clone())),
+            Self::Forbidden(m) => (StatusCode::FORBIDDEN, "forbidden", Some(m.clone())),
+            Self::BadRequest(m) => (StatusCode::BAD_REQUEST, "bad_request", Some(m.clone())),
         };
         (status, Json(ErrorBody { error: err.into(), details: det })).into_response()
     }
