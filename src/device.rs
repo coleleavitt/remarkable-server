@@ -20,6 +20,12 @@ const BLOB_URL_LIFETIME_MINUTES: i64 = 60;
 /// e.g. a bare `hwc` fails to parse and leaves handwriting conversion off.
 /// `sync:fox` selects the sync tier; `intgr`/`docedit`/`screenshare` are plain flags.
 const USER_SCOPES: &str = "intgr docedit screenshare sync:fox hwc:-1 mail:-1";
+/// `device-id` of user tokens minted by `create_user_token` (admin/test); they are not tied to
+/// a registration, so they skip the device check. Reserved: no device may register under it.
+const ADMIN_DEVICE_ID: &str = "admin";
+/// How often an open notification session re-checks its registration, as a backstop for a
+/// missed revocation event.
+const SESSION_RECHECK: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct DeviceManager {
@@ -27,6 +33,7 @@ pub struct DeviceManager {
 }
 struct Inner {
     conn: Mutex<Connection>,
+    revocations: tokio::sync::broadcast::Sender<DeviceRevoked>,
     region: String,
     issuer: String,
     encoding_key: jsonwebtoken::EncodingKey,
@@ -40,6 +47,24 @@ pub struct Device {
     pub registered_at: DateTime<Utc>,
     pub last_refresh: DateTime<Utc>,
     pub user_id: String,
+}
+
+/// Emitted when a device's registration for `user_id` ends (deleted, self-unregistered, or
+/// re-paired to another user): every token and open session of that device must stop working.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceRevoked {
+    pub user_id: String,
+    pub device_id: String,
+}
+
+/// Who a bearer token authenticates: enough for a long-lived session (WebSocket/MQTT) to
+/// re-check later that the registration it was opened under still stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionIdentity {
+    pub user_id: String,
+    pub device_id: String,
+    pub device_desc: String,
+    epoch: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -84,6 +109,10 @@ struct UserTokenClaims {
     device_desc: String,
     #[serde(rename = "https://auth.remarkable.com/subscription")]
     subscription: SubscriptionClaim,
+    /// The minting device's revocation epoch, as in `DeviceTokenClaims`. Omitted when 0, and a
+    /// missing claim (user tokens minted before this existed) reads as 0.
+    #[serde(rename = "rms-epoch", default, skip_serializing_if = "is_zero")]
+    epoch: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,9 +239,11 @@ impl DeviceManager {
         let secret = load_jwt_secret(db_path.as_ref().parent().unwrap_or_else(|| Path::new(".")))?;
         let encoding_key = jsonwebtoken::EncodingKey::from_secret(&secret);
         let decoding_key = jsonwebtoken::DecodingKey::from_secret(&secret);
+        let (revocations, _) = tokio::sync::broadcast::channel(64);
         Ok(Self {
             inner: Arc::new(Inner {
                 conn: Mutex::new(conn),
+                revocations,
                 region: region.into(),
                 issuer: issuer.into(),
                 encoding_key,
@@ -266,10 +297,10 @@ impl DeviceManager {
         }
         conn.execute("DELETE FROM pending_codes WHERE code = ?", params![code])
             .ok();
-        let epoch = Self::register(&conn, device_id, device_desc, &user_id)?;
+        let epoch = self.register(&conn, device_id, device_desc, &user_id)?;
         drop(conn);
         let dt = self.gen_device_token(device_id, device_desc, &user_id, epoch)?;
-        let ut = self.gen_user_token(device_id, device_desc, &user_id)?;
+        let ut = self.gen_user_token(device_id, device_desc, &user_id, epoch)?;
         Ok((dt, ut))
     }
     /// Unregister the device a (validly signed) device token names, scoped to the token's user.
@@ -283,11 +314,11 @@ impl DeviceManager {
             Err(ServerError::InvalidToken) => return Ok(false),
             Err(e) => return Err(e),
         }
-        Self::unregister(&conn, &c.device_id, Some(&c.auth0_userid))
+        self.unregister(&conn, &c.device_id, Some(&c.auth0_userid))
     }
     pub fn refresh_user_token(&self, device_token: &str) -> Result<String> {
         let c = self.touch_device_token(device_token)?;
-        self.gen_user_token(&c.device_id, &c.device_desc, &c.auth0_userid)
+        self.gen_user_token(&c.device_id, &c.device_desc, &c.auth0_userid, c.epoch)
     }
     /// Registered devices; `Some(user)` limits it to that user's own, `None` (admin/startup) lists all.
     pub fn list_devices(&self, owner: Option<&str>) -> Result<Vec<Device>> {
@@ -315,21 +346,44 @@ impl DeviceManager {
     /// `Some(user)` only deletes it if that user owns it (another user's device is a no-op, false);
     /// `None` (admin) deletes regardless of owner.
     pub fn delete_device(&self, device_id: &str, owner: Option<&str>) -> Result<bool> {
-        Self::unregister(&self.inner.conn.lock(), device_id, owner)
+        self.unregister(&self.inner.conn.lock(), device_id, owner)
     }
     /// Delete the registration and bump the epoch in one transaction: a delete without the bump
     /// would let a later re-pair revive every token minted before it.
-    fn unregister(conn: &Connection, device_id: &str, owner: Option<&str>) -> Result<bool> {
+    /// Once committed, open sessions of the device are told to close (`subscribe_revocations`).
+    fn unregister(&self, conn: &Connection, device_id: &str, owner: Option<&str>) -> Result<bool> {
         let tx = conn.unchecked_transaction()?; // callers hold the connection mutex
-        let deleted = tx.execute(
-            "DELETE FROM devices WHERE device_id = ?1 AND (?2 IS NULL OR user_id = ?2)",
-            params![device_id, owner],
-        )? > 0;
-        if deleted {
-            Self::bump_epoch(&tx, device_id)?;
-        }
+        let user: Option<String> = tx
+            .query_row(
+                "SELECT user_id FROM devices WHERE device_id = ?1 AND (?2 IS NULL OR user_id = ?2)",
+                params![device_id, owner],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(user_id) = user else {
+            return Ok(false);
+        };
+        tx.execute(
+            "DELETE FROM devices WHERE device_id = ?",
+            params![device_id],
+        )?;
+        Self::bump_epoch(&tx, device_id)?;
         tx.commit()?;
-        Ok(deleted)
+        self.announce_revoked(user_id, device_id);
+        Ok(true)
+    }
+    fn announce_revoked(&self, user_id: String, device_id: &str) {
+        tracing::info!(%device_id, "device revoked; closing its open sessions");
+        // No receivers (no open sessions) is not an error.
+        let _ = self.inner.revocations.send(DeviceRevoked {
+            user_id,
+            device_id: device_id.into(),
+        });
+    }
+    /// Revocation events for open sessions. Subscribe before checking a session's registration,
+    /// so a revocation landing in between is not missed.
+    pub fn subscribe_revocations(&self) -> tokio::sync::broadcast::Receiver<DeviceRevoked> {
+        self.inner.revocations.subscribe()
     }
     /// Invalidate all device tokens minted for `device_id` so far, even if it is paired again later.
     fn bump_epoch(conn: &Connection, device_id: &str) -> Result<()> {
@@ -341,11 +395,17 @@ impl DeviceManager {
     /// come back to life if the device were later paired back to that user).
     /// Bump + upsert run in one transaction so a failure can't hand the device over un-revoked.
     fn register(
+        &self,
         conn: &Connection,
         device_id: &str,
         device_desc: &str,
         user_id: &str,
     ) -> Result<i64> {
+        if device_id == ADMIN_DEVICE_ID {
+            return Err(ServerError::BadRequest(format!(
+                "device id {ADMIN_DEVICE_ID:?} is reserved"
+            )));
+        }
         let tx = conn.unchecked_transaction()?; // callers hold the connection mutex
         let prev: Option<String> = tx
             .query_row(
@@ -354,7 +414,8 @@ impl DeviceManager {
                 |r| r.get(0),
             )
             .optional()?;
-        if prev.is_some_and(|u| u != user_id) {
+        let revoked = prev.filter(|u| u != user_id);
+        if revoked.is_some() {
             Self::bump_epoch(&tx, device_id)?;
         }
         let now = Utc::now().to_rfc3339();
@@ -368,6 +429,9 @@ impl DeviceManager {
             |r| r.get(0),
         )?;
         tx.commit()?;
+        if let Some(prev) = revoked {
+            self.announce_revoked(prev, device_id);
+        }
         Ok(epoch)
     }
 
@@ -456,7 +520,13 @@ impl DeviceManager {
         )
         .map_err(|e| ServerError::TokenError(e.to_string()))
     }
-    fn gen_user_token(&self, device_id: &str, device_desc: &str, user_id: &str) -> Result<String> {
+    fn gen_user_token(
+        &self,
+        device_id: &str,
+        device_desc: &str,
+        user_id: &str,
+        epoch: i64,
+    ) -> Result<String> {
         let now = Utc::now().timestamp();
         encode(
             &Header::new(Algorithm::HS256),
@@ -484,6 +554,7 @@ impl DeviceManager {
                     status: "active".into(),
                     plan: "connect".into(),
                 },
+                epoch,
             },
             &self.inner.encoding_key,
         )
@@ -499,13 +570,44 @@ impl DeviceManager {
         Ok(c)
     }
     fn check_registered(conn: &Connection, c: &DeviceTokenClaims) -> Result<()> {
+        Self::check_registration(conn, &c.device_id, &c.auth0_userid, c.epoch, "device")
+    }
+    /// A token (or session) of `device_id` for `user_id` minted at `epoch` is only honoured while
+    /// that device is still registered to that user at that epoch.
+    fn check_registration(
+        conn: &Connection,
+        device_id: &str,
+        user_id: &str,
+        token_epoch: i64,
+        kind: &str,
+    ) -> Result<()> {
         // devices.device_id and device_token_epochs.device_id are PRIMARY KEYs: two index lookups.
-        let epoch: Option<i64> = conn.query_row("SELECT COALESCE((SELECT epoch FROM device_token_epochs WHERE device_id = ?1), 0) FROM devices WHERE device_id = ?1 AND user_id = ?2", params![c.device_id, c.auth0_userid], |r| r.get(0)).optional()?;
-        if epoch != Some(c.epoch) {
-            tracing::warn!(device_id = %c.device_id, "rejecting device token: device not registered to this user, or token revoked");
+        let epoch: Option<i64> = conn.query_row("SELECT COALESCE((SELECT epoch FROM device_token_epochs WHERE device_id = ?1), 0) FROM devices WHERE device_id = ?1 AND user_id = ?2", params![device_id, user_id], |r| r.get(0)).optional()?;
+        if epoch != Some(token_epoch) {
+            tracing::warn!(%device_id, "rejecting {kind} token: device not registered to this user, or token revoked");
             return Err(ServerError::InvalidToken);
         }
         Ok(())
+    }
+    /// User tokens expire (3h) but are also revoked with the device that minted them: same
+    /// registration + epoch check as device tokens. Admin tokens (`create_user_token`) have no
+    /// device and skip it.
+    fn decode_user_token(&self, token: &str) -> Result<UserTokenClaims> {
+        let mut val = Validation::new(Algorithm::HS256);
+        val.set_required_spec_claims(&["sub", "exp"]);
+        let c = decode::<UserTokenClaims>(token, &self.inner.decoding_key, &val)
+            .map_err(|_| ServerError::InvalidToken)?
+            .claims;
+        if c.device_id != ADMIN_DEVICE_ID {
+            Self::check_registration(
+                &self.inner.conn.lock(),
+                &c.device_id,
+                &c.sub,
+                c.epoch,
+                "user",
+            )?;
+        }
+        Ok(c)
     }
     /// Validate a device token and record the refresh under one lock, so a delete/re-pair can't
     /// land between the registration check and the write (which would otherwise undo it).
@@ -529,33 +631,93 @@ impl DeviceManager {
             .map_err(|_| ServerError::InvalidToken)
     }
     pub fn validate_token(&self, auth: &str) -> Result<String> {
-        let token = auth
-            .strip_prefix("Bearer ")
-            .ok_or(ServerError::Unauthorized)?;
-        if let Ok(c) = self.decode_device_token(token) {
-            return Ok(c.auth0_userid);
-        }
-        let mut val = Validation::new(Algorithm::HS256);
-        val.set_required_spec_claims(&["sub", "exp"]);
-        if let Ok(d) = decode::<UserTokenClaims>(token, &self.inner.decoding_key, &val) {
-            return Ok(d.claims.sub);
-        }
-        Err(ServerError::InvalidToken)
+        self.session_identity(auth).map(|s| s.user_id)
     }
     /// Resolve a bearer header to (user id, device id, device description).
     pub fn caller(&self, auth: &str) -> Result<(String, String, String)> {
+        self.session_identity(auth)
+            .map(|s| (s.user_id, s.device_id, s.device_desc))
+    }
+    /// Resolve a bearer header (device or user token) to who it authenticates.
+    pub fn session_identity(&self, auth: &str) -> Result<SessionIdentity> {
         let token = auth
             .strip_prefix("Bearer ")
             .ok_or(ServerError::Unauthorized)?;
         if let Ok(c) = self.decode_device_token(token) {
-            return Ok((c.auth0_userid, c.device_id, c.device_desc));
+            return Ok(SessionIdentity {
+                user_id: c.auth0_userid,
+                device_id: c.device_id,
+                device_desc: c.device_desc,
+                epoch: c.epoch,
+            });
         }
-        let mut val = Validation::new(Algorithm::HS256);
-        val.set_required_spec_claims(&["sub", "exp"]);
-        let c = decode::<UserTokenClaims>(token, &self.inner.decoding_key, &val)
-            .map_err(|_| ServerError::InvalidToken)?
-            .claims;
-        Ok((c.sub, c.device_id, c.device_desc))
+        let c = self.decode_user_token(token)?;
+        Ok(SessionIdentity {
+            user_id: c.sub,
+            device_id: c.device_id,
+            device_desc: c.device_desc,
+            epoch: c.epoch,
+        })
+    }
+    /// Whether the registration a session was opened under still stands (token expiry is not
+    /// re-checked: a session outliving its 3h user token is the tablet's normal behaviour).
+    /// Fails closed on a DB error; the client just reconnects.
+    pub fn session_still_valid(&self, s: &SessionIdentity) -> bool {
+        s.device_id == ADMIN_DEVICE_ID
+            || Self::check_registration(
+                &self.inner.conn.lock(),
+                &s.device_id,
+                &s.user_id,
+                s.epoch,
+                "session",
+            )
+            .is_ok()
+    }
+    /// Resolves once the session's device is revoked: on its `DeviceRevoked` event, or when a
+    /// periodic re-check (every `SESSION_RECHECK`, and after a lagged event stream) finds the
+    /// registration gone. Subscribes before the first check, so nothing slips in between.
+    pub fn session_revoked(
+        &self,
+        s: &SessionIdentity,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        self.session_revoked_every(s, SESSION_RECHECK)
+    }
+    pub(crate) fn session_revoked_every(
+        &self,
+        s: &SessionIdentity,
+        recheck: std::time::Duration,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        use tokio::sync::broadcast::error::RecvError;
+        let mut rx = self.subscribe_revocations();
+        let dm = self.clone();
+        let s = s.clone();
+        async move {
+            if !dm.session_still_valid(&s) {
+                return;
+            }
+            let start = tokio::time::Instant::now() + recheck;
+            let mut tick = tokio::time::interval_at(start, recheck);
+            let mut events_open = true;
+            loop {
+                tokio::select! {
+                    ev = rx.recv(), if events_open => match ev {
+                        Ok(r) if r.user_id == s.user_id && r.device_id == s.device_id => return,
+                        Ok(_) => {}
+                        Err(RecvError::Lagged(_)) => {
+                            if !dm.session_still_valid(&s) {
+                                return;
+                            }
+                        }
+                        Err(RecvError::Closed) => events_open = false,
+                    },
+                    _ = tick.tick() => {
+                        if !dm.session_still_valid(&s) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Record a passcode (PIN) reset request from a device. Idempotent per request id while it is live:
@@ -743,7 +905,7 @@ impl DeviceManager {
     /// Create a user token for admin/test purposes
     pub fn create_user_token(&self, user_id: &str) -> Result<String> {
         // Same claims as a device-issued user token, so validate_token accepts it.
-        self.gen_user_token("admin", "admin", user_id)
+        self.gen_user_token(ADMIN_DEVICE_ID, ADMIN_DEVICE_ID, user_id, 0)
     }
 
     /// Register/refresh a device and mint an OAuth bundle for software 3.28:
@@ -755,7 +917,7 @@ impl DeviceManager {
         device_id: &str,
         device_desc: &str,
     ) -> Result<(String, String, String)> {
-        let epoch = Self::register(&self.inner.conn.lock(), device_id, device_desc, user_id)?;
+        let epoch = self.register(&self.inner.conn.lock(), device_id, device_desc, user_id)?;
         self.mint_bundle(user_id, device_id, device_desc, epoch)
     }
     fn mint_bundle(
@@ -766,7 +928,7 @@ impl DeviceManager {
         epoch: i64,
     ) -> Result<(String, String, String)> {
         Ok((
-            self.gen_user_token(device_id, device_desc, user_id)?,
+            self.gen_user_token(device_id, device_desc, user_id, epoch)?,
             self.gen_device_token(device_id, device_desc, user_id, epoch)?,
             self.issue_id_token(user_id)?,
         ))
@@ -1127,6 +1289,141 @@ mod revocation_tests {
         assert!(dm.validate_token(&bearer(&b)).is_err());
     }
 
+    fn payload_json(token: &str) -> String {
+        let payload = token.split('.').nth(1).unwrap();
+        String::from_utf8(
+            base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload)
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn user_tokens_die_with_their_device() {
+        let (dm, _tmp) = setup();
+        let code = dm.create_pairing_code("local-user").unwrap();
+        let (dt, paired_ut) = dm.exchange_code(&code, "RM110-1", "remarkable").unwrap();
+        let refreshed = dm.refresh_user_token(&dt).unwrap();
+        let (bundle_ut, ..) = dm.refresh_oauth(&dt).unwrap();
+        let other = pair(&dm, "local-user", "RM110-2");
+        let other_ut = dm.refresh_user_token(&other).unwrap();
+        for t in [&paired_ut, &refreshed, &bundle_ut] {
+            assert_eq!(dm.validate_token(&bearer(t)).unwrap(), "local-user");
+        }
+        assert!(dm.delete_device("RM110-1", None).unwrap());
+        for t in [&paired_ut, &refreshed, &bundle_ut] {
+            assert!(matches!(
+                dm.validate_token(&bearer(t)),
+                Err(ServerError::InvalidToken)
+            ));
+            assert!(dm.caller(&bearer(t)).is_err());
+            assert!(dm.session_identity(&bearer(t)).is_err());
+        }
+        assert!(
+            dm.validate_token(&bearer(&other_ut)).is_ok(),
+            "other device's user token unaffected"
+        );
+        // Re-pairing the device does not revive user tokens minted before the delete.
+        let new = pair(&dm, "local-user", "RM110-1");
+        let new_ut = dm.refresh_user_token(&new).unwrap();
+        assert!(payload_json(&new_ut).contains("\"rms-epoch\":1"));
+        assert!(dm.validate_token(&bearer(&new_ut)).is_ok());
+        for t in [&paired_ut, &refreshed, &bundle_ut] {
+            assert!(dm.validate_token(&bearer(t)).is_err());
+        }
+        // Moving the device to another user kills the previous owner's user tokens too.
+        let _b = pair(&dm, "user-b", "RM110-1");
+        assert!(dm.validate_token(&bearer(&new_ut)).is_err());
+        // Self-unregister (DELETE /token/json/3/device) does as well.
+        let other_dt = other;
+        assert!(dm.revoke_device_token(&other_dt).unwrap());
+        assert!(dm.validate_token(&bearer(&other_ut)).is_err());
+    }
+
+    #[test]
+    fn admin_user_tokens_are_not_tied_to_a_device() {
+        let (dm, _tmp) = setup();
+        let admin = dm.create_user_token("local-user").unwrap();
+        let dt = pair(&dm, "local-user", "RM110-1");
+        assert!(dm.delete_device("RM110-1", None).unwrap());
+        assert!(dm.revoke_device_token(&dt).is_ok());
+        assert_eq!(dm.validate_token(&bearer(&admin)).unwrap(), "local-user");
+        let id = dm.session_identity(&bearer(&admin)).unwrap();
+        assert_eq!(id.device_id, ADMIN_DEVICE_ID);
+        assert!(dm.session_still_valid(&id));
+        // The admin device id is reserved, so a real registration can't masquerade as one.
+        let code = dm.create_pairing_code("local-user").unwrap();
+        assert!(matches!(
+            dm.exchange_code(&code, ADMIN_DEVICE_ID, "x"),
+            Err(ServerError::BadRequest(_))
+        ));
+        assert!(dm.oauth_bundle("local-user", ADMIN_DEVICE_ID, "x").is_err());
+        assert!(dm.get_device(ADMIN_DEVICE_ID).unwrap().is_none());
+    }
+
+    #[test]
+    fn legacy_user_token_without_epoch_is_accepted_while_registered() {
+        let (dm, _tmp) = setup();
+        let dt = pair(&dm, "local-user", "RM110-1");
+        // What the live tablet holds today: a user token minted before the claim existed.
+        let legacy = dm
+            .gen_user_token("RM110-1", "remarkable", "local-user", 0)
+            .unwrap();
+        assert!(!payload_json(&legacy).contains("rms-epoch"));
+        assert!(
+            !payload_json(&dm.refresh_user_token(&dt).unwrap()).contains("rms-epoch"),
+            "epoch-0 user tokens are unchanged on the wire"
+        );
+        assert_eq!(
+            dm.caller(&bearer(&legacy)).unwrap(),
+            ("local-user".into(), "RM110-1".into(), "remarkable".into())
+        );
+        assert!(dm.delete_device("RM110-1", None).unwrap());
+        assert!(dm.validate_token(&bearer(&legacy)).is_err());
+        // A user token for a device that was never registered is refused.
+        let unknown = dm
+            .gen_user_token("never-paired", "x", "local-user", 0)
+            .unwrap();
+        assert!(dm.validate_token(&bearer(&unknown)).is_err());
+    }
+
+    #[tokio::test]
+    async fn session_revoked_resolves_only_for_its_device() {
+        use std::time::Duration;
+        let (dm, tmp) = setup();
+        let a = pair(&dm, "local-user", "RM110-1");
+        let b = pair(&dm, "local-user", "RM110-2");
+        let ut_a = dm.refresh_user_token(&a).unwrap();
+        let ida = dm.session_identity(&bearer(&ut_a)).unwrap();
+        let idb = dm.session_identity(&bearer(&b)).unwrap();
+        let mut rev_a = Box::pin(dm.session_revoked(&ida));
+        let mut rev_b = Box::pin(dm.session_revoked(&idb));
+        async fn pending(f: impl std::future::Future<Output = ()>) -> bool {
+            tokio::time::timeout(Duration::from_millis(50), f)
+                .await
+                .is_err()
+        }
+        assert!(pending(&mut rev_a).await && pending(&mut rev_b).await);
+        assert!(dm.delete_device("RM110-1", None).unwrap());
+        tokio::time::timeout(Duration::from_secs(5), &mut rev_a)
+            .await
+            .expect("revoked on the delete event");
+        assert!(pending(&mut rev_b).await, "other device's session stays");
+        assert!(!dm.session_still_valid(&ida) && dm.session_still_valid(&idb));
+        // A session for an already-revoked identity resolves at once.
+        tokio::time::timeout(Duration::from_secs(5), dm.session_revoked(&ida))
+            .await
+            .unwrap();
+        // Backstop: a registration that vanishes without an event is caught by the re-check.
+        let rev_b = dm.session_revoked_every(&idb, Duration::from_millis(20));
+        side_conn(&tmp)
+            .execute("DELETE FROM devices WHERE device_id = 'RM110-2'", [])
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), rev_b)
+            .await
+            .expect("periodic re-check closes it");
+    }
+
     #[test]
     fn user_tokens_keep_exp_validation() {
         let (dm, _tmp) = setup();
@@ -1159,6 +1456,7 @@ mod revocation_tests {
                     status: "active".into(),
                     plan: "connect".into(),
                 },
+                epoch: 0,
             },
             &dm.inner.encoding_key,
         )

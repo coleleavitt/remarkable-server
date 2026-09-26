@@ -225,15 +225,24 @@ pub async fn notifications_ws(
     headers: axum::http::HeaderMap,
 ) -> crate::error::Result<impl IntoResponse> {
     // Same as the cloud: only authenticated devices/clients may subscribe.
-    let user_id = state.auth_user(&headers)?;
-    // For filtering direct screen share messages; unknown means no filtering.
     let auth = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    let device_id = state.devices.caller(auth).ok().map(|(_, device, _)| device);
+        .ok_or(crate::error::ServerError::Unauthorized)?;
+    let identity = state.devices.session_identity(auth)?;
+    // Closes the socket once the device it authenticated as is revoked.
+    let revoked = state.devices.session_revoked(&identity);
     info!("WebSocket upgrade request for notifications");
-    Ok(ws.on_upgrade(move |socket| handle_notifications_socket(socket, state, user_id, device_id)))
+    Ok(ws.on_upgrade(move |socket| {
+        handle_notifications_socket(
+            socket,
+            state,
+            identity.user_id,
+            // For filtering direct screen share messages.
+            Some(identity.device_id),
+            revoked,
+        )
+    }))
 }
 
 /// Handle an individual WebSocket connection
@@ -257,6 +266,7 @@ async fn handle_notifications_socket(
     state: AppState,
     user_id: String,
     device_id: Option<String>,
+    revoked: impl std::future::Future<Output = ()> + Send + 'static,
 ) {
     let session_id = uuid::Uuid::new_v4().to_string();
     info!(session_id = %session_id, "New notifications WebSocket connection");
@@ -277,12 +287,27 @@ async fn handle_notifications_socket(
     // Subscribe to broadcast channel for sync notifications
     let mut rx = state.notification_tx.subscribe();
 
-    // Spawn task to forward broadcasts to this client
+    // Spawn task to forward broadcasts to this client. It owns the sending half, so it is also
+    // what closes the socket when the device is revoked; it returns true in that case.
     let session_id_clone = session_id.clone();
     let storage = state.storage.clone();
-    let forward_task = tokio::spawn(async move {
+    let mut forward_task = tokio::spawn(async move {
+        tokio::pin!(revoked);
         loop {
-            let msg = match rx.recv().await {
+            let notif = tokio::select! {
+                notif = rx.recv() => notif,
+                () = &mut revoked => {
+                    info!(session_id = %session_id_clone, "device revoked, closing notifications WebSocket");
+                    let _ = sender
+                        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                            code: axum::extract::ws::close_code::POLICY,
+                            reason: "device revoked".into(),
+                        })))
+                        .await;
+                    return true;
+                }
+            };
+            let msg = match notif {
                 Ok(msg) => msg,
                 // Missing a few events beats ending notifications for this client.
                 // A skipped SyncComplete would leave it out of date, so send a
@@ -308,10 +333,22 @@ async fn handle_notifications_socket(
             }
         }
         debug!(session_id = %session_id_clone, "Forward task ended");
+        false
     });
 
-    // Handle incoming messages
-    while let Some(result) = receiver.next().await {
+    // Handle incoming messages until the client leaves or its device is revoked.
+    let mut forwarding = true;
+    loop {
+        let result = tokio::select! {
+            incoming = receiver.next() => match incoming { Some(r) => r, None => break },
+            ended = &mut forward_task, if forwarding => {
+                forwarding = false;
+                if matches!(ended, Ok(true)) {
+                    break; // revoked: the Close frame is out, stop serving this client
+                }
+                continue;
+            }
+        };
         match result {
             Ok(Message::Text(text)) => {
                 debug!(session_id = %session_id, "Received text: {}", text);
