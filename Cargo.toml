@@ -13,6 +13,8 @@ tower-http = { version = "0.6", features = ["trace", "cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+hmac = "0.12"
+sha1 = "0.10"
 crc32c = "0.6"
 base64 = "0.22"
 hex = "0.4"
@@ -62,6 +64,8 @@ diffy = "0.5.2"
 
 [dev-dependencies]
 tokio-test = "0.4"
+# WebSocket client for the /mqtt route test (same version axum's ws uses)
+tokio-tungstenite = "0.29"
 # Fake tablet peer for the screen share viewer test
 webrtc = { git = "https://github.com/coleleavitt/webrtc", branch = "fix/datachannel-max-message-size" }
 flate2 = "1"

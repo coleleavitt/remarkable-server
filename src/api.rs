@@ -104,24 +104,43 @@ pub async fn put_file(State(state): State<AppState>, Path(hash): Path<String>, h
     let filename = headers.get("rm-filename").and_then(|v| v.to_str().ok()).ok_or_else(|| ServerError::MissingHeader("rm-filename".into()))?;
     // Verify transport integrity via crc32c when the client sends it; the sha256 in
     // the URL can't be checked against the body (index hashes are over child hashes).
-    if let Some(goog) = headers.get("x-goog-hash").and_then(|v| v.to_str().ok()) {
-        if checksum::parse_goog_hash(goog).is_some_and(|crc| crc != checksum::crc32c(&body)) {
-            return Err(ServerError::ChecksumMismatch { expected: goog.to_string(), actual: checksum::format_goog_hash(&body) });
-        }
-    }
+    checksum::verify_goog_hash_header(&headers, &body)?;
     state.storage.put_with_hash(&body, &hash, filename)?;
     Ok(Json(UploadResponse { hash, size: body.len() as u64 }))
 }
 
-pub async fn create_pairing_code(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<PairingCodeResponse>> {
-    let user_id = state.auth_user(&headers)?;
-    let code = state.devices.create_pairing_code(&user_id)?;
+/// Default account for pairing codes: the single local account, as `--pair` (main.rs `PAIRING_USER`) issues codes for.
+const PAIRING_USER: &str = "local-user";
+
+#[derive(Deserialize, Default)]
+pub struct PairingQuery { user: Option<String> }
+
+/// A user id we're willing to bind a pairing code to: 1..=254 printable ASCII chars (an email's max
+/// length), no whitespace or path separators. Covers `local-user`, `auth0|...` and any email that
+/// `/admin/create-user` accepts, including `+` tags (send `+` as `%2B` in the query string).
+fn valid_user_id(u: &str) -> bool { !u.is_empty() && u.len() <= 254 && u.bytes().all(|b| b.is_ascii_graphic() && b != b'/' && b != b'\\') }
+
+/// `POST /devices/v1[?user=<id>]` -> a one-time pairing code for `user` (default `local-user`, same as `--pair`).
+/// Owner only (`x-admin-token`): a code registers a new device, and a second device of the same user can
+/// approve the first one's passcode reset, so an ordinary device/user token must not be able to mint one.
+/// `--pair` on the CLI is the other way.
+pub async fn create_pairing_code(State(state): State<AppState>, headers: HeaderMap, axum::extract::Query(q): axum::extract::Query<PairingQuery>) -> Result<Json<PairingCodeResponse>> {
+    pairing_code_with(&state, &headers, admin_token().as_deref(), q.user.as_deref())
+}
+
+fn pairing_code_with(state: &AppState, headers: &HeaderMap, admin: Option<&str>, user: Option<&str>) -> Result<Json<PairingCodeResponse>> {
+    check_admin(admin, headers)?;
+    let user = user.unwrap_or(PAIRING_USER);
+    if !valid_user_id(user) { return Err(ServerError::BadRequest("user must be 1-254 printable ASCII chars without spaces, '/' or '\\' (send '+' as %2B)".into())); }
+    let code = state.devices.create_pairing_code(user)?;
+    tracing::info!(%user, "pairing code issued via admin endpoint");
     Ok(Json(PairingCodeResponse { code, expires_in: 600 }))
 }
 
+/// The caller's own devices only.
 pub async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Vec<DeviceInfo>>> {
-    let _user_id = state.auth_user(&headers)?;
-    let devices = state.devices.list_devices()?.into_iter().map(|d| DeviceInfo {
+    let user_id = state.auth_user(&headers)?;
+    let devices = state.devices.list_devices(Some(&user_id))?.into_iter().map(|d| DeviceInfo {
         device_id: d.device_id,
         device_desc: d.device_desc,
         registered_at: d.registered_at.to_rfc3339(),
@@ -130,9 +149,10 @@ pub async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> 
     Ok(Json(devices))
 }
 
+/// Unregister one of the caller's own devices; anyone else's (or an unknown id) is a 404.
 pub async fn delete_device(State(state): State<AppState>, Path(id): Path<String>, headers: HeaderMap) -> Result<StatusCode> {
-    let _user_id = state.auth_user(&headers)?;
-    state.devices.delete_device(&id)?;
+    let user_id = state.auth_user(&headers)?;
+    if !state.devices.delete_device(&id, Some(&user_id))? { return Err(ServerError::NotFound(id)); }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -160,8 +180,7 @@ pub async fn register_device(State(state): State<AppState>, Json(req): Json<Devi
 }
 
 pub async fn delete_device_token(State(state): State<AppState>, headers: HeaderMap) -> Result<StatusCode> {
-    let device_id = state.devices.device_id_for_token(bearer(&headers)?)?;
-    state.devices.delete_device(&device_id)?;
+    state.devices.revoke_device_token(bearer(&headers)?)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -187,8 +206,10 @@ pub async fn list_files(State(state): State<AppState>, headers: HeaderMap) -> Re
     Ok(Json(state.storage.list().into_iter().map(|(hash, filename, size)| FileInfo { hash, filename, size }).collect()))
 }
 
+/// Admin: delete every blob and reset the root. A device token is not enough: any paired
+/// tablet or client could otherwise wipe the cloud.
 pub async fn clear_storage(State(state): State<AppState>, headers: HeaderMap) -> Result<StatusCode> {
-    state.auth_user(&headers)?;
+    require_admin(&headers)?;
     state.storage.clear()?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -213,8 +234,15 @@ pub struct CreateUserRequest { pub email: String }
 
 /// Admin-only endpoints are disabled unless `ADMIN_TOKEN` is set; callers must send it
 /// in `x-admin-token`.
-pub(crate) fn require_admin(headers: &HeaderMap) -> Result<()> {
-    let expected = std::env::var("ADMIN_TOKEN").ok().filter(|t| !t.is_empty()).ok_or(ServerError::Unauthorized)?;
+pub(crate) fn require_admin(headers: &HeaderMap) -> Result<()> { check_admin(admin_token().as_deref(), headers) }
+
+/// The configured `ADMIN_TOKEN`, if set and non-empty.
+pub(crate) fn admin_token() -> Option<String> { std::env::var("ADMIN_TOKEN").ok().filter(|t| !t.is_empty()) }
+
+/// `require_admin` against an explicit expected token (`None` = admin disabled), so callers
+/// can be tested without touching the process environment.
+pub(crate) fn check_admin(expected: Option<&str>, headers: &HeaderMap) -> Result<()> {
+    let expected = expected.filter(|t| !t.is_empty()).ok_or(ServerError::Unauthorized)?;
     let given = headers.get("x-admin-token").and_then(|v| v.to_str().ok()).ok_or(ServerError::Unauthorized)?;
     if given.as_bytes() != expected.as_bytes() { return Err(ServerError::Unauthorized); }
     Ok(())
@@ -265,4 +293,150 @@ pub async fn check_updates() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "available": false
     }))
+}
+
+#[cfg(test)]
+mod pairing_tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    // Passed to `pairing_code_with` directly; the process `ADMIN_TOKEN` env var is never set.
+    const ADMIN: &str = "pairing-test-admin-token";
+
+    fn setup() -> (AppState, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let devices = DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        (AppState::new(Storage::new(tmp.path()).unwrap(), devices), tmp)
+    }
+    fn hdr(name: &'static str, v: &str) -> HeaderMap { let mut h = HeaderMap::new(); h.insert(name, HeaderValue::from_str(v).unwrap()); h }
+    fn status_of<T>(r: Result<T>) -> StatusCode { r.err().expect("expected an error").into_response().status() }
+
+    #[tokio::test]
+    async fn device_and_user_tokens_cannot_mint_pairing_codes() {
+        use tower::ServiceExt;
+        let (state, _tmp) = setup();
+        let (dev, _) = state.devices.exchange_code(&state.devices.create_pairing_code(PAIRING_USER).unwrap(), "tablet-a", "remarkable").unwrap();
+        let user = state.devices.create_user_token(PAIRING_USER).unwrap();
+        for tok in [dev.as_str(), user.as_str()] {
+            let h = hdr("authorization", &format!("Bearer {tok}"));
+            // even with admin enabled, a Bearer token is not the admin credential
+            assert_eq!(status_of(pairing_code_with(&state, &h, Some(ADMIN), None)), StatusCode::UNAUTHORIZED);
+            // and through the real route (public handler + router, as mounted in main.rs)
+            let req = axum::http::Request::post("/devices/v1").header(header::AUTHORIZATION, format!("Bearer {tok}")).body(axum::body::Body::empty()).unwrap();
+            assert_eq!(crate::create_router(state.clone()).oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        }
+        let req = axum::http::Request::post("/devices/v1").body(axum::body::Body::empty()).unwrap();
+        assert_eq!(crate::create_router(state.clone()).oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        // wrong admin token, or admin disabled (no ADMIN_TOKEN configured)
+        assert_eq!(status_of(pairing_code_with(&state, &hdr("x-admin-token", "wrong"), Some(ADMIN), None)), StatusCode::UNAUTHORIZED);
+        assert_eq!(status_of(pairing_code_with(&state, &hdr("x-admin-token", ADMIN), None, None)), StatusCode::UNAUTHORIZED);
+        assert_eq!(status_of(pairing_code_with(&state, &hdr("x-admin-token", ""), Some(""), None)), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_token_issues_a_code_that_pairs_the_local_user() {
+        let (state, _tmp) = setup();
+        let Json(r) = pairing_code_with(&state, &hdr("x-admin-token", ADMIN), Some(ADMIN), None).unwrap();
+        assert_eq!((r.code.len(), r.expires_in), (8, 600));
+        let (dev, _) = state.devices.exchange_code(&r.code, "tablet-b", "remarkable").unwrap();
+        assert_eq!(state.devices.validate_token(&format!("Bearer {dev}")).unwrap(), PAIRING_USER);
+        assert!(state.devices.exchange_code(&r.code, "tablet-c", "remarkable").is_err(), "single use");
+    }
+
+    #[tokio::test]
+    async fn admin_can_pair_an_explicit_user() {
+        let (state, _tmp) = setup();
+        let admin = hdr("x-admin-token", ADMIN);
+        let Json(r) = pairing_code_with(&state, &admin, Some(ADMIN), Some("auth0|alice-2")).unwrap();
+        let (dev, _) = state.devices.exchange_code(&r.code, "tablet-d", "remarkable").unwrap();
+        assert_eq!(state.devices.validate_token(&format!("Bearer {dev}")).unwrap(), "auth0|alice-2");
+        // email-style ids with `+` tags (as `/admin/create-user` accepts) pair fine
+        let Json(r) = pairing_code_with(&state, &admin, Some(ADMIN), Some("john+tablet@example.com")).unwrap();
+        let (dev, _) = state.devices.exchange_code(&r.code, "tablet-e", "remarkable").unwrap();
+        assert_eq!(state.devices.validate_token(&format!("Bearer {dev}")).unwrap(), "john+tablet@example.com");
+        for bad in ["", "a b", "x/y", "x\\y", "tab\there", &"u".repeat(255)] {
+            assert_eq!(status_of(pairing_code_with(&state, &admin, Some(ADMIN), Some(bad))), StatusCode::BAD_REQUEST, "{bad:?}");
+        }
+        // auth is checked before the user id: a bad id without the admin token is still 401
+        assert_eq!(status_of(pairing_code_with(&state, &HeaderMap::new(), Some(ADMIN), Some(""))), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn user_query_through_the_router_still_needs_admin() {
+        use tower::ServiceExt;
+        let (state, _tmp) = setup();
+        // `?user=` parses through the real router; without an admin token it's still 401 (ADMIN_TOKEN is never set in tests)
+        for uri in ["/devices/v1?user=bob", "/devices/v1?user=", "/devices/v1?other=1"] {
+            let req = axum::http::Request::post(uri).body(axum::body::Body::empty()).unwrap();
+            assert_eq!(crate::create_router(state.clone()).oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod device_ownership_tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    fn hdrs(tk: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {tk}")).unwrap());
+        h
+    }
+    /// Pair `device` to `user` and return that device's token.
+    fn pair(state: &AppState, user: &str, device: &str) -> String {
+        let code = state.devices.create_pairing_code(user).unwrap();
+        state.devices.exchange_code(&code, device, "remarkable").unwrap().0
+    }
+
+    #[tokio::test]
+    async fn users_only_see_and_delete_their_own_devices() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let devices = DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        let state = AppState::new(Storage::new(tmp.path()).unwrap(), devices);
+        let a_dev = pair(&state, "user-a", "RM110-A");
+        let b_dev = pair(&state, "user-b", "RM110-B");
+        let a = state.devices.create_user_token("user-a").unwrap();
+        let ids = |v: Vec<DeviceInfo>| v.into_iter().map(|d| d.device_id).collect::<Vec<_>>();
+        let Json(listed) = list_devices(State(state.clone()), hdrs(&a)).await.unwrap();
+        assert_eq!(ids(listed), ["RM110-A"]);
+        // B's device token authenticates as B and sees only B's device.
+        let Json(listed) = list_devices(State(state.clone()), hdrs(&b_dev)).await.unwrap();
+        assert_eq!(ids(listed), ["RM110-B"]);
+        // A can't delete B's device: 404, and B's registration and token survive.
+        let err = delete_device(State(state.clone()), Path("RM110-B".into()), hdrs(&a)).await.unwrap_err();
+        assert!(matches!(err, ServerError::NotFound(_)), "{err:?}");
+        assert!(state.devices.get_device("RM110-B").unwrap().is_some());
+        assert_eq!(state.devices.validate_token(&format!("Bearer {b_dev}")).unwrap(), "user-b");
+        // Own device: 204, and its token is revoked.
+        assert_eq!(delete_device(State(state.clone()), Path("RM110-A".into()), hdrs(&a)).await.unwrap(), StatusCode::NO_CONTENT);
+        assert!(state.devices.validate_token(&format!("Bearer {a_dev}")).is_err());
+        let Json(listed) = list_devices(State(state.clone()), hdrs(&a)).await.unwrap();
+        assert!(listed.is_empty());
+        assert!(matches!(delete_device(State(state.clone()), Path("RM110-A".into()), hdrs(&a)).await, Err(ServerError::NotFound(_))));
+        // Admin-side (owner = None) still sees everything.
+        assert_eq!(state.devices.list_devices(None).unwrap().iter().map(|d| d.device_id.as_str()).collect::<Vec<_>>(), ["RM110-B"]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[tokio::test]
+    async fn non_admin_token_cannot_clear_storage() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        let hash = storage.put(b"keep me", "doc.pdf").unwrap();
+        let devices = DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        let token = devices.create_user_token("user").unwrap();
+        let state = AppState::new(storage, devices);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {token}")).unwrap());
+
+        let result = clear_storage(State(state.clone()), headers).await;
+        assert!(matches!(result, Err(ServerError::Unauthorized)));
+        assert!(state.storage.exists(&hash));
+    }
 }
