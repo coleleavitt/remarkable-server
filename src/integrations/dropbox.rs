@@ -20,11 +20,31 @@ use crate::integrations::{
 const API_BASE: &str = "https://api.dropboxapi.com/2";
 const CONTENT_BASE: &str = "https://content.dropboxapi.com/2";
 
+/// Make a JSON `Dropbox-API-Arg` value header-safe: HTTP header values must be visible ASCII,
+/// so Dropbox requires DEL and every non-ASCII character escaped as `\uXXXX` (UTF-16). Without
+/// this, a path like `/Notes/café.pdf` makes the request fail before it is sent.
+fn header_safe_json(json: &str) -> String {
+    let mut out = String::with_capacity(json.len());
+    for c in json.chars() {
+        if c.is_ascii() && c != '\x7f' {
+            out.push(c);
+        } else {
+            let mut buf = [0u16; 2];
+            for unit in c.encode_utf16(&mut buf) {
+                out.push_str(&format!("\\u{:04x}", unit));
+            }
+        }
+    }
+    out
+}
+
 /// Dropbox provider
 pub struct Dropbox {
     config: OAuthConfig,
     token: Option<OAuthToken>,
     client: Client,
+    api_base: String,
+    content_base: String,
 }
 
 impl Dropbox {
@@ -33,6 +53,8 @@ impl Dropbox {
             config,
             token: None,
             client: crate::integrations::http_client(),
+            api_base: API_BASE.into(),
+            content_base: CONTENT_BASE.into(),
         }
     }
 
@@ -41,7 +63,16 @@ impl Dropbox {
             config,
             token: Some(token),
             client: crate::integrations::http_client(),
+            api_base: API_BASE.into(),
+            content_base: CONTENT_BASE.into(),
         }
+    }
+
+    /// Point the provider at different API / content endpoints (tests, proxies).
+    pub fn with_base_urls(mut self, api_base: &str, content_base: &str) -> Self {
+        self.api_base = api_base.trim_end_matches('/').into();
+        self.content_base = content_base.trim_end_matches('/').into();
+        self
     }
 
     fn access_token(&self) -> Result<&str> {
@@ -57,7 +88,7 @@ impl Dropbox {
         body: &T,
     ) -> Result<R> {
         let token = self.access_token()?;
-        let url = format!("{}/{}", API_BASE, endpoint);
+        let url = format!("{}/{}", self.api_base, endpoint);
 
         let response = self
             .client
@@ -75,37 +106,49 @@ impl Dropbox {
         &self,
         response: reqwest::Response,
     ) -> Result<R> {
-        let status = response.status();
-
-        if status.is_success() {
+        if response.status().is_success() {
             response
                 .json()
                 .await
                 .map_err(|e| IntegrationError::Serialization(e.to_string()))
-        } else if status.as_u16() == 401 {
-            Err(IntegrationError::TokenExpired)
-        } else if status.as_u16() == 429 {
-            let retry_after = response
+        } else {
+            Err(response_error(response).await)
+        }
+    }
+}
+
+/// Map a non-success Dropbox response to an error. A missing path (409 `path/not_found`, or a
+/// plain 404) is [`IntegrationError::NotFound`] and content that can't be downloaded (409
+/// `unsupported_file`, e.g. Paper docs) is [`IntegrationError::NotDownloadable`], both
+/// permanent; auth, rate limits and 5xx stay retryable.
+async fn response_error(response: reqwest::Response) -> IntegrationError {
+    let status = response.status();
+    match status.as_u16() {
+        401 => IntegrationError::TokenExpired,
+        429 => IntegrationError::RateLimited {
+            retry_after_secs: response
                 .headers()
                 .get("Retry-After")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(60);
-            Err(IntegrationError::RateLimited {
-                retry_after_secs: retry_after,
-            })
-        } else if status.as_u16() == 409 {
+                .unwrap_or(60),
+        },
+        404 => IntegrationError::NotFound("Path not found".into()),
+        409 => {
             let body = response.text().await.unwrap_or_default();
             if body.contains("path/not_found") {
-                Err(IntegrationError::NotFound("Path not found".into()))
+                IntegrationError::NotFound("Path not found".into())
+            } else if body.contains("unsupported_file") {
+                IntegrationError::NotDownloadable(body)
             } else if body.contains("insufficient_space") {
-                Err(IntegrationError::QuotaExceeded)
+                IntegrationError::QuotaExceeded
             } else {
-                Err(IntegrationError::Conflict(body))
+                IntegrationError::Conflict(body)
             }
-        } else {
+        }
+        _ => {
             let body = response.text().await.unwrap_or_default();
-            Err(IntegrationError::Api(format!("{}: {}", status, body)))
+            IntegrationError::Api(format!("{}: {}", status, body))
         }
     }
 }
@@ -360,17 +403,15 @@ impl CloudProvider for Dropbox {
 
         let response = self
             .client
-            .post(format!("{}/files/download", CONTENT_BASE))
+            .post(format!("{}/files/download", self.content_base))
             .bearer_auth(token)
-            .header("Dropbox-API-Arg", arg)
+            .header("Dropbox-API-Arg", header_safe_json(&arg))
             .send()
             .await
             .map_err(|e| IntegrationError::Network(e.to_string()))?;
 
         if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(IntegrationError::Api(format!("{}: {}", status, body)));
+            return Err(response_error(response).await);
         }
 
         response
@@ -415,9 +456,9 @@ impl CloudProvider for Dropbox {
 
         let response = self
             .client
-            .post(format!("{}/files/upload", CONTENT_BASE))
+            .post(format!("{}/files/upload", self.content_base))
             .bearer_auth(token)
-            .header("Dropbox-API-Arg", arg)
+            .header("Dropbox-API-Arg", header_safe_json(&arg))
             .header("Content-Type", "application/octet-stream")
             .body(content.to_vec())
             .send()
@@ -581,5 +622,77 @@ impl CloudProvider for Dropbox {
             total: usage.allocation.allocated,
             trash: None, // Dropbox doesn't report trash size separately
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::IntoResponse;
+
+    use super::*;
+
+    /// Deleted paths (409 `path/not_found`) and Paper docs (409 `unsupported_file`) fail
+    /// permanently; auth and 5xx stay retryable.
+    #[tokio::test]
+    async fn download_error_mapping() {
+        let app = axum::Router::new().route(
+            "/files/download",
+            axum::routing::post(|headers: HeaderMap| async move {
+                let arg: serde_json::Value =
+                    serde_json::from_str(headers["Dropbox-API-Arg"].to_str().unwrap()).unwrap();
+                match arg["path"].as_str().unwrap() {
+                    "/gone" => (
+                        StatusCode::CONFLICT,
+                        r#"{"error_summary":"path/not_found/.."}"#,
+                    )
+                        .into_response(),
+                    "/paper" => (
+                        StatusCode::CONFLICT,
+                        r#"{"error_summary":"unsupported_file/.."}"#,
+                    )
+                        .into_response(),
+                    "/flaky" => StatusCode::BAD_GATEWAY.into_response(),
+                    "/auth" => StatusCode::UNAUTHORIZED.into_response(),
+                    _ => "content".into_response(),
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = OAuthConfig::dropbox("id".into(), None, "http://localhost/cb".into());
+        let token = OAuthToken {
+            access_token: "t".into(),
+            refresh_token: None,
+            token_type: "Bearer".into(),
+            expires_at: None,
+            scope: None,
+        };
+        let d = Dropbox::with_token(config, token).with_base_urls(&base, &base);
+
+        let err = d.download_file("/gone").await.unwrap_err();
+        assert!(matches!(err, IntegrationError::NotFound(_)), "{err}");
+        let err = d.download_file("/paper").await.unwrap_err();
+        assert!(matches!(err, IntegrationError::NotDownloadable(_)), "{err}");
+        for path in ["/flaky", "/auth"] {
+            let err = d.download_file(path).await.unwrap_err();
+            assert!(!err.is_permanent(), "{path}: {err}");
+        }
+        assert_eq!(d.download_file("/ok").await.unwrap(), b"content");
+    }
+
+    #[test]
+    fn api_arg_header_is_ascii_and_round_trips() {
+        let path = "/Notes/café/😀 \u{7f}.pdf";
+        let json = serde_json::to_string(&serde_json::json!({ "path": path })).unwrap();
+        let safe = header_safe_json(&json);
+        assert!(
+            reqwest::header::HeaderValue::from_str(&safe).is_ok(),
+            "{safe}"
+        );
+        assert!(safe.contains("caf\\u00e9") && safe.contains("\\ud83d\\ude00"));
+        let back: serde_json::Value = serde_json::from_str(&safe).unwrap();
+        assert_eq!(back["path"], path);
     }
 }

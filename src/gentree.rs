@@ -13,7 +13,6 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use base64::Engine;
 use serde_json::{Value, json};
 
 use crate::api::AppState;
@@ -129,30 +128,36 @@ pub async fn get_file(
 pub async fn put_file(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    Json(mut body): Json<Value>,
 ) -> Result<Json<Value>> {
     state.auth_user(&headers)?;
     let file_hash = body
         .get("fileHash")
         .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    if !is_valid_hash(file_hash) {
-        return Err(ServerError::InvalidHash(file_hash.into()));
+        .unwrap_or_default()
+        .to_owned();
+    if !is_valid_hash(&file_hash) {
+        return Err(ServerError::InvalidHash(file_hash));
     }
-    let b64 = body
-        .get(BLOB_FIELD)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| ServerError::MissingHeader(BLOB_FIELD.into()))?;
-    let data = base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .map_err(|_| ServerError::MissingHeader(format!("{BLOB_FIELD} (base64)")))?;
+    // The blob arrives base64 inside JSON, so the request is necessarily buffered (a
+    // streaming JSON parser would be needed otherwise). Take the payload string out of
+    // the tree and decode it step by step straight to a staged file, so the decoded
+    // blob (3/4 of the body again) never sits in memory next to it.
+    let b64 = match body.get_mut(BLOB_FIELD).map(Value::take) {
+        Some(Value::String(b64)) => b64,
+        _ => return Err(ServerError::MissingHeader(BLOB_FIELD.into())),
+    };
+    let staged = crate::upload::stage_base64(&state.storage, &b64, false)
+        .await?
+        .ok_or_else(|| ServerError::MissingHeader(format!("{BLOB_FIELD} (base64)")))?;
+    drop(b64);
     let file_path = body
         .get("filePath")
         .and_then(|v| v.as_str())
         .unwrap_or("gentree-blob");
-    state.storage.put_with_hash(&data, file_hash, file_path)?;
+    let size = staged.commit(&state.storage, &file_hash, file_path)?;
     Ok(Json(
-        json!({"fileHash": file_hash, "sizeBytes": data.len(), "state": "stored"}),
+        json!({"fileHash": file_hash, "sizeBytes": size, "state": "stored"}),
     ))
 }
 
@@ -220,6 +225,7 @@ pub async fn entry_session(
 #[cfg(test)]
 mod tests {
     use axum::http::HeaderValue;
+    use base64::Engine;
 
     use super::*;
     use crate::device::DeviceManager;

@@ -9,13 +9,19 @@
 //! Device codes follow RFC 8628: `/oauth/token` answers `authorization_pending` until the owner
 //! approves the `user_code` (`GET/POST /oauth/verify` or `POST /admin/oauth/approve`, with the
 //! `ADMIN_TOKEN`, or with a paired device's credential as `Authorization: Bearer`), and
-//! `expired_token` once the code is older than `expires_in`. Untested against a real 3.28 device.
+//! `expired_token` once the code is older than `expires_in` (`invalid_grant` for a code that
+//! was never issued or was already redeemed). Polling faster than `interval` while pending gets
+//! `slow_down` (and the interval grows by 5 s), and `/oauth/device/code` is rate limited per
+//! client IP and globally (429 `slow_down` + `Retry-After`). Untested against a real 3.28 device.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::{Query, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Query, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::{Form, Json};
@@ -31,6 +37,19 @@ const DEVICE_CODE_TTL: Duration = Duration::from_secs(600);
 /// Pending device codes kept at once; the oldest is dropped past this (endpoint is unauthenticated).
 const MAX_PENDING: usize = 256;
 const POLL_INTERVAL: u64 = 5;
+/// RFC 8628 3.5: each `slow_down` adds 5 s to the interval for this and later polls.
+const SLOW_DOWN_STEP: Duration = Duration::from_secs(5);
+/// Polls up to this much early still count as on time (timer jitter, request latency).
+const POLL_SLACK: Duration = Duration::from_secs(1);
+/// Device codes one client IP (IPv6: its /64) may request per `PER_IP_WINDOW`.
+const PER_IP_MAX: u32 = 5;
+const PER_IP_WINDOW: Duration = Duration::from_secs(600);
+/// Device codes issued to everyone per `GLOBAL_WINDOW`. 20/min stays under `MAX_PENDING` over a
+/// code's 10-minute lifetime, so admitted requests alone can never evict a live code.
+const GLOBAL_MAX: u32 = 20;
+const GLOBAL_WINDOW: Duration = Duration::from_secs(60);
+/// Hard bound on tracked client IPs (the global limit already keeps it near 200).
+const MAX_TRACKED_IPS: usize = 1024;
 const SCOPES: &str = "openid profile email offline_access";
 const EXPIRES_IN: u64 = 3 * 60 * 60;
 
@@ -39,19 +58,33 @@ struct Pending {
     user_code: String,
     at: Instant,
     approved_by: Option<String>,
+    /// Current minimum gap between polls (grows on `slow_down`).
+    interval: Duration,
+    last_poll: Option<Instant>,
 }
 
 #[derive(Debug, PartialEq)]
 enum Poll {
     Pending,
-    Approved { user_id: String, device_id: String },
+    /// Polled before `interval` elapsed; the new, longer interval.
+    SlowDown(Duration),
+    Approved {
+        user_id: String,
+        device_id: String,
+    },
+    /// Issued here but expired (or dropped at the cap) before being redeemed.
     Expired,
+    /// Never issued, already redeemed, or expired so long ago it's no longer remembered.
+    Unknown,
 }
 
 /// Outstanding device authorizations, keyed by device_code. Expired entries are dropped on every
-/// insert/poll/approve and the map never holds more than `cap` entries.
+/// insert/poll/approve and the map never holds more than `cap` entries. Dropped codes are
+/// remembered in `expired` (also at most `cap`, each for one more TTL) so a late poll gets
+/// `expired_token` rather than `invalid_grant`.
 struct PendingCodes {
     map: HashMap<String, Pending>,
+    expired: HashMap<String, Instant>,
     cap: usize,
 }
 
@@ -59,12 +92,37 @@ impl PendingCodes {
     fn new(cap: usize) -> Self {
         Self {
             map: HashMap::new(),
+            expired: HashMap::new(),
             cap,
         }
     }
     fn evict(&mut self, now: Instant) {
-        self.map
-            .retain(|_, p| now.saturating_duration_since(p.at) <= DEVICE_CODE_TTL);
+        let gone: Vec<String> = self
+            .map
+            .iter()
+            .filter(|(_, p)| now.saturating_duration_since(p.at) > DEVICE_CODE_TTL)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in gone {
+            self.map.remove(&k);
+            self.remember_expired(k, now);
+        }
+        self.expired
+            .retain(|_, at| now.saturating_duration_since(*at) <= DEVICE_CODE_TTL);
+    }
+    fn remember_expired(&mut self, device_code: String, now: Instant) {
+        while self.expired.len() >= self.cap {
+            let Some(oldest) = self
+                .expired
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.expired.remove(&oldest);
+        }
+        self.expired.insert(device_code, now);
     }
     /// Past the cap the oldest *unapproved* code goes first, so unauthenticated `/oauth/device/code`
     /// floods can't push out a code the owner already approved (only approvers create those).
@@ -82,6 +140,7 @@ impl PendingCodes {
                 break;
             };
             self.map.remove(&victim);
+            self.remember_expired(victim, now);
         }
         // Own random id (not a device_code prefix): no collisions between tablets, and the code never leaks into tokens.
         let device_id = format!("oauth-{}", uuid::Uuid::new_v4().simple());
@@ -92,6 +151,8 @@ impl PendingCodes {
                 user_code,
                 at: now,
                 approved_by: None,
+                interval: Duration::from_secs(POLL_INTERVAL),
+                last_poll: None,
             },
         );
     }
@@ -110,17 +171,23 @@ impl PendingCodes {
         }
     }
     /// Poll a device_code; an approved code is taken out (single use). Hand it back with `restore`
-    /// if issuing the tokens fails, so the tablet's next poll can retry.
+    /// if issuing the tokens fails, so the tablet's next poll can retry. Only a still-pending
+    /// answer is turned into `slow_down`: approved/expired results are never delayed.
     fn poll(&mut self, device_code: &str, now: Instant) -> (Poll, Option<Pending>) {
-        let expired = match self.map.get(device_code) {
-            Some(p) => now.saturating_duration_since(p.at) > DEVICE_CODE_TTL,
-            None => true,
-        };
         self.evict(now);
-        if expired {
-            return (Poll::Expired, None);
-        }
-        if self.map[device_code].approved_by.is_none() {
+        let Some(p) = self.map.get_mut(device_code) else {
+            let known = self.expired.contains_key(device_code);
+            return (if known { Poll::Expired } else { Poll::Unknown }, None);
+        };
+        if p.approved_by.is_none() {
+            let early = p
+                .last_poll
+                .is_some_and(|last| now.saturating_duration_since(last) + POLL_SLACK < p.interval);
+            p.last_poll = Some(now);
+            if early {
+                p.interval += SLOW_DOWN_STEP;
+                return (Poll::SlowDown(p.interval), None);
+            }
             return (Poll::Pending, None);
         }
         let p = self.map.remove(device_code).expect("checked above");
@@ -149,6 +216,155 @@ fn oauth_err(code: &str) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({"error": code}))).into_response()
 }
 
+/// The client address used for rate limiting. Behind the reverse proxy (a loopback peer, as
+/// with nginx on 127.0.0.1) it is the proxy-appended rightmost `X-Forwarded-For` entry, else
+/// `X-Real-IP`; from any other peer those headers are ignored and the socket address is used.
+/// Without `ConnectInfo` (not served with `into_make_service_with_connect_info`) every request
+/// shares the unspecified address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientIp(pub IpAddr);
+
+impl<S: Send + Sync> FromRequestParts<S> for ClientIp {
+    type Rejection = Infallible;
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|c| c.0.ip());
+        Ok(ClientIp(client_ip(peer, &parts.headers)))
+    }
+}
+
+fn client_ip(peer: Option<IpAddr>, headers: &HeaderMap) -> IpAddr {
+    match peer.map(|p| p.to_canonical()) {
+        Some(p) if p.is_loopback() => forwarded_ip(headers).unwrap_or(p),
+        Some(p) => p,
+        None => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+    }
+}
+
+/// Only the rightmost `X-Forwarded-For` hop is trusted: nginx's `$proxy_add_x_forwarded_for`
+/// appends the real peer after whatever the client sent. Earlier entries are client-controlled.
+fn forwarded_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    let parse = |v: &str| v.trim().parse::<IpAddr>().ok().map(|ip| ip.to_canonical());
+    if let Some(last) = headers.get_all("x-forwarded-for").iter().next_back() {
+        return last.to_str().ok()?.rsplit(',').next().and_then(parse);
+    }
+    headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse)
+}
+
+/// Rate-limit bucket: an IPv4 address, or the /64 of an IPv6 address (one host usually owns it).
+fn limit_key(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            IpAddr::V6(Ipv6Addr::new(seg[0], seg[1], seg[2], seg[3], 0, 0, 0, 0))
+        }
+        v4 => v4,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Window {
+    start: Instant,
+    count: u32,
+}
+
+impl Window {
+    fn fresh(now: Instant) -> Self {
+        Self {
+            start: now,
+            count: 0,
+        }
+    }
+}
+
+struct LimiterInner {
+    per_ip: HashMap<IpAddr, Window>,
+    global: Window,
+}
+
+/// Fixed-window limits on `POST /oauth/device/code`: `PER_IP_MAX` per client per
+/// `PER_IP_WINDOW` and `GLOBAL_MAX` overall per `GLOBAL_WINDOW`. Only admitted requests are
+/// recorded and stale windows are dropped on every check, so the table stays small.
+pub struct DeviceCodeLimiter {
+    inner: Mutex<LimiterInner>,
+}
+
+impl Default for DeviceCodeLimiter {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(LimiterInner {
+                per_ip: HashMap::new(),
+                global: Window::fresh(Instant::now()),
+            }),
+        }
+    }
+}
+
+impl DeviceCodeLimiter {
+    /// Admit one request from `ip`, or say how long to wait.
+    fn check(&self, ip: IpAddr, now: Instant) -> std::result::Result<(), Duration> {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let key = limit_key(ip);
+        g.per_ip
+            .retain(|_, w| now.saturating_duration_since(w.start) < PER_IP_WINDOW);
+        if let Some(w) = g.per_ip.get(&key) {
+            if w.count >= PER_IP_MAX {
+                return Err(PER_IP_WINDOW.saturating_sub(now.saturating_duration_since(w.start)));
+            }
+        }
+        if now.saturating_duration_since(g.global.start) >= GLOBAL_WINDOW {
+            g.global = Window::fresh(now);
+        }
+        let global_wait =
+            GLOBAL_WINDOW.saturating_sub(now.saturating_duration_since(g.global.start));
+        if g.global.count >= GLOBAL_MAX
+            || (g.per_ip.len() >= MAX_TRACKED_IPS && !g.per_ip.contains_key(&key))
+        {
+            return Err(global_wait);
+        }
+        g.global.count += 1;
+        g.per_ip
+            .entry(key)
+            .or_insert_with(|| Window::fresh(now))
+            .count += 1;
+        Ok(())
+    }
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.inner.lock().unwrap().per_ip.len()
+    }
+}
+
+/// 429 with an RFC 8628 `slow_down` error body and `Retry-After` (whole seconds, at least 1).
+fn too_many(wait: Duration) -> Response {
+    let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::RETRY_AFTER, secs.max(1).to_string())],
+        Json(json!({
+            "error": "slow_down",
+            "error_description": "too many device code requests; retry later",
+        })),
+    )
+        .into_response()
+}
+
+/// Base for links a person opens: `PUBLIC_URL` when set, else `https://<--host>`.
+fn public_base(state: &AppState) -> String {
+    match &state.public_url {
+        Some(u) => u.to_string(),
+        None => format!("https://{}", state.devices.get_endpoint()),
+    }
+}
+
 fn bundle_value(access: String, refresh: String, id: String) -> Value {
     json!({
         "access_token": access,
@@ -163,8 +379,13 @@ fn bundle_value(access: String, refresh: String, id: String) -> Value {
 /// `POST /oauth/device/code` -> a device authorization response the tablet polls on.
 pub async fn device_code(
     State(state): State<AppState>,
+    ClientIp(ip): ClientIp,
     Form(_f): Form<HashMap<String, String>>,
-) -> Json<Value> {
+) -> Response {
+    if let Err(wait) = state.device_code_limiter.check(ip, Instant::now()) {
+        tracing::warn!(%ip, "OAuth device code request rate limited");
+        return too_many(wait);
+    }
     let code = uuid::Uuid::new_v4().simple().to_string();
     let user_code = {
         use rand::Rng;
@@ -179,16 +400,17 @@ pub async fn device_code(
         p.insert(code.clone(), user_code.clone(), Instant::now());
         user_code
     };
-    let host = state.devices.get_endpoint();
-    tracing::warn!(%user_code, "OAuth device code requested; approve at /oauth/verify or POST /admin/oauth/approve");
+    let base = public_base(&state);
+    tracing::warn!(%user_code, %ip, "OAuth device code requested; approve at /oauth/verify or POST /admin/oauth/approve");
     Json(json!({
         "device_code": code,
         "user_code": user_code,
-        "verification_uri": format!("https://{host}/oauth/verify"),
-        "verification_uri_complete": format!("https://{host}/oauth/verify?user_code={user_code}"),
+        "verification_uri": format!("{base}/oauth/verify"),
+        "verification_uri_complete": format!("{base}/oauth/verify?user_code={user_code}"),
         "expires_in": DEVICE_CODE_TTL.as_secs(),
         "interval": POLL_INTERVAL,
     }))
+    .into_response()
 }
 
 /// `POST /oauth/token` -> device-code and refresh grants.
@@ -204,7 +426,13 @@ pub async fn token(
         let (polled, taken) = pending().poll(dc, Instant::now());
         match polled {
             Poll::Pending => oauth_err("authorization_pending"),
+            Poll::SlowDown(interval) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "slow_down", "interval": interval.as_secs()})),
+            )
+                .into_response(),
             Poll::Expired => oauth_err("expired_token"),
+            Poll::Unknown => oauth_err("invalid_grant"),
             Poll::Approved { user_id, device_id } => {
                 match state
                     .devices
@@ -403,8 +631,13 @@ mod tests {
         );
         h
     }
+    const TABLET: IpAddr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+    async fn request_code(state: &AppState, ip: IpAddr) -> (StatusCode, Value) {
+        body_json(device_code(State(state.clone()), ClientIp(ip), Form(HashMap::new())).await).await
+    }
     async fn mint(state: &AppState) -> (String, String) {
-        let Json(dc) = device_code(State(state.clone()), Form(HashMap::new())).await;
+        let (st, dc) = request_code(state, TABLET).await;
+        assert_eq!(st, StatusCode::OK, "{dc}");
         (
             dc["device_code"].as_str().unwrap().to_string(),
             dc["user_code"].as_str().unwrap().to_string(),
@@ -424,7 +657,7 @@ mod tests {
         let (state, _tmp) = setup();
 
         // 1. device/code
-        let Json(dc) = device_code(State(state.clone()), Form(HashMap::new())).await;
+        let (_, dc) = request_code(&state, TABLET).await;
         let code = dc["device_code"].as_str().unwrap().to_string();
         let user_code = dc["user_code"].as_str().unwrap().to_string();
         assert!(dc["verification_uri_complete"].is_string());
@@ -459,11 +692,11 @@ mod tests {
         assert_eq!(user, "local-user");
         assert!(device.starts_with("oauth-"));
 
-        // 4. the code is single-use
+        // 4. the code is single-use (redeemed, not expired -> invalid_grant)
         let (st, v) = body_json(token(State(state.clone()), grant(&code)).await).await;
         assert_eq!(
             (st, v["error"].as_str()),
-            (StatusCode::BAD_REQUEST, Some("expired_token"))
+            (StatusCode::BAD_REQUEST, Some("invalid_grant"))
         );
 
         // 5. refresh grant
@@ -626,7 +859,7 @@ mod tests {
             StatusCode::OK
         );
         let (_, v) = body_json(token(State(state.clone()), grant(&code)).await).await;
-        assert_eq!(v["error"], "expired_token");
+        assert_eq!(v["error"], "invalid_grant");
     }
 
     #[tokio::test]
@@ -704,7 +937,7 @@ mod tests {
         );
         assert_eq!(
             p.poll("code0004xxxx", t0 + Duration::from_secs(6)).0,
-            Poll::Expired,
+            Poll::Unknown,
             "single use"
         );
         p.restore("code0004xxxx".into(), taken.unwrap());
@@ -723,7 +956,7 @@ mod tests {
             t0 + DEVICE_CODE_TTL + Duration::from_secs(10),
         );
         assert_eq!(p.map.keys().collect::<Vec<_>>(), vec!["fresh000xxxx"]);
-        assert_eq!(p.poll("missing", t0).0, Poll::Expired);
+        assert_eq!(p.poll("missing", t0).0, Poll::Unknown);
     }
 
     #[test]
@@ -978,6 +1211,253 @@ mod tests {
             .0,
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn device_code_rate_limited_per_ip() {
+        let (state, _tmp) = setup();
+        for i in 0..PER_IP_MAX {
+            assert_eq!(request_code(&state, TABLET).await.0, StatusCode::OK, "{i}");
+        }
+        let resp = device_code(State(state.clone()), ClientIp(TABLET), Form(HashMap::new())).await;
+        let retry: u64 = resp.headers()[header::RETRY_AFTER]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((1..=PER_IP_WINDOW.as_secs()).contains(&retry), "{retry}");
+        let (st, v) = body_json(resp).await;
+        assert_eq!(
+            (st, v["error"].as_str()),
+            (StatusCode::TOO_MANY_REQUESTS, Some("slow_down"))
+        );
+        // another client is unaffected
+        let other = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+        assert_eq!(request_code(&state, other).await.0, StatusCode::OK);
+        // one IPv6 /64 is one client
+        for i in 0..PER_IP_MAX {
+            let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, i as u16 + 1));
+            assert_eq!(request_code(&state, ip).await.0, StatusCode::OK);
+        }
+        let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0xffff, 0, 0, 9));
+        assert_eq!(
+            request_code(&state, ip).await.0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[test]
+    fn limiter_global_cap_window_reset_and_eviction() {
+        let l = DeviceCodeLimiter::default();
+        let t0 = Instant::now();
+        let ip = |i: u32| IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i));
+        for i in 0..GLOBAL_MAX {
+            assert!(l.check(ip(i), t0).is_ok());
+        }
+        let wait = l.check(ip(999), t0).unwrap_err();
+        assert!(wait <= GLOBAL_WINDOW && wait > Duration::ZERO);
+        // next global window admits again
+        assert!(l.check(ip(999), t0 + GLOBAL_WINDOW).is_ok());
+        // per-IP window expiry frees the client and drops stale entries
+        for _ in 1..PER_IP_MAX {
+            assert!(l.check(ip(999), t0 + GLOBAL_WINDOW * 2).is_ok());
+        }
+        assert!(l.check(ip(999), t0 + GLOBAL_WINDOW * 3).is_err());
+        assert_eq!(l.tracked(), GLOBAL_MAX as usize + 1);
+        assert!(l.check(ip(999), t0 + GLOBAL_WINDOW + PER_IP_WINDOW).is_ok());
+        assert_eq!(l.tracked(), 1, "stale per-IP windows evicted");
+    }
+
+    #[test]
+    fn client_ip_trusts_forwarding_headers_only_from_loopback() {
+        let h = |pairs: &[(&'static str, &'static str)]| {
+            let mut m = HeaderMap::new();
+            for (k, v) in pairs {
+                m.append(*k, HeaderValue::from_static(v));
+            }
+            m
+        };
+        let lo = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        // nginx appends the real peer: only the rightmost hop counts
+        let xff = h(&[("x-forwarded-for", "6.6.6.6, 203.0.113.7")]);
+        assert_eq!(client_ip(lo, &xff), ip("203.0.113.7"));
+        let two = h(&[
+            ("x-forwarded-for", "6.6.6.6"),
+            ("x-forwarded-for", "203.0.113.8"),
+        ]);
+        assert_eq!(client_ip(lo, &two), ip("203.0.113.8"));
+        assert_eq!(
+            client_ip(Some(ip("::1")), &h(&[("x-real-ip", "2001:db8::5")])),
+            ip("2001:db8::5")
+        );
+        assert_eq!(
+            client_ip(Some(ip("::ffff:127.0.0.1")), &xff),
+            ip("203.0.113.7")
+        );
+        // unparsable forwarded value: fall back to the peer, never an earlier hop
+        let bad = h(&[("x-forwarded-for", "6.6.6.6, nonsense")]);
+        assert_eq!(client_ip(lo, &bad), ip("127.0.0.1"));
+        // a direct (non-proxy) peer can't choose its bucket
+        let peer = Some(ip("198.51.100.9"));
+        assert_eq!(client_ip(peer, &xff), ip("198.51.100.9"));
+        assert_eq!(
+            client_ip(peer, &h(&[("x-real-ip", "1.1.1.1")])),
+            ip("198.51.100.9")
+        );
+        assert_eq!(client_ip(None, &xff), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    }
+
+    /// `POST /oauth/device/code` through the real router with a socket peer (`ConnectInfo`).
+    async fn router_code(state: &AppState, peer: &str, xff: &str) -> StatusCode {
+        use tower::ServiceExt;
+        let mut req = axum::http::Request::post("/oauth/device/code")
+            .header(header::CONTENT_TYPE, FORM)
+            .header("x-forwarded-for", xff)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+        crate::create_router(state.clone())
+            .oneshot(req)
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn router_rate_limit_ignores_spoofed_forwarded_for() {
+        let (state, _tmp) = setup();
+        // a direct client rotating X-Forwarded-For is still one client
+        for i in 0..PER_IP_MAX {
+            let st = router_code(&state, "198.51.100.9:4000", &format!("10.0.0.{i}")).await;
+            assert_eq!(st, StatusCode::OK);
+        }
+        assert_eq!(
+            router_code(&state, "198.51.100.9:4001", "10.0.0.99").await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // behind nginx (loopback peer) distinct real clients get their own buckets
+        for i in 0..=PER_IP_MAX {
+            let st = router_code(&state, "127.0.0.1:5000", &format!("1.2.3.4, 192.0.2.{i}")).await;
+            assert_eq!(st, StatusCode::OK, "{i}");
+        }
+        // ... and one real client behind nginx is limited even if it forges an earlier hop
+        for i in 0..PER_IP_MAX {
+            let st =
+                router_code(&state, "127.0.0.1:5000", &format!("9.9.9.{i}, 192.0.2.200")).await;
+            assert_eq!(st, StatusCode::OK);
+        }
+        assert_eq!(
+            router_code(&state, "127.0.0.1:5000", "8.8.8.8, 192.0.2.200").await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[tokio::test]
+    async fn fast_polling_gets_slow_down() {
+        let (state, _tmp) = setup();
+        let (code, user_code) = mint(&state).await;
+        let (_, v) = body_json(token(State(state.clone()), grant(&code)).await).await;
+        assert_eq!(v["error"], "authorization_pending");
+        let (st, v) = body_json(token(State(state.clone()), grant(&code)).await).await;
+        assert_eq!(
+            (st, v["error"].as_str(), v["interval"].as_u64()),
+            (
+                StatusCode::BAD_REQUEST,
+                Some("slow_down"),
+                Some(POLL_INTERVAL + 5)
+            )
+        );
+        // an approved code is handed out immediately, however fast the poll
+        assert!(
+            approve_code(
+                &state,
+                &bearer(&paired_device_token(&state)),
+                &user_code,
+                None
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            token(State(state.clone()), grant(&code)).await.status(),
+            StatusCode::OK
+        );
+    }
+
+    #[test]
+    fn poll_interval_grows_on_each_slow_down() {
+        let t0 = Instant::now();
+        let s = |n| t0 + Duration::from_secs(n);
+        let mut p = PendingCodes::new(4);
+        p.insert("c".into(), "0000-0001".into(), t0);
+        assert_eq!(p.poll("c", s(0)).0, Poll::Pending, "first poll is free");
+        assert_eq!(p.poll("c", s(4)).0, Poll::Pending, "within the 1 s slack");
+        assert_eq!(p.poll("c", s(6)).0, Poll::SlowDown(Duration::from_secs(10)));
+        assert_eq!(
+            p.poll("c", s(12)).0,
+            Poll::SlowDown(Duration::from_secs(15))
+        );
+        assert_eq!(
+            p.poll("c", s(27)).0,
+            Poll::Pending,
+            "waited the new interval"
+        );
+        assert_eq!(p.poll("c", s(42)).0, Poll::Pending);
+    }
+
+    #[test]
+    fn expired_codes_are_remembered_unknown_codes_are_invalid() {
+        let t0 = Instant::now();
+        let mut p = PendingCodes::new(2);
+        p.insert("old".into(), "0000-0001".into(), t0);
+        let later = t0 + DEVICE_CODE_TTL + Duration::from_secs(1);
+        assert_eq!(p.poll("old", later).0, Poll::Expired);
+        assert_eq!(p.poll("old", later).0, Poll::Expired, "stays expired");
+        assert_eq!(p.poll("never-issued", later).0, Poll::Unknown);
+        // cap-evicted codes also count as expired
+        let sec = Duration::from_secs(1);
+        p.insert("a".into(), "0000-0002".into(), later);
+        p.insert("b".into(), "0000-0003".into(), later + sec);
+        p.insert("c".into(), "0000-0004".into(), later + sec * 2);
+        assert_eq!(p.poll("a", later + sec * 2).0, Poll::Expired);
+        // the record is bounded and forgotten after another TTL
+        assert!(p.expired.len() <= 2);
+        let much_later = later + DEVICE_CODE_TTL * 3;
+        assert_eq!(p.poll("a", much_later).0, Poll::Unknown);
+        assert!(p.expired.len() <= 2);
+    }
+
+    #[tokio::test]
+    async fn unknown_device_code_is_invalid_grant() {
+        let (state, _tmp) = setup();
+        let (st, v) = body_json(token(State(state.clone()), grant("no-such-code")).await).await;
+        assert_eq!(
+            (st, v["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_uri_uses_public_url_when_set() {
+        let (state, _tmp) = setup();
+        let (_, dc) = request_code(&state, TABLET).await;
+        assert_eq!(dc["verification_uri"], "https://local.test/oauth/verify");
+
+        let state = state.with_public_url(Some("https://remarkable.unwrap.rs/"));
+        let (_, dc) = request_code(&state, TABLET).await;
+        let uc = dc["user_code"].as_str().unwrap();
+        assert_eq!(
+            dc["verification_uri"],
+            "https://remarkable.unwrap.rs/oauth/verify"
+        );
+        assert_eq!(
+            dc["verification_uri_complete"],
+            format!("https://remarkable.unwrap.rs/oauth/verify?user_code={uc}")
+        );
+        // blank means unset
+        let state = state.with_public_url(Some("  "));
+        assert!(state.public_url.is_none());
     }
 
     #[tokio::test]

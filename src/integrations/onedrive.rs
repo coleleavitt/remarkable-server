@@ -19,11 +19,22 @@ use crate::integrations::{
 
 const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 
+/// Percent-encode each segment of a `/`-separated relative path for Graph path addressing
+/// (`items/{id}:/{path}:/content`); raw `#`, `?` or `%` in a name would otherwise truncate or
+/// corrupt the URL. Missing intermediate folders in the path are created by Graph itself.
+fn encode_path(path: &str) -> String {
+    path.split('/')
+        .map(|seg| urlencoding::encode(seg).into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// OneDrive provider
 pub struct OneDrive {
     config: OAuthConfig,
     token: Option<OAuthToken>,
     client: Client,
+    graph_base: String,
 }
 
 impl OneDrive {
@@ -32,6 +43,7 @@ impl OneDrive {
             config,
             token: None,
             client: crate::integrations::http_client(),
+            graph_base: GRAPH_BASE.into(),
         }
     }
 
@@ -40,7 +52,14 @@ impl OneDrive {
             config,
             token: Some(token),
             client: crate::integrations::http_client(),
+            graph_base: GRAPH_BASE.into(),
         }
+    }
+
+    /// Point the provider at a different Graph endpoint (tests, proxies).
+    pub fn with_base_url(mut self, graph_base: &str) -> Self {
+        self.graph_base = graph_base.trim_end_matches('/').into();
+        self
     }
 
     fn access_token(&self) -> Result<&str> {
@@ -59,35 +78,37 @@ impl OneDrive {
         &self,
         response: reqwest::Response,
     ) -> Result<T> {
-        let status = response.status();
-
-        if status.is_success() {
+        if response.status().is_success() {
             response
                 .json()
                 .await
                 .map_err(|e| IntegrationError::Serialization(e.to_string()))
-        } else if status.as_u16() == 401 {
-            Err(IntegrationError::TokenExpired)
-        } else if status.as_u16() == 429 {
-            let retry_after = response
+        } else {
+            Err(response_error(response).await)
+        }
+    }
+}
+
+/// Map a non-success Graph response to an error: 404 is [`IntegrationError::NotFound`]
+/// (permanent); auth, rate limits and 5xx stay retryable.
+async fn response_error(response: reqwest::Response) -> IntegrationError {
+    let status = response.status();
+    match status.as_u16() {
+        401 => IntegrationError::TokenExpired,
+        429 => IntegrationError::RateLimited {
+            retry_after_secs: response
                 .headers()
                 .get("Retry-After")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(60);
-            Err(IntegrationError::RateLimited {
-                retry_after_secs: retry_after,
-            })
-        } else if status.as_u16() == 404 {
-            Err(IntegrationError::NotFound("Item not found".into()))
-        } else if status.as_u16() == 507 {
-            Err(IntegrationError::QuotaExceeded)
-        } else if status.as_u16() == 409 {
+                .unwrap_or(60),
+        },
+        404 => IntegrationError::NotFound("Item not found".into()),
+        507 => IntegrationError::QuotaExceeded,
+        409 => IntegrationError::Conflict(response.text().await.unwrap_or_default()),
+        _ => {
             let body = response.text().await.unwrap_or_default();
-            Err(IntegrationError::Conflict(body))
-        } else {
-            let body = response.text().await.unwrap_or_default();
-            Err(IntegrationError::Api(format!("{}: {}", status, body)))
+            IntegrationError::Api(format!("{}: {}", status, body))
         }
     }
 }
@@ -266,9 +287,9 @@ impl CloudProvider for OneDrive {
 
     async fn list_files(&self, folder_id: Option<&str>) -> Result<Vec<CloudFile>> {
         let url = if let Some(id) = folder_id {
-            format!("{}/me/drive/items/{}/children", GRAPH_BASE, id)
+            format!("{}/me/drive/items/{}/children", self.graph_base, id)
         } else {
-            format!("{}/me/drive/root/children", GRAPH_BASE)
+            format!("{}/me/drive/root/children", self.graph_base)
         };
 
         let response = self
@@ -304,7 +325,7 @@ impl CloudProvider for OneDrive {
         // Use search to find all folders
         let url = format!(
             "{}/me/drive/root/search(q='')?$filter=folder ne null",
-            GRAPH_BASE
+            self.graph_base
         );
 
         let response = self
@@ -347,7 +368,7 @@ impl CloudProvider for OneDrive {
     }
 
     async fn get_file_metadata(&self, file_id: &str) -> Result<CloudFile> {
-        let url = format!("{}/me/drive/items/{}", GRAPH_BASE, file_id);
+        let url = format!("{}/me/drive/items/{}", self.graph_base, file_id);
 
         let response = self
             .request(reqwest::Method::GET, &url)
@@ -361,7 +382,7 @@ impl CloudProvider for OneDrive {
     }
 
     async fn download_file(&self, file_id: &str) -> Result<Vec<u8>> {
-        let url = format!("{}/me/drive/items/{}/content", GRAPH_BASE, file_id);
+        let url = format!("{}/me/drive/items/{}/content", self.graph_base, file_id);
 
         let response = self
             .request(reqwest::Method::GET, &url)
@@ -378,12 +399,16 @@ impl CloudProvider for OneDrive {
                 .and_then(|v| v.to_str().ok())
                 .ok_or_else(|| IntegrationError::Api("Missing redirect location".into()))?;
 
-            let content = self
+            let response = self
                 .client
                 .get(download_url)
                 .send()
                 .await
-                .map_err(|e| IntegrationError::Network(e.to_string()))?
+                .map_err(|e| IntegrationError::Network(e.to_string()))?;
+            if !response.status().is_success() {
+                return Err(response_error(response).await);
+            }
+            let content = response
                 .bytes()
                 .await
                 .map_err(|e| IntegrationError::Network(e.to_string()))?;
@@ -392,9 +417,7 @@ impl CloudProvider for OneDrive {
         }
 
         if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(IntegrationError::Api(format!("{}: {}", status, body)));
+            return Err(response_error(response).await);
         }
 
         response
@@ -416,9 +439,18 @@ impl CloudProvider for OneDrive {
         const SIMPLE_UPLOAD_LIMIT: usize = 4 * 1024 * 1024;
 
         let url = if let Some(id) = parent_id {
-            format!("{}/me/drive/items/{}:/{}:/content", GRAPH_BASE, id, name)
+            format!(
+                "{}/me/drive/items/{}:/{}:/content",
+                self.graph_base,
+                id,
+                encode_path(name)
+            )
         } else {
-            format!("{}/me/drive/root:/{}:/content", GRAPH_BASE, name)
+            format!(
+                "{}/me/drive/root:/{}:/content",
+                self.graph_base,
+                encode_path(name)
+            )
         };
 
         if content.len() <= SIMPLE_UPLOAD_LIMIT {
@@ -442,9 +474,9 @@ impl CloudProvider for OneDrive {
 
     async fn create_folder(&self, parent_id: Option<&str>, name: &str) -> Result<CloudFolder> {
         let url = if let Some(id) = parent_id {
-            format!("{}/me/drive/items/{}/children", GRAPH_BASE, id)
+            format!("{}/me/drive/items/{}/children", self.graph_base, id)
         } else {
-            format!("{}/me/drive/root/children", GRAPH_BASE)
+            format!("{}/me/drive/root/children", self.graph_base)
         };
 
         #[derive(Serialize)]
@@ -474,7 +506,7 @@ impl CloudProvider for OneDrive {
     }
 
     async fn delete(&self, file_id: &str) -> Result<()> {
-        let url = format!("{}/me/drive/items/{}", GRAPH_BASE, file_id);
+        let url = format!("{}/me/drive/items/{}", self.graph_base, file_id);
 
         let response = self
             .request(reqwest::Method::DELETE, &url)
@@ -497,7 +529,7 @@ impl CloudProvider for OneDrive {
         new_parent_id: &str,
         new_name: Option<&str>,
     ) -> Result<CloudFile> {
-        let url = format!("{}/me/drive/items/{}", GRAPH_BASE, file_id);
+        let url = format!("{}/me/drive/items/{}", self.graph_base, file_id);
 
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
@@ -534,7 +566,7 @@ impl CloudProvider for OneDrive {
             // Use delta link directly
             delta_link.to_string()
         } else {
-            format!("{}/me/drive/root/delta", GRAPH_BASE)
+            format!("{}/me/drive/root/delta", self.graph_base)
         };
 
         let response = self
@@ -555,7 +587,7 @@ impl CloudProvider for OneDrive {
     }
 
     async fn get_quota(&self) -> Result<StorageQuota> {
-        let url = format!("{}/me/drive", GRAPH_BASE);
+        let url = format!("{}/me/drive", self.graph_base);
 
         let response = self
             .request(reqwest::Method::GET, &url)
@@ -586,12 +618,15 @@ impl OneDrive {
         let session_url = if let Some(id) = parent_id {
             format!(
                 "{}/me/drive/items/{}:/{}:/createUploadSession",
-                GRAPH_BASE, id, name
+                self.graph_base,
+                id,
+                encode_path(name)
             )
         } else {
             format!(
                 "{}/me/drive/root:/{}:/createUploadSession",
-                GRAPH_BASE, name
+                self.graph_base,
+                encode_path(name)
             )
         };
 
@@ -668,5 +703,76 @@ impl OneDrive {
         last_response.map(|i| i.to_cloud_file()).ok_or_else(|| {
             IntegrationError::Api("Upload completed but no response received".into())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::extract::Path;
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+
+    use super::*;
+
+    /// A deleted item (404, directly or at the redirected download URL) fails permanently;
+    /// throttling and 5xx stay retryable.
+    #[tokio::test]
+    async fn download_error_mapping() {
+        let app = axum::Router::new()
+            .route(
+                "/me/drive/items/{id}/content",
+                axum::routing::get(|Path(id): Path<String>| async move {
+                    match id.as_str() {
+                        "gone" => StatusCode::NOT_FOUND.into_response(),
+                        "moved" => {
+                            (StatusCode::FOUND, [(header::LOCATION, "/blob/gone")]).into_response()
+                        }
+                        "flaky" => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                        "busy" => StatusCode::TOO_MANY_REQUESTS.into_response(),
+                        _ => (StatusCode::FOUND, [(header::LOCATION, "/blob/ok")]).into_response(),
+                    }
+                }),
+            )
+            .route(
+                "/blob/{name}",
+                axum::routing::get(|Path(name): Path<String>| async move {
+                    if name == "ok" {
+                        "content".into_response()
+                    } else {
+                        StatusCode::NOT_FOUND.into_response()
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = OAuthConfig::onedrive("id".into(), None, "http://localhost/cb".into());
+        let token = OAuthToken {
+            access_token: "t".into(),
+            refresh_token: None,
+            token_type: "Bearer".into(),
+            expires_at: None,
+            scope: None,
+        };
+        let d = OneDrive::with_token(config, token).with_base_url(&base);
+
+        for id in ["gone", "moved"] {
+            let err = d.download_file(id).await.unwrap_err();
+            assert!(matches!(err, IntegrationError::NotFound(_)), "{id}: {err}");
+        }
+        for id in ["flaky", "busy"] {
+            let err = d.download_file(id).await.unwrap_err();
+            assert!(!err.is_permanent(), "{id}: {err}");
+        }
+        assert_eq!(d.download_file("ok").await.unwrap(), b"content");
+    }
+
+    #[test]
+    fn path_segments_are_encoded_but_slashes_kept() {
+        assert_eq!(
+            encode_path("My Notes/50% #1?/café.pdf"),
+            "My%20Notes/50%25%20%231%3F/caf%C3%A9.pdf"
+        );
+        assert_eq!(encode_path("a.pdf"), "a.pdf");
     }
 }

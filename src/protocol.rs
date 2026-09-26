@@ -8,12 +8,13 @@
 //! - V4: Future protocol (extended metadata)
 
 use axum::Json;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use crate::api::AppState;
+use crate::error::ServerError;
 
 /// Sync protocol version
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -366,27 +367,51 @@ pub async fn v2_get_file(
         .map_err(|_| StatusCode::NOT_FOUND)
 }
 
+/// Shared body of the v2/v4 blob PUTs: stream the body to a staged file (same 2 MiB cap
+/// axum's default body limit gave these routes), then store it. A too-large body is 413 and
+/// an unreadable one 400, as the `Bytes` extractor answered; any storage failure,
+/// including an invalid hash, is still a bare 500.
+async fn put_streamed(
+    state: &AppState,
+    hash: &str,
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<StatusCode, StatusCode> {
+    let filename = headers
+        .get("rm-filename")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or(hash)
+        .to_string();
+    let staged = crate::upload::stage_body(
+        &state.storage,
+        headers,
+        body,
+        crate::upload::DEFAULT_LIMIT,
+        false,
+    )
+    .await
+    .map_err(|e| match e {
+        ServerError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+        ServerError::BadRequest(_) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    })?;
+    staged
+        .commit(&state.storage, hash, &filename)
+        .map(|_| StatusCode::OK)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 /// PUT /sync/v2/files/{hash} - Put file (V2)  
 pub async fn v2_put_file(
     State(state): State<AppState>,
     Path(hash): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<StatusCode, StatusCode> {
     state
         .auth_user(&headers)
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let filename = headers
-        .get("rm-filename")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or(&hash)
-        .to_string();
-
-    state
-        .storage
-        .put_with_hash(&body, &hash, &filename)
-        .map(|_| StatusCode::OK)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    put_streamed(&state, &hash, &headers, body).await
 }
 
 // ============================================================================
@@ -468,20 +493,10 @@ pub async fn v4_put_file(
     State(state): State<AppState>,
     Path(hash): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<StatusCode, StatusCode> {
     state
         .auth_user(&headers)
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let filename = headers
-        .get("rm-filename")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or(&hash)
-        .to_string();
-
-    state
-        .storage
-        .put_with_hash(&body, &hash, &filename)
-        .map(|_| StatusCode::OK)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    put_streamed(&state, &hash, &headers, body).await
 }

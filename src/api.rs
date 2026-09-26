@@ -1,5 +1,5 @@
 use axum::Json;
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -24,6 +24,11 @@ pub struct AppState {
     pub notification_tx: tokio::sync::broadcast::Sender<crate::notifications::WsMessage>,
     pub screenshare: crate::screenshare_rest::RoomManager,
     pub ice_servers: std::sync::Arc<serde_json::Value>,
+    /// Public base URL (`PUBLIC_URL`, e.g. `https://remarkable.unwrap.rs`) for links shown to a
+    /// person, such as the OAuth `verification_uri`. `None` falls back to `https://<--host>`.
+    pub public_url: Option<std::sync::Arc<str>>,
+    /// Per-client-IP and global limits on unauthenticated `POST /oauth/device/code`.
+    pub(crate) device_code_limiter: std::sync::Arc<crate::oauth::DeviceCodeLimiter>,
 }
 
 impl AppState {
@@ -35,7 +40,17 @@ impl AppState {
             notification_tx,
             screenshare: crate::screenshare_rest::RoomManager::new(),
             ice_servers: std::sync::Arc::new(serde_json::json!([])),
+            public_url: None,
+            device_code_limiter: std::sync::Arc::default(),
         }
+    }
+    /// Set the public base URL used for links a person opens (blank values are ignored).
+    pub fn with_public_url(mut self, url: Option<&str>) -> Self {
+        self.public_url = url
+            .map(|u| u.trim().trim_end_matches('/'))
+            .filter(|u| !u.is_empty())
+            .map(std::sync::Arc::from);
+        self
     }
     /// Set the ICE server list handed out to screenshare clients.
     pub fn with_ice_servers(mut self, ice: serde_json::Value) -> Self {
@@ -120,18 +135,26 @@ pub struct CheckFilesResponse {
 }
 
 /// Which of the listed blobs the server doesn't have.
+///
+/// The client won't re-upload a blob reported present, so every listed blob is touched
+/// (pulled inside GC's grace window) *before* existence is checked: a blob GC deletes
+/// first is then reported missing, and one touched first is kept by GC's re-check. If the
+/// touch fails this is a 500 so the client retries instead of trusting an unprotected blob.
 pub async fn check_files(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<CheckFilesRequest>,
 ) -> Result<Json<CheckFilesResponse>> {
     state.auth_user(&headers)?;
-    let (present, missing_files): (Vec<String>, Vec<String>) =
-        req.files.into_iter().partition(|h| state.storage.exists(h));
-    // The client won't re-upload these, so keep them out of the unreachable report's grace window.
-    if let Err(e) = state.storage.touch(&present) {
-        tracing::warn!(error = %e, "could not mark checked blobs as recently used");
-    }
+    state.storage.touch(&req.files).map_err(|e| {
+        tracing::error!(error = %e, "could not mark checked blobs as recently used");
+        ServerError::Internal("could not mark blobs as in use; retry".into())
+    })?;
+    let missing_files = req
+        .files
+        .into_iter()
+        .filter(|h| !state.storage.exists(h))
+        .collect();
     Ok(Json(CheckFilesResponse { missing_files }))
 }
 
@@ -190,21 +213,34 @@ pub async fn put_file(
     State(state): State<AppState>,
     Path(hash): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Json<UploadResponse>> {
     let _user_id = state.auth_user(&headers)?;
+    // Reject a bad hash before streaming up to MAX_BLOB_BYTES to disk for nothing.
+    if !crate::storage::is_valid_hash(&hash) {
+        return Err(ServerError::InvalidHash(hash));
+    }
     let filename = headers
         .get("rm-filename")
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| ServerError::MissingHeader("rm-filename".into()))?;
     // Verify transport integrity via crc32c when the client sends it; the sha256 in
     // the URL can't be checked against the body (index hashes are over child hashes).
-    checksum::verify_goog_hash_header(&headers, &body)?;
-    state.storage.put_with_hash(&body, &hash, filename)?;
-    Ok(Json(UploadResponse {
-        hash,
-        size: body.len() as u64,
-    }))
+    // The header is parsed before the body is read; the body streams to a staged file.
+    let expected = checksum::GoogHash::from_headers(&headers)?;
+    let staged = crate::upload::stage_body(
+        &state.storage,
+        &headers,
+        body,
+        crate::MAX_BLOB_BYTES as u64,
+        false,
+    )
+    .await?;
+    if let Some(expected) = expected {
+        expected.verify(staged.crc32c())?;
+    }
+    let size = staged.commit(&state.storage, &hash, filename)?;
+    Ok(Json(UploadResponse { hash, size }))
 }
 
 /// Default account for pairing codes: the single local account, as `--pair` (main.rs `PAIRING_USER`) issues codes for.
@@ -414,6 +450,44 @@ pub async fn unreachable_blobs(
         .storage
         .unreachable_blobs(std::time::Duration::from_secs(grace_secs))?;
     Ok(Json(UnreachableResponse { grace_secs, hashes }))
+}
+
+/// Default grace for `POST /admin/storage/gc`: 7 days.
+const GC_DEFAULT_GRACE_SECS: u64 = 7 * 24 * 60 * 60;
+
+#[derive(Deserialize)]
+pub struct GcQuery {
+    pub grace_secs: Option<u64>,
+    /// Defaults to `true`: deleting takes an explicit `dry_run=false`.
+    pub dry_run: Option<bool>,
+}
+
+/// Admin: delete blobs unreachable from the current and previous roots, outside version
+/// history and untouched for `grace_secs` (default 7 days). A dry run unless
+/// `dry_run=false`. Refuses (500) if the current tree isn't fully parsed, and answers 409
+/// with the partial report if a sync committed a new root while deleting.
+pub async fn storage_gc(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<GcQuery>,
+) -> Result<Response> {
+    require_admin(&headers)?;
+    run_gc(&state, q).await
+}
+
+async fn run_gc(state: &AppState, q: GcQuery) -> Result<Response> {
+    let grace = std::time::Duration::from_secs(q.grace_secs.unwrap_or(GC_DEFAULT_GRACE_SECS));
+    let dry_run = q.dry_run.unwrap_or(true);
+    let storage = state.storage.clone();
+    let report = tokio::task::spawn_blocking(move || storage.gc(grace, dry_run))
+        .await
+        .map_err(|e| ServerError::Internal(format!("gc task failed: {e}")))??;
+    let status = if report.aborted.is_some() {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(report)).into_response())
 }
 
 #[derive(Deserialize)]
@@ -823,5 +897,132 @@ mod tests {
         let result = clear_storage(State(state.clone()), headers).await;
         assert!(matches!(result, Err(ServerError::Unauthorized)));
         assert!(state.storage.exists(&hash));
+    }
+
+    fn state_with_user(tmp: &tempfile::TempDir) -> (AppState, HeaderMap) {
+        let storage = Storage::new(tmp.path()).unwrap();
+        let devices =
+            DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        let token = devices.create_user_token("user").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        (AppState::new(storage, devices), headers)
+    }
+
+    /// Backdate every blob's row and file far past any grace period.
+    fn age_all(tmp: &tempfile::TempDir, storage: &Storage) {
+        let db = rusqlite::Connection::open(tmp.path().join("sync.db")).unwrap();
+        db.execute("UPDATE blobs SET updated_at = 0", []).unwrap();
+        for hash in storage.list_hashes().unwrap() {
+            std::fs::File::options()
+                .write(true)
+                .open(tmp.path().join(&hash[..2]).join(&hash))
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000))
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn check_files_protects_present_blobs_from_gc() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (state, headers) = state_with_user(&tmp);
+        crate::documents::create_document(&state.storage, "Doc", "pdf", b"%PDF-1.4 doc").unwrap();
+        let orphan = state.storage.put(b"orphan", "o.rm").unwrap();
+        age_all(&tmp, &state.storage);
+        let absent = "a".repeat(64);
+
+        let Json(r) = check_files(
+            State(state.clone()),
+            headers,
+            Json(CheckFilesRequest {
+                files: vec![orphan.clone(), absent.clone()],
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.missing_files, vec![absent]);
+        // The client now relies on `orphan` without re-uploading it: GC must keep it.
+        let report = state
+            .storage
+            .gc(std::time::Duration::from_secs(3600), false)
+            .unwrap();
+        assert_eq!(report.deleted, 0);
+        assert!(state.storage.exists(&orphan));
+    }
+
+    #[tokio::test]
+    async fn check_files_fails_when_touch_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (state, headers) = state_with_user(&tmp);
+        let hash = state.storage.put(b"present", "p.rm").unwrap();
+        rusqlite::Connection::open(tmp.path().join("sync.db"))
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER no_touch BEFORE UPDATE ON blobs BEGIN SELECT RAISE(FAIL, 'boom'); END;",
+            )
+            .unwrap();
+
+        let err = check_files(
+            State(state),
+            headers,
+            Json(CheckFilesRequest { files: vec![hash] }),
+        )
+        .await
+        .err()
+        .expect("touch failure must not report the blob present");
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_endpoint_needs_admin_and_defaults_to_dry_run() {
+        use tower::ServiceExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (state, headers) = state_with_user(&tmp);
+        crate::documents::create_document(&state.storage, "Doc", "pdf", b"%PDF-1.4 doc").unwrap();
+        let orphan = state.storage.put(b"orphan", "o.rm").unwrap();
+        age_all(&tmp, &state.storage);
+
+        // A device/user token is not the admin credential (ADMIN_TOKEN is never set in tests).
+        let mut req = axum::http::Request::post("/admin/storage/gc?dry_run=false&grace_secs=0");
+        req.headers_mut().unwrap().extend(headers);
+        let status = crate::create_router(state.clone())
+            .oneshot(req.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(state.storage.exists(&orphan));
+
+        // No dry_run parameter: report only.
+        let default = GcQuery {
+            grace_secs: None,
+            dry_run: None,
+        };
+        let resp = run_gc(&state, default).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(report["dryRun"], true);
+        assert_eq!(report["graceSecs"], GC_DEFAULT_GRACE_SECS);
+        assert_eq!(report["hashes"], serde_json::json!([orphan]));
+        assert_eq!(report["deleted"], 0);
+        assert!(state.storage.exists(&orphan));
+
+        let run = GcQuery {
+            grace_secs: Some(3600),
+            dry_run: Some(false),
+        };
+        assert_eq!(run_gc(&state, run).await.unwrap().status(), StatusCode::OK);
+        assert!(!state.storage.exists(&orphan));
+        assert!(state.storage.missing_from_root().unwrap().is_empty());
     }
 }

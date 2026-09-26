@@ -62,24 +62,50 @@ pub fn verify_goog_hash_header(
     headers: &axum::http::HeaderMap,
     body: &[u8],
 ) -> crate::error::Result<()> {
-    use crate::error::ServerError;
-    let Some(raw) = headers.get("x-goog-hash") else {
-        return Ok(());
-    };
-    let goog = raw.to_str().ok().filter(|v| !v.trim().is_empty());
-    let Some(crc) = goog.and_then(parse_goog_hash_strict) else {
-        tracing::warn!(header = ?raw, "rejected malformed x-goog-hash");
-        return Err(ServerError::InvalidHeader(format!(
-            "x-goog-hash: {raw:?} (expected crc32c=<base64>)"
-        )));
-    };
-    if crc != crc32c(body) {
-        return Err(ServerError::ChecksumMismatch {
-            expected: goog.unwrap_or_default().to_string(),
-            actual: format_goog_hash(body),
-        });
+    match GoogHash::from_headers(headers)? {
+        Some(expected) => expected.verify(crc32c(body)),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// The crc32c a request's `x-goog-hash` promises, parsed up front so a streamed body
+/// can be checked once its running crc is known (see [`crate::upload`]).
+pub struct GoogHash {
+    crc: u32,
+    raw: String,
+}
+
+impl GoogHash {
+    /// Absent header: `None`, nothing to check (GCS semantics). Present but without a
+    /// usable crc32c: 400, never silently skipped.
+    pub fn from_headers(headers: &axum::http::HeaderMap) -> crate::error::Result<Option<Self>> {
+        use crate::error::ServerError;
+        let Some(raw) = headers.get("x-goog-hash") else {
+            return Ok(None);
+        };
+        let goog = raw.to_str().ok().filter(|v| !v.trim().is_empty());
+        let Some(crc) = goog.and_then(parse_goog_hash_strict) else {
+            tracing::warn!(header = ?raw, "rejected malformed x-goog-hash");
+            return Err(ServerError::InvalidHeader(format!(
+                "x-goog-hash: {raw:?} (expected crc32c=<base64>)"
+            )));
+        };
+        Ok(Some(Self {
+            crc,
+            raw: goog.unwrap_or_default().to_string(),
+        }))
+    }
+
+    /// Compare against the body's crc32c; a mismatch is the same 400 as before streaming.
+    pub fn verify(&self, actual: u32) -> crate::error::Result<()> {
+        if self.crc != actual {
+            return Err(crate::error::ServerError::ChecksumMismatch {
+                expected: self.raw.clone(),
+                actual: format!("crc32c={}", STANDARD.encode(actual.to_be_bytes())),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Verify checksum matches expected value
