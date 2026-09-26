@@ -33,7 +33,12 @@ struct Inner {
 pub struct Device { pub device_id: String, pub device_desc: String, pub registered_at: DateTime<Utc>, pub last_refresh: DateTime<Utc>, pub user_id: String }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct DeviceTokenClaims { sub: String, iss: String, iat: i64, nbf: i64, jti: String, #[serde(rename = "device-id")] device_id: String, #[serde(rename = "device-desc")] device_desc: String, #[serde(rename = "auth0-userid")] auth0_userid: String }
+struct DeviceTokenClaims { sub: String, iss: String, iat: i64, nbf: i64, jti: String, #[serde(rename = "device-id")] device_id: String, #[serde(rename = "device-desc")] device_desc: String, #[serde(rename = "auth0-userid")] auth0_userid: String,
+    /// Revocation generation (see `device_token_epochs`). Omitted when 0, so tokens minted before any
+    /// revocation (e.g. the already-paired tablet's) are byte-for-byte what they always were.
+    #[serde(rename = "rms-epoch", default, skip_serializing_if = "is_zero")] epoch: i64 }
+fn is_zero(n: &i64) -> bool { *n == 0 }
+const UPSERT_DEVICE: &str = "INSERT INTO devices (device_id, device_desc, registered_at, last_refresh, user_id) VALUES (?, ?, ?, ?, ?) ON CONFLICT(device_id) DO UPDATE SET device_desc=excluded.device_desc, last_refresh=excluded.last_refresh, user_id=excluded.user_id";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct UserTokenClaims { sub: String, iss: String, iat: i64, exp: i64, nbf: i64, jti: String, #[serde(rename = "https://auth.remarkable.com/tectonic")] tectonic: String, scopes: String, #[serde(rename = "auth0-profile")] auth0_profile: Auth0Profile, #[serde(rename = "device-id")] device_id: String, #[serde(rename = "device-desc")] device_desc: String, #[serde(rename = "https://auth.remarkable.com/subscription")] subscription: SubscriptionClaim }
@@ -113,7 +118,7 @@ fn load_jwt_secret(storage_dir: &Path) -> Result<Vec<u8>> {
 impl DeviceManager {
     pub fn new<P: AsRef<Path>>(db_path: P, region: &str, issuer: &str) -> Result<Self> {
         let conn = Connection::open(db_path.as_ref())?;
-        conn.execute_batch("CREATE TABLE IF NOT EXISTS devices (device_id TEXT PRIMARY KEY, device_desc TEXT NOT NULL, registered_at TEXT NOT NULL, last_refresh TEXT NOT NULL, user_id TEXT NOT NULL); CREATE TABLE IF NOT EXISTS pending_codes (code TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS passcode_resets (request_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, device_id TEXT NOT NULL, device_name TEXT NOT NULL, created TEXT NOT NULL, expires TEXT NOT NULL, approved INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS mdm_instructions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, data_key TEXT, data_value TEXT, status TEXT NOT NULL DEFAULT 'pending', detail TEXT, created TEXT NOT NULL);")?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS devices (device_id TEXT PRIMARY KEY, device_desc TEXT NOT NULL, registered_at TEXT NOT NULL, last_refresh TEXT NOT NULL, user_id TEXT NOT NULL); CREATE TABLE IF NOT EXISTS pending_codes (code TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS passcode_resets (request_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, device_id TEXT NOT NULL, device_name TEXT NOT NULL, created TEXT NOT NULL, expires TEXT NOT NULL, approved INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS mdm_instructions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, data_key TEXT, data_value TEXT, status TEXT NOT NULL DEFAULT 'pending', detail TEXT, created TEXT NOT NULL); CREATE TABLE IF NOT EXISTS device_token_epochs (device_id TEXT PRIMARY KEY, epoch INTEGER NOT NULL);")?;
         // One HS256 signing key for every token; see load_jwt_secret for where it comes from.
         let secret = load_jwt_secret(db_path.as_ref().parent().unwrap_or_else(|| Path::new(".")))?;
         let encoding_key = jsonwebtoken::EncodingKey::from_secret(&secret);
@@ -139,27 +144,61 @@ impl DeviceManager {
         let expires = DateTime::parse_from_rfc3339(&expires_str).map_err(|_| ServerError::InvalidCode("Invalid expiry".into()))?.with_timezone(&Utc);
         if Utc::now() > expires { conn.execute("DELETE FROM pending_codes WHERE code = ?", params![code]).ok(); return Err(ServerError::InvalidCode("Code expired".into())); }
         conn.execute("DELETE FROM pending_codes WHERE code = ?", params![code]).ok();
-        let now = Utc::now();
-        conn.execute("INSERT INTO devices (device_id, device_desc, registered_at, last_refresh, user_id) VALUES (?, ?, ?, ?, ?) ON CONFLICT(device_id) DO UPDATE SET device_desc=excluded.device_desc, last_refresh=excluded.last_refresh, user_id=excluded.user_id", params![device_id, device_desc, now.to_rfc3339(), now.to_rfc3339(), user_id])?;
+        let epoch = Self::register(&conn, device_id, device_desc, &user_id)?;
         drop(conn);
-        let dt = self.gen_device_token(device_id, device_desc, &user_id)?; let ut = self.gen_user_token(device_id, device_desc, &user_id)?;
+        let dt = self.gen_device_token(device_id, device_desc, &user_id, epoch)?; let ut = self.gen_user_token(device_id, device_desc, &user_id)?;
         Ok((dt, ut))
     }
-    pub fn device_id_for_token(&self, device_token: &str) -> Result<String> {
-        Ok(self.decode_device_token(device_token)?.device_id)
+    /// Unregister the device a (validly signed) device token names, scoped to the token's user.
+    /// Idempotent: a token whose device is already gone is still accepted here and deletes nothing.
+    /// A token from an earlier registration (older epoch) deletes nothing, so it can't knock out a re-pair.
+    pub fn revoke_device_token(&self, device_token: &str) -> Result<bool> {
+        let c = self.decode_device_token_signature(device_token)?; let conn = self.inner.conn.lock();
+        match Self::check_registered(&conn, &c) { Ok(()) => {} Err(ServerError::InvalidToken) => return Ok(false), Err(e) => return Err(e) }
+        Self::unregister(&conn, &c.device_id, Some(&c.auth0_userid))
     }
     pub fn refresh_user_token(&self, device_token: &str) -> Result<String> {
-        let claims = self.decode_device_token(device_token)?; let conn = self.inner.conn.lock();
-        conn.execute("UPDATE devices SET last_refresh = ? WHERE device_id = ?", params![Utc::now().to_rfc3339(), claims.device_id]).ok();
-        drop(conn); self.gen_user_token(&claims.device_id, &claims.device_desc, &claims.auth0_userid)
+        let c = self.touch_device_token(device_token)?;
+        self.gen_user_token(&c.device_id, &c.device_desc, &c.auth0_userid)
     }
-    pub fn list_devices(&self) -> Result<Vec<Device>> {
+    /// Registered devices; `Some(user)` limits it to that user's own, `None` (admin/startup) lists all.
+    pub fn list_devices(&self, owner: Option<&str>) -> Result<Vec<Device>> {
         let conn = self.inner.conn.lock();
-        let mut stmt = conn.prepare("SELECT device_id, device_desc, registered_at, last_refresh, user_id FROM devices")?;
-        let devices = stmt.query_map([], |row| Ok(Device { device_id: row.get(0)?, device_desc: row.get(1)?, registered_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(2)?).map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()), last_refresh: DateTime::parse_from_rfc3339(&row.get::<_, String>(3)?).map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()), user_id: row.get(4)? }))?.filter_map(|r| r.ok()).collect();
+        let mut stmt = conn.prepare("SELECT device_id, device_desc, registered_at, last_refresh, user_id FROM devices WHERE ?1 IS NULL OR user_id = ?1")?;
+        let devices = stmt.query_map(params![owner], |row| Ok(Device { device_id: row.get(0)?, device_desc: row.get(1)?, registered_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(2)?).map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()), last_refresh: DateTime::parse_from_rfc3339(&row.get::<_, String>(3)?).map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()), user_id: row.get(4)? }))?.filter_map(|r| r.ok()).collect();
         Ok(devices)
     }
-    pub fn delete_device(&self, device_id: &str) -> Result<bool> { let conn = self.inner.conn.lock(); Ok(conn.execute("DELETE FROM devices WHERE device_id = ?", params![device_id])? > 0) }
+    /// Unregister a device and revoke every device token issued for it so far.
+    /// `Some(user)` only deletes it if that user owns it (another user's device is a no-op, false);
+    /// `None` (admin) deletes regardless of owner.
+    pub fn delete_device(&self, device_id: &str, owner: Option<&str>) -> Result<bool> {
+        Self::unregister(&self.inner.conn.lock(), device_id, owner)
+    }
+    /// Delete the registration and bump the epoch in one transaction: a delete without the bump
+    /// would let a later re-pair revive every token minted before it.
+    fn unregister(conn: &Connection, device_id: &str, owner: Option<&str>) -> Result<bool> {
+        let tx = conn.unchecked_transaction()?; // callers hold the connection mutex
+        let deleted = tx.execute("DELETE FROM devices WHERE device_id = ?1 AND (?2 IS NULL OR user_id = ?2)", params![device_id, owner])? > 0;
+        if deleted { Self::bump_epoch(&tx, device_id)?; }
+        tx.commit()?; Ok(deleted)
+    }
+    /// Invalidate all device tokens minted for `device_id` so far, even if it is paired again later.
+    fn bump_epoch(conn: &Connection, device_id: &str) -> Result<()> {
+        conn.execute("INSERT INTO device_token_epochs (device_id, epoch) VALUES (?, 1) ON CONFLICT(device_id) DO UPDATE SET epoch = epoch + 1", params![device_id])?; Ok(())
+    }
+    /// Upsert a device registration; returns the epoch to mint its device token with.
+    /// Moving a device to another user revokes the previous owner's tokens (they'd otherwise
+    /// come back to life if the device were later paired back to that user).
+    /// Bump + upsert run in one transaction so a failure can't hand the device over un-revoked.
+    fn register(conn: &Connection, device_id: &str, device_desc: &str, user_id: &str) -> Result<i64> {
+        let tx = conn.unchecked_transaction()?; // callers hold the connection mutex
+        let prev: Option<String> = tx.query_row("SELECT user_id FROM devices WHERE device_id = ?", params![device_id], |r| r.get(0)).optional()?;
+        if prev.is_some_and(|u| u != user_id) { Self::bump_epoch(&tx, device_id)?; }
+        let now = Utc::now().to_rfc3339();
+        tx.execute(UPSERT_DEVICE, params![device_id, device_desc, now, now, user_id])?;
+        let epoch = tx.query_row("SELECT COALESCE((SELECT epoch FROM device_token_epochs WHERE device_id = ?), 0)", params![device_id], |r| r.get(0))?;
+        tx.commit()?; Ok(epoch)
+    }
 
     // ---- MDM instruction queue (enterprise device management, /mdm/v1) ----
     /// Enqueue an instruction for the user's devices; returns its id.
@@ -185,9 +224,10 @@ impl DeviceManager {
     }
 
     /// Record a device-reported status for an instruction.
-    pub fn mdm_set_status(&self, id: &str, status: &str, detail: Option<&str>) -> Result<bool> {
+    /// Only the owning user's instructions can be updated; another user's id is a no-op (false).
+    pub fn mdm_set_status(&self, user_id: &str, id: &str, status: &str, detail: Option<&str>) -> Result<bool> {
         let conn = self.inner.conn.lock();
-        Ok(conn.execute("UPDATE mdm_instructions SET status = ?, detail = ? WHERE id = ?", params![status, detail, id])? > 0)
+        Ok(conn.execute("UPDATE mdm_instructions SET status = ?, detail = ? WHERE id = ? AND user_id = ?", params![status, detail, id, user_id])? > 0)
     }
 
     /// All instructions for the user: (id, name, status, detail).
@@ -197,15 +237,38 @@ impl DeviceManager {
         let rows = stmt.query_map(params![user_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.filter_map(|x| x.ok()).collect();
         Ok(rows)
     }
-    fn gen_device_token(&self, device_id: &str, device_desc: &str, user_id: &str) -> Result<String> {
+    fn gen_device_token(&self, device_id: &str, device_desc: &str, user_id: &str, epoch: i64) -> Result<String> {
         let now = Utc::now().timestamp();
-        encode(&Header::new(Algorithm::HS256), &DeviceTokenClaims { sub: "rM Device Token".into(), iss: self.inner.issuer.clone(), iat: now, nbf: now, jti: uuid::Uuid::new_v4().to_string(), device_id: device_id.into(), device_desc: device_desc.into(), auth0_userid: user_id.into() }, &self.inner.encoding_key).map_err(|e| ServerError::TokenError(e.to_string()))
+        encode(&Header::new(Algorithm::HS256), &DeviceTokenClaims { sub: "rM Device Token".into(), iss: self.inner.issuer.clone(), iat: now, nbf: now, jti: uuid::Uuid::new_v4().to_string(), device_id: device_id.into(), device_desc: device_desc.into(), auth0_userid: user_id.into(), epoch }, &self.inner.encoding_key).map_err(|e| ServerError::TokenError(e.to_string()))
     }
     fn gen_user_token(&self, device_id: &str, device_desc: &str, user_id: &str) -> Result<String> {
         let now = Utc::now().timestamp();
         encode(&Header::new(Algorithm::HS256), &UserTokenClaims { sub: user_id.into(), iss: self.inner.issuer.clone(), iat: now, exp: now + USER_TOKEN_LIFETIME, nbf: now, jti: uuid::Uuid::new_v4().to_string(), tectonic: self.inner.region.clone(), scopes: USER_SCOPES.into(), auth0_profile: Auth0Profile { user_id: user_id.into(), email: format!("local@{}", self.inner.issuer), name: user_id.into(), nickname: user_id.into(), level: "connect".into(), is_connected: true, is_beta: false }, device_id: device_id.into(), device_desc: device_desc.into(), subscription: SubscriptionClaim { status: "active".into(), plan: "connect".into() } }, &self.inner.encoding_key).map_err(|e| ServerError::TokenError(e.to_string()))
     }
+    /// Device tokens carry no `exp` (long-lived by design, like the real cloud's), so revocation
+    /// is by registration: the token is only honoured while its device is still in `devices`,
+    /// still paired to the user the token names, and the token's epoch is the device's current
+    /// one. Deleting the row bumps the epoch, so re-pairing doesn't revive old tokens.
     fn decode_device_token(&self, token: &str) -> Result<DeviceTokenClaims> {
+        let c = self.decode_device_token_signature(token)?;
+        Self::check_registered(&self.inner.conn.lock(), &c)?; Ok(c)
+    }
+    fn check_registered(conn: &Connection, c: &DeviceTokenClaims) -> Result<()> {
+        // devices.device_id and device_token_epochs.device_id are PRIMARY KEYs: two index lookups.
+        let epoch: Option<i64> = conn.query_row("SELECT COALESCE((SELECT epoch FROM device_token_epochs WHERE device_id = ?1), 0) FROM devices WHERE device_id = ?1 AND user_id = ?2", params![c.device_id, c.auth0_userid], |r| r.get(0)).optional()?;
+        if epoch != Some(c.epoch) { tracing::warn!(device_id = %c.device_id, "rejecting device token: device not registered to this user, or token revoked"); return Err(ServerError::InvalidToken); }
+        Ok(())
+    }
+    /// Validate a device token and record the refresh under one lock, so a delete/re-pair can't
+    /// land between the registration check and the write (which would otherwise undo it).
+    fn touch_device_token(&self, token: &str) -> Result<DeviceTokenClaims> {
+        let c = self.decode_device_token_signature(token)?; let conn = self.inner.conn.lock();
+        Self::check_registered(&conn, &c)?;
+        conn.execute("UPDATE devices SET last_refresh = ? WHERE device_id = ? AND user_id = ?", params![Utc::now().to_rfc3339(), c.device_id, c.auth0_userid])?;
+        Ok(c)
+    }
+    /// Signature/claims check only, no registration lookup. Use `decode_device_token` for auth.
+    fn decode_device_token_signature(&self, token: &str) -> Result<DeviceTokenClaims> {
         let mut val = Validation::new(Algorithm::HS256); val.validate_exp = false; val.set_required_spec_claims(&["sub", "iss", "iat"]);
         decode::<DeviceTokenClaims>(token, &self.inner.decoding_key, &val).map(|d| d.claims).map_err(|_| ServerError::InvalidToken)
     }
@@ -295,40 +358,39 @@ impl DeviceManager {
     /// access = the same user auth data our sync/gentree auth already accepts,
     /// refresh = a device auth data, id = an HS512 id auth data with auth.remarkable.com claims.
     pub fn oauth_bundle(&self, user_id: &str, device_id: &str, device_desc: &str) -> Result<(String, String, String)> {
-        let now = Utc::now();
-        {
-            let conn = self.inner.conn.lock();
-            conn.execute(
-                "INSERT INTO devices (device_id, device_desc, registered_at, last_refresh, user_id) VALUES (?, ?, ?, ?, ?) ON CONFLICT(device_id) DO UPDATE SET device_desc=excluded.device_desc, last_refresh=excluded.last_refresh, user_id=excluded.user_id",
-                params![device_id, device_desc, now.to_rfc3339(), now.to_rfc3339(), user_id],
-            )?;
-        }
+        let epoch = Self::register(&self.inner.conn.lock(), device_id, device_desc, user_id)?;
+        self.mint_bundle(user_id, device_id, device_desc, epoch)
+    }
+    fn mint_bundle(&self, user_id: &str, device_id: &str, device_desc: &str, epoch: i64) -> Result<(String, String, String)> {
         Ok((
             self.gen_user_token(device_id, device_desc, user_id)?,
-            self.gen_device_token(device_id, device_desc, user_id)?,
+            self.gen_device_token(device_id, device_desc, user_id, epoch)?,
             self.issue_id_token(user_id)?,
         ))
     }
 
     /// Re-mint an OAuth bundle from a refresh auth data (a device auth data).
+    /// Only refreshes an existing registration (never re-creates a deleted one).
     pub fn refresh_oauth(&self, refresh: &str) -> Result<(String, String, String)> {
-        let c = self.decode_device_token(refresh)?;
-        self.oauth_bundle(&c.auth0_userid, &c.device_id, &c.device_desc)
+        let c = self.touch_device_token(refresh)?;
+        self.mint_bundle(&c.auth0_userid, &c.device_id, &c.device_desc, c.epoch)
     }
 
     /// Exchange a legacy device auth data for an OAuth bundle (`/token/json/4/device/exchange`).
     pub fn exchange_device_token(&self, device: &str) -> Result<(String, String, String)> {
-        let c = self.decode_device_token(device)?;
-        self.oauth_bundle(&c.auth0_userid, &c.device_id, &c.device_desc)
+        let c = self.touch_device_token(device)?;
+        self.mint_bundle(&c.auth0_userid, &c.device_id, &c.device_desc, c.epoch)
     }
 
     /// Owner of a device (refresh) auth data; lets a paired device approve an OAuth device code.
     /// The device must still be registered to that user, so a deleted device's credential can't approve.
     pub fn device_token_user(&self, device: &str) -> Result<String> {
-        let c = self.decode_device_token(device)?;
-        let conn = self.inner.conn.lock();
-        let registered = conn.query_row("SELECT 1 FROM devices WHERE device_id = ? AND user_id = ?", params![c.device_id, c.auth0_userid], |_| Ok(())).optional()?.is_some();
-        if registered { Ok(c.auth0_userid) } else { Err(ServerError::Unauthorized) }
+        // decode_device_token checks registration and the revocation epoch.
+        match self.decode_device_token(device) {
+            Ok(c) => Ok(c.auth0_userid),
+            Err(ServerError::InvalidToken) => Err(ServerError::Unauthorized),
+            Err(e) => Err(e),
+        }
     }
 
     fn issue_id_token(&self, user_id: &str) -> Result<String> {
@@ -407,5 +469,204 @@ mod jwt_secret_tests {
         if std::env::var_os("JWT_SECRET").is_none() && std::env::var_os("JWT_SECRET_FILE").is_none() {
             assert!(load_jwt_secret(dir.path()).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod revocation_tests {
+    use super::*;
+
+    fn setup() -> (DeviceManager, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        (DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap(), tmp)
+    }
+    /// Pair `device` to `user` the way the tablet does (pairing code -> /token/json/2/device/new).
+    fn pair(dm: &DeviceManager, user: &str, device: &str) -> String {
+        let code = dm.create_pairing_code(user).unwrap();
+        dm.exchange_code(&code, device, "remarkable").unwrap().0
+    }
+    fn bearer(t: &str) -> String { format!("Bearer {t}") }
+
+    #[test]
+    fn registered_device_token_is_accepted() {
+        let (dm, _tmp) = setup();
+        let dt = pair(&dm, "local-user", "RM110-1");
+        assert_eq!(dm.validate_token(&bearer(&dt)).unwrap(), "local-user");
+        assert_eq!(dm.caller(&bearer(&dt)).unwrap().1, "RM110-1");
+        let ut = dm.refresh_user_token(&dt).unwrap();
+        assert_eq!(dm.caller(&bearer(&ut)).unwrap(), ("local-user".into(), "RM110-1".into(), "remarkable".into()));
+        assert!(dm.exchange_device_token(&dt).is_ok());
+    }
+
+    #[test]
+    fn deleted_device_token_is_rejected_everywhere() {
+        let (dm, _tmp) = setup();
+        let dt = pair(&dm, "local-user", "RM110-1");
+        assert!(dm.delete_device("RM110-1", None).unwrap());
+        assert!(matches!(dm.validate_token(&bearer(&dt)), Err(ServerError::InvalidToken)));
+        assert!(dm.caller(&bearer(&dt)).is_err());
+        assert!(dm.refresh_user_token(&dt).is_err());
+        // Refresh/exchange must not silently re-register the deleted device.
+        assert!(dm.refresh_oauth(&dt).is_err());
+        assert!(dm.exchange_device_token(&dt).is_err());
+        assert!(dm.get_device("RM110-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn self_revoke_invalidates_token_and_is_idempotent() {
+        let (dm, _tmp) = setup();
+        let dt = pair(&dm, "local-user", "RM110-1");
+        let other = pair(&dm, "local-user", "RM110-2");
+        assert!(dm.revoke_device_token(&dt).unwrap());
+        assert!(dm.validate_token(&bearer(&dt)).is_err());
+        assert!(!dm.revoke_device_token(&dt).unwrap(), "second delete is a no-op, not an error");
+        assert!(dm.revoke_device_token("not-a-jwt").is_err());
+        assert!(dm.validate_token(&bearer(&other)).is_ok(), "other devices unaffected");
+    }
+
+    #[test]
+    fn token_for_another_users_device_is_rejected() {
+        let (dm, _tmp) = setup();
+        let _b = pair(&dm, "user-b", "RM110-B");
+        // Validly signed, but claims user A for a device registered to user B.
+        let forged = dm.gen_device_token("RM110-B", "remarkable", "user-a", 0).unwrap();
+        assert!(dm.validate_token(&bearer(&forged)).is_err());
+        assert!(dm.caller(&bearer(&forged)).is_err());
+        assert!(!dm.revoke_device_token(&forged).unwrap(), "must not delete user B's device");
+        assert!(dm.get_device("RM110-B").unwrap().is_some());
+        // A device re-paired to a new user drops the old user's token.
+        let old = pair(&dm, "user-a", "RM110-X");
+        let new = pair(&dm, "user-b", "RM110-X");
+        assert!(dm.validate_token(&bearer(&old)).is_err());
+        assert_eq!(dm.validate_token(&bearer(&new)).unwrap(), "user-b");
+    }
+
+    #[test]
+    fn repairing_does_not_revive_revoked_tokens() {
+        let (dm, _tmp) = setup();
+        let old = pair(&dm, "local-user", "RM110-1");
+        let (_, old_refresh, _) = dm.refresh_oauth(&old).unwrap();
+        assert!(dm.delete_device("RM110-1", None).unwrap());
+        let new = pair(&dm, "local-user", "RM110-1");
+        assert!(dm.validate_token(&bearer(&new)).is_ok());
+        for t in [&old, &old_refresh] {
+            assert!(dm.validate_token(&bearer(t)).is_err());
+            assert!(dm.refresh_user_token(t).is_err());
+            assert!(dm.refresh_oauth(t).is_err());
+            assert!(dm.exchange_device_token(t).is_err());
+            assert!(!dm.revoke_device_token(t).unwrap(), "stale token must not unregister the new pairing");
+        }
+        assert!(dm.validate_token(&bearer(&new)).is_ok());
+        // Self-revoke also bumps the epoch.
+        assert!(dm.revoke_device_token(&new).unwrap());
+        let newer = pair(&dm, "local-user", "RM110-1");
+        assert!(dm.validate_token(&bearer(&new)).is_err());
+        assert!(dm.validate_token(&bearer(&newer)).is_ok());
+        // Refreshed tokens carry the current epoch and keep working.
+        let (_, r, _) = dm.refresh_oauth(&newer).unwrap();
+        assert!(dm.validate_token(&bearer(&r)).is_ok());
+    }
+
+    #[test]
+    fn owner_round_trip_does_not_revive_first_owners_tokens() {
+        let (dm, _tmp) = setup();
+        let a1 = pair(&dm, "user-a", "RM110-X");
+        let _b = pair(&dm, "user-b", "RM110-X");
+        let a2 = pair(&dm, "user-a", "RM110-X");
+        assert!(dm.validate_token(&bearer(&a1)).is_err());
+        assert!(dm.validate_token(&bearer(&a2)).is_ok());
+        // Plain same-user re-pairing (no delete, no owner change) keeps earlier tokens valid.
+        let a3 = pair(&dm, "user-a", "RM110-X");
+        assert!(dm.validate_token(&bearer(&a2)).is_ok() && dm.validate_token(&bearer(&a3)).is_ok());
+    }
+
+    #[test]
+    fn refresh_never_recreates_or_reassigns_registration() {
+        let (dm, _tmp) = setup();
+        let a = pair(&dm, "user-a", "RM110-X");
+        let _b = pair(&dm, "user-b", "RM110-X");
+        assert!(dm.refresh_oauth(&a).is_err());
+        assert!(dm.exchange_device_token(&a).is_err());
+        assert_eq!(dm.get_device("RM110-X").unwrap().unwrap().user_id, "user-b");
+    }
+
+    #[test]
+    fn epoch_zero_tokens_are_unchanged_on_the_wire() {
+        let (dm, _tmp) = setup();
+        let dt = pair(&dm, "local-user", "RM110-1");
+        let payload = dt.split('.').nth(1).unwrap();
+        let json = String::from_utf8(base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload).unwrap()).unwrap();
+        assert!(!json.contains("rms-epoch"), "{json}");
+        // A pre-existing token (minted before this column/claim existed) is still accepted.
+        assert!(dm.validate_token(&bearer(&dt)).is_ok());
+        assert!(dm.refresh_oauth(&dt).is_ok());
+    }
+
+    /// A second connection to the same DB, to break things under the manager's feet.
+    fn side_conn(tmp: &tempfile::TempDir) -> Connection { Connection::open(tmp.path().join("devices.db")).unwrap() }
+    /// Make every epoch bump fail (both the insert and the ON CONFLICT update path).
+    fn fail_epoch_bumps(tmp: &tempfile::TempDir) {
+        side_conn(tmp).execute_batch("CREATE TRIGGER fail_ins BEFORE INSERT ON device_token_epochs BEGIN SELECT RAISE(ABORT, 'forced'); END; CREATE TRIGGER fail_upd BEFORE UPDATE ON device_token_epochs BEGIN SELECT RAISE(ABORT, 'forced'); END;").unwrap();
+    }
+
+    #[test]
+    fn self_revoke_propagates_db_errors() {
+        let (dm, tmp) = setup();
+        let dt = pair(&dm, "local-user", "RM110-1");
+        side_conn(&tmp).execute_batch("ALTER TABLE devices RENAME TO devices_gone").unwrap();
+        assert!(matches!(dm.revoke_device_token(&dt), Err(ServerError::Database(_))), "a DB error is not 'already unregistered'");
+        side_conn(&tmp).execute_batch("ALTER TABLE devices_gone RENAME TO devices").unwrap();
+        assert!(dm.validate_token(&bearer(&dt)).is_ok(), "nothing was deleted");
+        assert!(dm.revoke_device_token(&dt).unwrap());
+    }
+
+    #[test]
+    fn failed_epoch_bump_rolls_back_the_delete() {
+        let (dm, tmp) = setup();
+        let dt = pair(&dm, "local-user", "RM110-1");
+        pair(&dm, "local-user", "RM110-2");
+        assert!(dm.delete_device("RM110-2", None).unwrap()); // RM110-2 now has an epochs row (update path)
+        let other2 = pair(&dm, "local-user", "RM110-2");
+        fail_epoch_bumps(&tmp);
+        // Admin/user delete (insert path for RM110-1, update path for RM110-2) and self-unregister.
+        assert!(dm.delete_device("RM110-1", None).is_err());
+        assert!(dm.delete_device("RM110-2", Some("local-user")).is_err());
+        assert!(dm.revoke_device_token(&dt).is_err());
+        assert!(dm.revoke_device_token(&other2).is_err());
+        for (d, t) in [("RM110-1", &dt), ("RM110-2", &other2)] {
+            assert!(dm.get_device(d).unwrap().is_some(), "{d}: delete rolled back");
+            assert!(dm.validate_token(&bearer(t)).is_ok(), "{d}: token still valid, epoch unchanged");
+        }
+        // Re-pairing to another user must not hand the device over un-revoked.
+        let code = dm.create_pairing_code("user-b").unwrap();
+        assert!(dm.exchange_code(&code, "RM110-1", "remarkable").is_err());
+        assert_eq!(dm.get_device("RM110-1").unwrap().unwrap().user_id, "local-user");
+        assert!(dm.validate_token(&bearer(&dt)).is_ok());
+        side_conn(&tmp).execute_batch("DROP TRIGGER fail_ins; DROP TRIGGER fail_upd;").unwrap();
+        assert!(dm.delete_device("RM110-1", None).unwrap());
+        assert!(dm.validate_token(&bearer(&dt)).is_err());
+    }
+
+    #[test]
+    fn delete_device_respects_owner() {
+        let (dm, _tmp) = setup();
+        let b = pair(&dm, "user-b", "RM110-B");
+        assert!(!dm.delete_device("RM110-B", Some("user-a")).unwrap());
+        assert!(dm.validate_token(&bearer(&b)).is_ok());
+        assert_eq!(dm.list_devices(Some("user-a")).unwrap().len(), 0);
+        assert_eq!(dm.list_devices(Some("user-b")).unwrap().len(), 1);
+        assert!(dm.delete_device("RM110-B", Some("user-b")).unwrap());
+        assert!(dm.validate_token(&bearer(&b)).is_err());
+    }
+
+    #[test]
+    fn user_tokens_keep_exp_validation() {
+        let (dm, _tmp) = setup();
+        let ut = dm.create_user_token("local-user").unwrap();
+        assert_eq!(dm.validate_token(&bearer(&ut)).unwrap(), "local-user");
+        let now = Utc::now().timestamp();
+        let expired = encode(&Header::new(Algorithm::HS256), &UserTokenClaims { sub: "local-user".into(), iss: "local.test".into(), iat: now - 7200, exp: now - 3600, nbf: now - 7200, jti: "x".into(), tectonic: "local".into(), scopes: USER_SCOPES.into(), auth0_profile: Auth0Profile { user_id: "local-user".into(), email: String::new(), name: String::new(), nickname: String::new(), level: String::new(), is_connected: true, is_beta: false }, device_id: "RM110-1".into(), device_desc: "remarkable".into(), subscription: SubscriptionClaim { status: "active".into(), plan: "connect".into() } }, &dm.inner.encoding_key).unwrap();
+        assert!(dm.validate_token(&bearer(&expired)).is_err());
+        assert!(dm.caller(&bearer(&expired)).is_err());
     }
 }

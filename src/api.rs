@@ -115,9 +115,10 @@ pub async fn create_pairing_code(State(state): State<AppState>, headers: HeaderM
     Ok(Json(PairingCodeResponse { code, expires_in: 600 }))
 }
 
+/// The caller's own devices only.
 pub async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Vec<DeviceInfo>>> {
-    let _user_id = state.auth_user(&headers)?;
-    let devices = state.devices.list_devices()?.into_iter().map(|d| DeviceInfo {
+    let user_id = state.auth_user(&headers)?;
+    let devices = state.devices.list_devices(Some(&user_id))?.into_iter().map(|d| DeviceInfo {
         device_id: d.device_id,
         device_desc: d.device_desc,
         registered_at: d.registered_at.to_rfc3339(),
@@ -126,9 +127,10 @@ pub async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> 
     Ok(Json(devices))
 }
 
+/// Unregister one of the caller's own devices; anyone else's (or an unknown id) is a 404.
 pub async fn delete_device(State(state): State<AppState>, Path(id): Path<String>, headers: HeaderMap) -> Result<StatusCode> {
-    let _user_id = state.auth_user(&headers)?;
-    state.devices.delete_device(&id)?;
+    let user_id = state.auth_user(&headers)?;
+    if !state.devices.delete_device(&id, Some(&user_id))? { return Err(ServerError::NotFound(id)); }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -156,8 +158,7 @@ pub async fn register_device(State(state): State<AppState>, Json(req): Json<Devi
 }
 
 pub async fn delete_device_token(State(state): State<AppState>, headers: HeaderMap) -> Result<StatusCode> {
-    let device_id = state.devices.device_id_for_token(bearer(&headers)?)?;
-    state.devices.delete_device(&device_id)?;
+    state.devices.revoke_device_token(bearer(&headers)?)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -255,6 +256,52 @@ pub async fn check_updates() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "available": false
     }))
+}
+
+#[cfg(test)]
+mod device_ownership_tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    fn hdrs(tk: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {tk}")).unwrap());
+        h
+    }
+    /// Pair `device` to `user` and return that device's token.
+    fn pair(state: &AppState, user: &str, device: &str) -> String {
+        let code = state.devices.create_pairing_code(user).unwrap();
+        state.devices.exchange_code(&code, device, "remarkable").unwrap().0
+    }
+
+    #[tokio::test]
+    async fn users_only_see_and_delete_their_own_devices() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let devices = DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        let state = AppState::new(Storage::new(tmp.path()).unwrap(), devices);
+        let a_dev = pair(&state, "user-a", "RM110-A");
+        let b_dev = pair(&state, "user-b", "RM110-B");
+        let a = state.devices.create_user_token("user-a").unwrap();
+        let ids = |v: Vec<DeviceInfo>| v.into_iter().map(|d| d.device_id).collect::<Vec<_>>();
+        let Json(listed) = list_devices(State(state.clone()), hdrs(&a)).await.unwrap();
+        assert_eq!(ids(listed), ["RM110-A"]);
+        // B's device token authenticates as B and sees only B's device.
+        let Json(listed) = list_devices(State(state.clone()), hdrs(&b_dev)).await.unwrap();
+        assert_eq!(ids(listed), ["RM110-B"]);
+        // A can't delete B's device: 404, and B's registration and token survive.
+        let err = delete_device(State(state.clone()), Path("RM110-B".into()), hdrs(&a)).await.unwrap_err();
+        assert!(matches!(err, ServerError::NotFound(_)), "{err:?}");
+        assert!(state.devices.get_device("RM110-B").unwrap().is_some());
+        assert_eq!(state.devices.validate_token(&format!("Bearer {b_dev}")).unwrap(), "user-b");
+        // Own device: 204, and its token is revoked.
+        assert_eq!(delete_device(State(state.clone()), Path("RM110-A".into()), hdrs(&a)).await.unwrap(), StatusCode::NO_CONTENT);
+        assert!(state.devices.validate_token(&format!("Bearer {a_dev}")).is_err());
+        let Json(listed) = list_devices(State(state.clone()), hdrs(&a)).await.unwrap();
+        assert!(listed.is_empty());
+        assert!(matches!(delete_device(State(state.clone()), Path("RM110-A".into()), hdrs(&a)).await, Err(ServerError::NotFound(_))));
+        // Admin-side (owner = None) still sees everything.
+        assert_eq!(state.devices.list_devices(None).unwrap().iter().map(|d| d.device_id.as_str()).collect::<Vec<_>>(), ["RM110-B"]);
+    }
 }
 
 #[cfg(test)]

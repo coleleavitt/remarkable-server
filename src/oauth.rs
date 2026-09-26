@@ -355,7 +355,7 @@ mod tests {
         let (state, _tmp) = setup();
         let (_, user_code) = mint(&state).await;
         let dev = paired_device_token(&state);
-        assert!(state.devices.delete_device("paired-tablet").unwrap());
+        assert!(state.devices.delete_device("paired-tablet", None).unwrap());
         assert!(matches!(approve_code(&state, &bearer(&dev), &user_code, None), Err(ServerError::Unauthorized)));
         // signature alone is not enough: the device row must still exist
         assert!(state.devices.device_token_user(&dev).is_err());
