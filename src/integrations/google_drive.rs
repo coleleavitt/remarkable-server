@@ -470,6 +470,28 @@ impl CloudProvider for GoogleDrive {
         Ok(out)
     }
 
+    /// `about.get`'s `user.permissionId`, the signed-in user's stable id.
+    async fn account_id(&self) -> Result<Option<String>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct User {
+            permission_id: String,
+        }
+        #[derive(Deserialize)]
+        struct About {
+            user: User,
+        }
+        let url = format!("{}/about?fields=user(permissionId)", self.api_base);
+        let response = self
+            .request(reqwest::Method::GET, &url)
+            .await?
+            .send()
+            .await
+            .map_err(|e| IntegrationError::Network(e.to_string()))?;
+        let about: About = self.handle_response(response).await?;
+        Ok(Some(about.user.permission_id))
+    }
+
     async fn list_folders(&self) -> Result<Vec<CloudFolder>> {
         let query = format!("mimeType = '{}' and trashed = false", FOLDER_MIME);
         Ok(self
@@ -1199,6 +1221,31 @@ mod tests {
         let err = d.download_file("flaky").await.unwrap_err();
         assert!(!err.is_permanent(), "{err}");
         assert_eq!(d.download_file("ok").await.unwrap(), b"ok");
+    }
+
+    /// The account a sync's state is kept for is `about.get`'s `user.permissionId`.
+    #[tokio::test]
+    async fn account_id_is_the_users_permission_id() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        let app = axum::Router::new().route(
+            "/about",
+            get(|Query(q): Query<HashMap<String, String>>| async move {
+                match q.get("fields").map(String::as_str) {
+                    Some("user(permissionId)") => {
+                        Json(json!({ "user": { "permissionId": "0123abc" } })).into_response()
+                    }
+                    _ => StatusCode::BAD_REQUEST.into_response(),
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        assert_eq!(
+            drive(&base).account_id().await.unwrap().as_deref(),
+            Some("0123abc")
+        );
     }
 
     #[test]

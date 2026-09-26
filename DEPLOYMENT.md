@@ -281,12 +281,31 @@ Afterwards:
   OneDrive, `/Documents/Notes/Documents/Notes/…`). If the folder has a subfolder at
   that path, the upgrade sync says so in `notices` and (unless it only uploads)
   downloads it to `integrations/<local_path>/Notes/`. If it is that duplicate,
-  delete it in Dropbox or OneDrive and delete the local copy before the next sync.
-  A full sync uploads files that exist only locally and downloads files that exist
-  only remotely, so whichever copy is left brings the other back.
+  delete it in Dropbox or OneDrive: the next sync moves the local copy it
+  downloaded into `.rms-remote-deleted/` (below). Deleting only the local copy
+  leaves the remote one in place (it isn't downloaded again, but a sync never
+  deletes remote files).
 
 Before the first sync after deploying, look under `integrations/` for directories
 named after a synced folder's path, so the notices hold no surprises.
+
+Cloud sync state: each synced directory `integrations/<local_path>/` holds
+`.rms-sync-state.json`, the state of the last sync of each provider, account and
+`cloud_folder` synced into it, which full sync reconciles against (README,
+"Integrations API"). Leave it in place, and keep it with the directory when moving
+or restoring storage: without it the next sync of that directory is a first sync
+again, which can't tell deletions from new files and uploads files deleted remotely
+since from their local copies. The first sync after deploying this is such a first
+sync (as every sync was before), so a file deleted remotely before then comes back
+that one last time. Local copies of files deleted remotely are moved to
+`.rms-remote-deleted/<UTC time>/` in the same directory, never deleted: look
+through it now and then and delete what isn't needed, as nothing else does. A state
+file the server can't read (not JSON, or written by a newer version) fails the sync
+with an error naming it; delete it to start over with a first sync. Rolling back to
+an older binary is safe: it ignores both (hidden entries). Upgrading again after
+syncs by the older binary is safe too: the state they didn't update costs at most
+transfers of unchanged content, or for Google Drive a conflict-strategy decision, as
+before this change.
 
 Migrating storage from a local server: stop both, `rsync -a test-storage/ linode:/var/lib/remarkable-server/`,
 `chown -R remarkable:remarkable`, start. `sync.db` (with its `-wal`/`-shm`

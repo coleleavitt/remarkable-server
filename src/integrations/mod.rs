@@ -303,6 +303,16 @@ pub trait CloudProvider: Send + Sync {
         Ok(None)
     }
 
+    /// A stable identifier of the account the token is for (Dropbox `account_id`, Google
+    /// Drive `permissionId`, OneDrive drive `id`). The manifest full sync keeps between runs
+    /// ([`SyncConfig::persist_state`]) is stored per account, so what one account's sync
+    /// recorded is never applied to another's files: after the provider is connected to
+    /// another account, that account's first sync infers no deletions. `None` when the
+    /// provider can't tell (the default); every account then shares one manifest per folder.
+    async fn account_id(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Whether `content` is the content of the remote file `file`, going by the hash its listing
     /// carries ([`CloudFile::content_hash`]). `false` when that can't be told (the default).
     /// Full sync leaves a file that is the same on both sides alone.

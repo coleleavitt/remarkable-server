@@ -647,6 +647,18 @@ impl CloudProvider for OneDrive {
         Ok(parts.iter().all(|p| is_safe_name(p)).then_some(parts))
     }
 
+    /// The `id` of the signed-in user's drive (`/me/drive`), which every path here is in.
+    async fn account_id(&self) -> Result<Option<String>> {
+        #[derive(Deserialize)]
+        struct Drive {
+            id: String,
+        }
+        let drive: Drive = self
+            .get_json(&format!("{}/me/drive?$select=id", self.graph_base))
+            .await?;
+        Ok(Some(drive.id))
+    }
+
     /// Compares `content_hash` (Graph's `sha256Hash`, else its `quickXorHash`) with the same
     /// hash of `content`.
     fn content_matches(&self, file: &CloudFile, content: &[u8]) -> bool {
@@ -1999,6 +2011,38 @@ mod tests {
         for len in (0..400).chain([999, 1000]) {
             assert_eq!(quick_xor_hash(&data[..len]), by_bits(&data[..len]), "{len}");
         }
+    }
+
+    /// The account a sync's state is kept for is the signed-in user's drive, by its `id`.
+    #[tokio::test]
+    async fn account_id_is_the_drive_id() {
+        use std::collections::HashMap;
+
+        use axum::extract::Query;
+        let app = axum::Router::new().route(
+            "/me/drive",
+            axum::routing::get(|Query(q): Query<HashMap<String, String>>| async move {
+                match q.get("$select").map(String::as_str) {
+                    Some("id") => {
+                        axum::Json(serde_json::json!({ "id": "b!drive" })).into_response()
+                    }
+                    _ => StatusCode::BAD_REQUEST.into_response(),
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = OAuthConfig::onedrive("id".into(), None, "http://localhost/cb".into());
+        let token = OAuthToken {
+            access_token: "t".into(),
+            refresh_token: None,
+            token_type: "Bearer".into(),
+            expires_at: None,
+            scope: None,
+        };
+        let d = OneDrive::with_token(config, token).with_base_url(&base);
+        assert_eq!(d.account_id().await.unwrap().as_deref(), Some("b!drive"));
     }
 
     /// Graph's `sha256Hash` (upper-case hex) or `quickXorHash`, whichever the listing kept.

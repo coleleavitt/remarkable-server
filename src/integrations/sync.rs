@@ -2,7 +2,7 @@
 //!
 //! Handles sync between local remarkable storage and cloud providers.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,14 @@ use crate::integrations::conflict::{
     ConflictStrategy,
     ConflictType,
 };
-use crate::integrations::{CloudFile, CloudProvider, IntegrationError, Result, SyncFolderConfig};
+use crate::integrations::{
+    CloudFile,
+    CloudProvider,
+    IntegrationError,
+    ProviderType,
+    Result,
+    SyncFolderConfig,
+};
 
 /// Longest path segment, in bytes, that a local path may have: `NAME_MAX` on the usual Linux
 /// filesystems (ext4, XFS, Btrfs). Dropbox and OneDrive allow names of 255 *characters*, so
@@ -131,7 +138,9 @@ pub(crate) async fn create_dirs_within(root: &Path, rel: &Path) -> Result<Option
 /// Replace `target` (in `dir`) via a fresh temp file + rename: `create_new` never follows a
 /// symlink and `rename` replaces the directory entry rather than writing through it, so a
 /// symlink swapped in after our checks can't redirect the content. Also makes writes atomic.
-async fn write_replace(dir: &Path, target: &Path, content: &[u8]) -> Result<()> {
+/// Returns the metadata of the file written, taken before the rename (which keeps it), so it
+/// describes what was written whatever happens to `target` afterwards.
+async fn write_replace(dir: &Path, target: &Path, content: &[u8]) -> Result<std::fs::Metadata> {
     let tmp = dir.join(format!(".rms-sync-{}.tmp", uuid::Uuid::new_v4()));
     let res = async {
         let mut f = fs::OpenOptions::new()
@@ -140,7 +149,9 @@ async fn write_replace(dir: &Path, target: &Path, content: &[u8]) -> Result<()> 
             .open(&tmp)
             .await?;
         write_durably(&mut f, content).await?;
-        fs::rename(&tmp, target).await
+        let written = f.metadata().await?;
+        fs::rename(&tmp, target).await?;
+        Ok::<_, std::io::Error>(written)
     }
     .await;
     if res.is_err() {
@@ -185,24 +196,32 @@ pub(crate) const LAYOUT_MARKER: &str = ".rms-sync-layout";
 /// Directory at the top of the local sync directory that old-layout directories are moved into.
 pub(crate) const OLD_LAYOUT_DIR: &str = ".rms-old-layout";
 
-/// Whether `name`, at the top of the local sync directory, is one of the sync engine's own
-/// entries ([`LAYOUT_MARKER`], [`OLD_LAYOUT_DIR`]).
+/// File at the top of the local sync directory that keeps the [manifest](SyncManifest) of the
+/// last sync of each cloud folder synced into it, with [`SyncConfig::persist_state`].
+pub(crate) const MANIFEST_FILE: &str = ".rms-sync-state.json";
+
+/// Directory at the top of the local sync directory that local copies of files deleted remotely
+/// are moved into, as `<run>/<path>` (`<run>` is the time of the sync, in UTC:
+/// `20260926T101500Z`). A sync never deletes a local file.
+pub(crate) const QUARANTINE_DIR: &str = ".rms-remote-deleted";
+
+/// Whether `name` is one of the sync engine's own entries ([`LAYOUT_MARKER`],
+/// [`OLD_LAYOUT_DIR`], [`MANIFEST_FILE`], [`QUARANTINE_DIR`]).
 fn is_reserved_name(name: &str) -> bool {
-    [LAYOUT_MARKER, OLD_LAYOUT_DIR]
+    [LAYOUT_MARKER, OLD_LAYOUT_DIR, MANIFEST_FILE, QUARANTINE_DIR]
         .iter()
         .any(|r| name.eq_ignore_ascii_case(r))
 }
 
-/// Whether the sync path `path` (`/x/…`) is in one of the sync engine's own entries. Such a
-/// path is never uploaded, and a remote file there is never written over them.
+/// Whether the sync path `path` (`/x/…`) is, or is in, one of the sync engine's own entries.
+/// Such a path is never uploaded, and a remote file there is never written over them. Any
+/// component counts, not just the first, so the entries of a sync directory nested in another
+/// are the outer sync's as well.
 fn is_reserved(path: &str) -> bool {
-    is_reserved_name(
-        path.strip_prefix('/')
-            .unwrap_or(path)
-            .split('/')
-            .next()
-            .unwrap_or(""),
-    )
+    path.strip_prefix('/')
+        .unwrap_or(path)
+        .split('/')
+        .any(is_reserved_name)
 }
 
 /// `name` as the old layout is matched: case-insensitively (Dropbox and OneDrive paths are),
@@ -282,6 +301,263 @@ async fn move_old_layout(root: &Path, dir: &[String]) -> Result<Vec<(PathBuf, Pa
     Ok(moved)
 }
 
+/// Version of the [`MANIFEST_FILE`] format written by this server.
+const MANIFEST_VERSION: u32 = 1;
+
+/// What each file of a synced folder looked like, on each side, at the end of the last sync that
+/// dealt with it, keyed by sync path (`/dir/file.pdf`). Full sync compares both sides with it (a
+/// three-way reconciliation): a side that still matches its entry hasn't changed since, so a file
+/// missing on one side and unchanged on the other was deleted there, not created here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncManifest {
+    pub files: BTreeMap<String, ManifestEntry>,
+}
+
+/// One file of a [`SyncManifest`]. A side that is `None` was absent there: the file was deleted
+/// on that side and the copy on the other kept (a sync never deletes remote files, and an
+/// upload-only sync never touches local ones). It isn't brought back while that copy stays as it
+/// was.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<LocalIdentity>,
+}
+
+impl ManifestEntry {
+    /// Both sides in step: `remote` as listed, and the local file that has its content.
+    fn synced(remote: &CloudFile, local: LocalIdentity) -> Self {
+        Self {
+            remote: Some(RemoteIdentity::of(remote)),
+            local: Some(local),
+        }
+    }
+}
+
+/// A remote file as its listing (or upload) described it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteIdentity {
+    pub id: String,
+    /// [`CloudFile::content_hash`]: Dropbox `content_hash`, Drive `md5Checksum`, OneDrive
+    /// `sha256Hash` or `quickXorHash`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    pub size: u64,
+    pub modified_at: i64,
+}
+
+impl RemoteIdentity {
+    fn of(f: &CloudFile) -> Self {
+        Self {
+            id: f.id.clone(),
+            content_hash: f.content_hash.clone(),
+            size: f.size,
+            modified_at: f.modified_at,
+        }
+    }
+
+    /// Whether `f` is still this file: the same content hash and size when both carry a hash,
+    /// otherwise the same id, size and modification time. Anything else counts as a change,
+    /// which at worst transfers a file again.
+    fn matches(&self, f: &CloudFile) -> bool {
+        match (&self.content_hash, &f.content_hash) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b) && self.size == f.size,
+            _ => self.id == f.id && self.size == f.size && self.modified_at == f.modified_at,
+        }
+    }
+}
+
+/// A local file as it was when last synced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalIdentity {
+    pub size: u64,
+    /// Modification time, in nanoseconds since the Unix epoch (`None` if not available).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime_ns: Option<i64>,
+    /// SHA-256 of the content, in hex: tells a file that was only touched from one edited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+}
+
+/// A file found by the local scan.
+#[derive(Debug, Clone)]
+struct LocalFile {
+    path: PathBuf,
+    /// Modification time in whole seconds, as the conflict strategy compares it.
+    mtime: i64,
+    mtime_ns: Option<i64>,
+    size: u64,
+}
+
+impl LocalFile {
+    fn identity(&self, sha256: Option<String>) -> LocalIdentity {
+        LocalIdentity {
+            size: self.size,
+            mtime_ns: self.mtime_ns,
+            sha256,
+        }
+    }
+
+    /// Whether this file is still as `base` recorded it: the same size and either the same
+    /// modification time or (touched since) the same content. The file is only read in the
+    /// second case.
+    async fn matches(&self, base: &LocalIdentity) -> bool {
+        if self.size != base.size {
+            return false;
+        }
+        if self.mtime_ns.is_some() && self.mtime_ns == base.mtime_ns {
+            return true;
+        }
+        let Some(hash) = &base.sha256 else {
+            return false;
+        };
+        fs::read(&self.path)
+            .await
+            .is_ok_and(|content| sha256_hex(&content) == *hash)
+    }
+}
+
+/// `meta`'s modification time in nanoseconds since the Unix epoch (negative before it).
+fn mtime_ns(meta: &std::fs::Metadata) -> Option<i64> {
+    let ns = match meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH) {
+        Ok(after) => i128::try_from(after.as_nanos()).ok()?,
+        Err(before) => -i128::try_from(before.duration().as_nanos()).ok()?,
+    };
+    i64::try_from(ns).ok()
+}
+
+fn sha256_hex(content: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(content))
+}
+
+/// Contents of [`MANIFEST_FILE`]: a manifest for each provider, account and cloud folder synced
+/// into the directory.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ManifestFile {
+    version: u32,
+    #[serde(default)]
+    syncs: Vec<StoredManifest>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredManifest {
+    provider: ProviderType,
+    account: String,
+    cloud_folder: String,
+    /// When it was written (Unix seconds).
+    synced_at: i64,
+    files: BTreeMap<String, ManifestEntry>,
+}
+
+impl StoredManifest {
+    fn is(&self, key: &ManifestKey) -> bool {
+        self.provider == key.provider
+            && self.account == key.account
+            && self.cloud_folder == key.cloud_folder
+    }
+}
+
+/// Which manifest in [`MANIFEST_FILE`] is a sync's: the provider, the account the token is for
+/// ([`CloudProvider::account_id`]) and the cloud folder as configured (without a trailing
+/// slash). The local directory is the one the file is in. A folder spelled another way gets a
+/// manifest of its own, starting with a sync that infers no deletions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManifestKey {
+    provider: ProviderType,
+    account: String,
+    cloud_folder: String,
+}
+
+/// The [`MANIFEST_FILE`] in `root`; empty if there is none. One this server can't read (not
+/// JSON, or written by a newer version) is an error: syncing as if there were none would bring
+/// back what was deleted.
+async fn read_manifest_file(root: &Path) -> Result<ManifestFile> {
+    let path = root.join(MANIFEST_FILE);
+    let bytes = match fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ManifestFile::default()),
+        Err(e) => return Err(e.into()),
+    };
+    let bad = |why: String| IntegrationError::Serialization(format!("{}: {}", path.display(), why));
+    let file: ManifestFile = serde_json::from_slice(&bytes).map_err(|e| bad(e.to_string()))?;
+    if file.version > MANIFEST_VERSION {
+        return Err(bad(format!(
+            "version {} is newer than this server's {}",
+            file.version, MANIFEST_VERSION
+        )));
+    }
+    Ok(file)
+}
+
+/// `n` files, for a notice.
+fn count(n: usize) -> String {
+    match n {
+        1 => "1 file".to_string(),
+        n => format!("{} files", n),
+    }
+}
+
+/// Up to 20 of `paths`, for a notice.
+fn some_of(paths: &[String]) -> String {
+    const SHOWN: usize = 20;
+    let mut list = paths
+        .iter()
+        .take(SHOWN)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if paths.len() > SHOWN {
+        list.push_str(&format!(" and {} more", paths.len() - SHOWN));
+    }
+    list
+}
+
+/// Move the local file `src` (the scan found it at the sync path `path`) to
+/// `<root>/QUARANTINE_DIR/<run>/<path>`, adding ` (2)`, ` (3)`… if that name is taken. Only a
+/// file whose directory resolves inside `root` is moved (not one reached through a symlink to
+/// elsewhere), and the quarantine directories are created with [`create_dirs_within`]. The
+/// directories the move leaves empty are removed (only empty ones), so a remote folder that
+/// replaced the file, or a file that replaced its folder, can be downloaded. Returns where the
+/// file went, relative to `root`.
+async fn quarantine(root: &Path, run: &str, path: &str, src: &Path) -> Result<PathBuf> {
+    let parts = cloud_path_components(path)?;
+    let Some((name, dirs)) = parts.split_last() else {
+        return Err(IntegrationError::InvalidPath(format!("{:?}: empty", path)));
+    };
+    let root = fs::canonicalize(root).await?;
+    let outside =
+        || IntegrationError::InvalidPath(format!("{:?} resolves outside sync root", path));
+    let src_dir = fs::canonicalize(src.parent().ok_or_else(outside)?).await?;
+    if !src_dir.starts_with(&root) {
+        return Err(outside());
+    }
+    if fs::symlink_metadata(src).await?.is_dir() {
+        return Err(IntegrationError::LocalPathUnusable(format!(
+            "{:?}: a directory, not a file",
+            path
+        )));
+    }
+
+    let rel: PathBuf = [QUARANTINE_DIR, run].iter().chain(dirs).collect();
+    let dir = create_dirs_within(&root, &rel).await?.ok_or_else(outside)?;
+    let mut to = dir.join(name);
+    for n in 2.. {
+        if fs::symlink_metadata(&to).await.is_err() {
+            break;
+        }
+        to = dir.join(format!("{} ({})", name, n));
+    }
+    fs::rename(src, &to).await?;
+
+    let mut emptied = src_dir;
+    while emptied != root && fs::remove_dir(&emptied).await.is_ok() {
+        emptied.pop();
+    }
+    Ok(to.strip_prefix(&root).unwrap_or(&to).to_path_buf())
+}
+
 /// Sync direction
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyncDirection {
@@ -305,6 +581,8 @@ pub struct SyncResult {
     pub status: SyncStatus,
     pub uploaded: usize,
     pub downloaded: usize,
+    /// Local copies of files deleted remotely, moved into [`QUARANTINE_DIR`] (a sync deletes
+    /// nothing).
     pub deleted: usize,
     pub conflicts: Vec<Conflict>,
     pub errors: Vec<String>,
@@ -358,6 +636,12 @@ pub struct SyncConfig {
     pub max_file_size: Option<u64>,
     /// Sync hidden files (starting with .)
     pub sync_hidden: bool,
+    /// Keep the [manifest](SyncManifest) of the last sync in [`MANIFEST_FILE`] at the top of
+    /// `local_path` (per provider, account and `cloud_folder`), so that a later `CloudSync`
+    /// (`POST /sync` makes one per request) reconciles against it. Otherwise the manifest lasts
+    /// only as long as this `CloudSync`.
+    #[serde(default)]
+    pub persist_state: bool,
 }
 
 impl Default for SyncConfig {
@@ -376,6 +660,7 @@ impl Default for SyncConfig {
             ],
             max_file_size: Some(100 * 1024 * 1024), // 100MB default
             sync_hidden: false,
+            persist_state: false,
         }
     }
 }
@@ -393,6 +678,11 @@ pub struct SyncState {
     pub hash_map: HashMap<String, String>,
     /// Map of local path to last sync modification time
     pub mtime_map: HashMap<String, i64>,
+    /// Manifest of the last full sync (see [`CloudSync::sync`]); `None` before the first, which
+    /// therefore infers no deletions. Loaded from and saved to [`MANIFEST_FILE`] with
+    /// [`SyncConfig::persist_state`].
+    #[serde(default)]
+    pub manifest: Option<SyncManifest>,
 }
 
 /// Cloud sync engine
@@ -401,17 +691,14 @@ pub struct CloudSync<P: CloudProvider> {
     config: SyncConfig,
     state: SyncState,
     conflict_resolver: ConflictResolver,
+    /// With [`SyncConfig::persist_state`], which stored manifest is this sync's; set once it is
+    /// loaded.
+    manifest_key: Option<ManifestKey>,
 }
 
 impl<P: CloudProvider> CloudSync<P> {
     pub fn new(provider: P, config: SyncConfig) -> Self {
-        let conflict_resolver = ConflictResolver::new(config.conflict_strategy);
-        Self {
-            provider,
-            config,
-            state: SyncState::default(),
-            conflict_resolver,
-        }
+        Self::with_state(provider, config, SyncState::default())
     }
 
     pub fn with_state(provider: P, config: SyncConfig, state: SyncState) -> Self {
@@ -421,6 +708,7 @@ impl<P: CloudProvider> CloudSync<P> {
             config,
             state,
             conflict_resolver,
+            manifest_key: None,
         }
     }
 
@@ -429,18 +717,132 @@ impl<P: CloudProvider> CloudSync<P> {
         &self.state
     }
 
-    /// Perform full sync: files only present locally are uploaded, files only present remotely
-    /// are downloaded, and a file on both sides is left alone when the provider vouches that
-    /// the content is the same ([`CloudProvider::content_matches`]); otherwise its conflict is
-    /// resolved by the configured strategy. With no state kept from an earlier sync (as
-    /// `POST /sync` runs it), a file deleted remotely but still here is only present locally, so
-    /// it is uploaded again.
+    /// Perform full sync, a three-way reconciliation of the remote listing and the local tree
+    /// against the [manifest](SyncManifest) of the last full sync, path by path:
+    ///
+    /// - Unchanged on both sides since: nothing is done (no transfer, no conflict strategy).
+    /// - Changed on one side only: that side's version is sent across, as far as the direction
+    ///   allows (an upload-only sync never downloads, a download-only one never uploads; the
+    ///   change then waits for a sync that can send it).
+    /// - Changed on both: left alone if the provider vouches that the content is now the same
+    ///   ([`CloudProvider::content_matches`]), otherwise the conflict strategy decides.
+    /// - Deleted remotely and unchanged here: not uploaded again. The local copy is moved into
+    ///   [`QUARANTINE_DIR`] (never deleted) and leaves the manifest; an upload-only sync leaves
+    ///   it where it is. Deleted remotely but changed here: a conflict, which keeps the local
+    ///   copy and uploads it again.
+    /// - Deleted here and unchanged remotely: not downloaded again, and not deleted remotely
+    ///   either (a sync never deletes remote files); the manifest records it. Deleted here but
+    ///   changed remotely: downloaded again.
+    ///
+    /// A path the manifest doesn't know (all of them on the first sync, or every sync without
+    /// [`SyncConfig::persist_state`] and a new `CloudSync`) is synced as with no state: a file
+    /// only present locally is uploaded, one only present remotely is downloaded, and one on
+    /// both sides is left alone when the provider vouches for its content, or else goes
+    /// through the conflict strategy. No deletion is inferred for such a path.
+    ///
+    /// The new manifest records every file that ended the sync in step on both sides, and the
+    /// deletions kept as above. A file whose transfer failed keeps its old entry (or stays
+    /// out), so the next sync tries again; a path out of view (over the size limit on either
+    /// side, hidden, excluded) keeps its entry as it was. Nothing is recorded, or saved, when
+    /// the sync fails as a whole (the listing, the local scan, the old-layout move below).
     ///
     /// The first full sync of a folder the provider kept elsewhere locally before #34 (see
     /// [`CloudProvider::legacy_layout_dir`]) moves that directory aside first; see
-    /// [`move_legacy_layout`](Self::move_legacy_layout).
+    /// [`move_legacy_layout`](Self::move_legacy_layout). That sync goes without a manifest.
     pub async fn sync(&mut self) -> Result<SyncResult> {
         Ok(self.reconcile(LocalOnly::Upload).await?.result)
+    }
+
+    /// With [`SyncConfig::persist_state`], find out which account the provider is signed in to
+    /// and load the manifest of this folder's last sync from [`MANIFEST_FILE`], once per
+    /// `CloudSync`. If there is none (the first sync of this folder with this account), the
+    /// state is left as it is.
+    async fn load_manifest(&mut self) -> Result<()> {
+        if !self.config.persist_state || self.manifest_key.is_some() {
+            return Ok(());
+        }
+        let key = ManifestKey {
+            provider: self.provider.provider_type(),
+            account: self.provider.account_id().await?.unwrap_or_default(),
+            cloud_folder: self
+                .config
+                .cloud_folder
+                .as_deref()
+                .unwrap_or("")
+                .trim_end_matches('/')
+                .to_string(),
+        };
+        if self.state.manifest.is_none() {
+            let stored = read_manifest_file(&self.config.local_path).await?;
+            self.state.manifest = stored
+                .syncs
+                .into_iter()
+                .find(|s| s.is(&key))
+                .map(|s| SyncManifest { files: s.files });
+        }
+        self.manifest_key = Some(key);
+        Ok(())
+    }
+
+    /// Write the manifest to [`MANIFEST_FILE`] in place of this folder's previous one (the other
+    /// folders' are kept), atomically, and fsync it and its directory. Nothing to do unless it
+    /// was [loaded](Self::load_manifest).
+    async fn save_manifest(&self) -> Result<()> {
+        let (Some(key), Some(manifest)) = (&self.manifest_key, &self.state.manifest) else {
+            return Ok(());
+        };
+        let root = &self.config.local_path;
+        let mut stored = read_manifest_file(root).await?;
+        stored.version = MANIFEST_VERSION;
+        stored.syncs.retain(|s| !s.is(key));
+        stored.syncs.push(StoredManifest {
+            provider: key.provider,
+            account: key.account.clone(),
+            cloud_folder: key.cloud_folder.clone(),
+            synced_at: chrono::Utc::now().timestamp(),
+            files: manifest.files.clone(),
+        });
+        let json = serde_json::to_vec(&stored)
+            .map_err(|e| IntegrationError::Serialization(e.to_string()))?;
+        write_replace(root, &root.join(MANIFEST_FILE), &json).await?;
+        fs::File::open(root).await?.sync_all().await?;
+        Ok(())
+    }
+
+    /// Whether the local scan would list a file at the sync path `path` if there was one (within
+    /// the size limit): not one of the sync's own entries, no hidden component unless hidden
+    /// files are synced, and none excluded by pattern or by selective sync. Only such paths are
+    /// kept in the manifest: for any other, a missing local copy tells nothing.
+    fn visible(&self, path: &str) -> bool {
+        let Ok(parts) = cloud_path_components(path) else {
+            return false;
+        };
+        let mut dir = self.config.local_path.clone();
+        for (i, part) in parts.iter().enumerate() {
+            if (!self.config.sync_hidden && part.starts_with('.')) || self.should_exclude(part) {
+                return false;
+            }
+            if i + 1 < parts.len() {
+                dir.push(part);
+                if !self.should_sync_folder(&dir) {
+                    return false;
+                }
+            }
+        }
+        !is_reserved(path)
+    }
+
+    /// Record in the manifest, if there is one, that `f` was just downloaded as `local`, so the
+    /// next full sync finds both sides unchanged instead of changed on both.
+    fn record_download(&mut self, f: &CloudFile, local: LocalIdentity) {
+        if !self.visible(&f.path) {
+            return;
+        }
+        if let Some(manifest) = self.state.manifest.as_mut() {
+            manifest
+                .files
+                .insert(f.path.clone(), ManifestEntry::synced(f, local));
+        }
     }
 
     /// Move the local directory where this folder's files were kept before #34 (see
@@ -453,15 +855,18 @@ impl<P: CloudProvider> CloudSync<P> {
     ///
     /// Returns notices for the result: what was moved, and whether `cloud` (the folder's
     /// listing) has a subfolder at that path, which may be the duplicate that versions before
-    /// #34 uploaded from the second sync on.
-    async fn move_legacy_layout(&self, cloud: &HashMap<String, CloudFile>) -> Result<Vec<String>> {
+    /// #34 uploaded from the second sync on. Also whether anything was moved.
+    async fn move_legacy_layout(
+        &self,
+        cloud: &HashMap<String, CloudFile>,
+    ) -> Result<(Vec<String>, bool)> {
         let Some(dir) = self
             .provider
             .legacy_layout_dir(self.config.cloud_folder.as_deref())
             .await?
             .filter(|dir| !dir.is_empty())
         else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         };
         let root = &self.config.local_path;
         let marker_path = root.join(LAYOUT_MARKER);
@@ -475,11 +880,12 @@ impl<P: CloudProvider> CloudSync<P> {
         let folded: Vec<String> = dir.iter().map(|c| fold_name(c)).collect();
         let key = format!("/{}", folded.join("/"));
         if marker.handled.contains(&key) {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
 
         let mut notices = Vec::new();
-        for (from, to) in move_old_layout(root, &dir).await? {
+        let moved = move_old_layout(root, &dir).await?;
+        for (from, to) in &moved {
             notices.push(format!(
                 "Moved {} to {}: versions before #34 kept this folder's files there, under the \
                  folder's own path from the drive root, and they now go at their path inside \
@@ -490,11 +896,21 @@ impl<P: CloudProvider> CloudSync<P> {
         }
         if cloud.keys().any(|p| is_under(p, &dir)) {
             let shown = format!("/{}", dir.join("/"));
+            let what_to_do = if self.config.persist_state {
+                format!(
+                    "delete it remotely: the next sync then moves its local copy {shown}, if one \
+                     was downloaded, into {QUARANTINE_DIR}/"
+                )
+            } else {
+                format!(
+                    "delete it remotely, and its local copy {shown} here if a sync downloaded \
+                     one, before the next sync: either copy left behind brings the other back"
+                )
+            };
             notices.push(format!(
                 "This folder has a subfolder {shown}. From their second sync on, versions before \
                  #34 uploaded the folder's files into it ({shown}/…). If that is what it holds, \
-                 delete it remotely, and its local copy {shown} here if a sync downloaded one, \
-                 before the next sync: either copy left behind brings the other back"
+                 {what_to_do}"
             ));
         }
 
@@ -505,7 +921,7 @@ impl<P: CloudProvider> CloudSync<P> {
         for notice in &notices {
             tracing::warn!("cloud sync: {}", notice);
         }
-        Ok(notices)
+        Ok((notices, !moved.is_empty()))
     }
 
     /// Whether `f` is a file over `max_file_size`. Such remote files are never fetched: a
@@ -515,26 +931,25 @@ impl<P: CloudProvider> CloudSync<P> {
         !f.is_folder && self.config.max_file_size.is_some_and(|max| f.size > max)
     }
 
-    /// Whether the local file at `path` has the content of `cloud_file`: the same size, and the
-    /// provider [vouches for its hash](CloudProvider::content_matches). The local file is only
-    /// read when the sizes match. If so, the state records the file as in sync.
+    /// Whether the local file `local` (at the sync path `path`) has the content of `cloud_file`:
+    /// the same size, and the provider [vouches for its hash](CloudProvider::content_matches).
+    /// The local file is only read when the sizes match. If so, the state records the file as
+    /// in sync, and its identity for the manifest is returned.
     async fn same_on_both_sides(
         &mut self,
         path: &str,
-        local_info: &(PathBuf, i64, u64),
+        local: &LocalFile,
         cloud_file: &CloudFile,
-    ) -> bool {
+    ) -> Option<LocalIdentity> {
         if cloud_file.is_folder
             || cloud_file.content_hash.is_none()
-            || cloud_file.size != local_info.2
+            || cloud_file.size != local.size
         {
-            return false;
+            return None;
         }
-        let Ok(content) = fs::read(&local_info.0).await else {
-            return false;
-        };
+        let content = fs::read(&local.path).await.ok()?;
         if !self.provider.content_matches(cloud_file, &content) {
-            return false;
+            return None;
         }
         self.state
             .file_map
@@ -542,14 +957,34 @@ impl<P: CloudProvider> CloudSync<P> {
         if let Some(hash) = &cloud_file.content_hash {
             self.state.hash_map.insert(path.to_string(), hash.clone());
         }
-        self.state.mtime_map.insert(path.to_string(), local_info.1);
-        true
+        self.state.mtime_map.insert(path.to_string(), local.mtime);
+        Some(LocalIdentity {
+            size: content.len() as u64,
+            mtime_ns: local.mtime_ns,
+            sha256: Some(sha256_hex(&content)),
+        })
     }
 
-    /// Full sync: compare the whole listing with the local tree and transfer what differs.
+    /// Full sync: compare the whole listing and the local tree with the manifest of the last
+    /// sync, transfer what differs, and record the new manifest (see [`sync`](Self::sync)).
     async fn reconcile(&mut self, local_only: LocalOnly) -> Result<Reconciled> {
         let start = std::time::Instant::now();
         let mut result = SyncResult::new();
+        let failed = |mut result: SyncResult, error: String| -> Result<Reconciled> {
+            result.status = SyncStatus::Failed;
+            result.errors.push(error);
+            result.duration_ms = start.elapsed().as_millis() as u64;
+            Ok(Reconciled {
+                result,
+                retry_needed: true,
+            })
+        };
+
+        // Without the manifest a deletion can't be told from a new file: rather than sync as if
+        // there were none (bringing deleted files back), nothing is synced.
+        if let Err(e) = self.load_manifest().await {
+            return failed(result, format!("Failed to load the sync state: {}", e));
+        }
 
         // Get cloud files
         let cloud_files = match self
@@ -558,17 +993,7 @@ impl<P: CloudProvider> CloudSync<P> {
             .await
         {
             Ok(files) => files,
-            Err(e) => {
-                result.status = SyncStatus::Failed;
-                result
-                    .errors
-                    .push(format!("Failed to list cloud files: {}", e));
-                result.duration_ms = start.elapsed().as_millis() as u64;
-                return Ok(Reconciled {
-                    result,
-                    retry_needed: true,
-                });
-            }
+            Err(e) => return failed(result, format!("Failed to list cloud files: {}", e)),
         };
 
         // Build cloud file map
@@ -579,20 +1004,18 @@ impl<P: CloudProvider> CloudSync<P> {
 
         // Before the local tree is read: syncing the old layout would copy it into the folder
         // one level down, so nothing is synced until it has been moved aside.
-        match self.move_legacy_layout(&cloud_map).await {
-            Ok(notices) => result.notices = notices,
-            Err(e) => {
-                result.status = SyncStatus::Failed;
-                result
-                    .errors
-                    .push(format!("Failed to move the old local layout aside: {}", e));
-                result.duration_ms = start.elapsed().as_millis() as u64;
-                return Ok(Reconciled {
-                    result,
-                    retry_needed: true,
-                });
+        let moved_old_layout = match self.move_legacy_layout(&cloud_map).await {
+            Ok((notices, moved)) => {
+                result.notices = notices;
+                moved
             }
-        }
+            Err(e) => {
+                return failed(
+                    result,
+                    format!("Failed to move the old local layout aside: {}", e),
+                );
+            }
+        };
         cloud_map.retain(|path, _| {
             let keep = !is_reserved(path);
             if !keep {
@@ -605,26 +1028,19 @@ impl<P: CloudProvider> CloudSync<P> {
         });
 
         // Get local files
-        let mut local_files = match self.list_local_files().await {
-            Ok(mut files) => {
+        let (mut local_files, local_too_large) = match self.list_local_files().await {
+            Ok((mut files, too_large)) => {
                 files.retain(|path, _| !is_reserved(path));
-                files
+                (files, too_large)
             }
-            Err(e) => {
-                result.status = SyncStatus::Failed;
-                result
-                    .errors
-                    .push(format!("Failed to list local files: {}", e));
-                result.duration_ms = start.elapsed().as_millis() as u64;
-                return Ok(Reconciled {
-                    result,
-                    retry_needed: true,
-                });
-            }
+            Err(e) => return failed(result, format!("Failed to list local files: {}", e)),
         };
 
-        // A path whose remote file is too large is left alone in both directions: not
-        // downloaded, and a local file there isn't uploaded over it either.
+        // A path whose file is too large on either side is left alone in both directions: a
+        // remote one isn't downloaded and a local file there isn't uploaded over it, a local one
+        // isn't uploaded and a remote file there isn't downloaded over it. Out of view this way,
+        // it isn't taken for deleted either: its manifest entry stays as it was.
+        let mut out_of_view: HashSet<String> = HashSet::new();
         cloud_map.retain(|path, f| {
             let keep = !self.too_large(f);
             if !keep {
@@ -634,179 +1050,265 @@ impl<P: CloudProvider> CloudSync<P> {
                     f.size
                 );
                 local_files.remove(path);
+                out_of_view.insert(path.clone());
             }
             keep
         });
+        for path in local_too_large {
+            if cloud_map.remove(&path).is_some() {
+                tracing::warn!(
+                    "cloud sync: skipping {:?}: the local file is over the size limit",
+                    path
+                );
+            }
+            out_of_view.insert(path);
+        }
 
         // Set when a remote file wasn't fetched for a reason that may go away; a resync then
         // keeps its old cursor so the fetch is retried (see `resync`).
         let mut retry_needed = false;
 
-        // Build sets for comparison
-        let local_paths: HashSet<String> = local_files.keys().cloned().collect();
-        let cloud_paths: HashSet<String> = cloud_map.keys().cloned().collect();
+        // Moving the old layout aside changed the local tree the manifest describes, so that
+        // sync goes without one (as a first sync does) and records a fresh one.
+        let base = match moved_old_layout {
+            true => None,
+            false => self.state.manifest.take(),
+        };
+        let can_upload = self.config.direction != SyncDirection::Download;
+        let can_download = self.config.direction != SyncDirection::Upload;
+        let upload_new = can_upload && local_only == LocalOnly::Upload;
 
-        // Files only in local (need upload)
-        let upload_paths: Vec<&String> = local_paths.difference(&cloud_paths).collect();
+        let mut manifest = SyncManifest::default();
+        let mut plan: Vec<Planned> = Vec::new();
+        // Deleted here, unchanged remotely, and seen for the first time.
+        let mut kept_remotely: Vec<String> = Vec::new();
 
-        // Files only in cloud (need download)
-        let download_paths: Vec<&String> = cloud_paths.difference(&local_paths).collect();
-
-        // Files in both (need comparison)
-        let common_paths: Vec<&String> = local_paths.intersection(&cloud_paths).collect();
-
-        match self.config.direction {
-            SyncDirection::Upload | SyncDirection::Bidirectional
-                if local_only == LocalOnly::Upload =>
-            {
-                // Upload new local files
-                for path in &upload_paths {
-                    let local_info = &local_files[*path];
-                    match self.upload_file(path, local_info).await {
-                        Ok(_) => result.uploaded += 1,
-                        Err(e) => {
-                            result.errors.push(format!("Upload {} failed: {}", path, e));
-                        }
-                    }
-                }
-            }
-            _ => {}
+        let mut paths: BTreeSet<String> = local_files.keys().cloned().collect();
+        paths.extend(cloud_map.keys().cloned());
+        if let Some(base) = &base {
+            paths.extend(base.files.keys().cloned());
         }
-
-        match self.config.direction {
-            SyncDirection::Download | SyncDirection::Bidirectional => {
-                // Download new cloud files
-                for path in &download_paths {
-                    let cloud_file = &cloud_map[*path];
-                    if !cloud_file.is_folder {
-                        match self.download_file(cloud_file).await {
-                            Ok(_) => result.downloaded += 1,
-                            Err(e) => {
-                                retry_needed |= !e.is_permanent();
-                                result
-                                    .errors
-                                    .push(format!("Download {} failed: {}", path, e));
-                            }
-                        }
+        for path in paths {
+            let local = local_files.get(&path);
+            let cloud = cloud_map.get(&path);
+            let tracked = !out_of_view.contains(&path) && self.visible(&path);
+            let entry = match (tracked, base.as_ref().and_then(|b| b.files.get(&path))) {
+                (true, Some(entry)) => entry,
+                (tracked, entry) => {
+                    if let Some(entry) = entry {
+                        // Out of view: kept as it was.
+                        manifest.files.insert(path.clone(), entry.clone());
                     }
+                    // Unknown to the manifest: synced as with no state.
+                    let step = match (local, cloud) {
+                        (Some(_), None) if upload_new => Step::Upload,
+                        (None, Some(f)) if !f.is_folder && can_download => Step::Download,
+                        (Some(_), Some(_)) => Step::Both { known: false },
+                        _ => continue,
+                    };
+                    plan.push(Planned {
+                        path,
+                        step,
+                        track: tracked,
+                        old: None,
+                    });
+                    continue;
                 }
-            }
-            SyncDirection::Upload => {}
-        }
+            };
 
-        // Handle files that exist in both
-        for path in common_paths {
-            let local_info = &local_files[path];
-            let cloud_file = &cloud_map[path];
-
-            // Nothing to send either way. Without this, a sync with no state from an earlier
-            // one (no `last_sync`) sees every such file as changed on both sides and, as a
-            // download is stamped with the time it was written, uploads each one again.
-            if self.same_on_both_sides(path, local_info, cloud_file).await {
-                continue;
-            }
-
-            // Check for conflicts
-            let conflict = ConflictResolver::detect_conflict(
-                &local_info.0,
-                local_info.1,
-                local_info.2,
-                true,
-                Some(cloud_file),
-                self.state.last_sync,
-            );
-
-            if let Some(mut conflict) = conflict {
-                let resolution = self.conflict_resolver.resolve(&mut conflict);
-
-                match resolution {
-                    ConflictResolution::UseLocal => {
-                        if self.config.direction != SyncDirection::Download {
-                            match self.upload_file(path, local_info).await {
-                                Ok(_) => result.uploaded += 1,
-                                Err(e) => {
-                                    result.errors.push(format!("Upload {} failed: {}", path, e))
-                                }
-                            }
-                        }
-                    }
-                    ConflictResolution::UseCloud => {
-                        if self.config.direction != SyncDirection::Upload {
-                            match self.download_file(cloud_file).await {
-                                Ok(_) => result.downloaded += 1,
-                                Err(e) => {
-                                    retry_needed |= !e.is_permanent();
-                                    result
-                                        .errors
-                                        .push(format!("Download {} failed: {}", path, e));
-                                }
-                            }
-                        }
-                    }
-                    ConflictResolution::KeepBoth { renamed_to } => {
-                        // Download cloud version with new name
-                        let mut renamed_file = cloud_file.clone();
-                        renamed_file.name = renamed_to;
-                        renamed_file.path = format!(
-                            "{}/{}",
-                            cloud_file
-                                .path
-                                .rsplit_once('/')
-                                .map(|(p, _)| p)
-                                .unwrap_or(""),
-                            renamed_file.name
-                        );
-
-                        if self.config.direction != SyncDirection::Upload {
-                            match self.download_file(&renamed_file).await {
-                                Ok(_) => result.downloaded += 1,
-                                Err(e) => {
-                                    retry_needed |= !e.is_permanent();
-                                    result
-                                        .errors
-                                        .push(format!("Download conflict copy failed: {}", e));
-                                }
-                            }
-                        }
-                    }
-                    ConflictResolution::ManualRequired => {
-                        result.conflicts.push(conflict);
-                    }
-                    _ => {}
+            // Only files are recorded: a folder where the file was means the file is gone.
+            let file = cloud.filter(|f| !f.is_folder);
+            let local_changed = match (local, &entry.local) {
+                (Some(l), Some(base)) => !l.matches(base).await,
+                (None, None) => false,
+                _ => true,
+            };
+            let remote_changed = match (file, &entry.remote) {
+                (Some(f), Some(base)) => !base.matches(f),
+                (None, None) => false,
+                _ => true,
+            };
+            let step = match (local_changed, remote_changed, local, file) {
+                // Unchanged since the last sync on both sides (a deletion kept included). The
+                // entry is refreshed, so a file only touched isn't read again next time.
+                (false, false, ..) => {
+                    let sha256 = entry.local.as_ref().and_then(|l| l.sha256.clone());
+                    manifest.files.insert(
+                        path,
+                        ManifestEntry {
+                            remote: file.map(RemoteIdentity::of),
+                            local: local.map(|l| l.identity(sha256)),
+                        },
+                    );
+                    continue;
                 }
-            } else {
-                // No conflict - sync based on modification time
-                let last_sync = self.state.mtime_map.get(path).copied().unwrap_or(0);
-
-                if local_info.1 > last_sync && self.config.direction != SyncDirection::Download {
-                    // Local is newer
-                    match self.upload_file(path, local_info).await {
-                        Ok(_) => result.uploaded += 1,
-                        Err(e) => result.errors.push(format!("Upload {} failed: {}", path, e)),
-                    }
-                } else if cloud_file.modified_at > last_sync
-                    && self.config.direction != SyncDirection::Upload
+                // Changed here only.
+                (true, false, Some(_), _)
+                    if can_upload && (file.is_some() || local_only == LocalOnly::Upload) =>
                 {
-                    // Cloud is newer
-                    match self.download_file(cloud_file).await {
-                        Ok(_) => result.downloaded += 1,
+                    Step::Upload
+                }
+                (true, false, None, Some(f)) => {
+                    tracing::info!(
+                        "cloud sync: {:?} was deleted here; keeping the remote copy",
+                        path
+                    );
+                    kept_remotely.push(path.clone());
+                    manifest.files.insert(
+                        path,
+                        ManifestEntry {
+                            remote: Some(RemoteIdentity::of(f)),
+                            local: None,
+                        },
+                    );
+                    continue;
+                }
+                // Changed remotely only.
+                (false, true, _, Some(_)) if can_download => Step::Download,
+                (false, true, Some(_), None) if can_download => Step::Quarantine,
+                (false, true, Some(l), None) => {
+                    // Upload-only never touches local files: the copy stays, and isn't uploaded
+                    // again unless it changes.
+                    let sha256 = entry.local.as_ref().and_then(|l| l.sha256.clone());
+                    manifest.files.insert(
+                        path,
+                        ManifestEntry {
+                            remote: None,
+                            local: Some(l.identity(sha256)),
+                        },
+                    );
+                    continue;
+                }
+                // Changed on both sides.
+                (true, true, Some(_), Some(_)) => Step::Both { known: true },
+                (true, true, Some(_), None) if upload_new => {
+                    tracing::warn!(
+                        "cloud sync: {:?} was deleted remotely but changed here since the last \
+                         sync; uploading it again",
+                        path
+                    );
+                    Step::Reupload
+                }
+                (true, true, None, Some(_)) if can_download => Step::Download,
+                // Gone from both sides: the entry goes too.
+                (_, _, None, None) => continue,
+                // A change the direction doesn't send (or a resync, which leaves files only
+                // present here alone): the entry stays, so it is still a change next time.
+                _ => {
+                    manifest.files.insert(path, entry.clone());
+                    continue;
+                }
+            };
+            plan.push(Planned {
+                path,
+                step,
+                track: true,
+                old: Some(entry.clone()),
+            });
+        }
+
+        // Stable, so paths stay sorted within a step. Local copies are moved aside first, so a
+        // remote folder that replaced a file, or a file that replaced a folder, can come down.
+        plan.sort_by_key(|p| p.step.order());
+        let run = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let mut quarantined = Vec::new();
+        for Planned {
+            path,
+            step,
+            track,
+            old,
+        } in plan
+        {
+            let recorded = match step {
+                Step::Quarantine => {
+                    let src = &local_files[&path].path;
+                    match quarantine(&self.config.local_path, &run, &path, src).await {
+                        Ok(to) => {
+                            tracing::info!(
+                                "cloud sync: {:?} was deleted remotely; moved the local copy to {}",
+                                path,
+                                to.display()
+                            );
+                            result.deleted += 1;
+                            quarantined.push(path);
+                            continue;
+                        }
                         Err(e) => {
-                            retry_needed |= !e.is_permanent();
-                            result
-                                .errors
-                                .push(format!("Download {} failed: {}", path, e));
+                            result.errors.push(format!(
+                                "Moving aside {} (deleted remotely) failed: {}",
+                                path, e
+                            ));
+                            None
                         }
                     }
                 }
+                Step::Upload | Step::Reupload => {
+                    let entry = self
+                        .upload_counted(&path, &local_files[&path], &mut result)
+                        .await;
+                    if entry.is_some() && step == Step::Reupload {
+                        result.notices.push(format!(
+                            "{} was deleted remotely but changed here since the last sync: \
+                             uploaded it again",
+                            path
+                        ));
+                    }
+                    entry
+                }
+                Step::Download => {
+                    self.download_counted(&cloud_map[&path], &mut result, &mut retry_needed)
+                        .await
+                }
+                Step::Both { known } => {
+                    self.sync_both(
+                        &path,
+                        &local_files[&path],
+                        &cloud_map[&path],
+                        known,
+                        &mut result,
+                        &mut retry_needed,
+                    )
+                    .await
+                }
+            };
+            // A failure keeps the old entry (or none), so the next sync sees the same change.
+            if let Some(entry) = recorded.or(old).filter(|_| track) {
+                manifest.files.insert(path, entry);
             }
+        }
+
+        if !quarantined.is_empty() {
+            result.notices.push(format!(
+                "{} deleted remotely since the last sync and unchanged here, moved to {}/{}/ \
+                 rather than deleted: {}",
+                count(quarantined.len()),
+                QUARANTINE_DIR,
+                run,
+                some_of(&quarantined)
+            ));
+        }
+        if !kept_remotely.is_empty() {
+            result.notices.push(format!(
+                "{} deleted here since the last sync and unchanged remotely, kept there (a sync \
+                 never deletes remote files) and not downloaded again unless changed there: {}",
+                count(kept_remotely.len()),
+                some_of(&kept_remotely)
+            ));
         }
 
         // Update state
         self.state.last_sync = Some(chrono::Utc::now().timestamp());
+        self.state.manifest = Some(manifest);
+        if let Err(e) = self.save_manifest().await {
+            tracing::error!("cloud sync: failed to save the sync state: {}", e);
+            result
+                .errors
+                .push(format!("Failed to save the sync state: {}", e));
+        }
 
         // Determine final status
         if !result.errors.is_empty() {
-            result.status = if result.uploaded > 0 || result.downloaded > 0 {
+            result.status = if result.uploaded > 0 || result.downloaded > 0 || result.deleted > 0 {
                 SyncStatus::PartialSuccess
             } else {
                 SyncStatus::Failed
@@ -820,13 +1322,157 @@ impl<P: CloudProvider> CloudSync<P> {
         })
     }
 
-    /// List local files with metadata
-    /// Returns map of relative path to (full path, mtime, size)
-    async fn list_local_files(&self) -> Result<HashMap<String, (PathBuf, i64, u64)>> {
+    /// A file present on both sides and not unchanged on both since the last sync. `known`: the
+    /// manifest says both changed since; without an entry (`false`), conflicts are detected as
+    /// with no state. Returns the manifest entry when the two sides end up in step.
+    async fn sync_both(
+        &mut self,
+        path: &str,
+        local: &LocalFile,
+        cloud_file: &CloudFile,
+        known: bool,
+        result: &mut SyncResult,
+        retry_needed: &mut bool,
+    ) -> Option<ManifestEntry> {
+        // Nothing to send either way. Without this, a sync with no state from an earlier one
+        // sees every such file as changed on both sides and, as a download is stamped with the
+        // time it was written, uploads each one again.
+        if let Some(identity) = self.same_on_both_sides(path, local, cloud_file).await {
+            return Some(ManifestEntry::synced(cloud_file, identity));
+        }
+
+        // Check for conflicts
+        let conflict = match known {
+            true => Some(Conflict {
+                local_path: local.path.clone(),
+                cloud_file: cloud_file.clone(),
+                local_modified_at: local.mtime,
+                local_size: local.size,
+                conflict_type: ConflictType::BothModified,
+                resolution: None,
+            }),
+            false => ConflictResolver::detect_conflict(
+                &local.path,
+                local.mtime,
+                local.size,
+                true,
+                Some(cloud_file),
+                self.state.last_sync,
+            ),
+        };
+        let direction = self.config.direction;
+
+        let Some(mut conflict) = conflict else {
+            // No conflict - sync based on modification time
+            let last_sync = self.state.mtime_map.get(path).copied().unwrap_or(0);
+            if local.mtime > last_sync && direction != SyncDirection::Download {
+                // Local is newer
+                return self.upload_counted(path, local, result).await;
+            } else if cloud_file.modified_at > last_sync && direction != SyncDirection::Upload {
+                // Cloud is newer
+                return self
+                    .download_counted(cloud_file, result, retry_needed)
+                    .await;
+            }
+            return None;
+        };
+
+        match self.conflict_resolver.resolve(&mut conflict) {
+            ConflictResolution::UseLocal if direction != SyncDirection::Download => {
+                self.upload_counted(path, local, result).await
+            }
+            ConflictResolution::UseCloud if direction != SyncDirection::Upload => {
+                self.download_counted(cloud_file, result, retry_needed)
+                    .await
+            }
+            ConflictResolution::KeepBoth { renamed_to } => {
+                // Download cloud version with new name. The two sides still differ at `path`,
+                // so it isn't recorded: the local version there was never sent.
+                let mut renamed_file = cloud_file.clone();
+                renamed_file.name = renamed_to;
+                renamed_file.path = format!(
+                    "{}/{}",
+                    cloud_file
+                        .path
+                        .rsplit_once('/')
+                        .map(|(p, _)| p)
+                        .unwrap_or(""),
+                    renamed_file.name
+                );
+
+                if direction != SyncDirection::Upload {
+                    match self.download_file(&renamed_file).await {
+                        Ok(_) => result.downloaded += 1,
+                        Err(e) => {
+                            *retry_needed |= !e.is_permanent();
+                            result
+                                .errors
+                                .push(format!("Download conflict copy failed: {}", e));
+                        }
+                    }
+                }
+                None
+            }
+            ConflictResolution::ManualRequired => {
+                result.conflicts.push(conflict);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// [Upload](Self::upload_file) `local`, counting it in `result`; its manifest entry, if it
+    /// went.
+    async fn upload_counted(
+        &mut self,
+        path: &str,
+        local: &LocalFile,
+        result: &mut SyncResult,
+    ) -> Option<ManifestEntry> {
+        match self.upload_file(path, local).await {
+            Ok(entry) => {
+                result.uploaded += 1;
+                Some(entry)
+            }
+            Err(e) => {
+                result.errors.push(format!("Upload {} failed: {}", path, e));
+                None
+            }
+        }
+    }
+
+    /// [Download](Self::download_file) `cloud_file`, counting it in `result`; its manifest
+    /// entry, if it came. A failure that may go away sets `retry_needed`.
+    async fn download_counted(
+        &mut self,
+        cloud_file: &CloudFile,
+        result: &mut SyncResult,
+        retry_needed: &mut bool,
+    ) -> Option<ManifestEntry> {
+        match self.download_file(cloud_file).await {
+            Ok(local) => {
+                result.downloaded += 1;
+                Some(ManifestEntry::synced(cloud_file, local))
+            }
+            Err(e) => {
+                *retry_needed |= !e.is_permanent();
+                result
+                    .errors
+                    .push(format!("Download {} failed: {}", cloud_file.path, e));
+                None
+            }
+        }
+    }
+
+    /// The local files by sync path (`/dir/file.pdf`), and the paths of those skipped for
+    /// being over the size limit.
+    async fn list_local_files(&self) -> Result<(HashMap<String, LocalFile>, Vec<String>)> {
         let mut files = HashMap::new();
-        self.scan_directory(&self.config.local_path, &self.config.local_path, &mut files)
+        let mut too_large = Vec::new();
+        let root = &self.config.local_path;
+        self.scan_directory(root, root, &mut files, &mut too_large)
             .await?;
-        Ok(files)
+        Ok((files, too_large))
     }
 
     /// Recursively scan directory
@@ -834,7 +1480,8 @@ impl<P: CloudProvider> CloudSync<P> {
         &self,
         base: &Path,
         dir: &Path,
-        files: &mut HashMap<String, (PathBuf, i64, u64)>,
+        files: &mut HashMap<String, LocalFile>,
+        too_large: &mut Vec<String>,
     ) -> Result<()> {
         let mut entries = fs::read_dir(dir).await?;
 
@@ -857,27 +1504,34 @@ impl<P: CloudProvider> CloudSync<P> {
             if metadata.is_dir() {
                 // Check if folder is in selective sync
                 if self.should_sync_folder(&path) {
-                    Box::pin(self.scan_directory(base, &path, files)).await?;
+                    Box::pin(self.scan_directory(base, &path, files, too_large)).await?;
                 }
             } else {
-                // Check file size limit
-                if let Some(max_size) = self.config.max_file_size {
-                    if metadata.len() > max_size {
-                        continue;
-                    }
-                }
-
                 let relative_path = path
                     .strip_prefix(base)
                     .map(|p| format!("/{}", p.to_string_lossy()))
                     .unwrap_or_else(|_| path.to_string_lossy().to_string());
 
-                let mtime = metadata
-                    .modified()
-                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64)
-                    .unwrap_or(0);
+                // Check file size limit
+                if self
+                    .config
+                    .max_file_size
+                    .is_some_and(|max| metadata.len() > max)
+                {
+                    too_large.push(relative_path);
+                    continue;
+                }
 
-                files.insert(relative_path, (path, mtime, metadata.len()));
+                let mtime_ns = mtime_ns(&metadata);
+                files.insert(
+                    relative_path,
+                    LocalFile {
+                        path,
+                        mtime: mtime_ns.map_or(0, |ns| ns.div_euclid(1_000_000_000)),
+                        mtime_ns,
+                        size: metadata.len(),
+                    },
+                );
             }
         }
 
@@ -949,12 +1603,14 @@ impl<P: CloudProvider> CloudSync<P> {
         false
     }
 
-    /// Upload a file to cloud
-    async fn upload_file(&mut self, path: &str, local_info: &(PathBuf, i64, u64)) -> Result<()> {
+    /// Upload a file to cloud. Returns its manifest entry: the remote file as the upload
+    /// answered, and the local one with the scan's modification time (from before the read, so
+    /// an edit made since is a change next time) and the size and hash of what was sent.
+    async fn upload_file(&mut self, path: &str, local: &LocalFile) -> Result<ManifestEntry> {
         // Keep the relative path (not just the basename) so nested files with the same
         // name don't collide remotely; validated like downloads.
         let components = cloud_path_components(path)?;
-        let content = fs::read(&local_info.0).await?;
+        let content = fs::read(&local.path).await?;
 
         // Determine parent folder
         let parent_id = self.config.cloud_folder.as_deref();
@@ -963,19 +1619,28 @@ impl<P: CloudProvider> CloudSync<P> {
             .provider
             .upload_file_at(parent_id, &components, &content, None)
             .await?;
+        let entry = ManifestEntry {
+            remote: Some(RemoteIdentity::of(&cloud_file)),
+            local: Some(LocalIdentity {
+                size: content.len() as u64,
+                mtime_ns: local.mtime_ns,
+                sha256: Some(sha256_hex(&content)),
+            }),
+        };
 
         // Update state
         self.state.file_map.insert(path.to_string(), cloud_file.id);
         if let Some(hash) = cloud_file.content_hash {
             self.state.hash_map.insert(path.to_string(), hash);
         }
-        self.state.mtime_map.insert(path.to_string(), local_info.1);
+        self.state.mtime_map.insert(path.to_string(), local.mtime);
 
-        Ok(())
+        Ok(entry)
     }
 
-    /// Download a file from cloud
-    async fn download_file(&mut self, cloud_file: &CloudFile) -> Result<()> {
+    /// Download a file from cloud. Returns the identity of the local file written, for the
+    /// manifest.
+    async fn download_file(&mut self, cloud_file: &CloudFile) -> Result<LocalIdentity> {
         // Validate before touching the network or the filesystem.
         let local_path =
             local_path_for(&self.config.local_path, &cloud_file.path).inspect_err(|e| {
@@ -985,9 +1650,9 @@ impl<P: CloudProvider> CloudSync<P> {
                     e
                 );
             })?;
-        // A local directory where the file goes (the remote folder was replaced by a file;
-        // remote deletions aren't applied locally, so the directory stays) would fail the write
-        // every time. Catch it before fetching the body rather than after.
+        // A local directory where the file goes (the remote folder was replaced by a file, and
+        // the directory still holds files that weren't moved aside as deleted remotely) would
+        // fail the write every time. Catch it before fetching the body rather than after.
         if fs::symlink_metadata(&local_path)
             .await
             .is_ok_and(|m| m.is_dir())
@@ -1032,7 +1697,7 @@ impl<P: CloudProvider> CloudSync<P> {
         {
             return Err(escape());
         }
-        write_replace(&dir, &target, &content)
+        let written = write_replace(&dir, &target, &content)
             .await
             .map_err(unusable)?;
 
@@ -1049,13 +1714,22 @@ impl<P: CloudProvider> CloudSync<P> {
             .mtime_map
             .insert(cloud_file.path.clone(), cloud_file.modified_at);
 
-        Ok(())
+        Ok(LocalIdentity {
+            size: written.len(),
+            mtime_ns: mtime_ns(&written),
+            sha256: Some(sha256_hex(&content)),
+        })
     }
 
     /// Perform delta sync using provider's change API: download what changed remotely. Remote
     /// deletions are reported by the provider but not applied, and local changes wait for a
     /// full [`sync`](Self::sync). Without a usable cursor (none yet, or rejected by the
     /// provider) it runs a [`resync`](Self::resync) instead.
+    ///
+    /// Downloads are recorded in the full sync's [manifest](SyncManifest), if there is one (and
+    /// saved with [`SyncConfig::persist_state`]), so the next full sync doesn't take them for
+    /// changes on both sides. A remote deletion leaves its entry alone: that full sync finds
+    /// the file gone remotely and moves the local copy aside if it is unchanged.
     ///
     /// With [`SyncDirection::Upload`] there is nothing to do: the change feed only brings
     /// remote changes down. The provider isn't asked, and the cursor is neither taken nor
@@ -1072,6 +1746,7 @@ impl<P: CloudProvider> CloudSync<P> {
             tracing::info!("cloud sync: no delta cursor yet; running a full sync");
             return self.resync().await;
         };
+        self.load_manifest().await?;
 
         let start = std::time::Instant::now();
         let mut result = SyncResult::new();
@@ -1156,10 +1831,7 @@ impl<P: CloudProvider> CloudSync<P> {
                         continue;
                     }
                 };
-                let local_mtime = metadata
-                    .modified()
-                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64)
-                    .unwrap_or(0);
+                let local_mtime = mtime_ns(&metadata).map_or(0, |ns| ns.div_euclid(1_000_000_000));
 
                 let last_sync_time = self.state.mtime_map.get(&cloud_file.path).copied();
 
@@ -1194,7 +1866,10 @@ impl<P: CloudProvider> CloudSync<P> {
             };
 
             match outcome {
-                Some(Ok(())) => result.downloaded += 1,
+                Some(Ok(local)) => {
+                    result.downloaded += 1;
+                    self.record_download(&cloud_file, local);
+                }
                 Some(Err(e)) => record(&mut result, "Download failed", e),
                 None => {}
             }
@@ -1208,6 +1883,12 @@ impl<P: CloudProvider> CloudSync<P> {
             self.state.cursor = new_cursor;
         }
         self.state.last_sync = Some(chrono::Utc::now().timestamp());
+        if let Err(e) = self.save_manifest().await {
+            tracing::error!("cloud sync: failed to save the sync state: {}", e);
+            result
+                .errors
+                .push(format!("Failed to save the sync state: {}", e));
+        }
 
         if !result.errors.is_empty() {
             result.status = SyncStatus::PartialSuccess;
@@ -1258,6 +1939,47 @@ enum LocalOnly {
     /// the local copies; a file missing from the listing may be one of those, and uploading it
     /// would bring back what was deleted remotely. A later full sync uploads new local files.
     Keep,
+}
+
+/// What a full sync does with a path (see [`CloudSync::reconcile`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// Deleted remotely and unchanged here: move the local copy into [`QUARANTINE_DIR`].
+    Quarantine,
+    Upload,
+    /// Deleted remotely but changed here: upload it again.
+    Reupload,
+    Download,
+    /// Present on both sides, and not unchanged on both. `known`: the manifest says both
+    /// changed since the last sync.
+    Both {
+        known: bool,
+    },
+}
+
+impl Step {
+    /// The order steps run in. Local copies are moved aside first, so a remote folder that
+    /// replaced a file, or a file that replaced a folder, can be downloaded in the same sync.
+    fn order(self) -> u8 {
+        match self {
+            Step::Quarantine => 0,
+            Step::Upload | Step::Reupload => 1,
+            Step::Download => 2,
+            Step::Both { .. } => 3,
+        }
+    }
+}
+
+/// A path's [`Step`] in a full sync.
+struct Planned {
+    path: String,
+    step: Step,
+    /// Whether the path goes in the manifest ([`CloudSync::visible`], and within the size
+    /// limit on both sides).
+    track: bool,
+    /// Its manifest entry from the last sync, kept if the step fails or leaves the two sides
+    /// apart.
+    old: Option<ManifestEntry>,
 }
 
 /// Outcome of a full sync ([`CloudSync::reconcile`]).
@@ -2460,6 +3182,824 @@ mod tests {
                 .map(String::as_str),
             Some("deep")
         );
+    }
+
+    /// A provider that keeps what is uploaded, as a real one does, by sync path. Every write is
+    /// a new revision (a later `modified_at`, the same id). `hashed` listings carry a content
+    /// hash that `content_matches` checks, as Dropbox and OneDrive listings do; without it they
+    /// are like Google Drive's, whose MD5 isn't compared. Downloads of paths in `fail` fail with
+    /// a (transient) network error, and while `list_fails` is set the listing does. `account`
+    /// answers `account_id`, `legacy` answers `legacy_layout_dir`, and remote deletions made by
+    /// the sync (there should be none) are recorded in `deletes`.
+    #[derive(Default)]
+    struct Store {
+        hashed: bool,
+        account: Option<String>,
+        legacy: Option<Vec<String>>,
+        files: Mutex<BTreeMap<String, (CloudFile, Vec<u8>)>>,
+        revision: std::sync::atomic::AtomicI64,
+        fail: Mutex<HashSet<String>>,
+        list_fails: std::sync::atomic::AtomicBool,
+        uploads: Mutex<Vec<String>>,
+        downloads: Mutex<Vec<String>>,
+        deletes: Mutex<Vec<String>>,
+    }
+
+    impl Store {
+        fn hashed() -> Self {
+            Self {
+                hashed: true,
+                ..Default::default()
+            }
+        }
+
+        /// Write `content` at `path`, as a new revision.
+        fn put(&self, path: &str, content: &str) -> CloudFile {
+            let rev = self
+                .revision
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let mut files = self.files.lock().unwrap();
+            let id = files
+                .get(path)
+                .map_or_else(|| format!("id-{rev}"), |(f, _)| f.id.clone());
+            let file = CloudFile {
+                id,
+                name: path.rsplit('/').next().unwrap().into(),
+                mime_type: None,
+                size: content.len() as u64,
+                modified_at: 1_000 + rev,
+                content_hash: self.hashed.then(|| sha256_hex(content.as_bytes())),
+                parent_id: None,
+                is_folder: false,
+                path: path.into(),
+                deleted: false,
+            };
+            files.insert(path.into(), (file.clone(), content.into()));
+            file
+        }
+
+        fn remove(&self, path: &str) {
+            assert!(self.files.lock().unwrap().remove(path).is_some(), "{path}");
+        }
+
+        fn content(&self, path: &str) -> Option<String> {
+            let files = self.files.lock().unwrap();
+            files
+                .get(path)
+                .map(|(_, c)| String::from_utf8(c.clone()).unwrap())
+        }
+
+        fn uploads(&self) -> Vec<String> {
+            self.uploads.lock().unwrap().clone()
+        }
+
+        fn downloads(&self) -> Vec<String> {
+            self.downloads.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl CloudProvider for Store {
+        fn provider_type(&self) -> ProviderType {
+            ProviderType::Dropbox
+        }
+        fn is_authenticated(&self) -> bool {
+            true
+        }
+        fn get_token(&self) -> Option<&OAuthToken> {
+            None
+        }
+        fn set_token(&mut self, _: OAuthToken) {}
+        async fn refresh_token(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn list_files(&self, _: Option<&str>) -> Result<Vec<CloudFile>> {
+            if self.list_fails.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(IntegrationError::Network("listing failed".into()));
+            }
+            let files = self.files.lock().unwrap();
+            Ok(files.values().map(|(f, _)| f.clone()).collect())
+        }
+        async fn list_folders(&self) -> Result<Vec<CloudFolder>> {
+            Ok(vec![])
+        }
+        async fn get_file_metadata(&self, id: &str) -> Result<CloudFile> {
+            Err(IntegrationError::NotFound(id.into()))
+        }
+        async fn download_file(&self, id: &str) -> Result<Vec<u8>> {
+            let (path, content) = {
+                let files = self.files.lock().unwrap();
+                let (f, content) = files
+                    .values()
+                    .find(|(f, _)| f.id == id)
+                    .ok_or_else(|| IntegrationError::NotFound(id.into()))?;
+                (f.path.clone(), content.clone())
+            };
+            self.downloads.lock().unwrap().push(path.clone());
+            if self.fail.lock().unwrap().contains(&path) {
+                return Err(IntegrationError::Network("connection reset".into()));
+            }
+            Ok(content)
+        }
+        async fn upload_file(
+            &self,
+            _: Option<&str>,
+            name: &str,
+            content: &[u8],
+            _: Option<&str>,
+        ) -> Result<CloudFile> {
+            let path = format!("/{name}");
+            self.uploads.lock().unwrap().push(path.clone());
+            Ok(self.put(&path, std::str::from_utf8(content).unwrap()))
+        }
+        async fn create_folder(&self, _: Option<&str>, _: &str) -> Result<CloudFolder> {
+            unimplemented!()
+        }
+        async fn delete(&self, id: &str) -> Result<()> {
+            self.deletes.lock().unwrap().push(id.into());
+            Ok(())
+        }
+        async fn move_file(&self, id: &str, _: &str, _: Option<&str>) -> Result<CloudFile> {
+            Err(IntegrationError::NotFound(id.into()))
+        }
+        /// Every file as changed since any cursor; nothing (and a cursor) without one.
+        async fn get_changes(
+            &self,
+            cursor: Option<&str>,
+        ) -> Result<(Vec<CloudFile>, Option<String>)> {
+            let Some(_) = cursor else {
+                return Ok((vec![], Some("c1".into())));
+            };
+            let files = self.files.lock().unwrap();
+            let changes = files.values().map(|(f, _)| f.clone()).collect();
+            Ok((changes, Some("c2".into())))
+        }
+        async fn get_quota(&self) -> Result<StorageQuota> {
+            Ok(StorageQuota {
+                used: 0,
+                total: None,
+                trash: None,
+            })
+        }
+        async fn legacy_layout_dir(&self, _: Option<&str>) -> Result<Option<Vec<String>>> {
+            Ok(self.legacy.clone())
+        }
+        async fn account_id(&self) -> Result<Option<String>> {
+            Ok(self.account.clone())
+        }
+        fn content_matches(&self, file: &CloudFile, content: &[u8]) -> bool {
+            self.hashed && file.content_hash.as_deref() == Some(sha256_hex(content).as_str())
+        }
+    }
+
+    /// `cfg`, keeping the manifest between syncs as `POST /sync` does.
+    fn kept(root: &Path, direction: SyncDirection) -> SyncConfig {
+        SyncConfig {
+            persist_state: true,
+            ..cfg(root, direction)
+        }
+    }
+
+    /// A new `CloudSync` over the same provider and config, as `POST /sync` makes one for each
+    /// request: all it knows of the last sync is what that saved.
+    fn again<P: CloudProvider>(sync: CloudSync<P>) -> CloudSync<P> {
+        again_with(sync, |_| {})
+    }
+
+    /// [`again`], with the config changed by `change`.
+    fn again_with<P: CloudProvider>(
+        sync: CloudSync<P>,
+        change: impl FnOnce(&mut SyncConfig),
+    ) -> CloudSync<P> {
+        let mut config = sync.config;
+        change(&mut config);
+        CloudSync::new(sync.provider, config)
+    }
+
+    /// A full sync that must report no errors.
+    async fn clean<P: CloudProvider>(sync: &mut CloudSync<P>) -> SyncResult {
+        let r = sync.sync().await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        r
+    }
+
+    /// Uploaded, downloaded, moved aside as deleted remotely.
+    fn counts(r: &SyncResult) -> (usize, usize, usize) {
+        (r.uploaded, r.downloaded, r.deleted)
+    }
+
+    /// The files moved aside as deleted remotely, by their path in their sync's directory.
+    fn quarantined(root: &Path) -> Vec<String> {
+        fn walk(dir: &Path, prefix: &str, out: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let name = format!("{prefix}{}", entry.file_name().to_string_lossy());
+                if entry.file_type().unwrap().is_dir() {
+                    walk(&entry.path(), &format!("{name}/"), out);
+                } else {
+                    out.push(name);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        if let Ok(runs) = std::fs::read_dir(root.join(QUARANTINE_DIR)) {
+            for run in runs {
+                walk(&run.unwrap().path(), "", &mut out);
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn has_notice(r: &SyncResult, start: &str) -> bool {
+        r.notices.iter().any(|n| n.starts_with(start))
+    }
+
+    /// A file deleted remotely isn't uploaded again from its local copy by the next sync (a new
+    /// `CloudSync`, going by the manifest the last one saved): the copy, unchanged since, is
+    /// moved aside rather than deleted, and the folders it leaves empty go. After that there is
+    /// nothing to do.
+    #[tokio::test]
+    async fn remote_deletions_are_moved_aside_not_uploaded_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = Store::hashed();
+        store.put("/a.txt", "a");
+        store.put("/gone.txt", "gone");
+        store.put("/sub/deep/gone.txt", "deep");
+        let mut sync = CloudSync::new(store, kept(root, SyncDirection::Bidirectional));
+        assert_eq!(counts(&clean(&mut sync).await), (0, 3, 0));
+        assert!(root.join(MANIFEST_FILE).is_file());
+
+        sync.provider.remove("/gone.txt");
+        sync.provider.remove("/sub/deep/gone.txt");
+        let mut sync = again(sync);
+        let r = clean(&mut sync).await;
+        assert_eq!(counts(&r), (0, 0, 2));
+        assert!(sync.provider.uploads().is_empty());
+        assert_eq!(quarantined(root), vec!["gone.txt", "sub/deep/gone.txt"]);
+        assert!(!root.join("gone.txt").exists() && !root.join("sub").exists());
+        assert_eq!(read(root, "a.txt"), "a");
+        assert!(
+            has_notice(&r, "2 files deleted remotely"),
+            "{:?}",
+            r.notices
+        );
+
+        let mut sync = again(sync);
+        let r = clean(&mut sync).await;
+        assert_eq!(counts(&r), (0, 0, 0));
+        assert!(r.notices.is_empty(), "{:?}", r.notices);
+        assert_eq!(quarantined(root).len(), 2);
+        assert!(sync.provider.uploads().is_empty());
+        assert!(sync.provider.deletes.lock().unwrap().is_empty());
+    }
+
+    /// A file deleted remotely but changed here since the last sync is a conflict that keeps the
+    /// local copy: it is uploaded again, and the result says so.
+    #[tokio::test]
+    async fn a_file_deleted_remotely_but_changed_here_is_uploaded_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = Store::hashed();
+        store.put("/a.txt", "a");
+        let mut sync = CloudSync::new(store, kept(root, SyncDirection::Bidirectional));
+        clean(&mut sync).await;
+
+        sync.provider.remove("/a.txt");
+        write(root, "a.txt", "edited here");
+        let mut sync = again(sync);
+        let r = clean(&mut sync).await;
+        assert_eq!(counts(&r), (1, 0, 0));
+        assert_eq!(
+            sync.provider.content("/a.txt").as_deref(),
+            Some("edited here")
+        );
+        assert!(quarantined(root).is_empty());
+        assert!(
+            has_notice(&r, "/a.txt was deleted remotely but changed here"),
+            "{:?}",
+            r.notices
+        );
+
+        let mut sync = again(sync);
+        assert_eq!(counts(&clean(&mut sync).await), (0, 0, 0));
+    }
+
+    /// A file deleted here isn't downloaded again while it is unchanged remotely, nor deleted
+    /// remotely; the result says so the first time. Once changed remotely, it comes back.
+    #[tokio::test]
+    async fn local_deletions_are_not_downloaded_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = Store::hashed();
+        store.put("/a.txt", "a");
+        store.put("/sub/b.txt", "b");
+        let mut sync = CloudSync::new(store, kept(root, SyncDirection::Bidirectional));
+        assert_eq!(counts(&clean(&mut sync).await), (0, 2, 0));
+
+        std::fs::remove_file(root.join("sub/b.txt")).unwrap();
+        let mut sync = again(sync);
+        let r = clean(&mut sync).await;
+        assert_eq!(counts(&r), (0, 0, 0));
+        assert!(has_notice(&r, "1 file deleted here"), "{:?}", r.notices);
+        assert_eq!(sync.provider.downloads(), vec!["/a.txt", "/sub/b.txt"]);
+        assert_eq!(sync.provider.content("/sub/b.txt").as_deref(), Some("b"));
+        assert!(sync.provider.deletes.lock().unwrap().is_empty());
+
+        let mut sync = again(sync);
+        let r = clean(&mut sync).await;
+        assert_eq!(counts(&r), (0, 0, 0));
+        assert!(r.notices.is_empty(), "{:?}", r.notices);
+        assert!(!root.join("sub/b.txt").exists());
+
+        sync.provider.put("/sub/b.txt", "b, edited remotely");
+        let mut sync = again(sync);
+        assert_eq!(counts(&clean(&mut sync).await), (0, 1, 0));
+        assert_eq!(read(root, "sub/b.txt"), "b, edited remotely");
+        let mut sync = again(sync);
+        assert_eq!(counts(&clean(&mut sync).await), (0, 0, 0));
+    }
+
+    /// Files unchanged on both sides since the last sync are left alone, with no transfer and no
+    /// conflict strategy, even when the listing carries no hash the provider checks (Google
+    /// Drive), and when the local file was only touched (same content, another time). Without
+    /// the manifest, `AskUser` reports each of them as a conflict.
+    #[tokio::test]
+    async fn unchanged_files_skip_the_conflict_strategy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = Store::default();
+        store.put("/a.txt", "a");
+        write(root, "mine.txt", "mine");
+        let mut sync = CloudSync::new(store, kept(root, SyncDirection::Bidirectional));
+        assert_eq!(counts(&clean(&mut sync).await), (1, 1, 0));
+
+        let mut sync = again_with(sync, |c| c.conflict_strategy = ConflictStrategy::AskUser);
+        let r = clean(&mut sync).await;
+        assert_eq!(counts(&r), (0, 0, 0));
+        assert!(r.conflicts.is_empty(), "{:?}", r.conflicts);
+
+        let touched = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(root.join("a.txt"))
+            .unwrap()
+            .set_modified(touched)
+            .unwrap();
+        let mut sync = again(sync);
+        let r = clean(&mut sync).await;
+        assert_eq!(counts(&r), (0, 0, 0));
+        assert!(r.conflicts.is_empty(), "{:?}", r.conflicts);
+
+        std::fs::remove_file(root.join(MANIFEST_FILE)).unwrap();
+        let mut sync = again(sync);
+        let r = clean(&mut sync).await;
+        assert_eq!(counts(&r), (0, 0, 0));
+        assert_eq!(r.conflicts.len(), 2, "{:?}", r.conflicts);
+    }
+
+    /// A file changed on one side only is sent across without the conflict strategy (`AskUser`
+    /// would report it), as far as the direction allows: a change the direction doesn't send
+    /// waits for a sync that does.
+    #[tokio::test]
+    async fn a_change_on_one_side_is_sent_across() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = Store::hashed();
+        store.put("/a.txt", "a");
+        store.put("/b.txt", "b");
+        let config = SyncConfig {
+            conflict_strategy: ConflictStrategy::AskUser,
+            ..kept(root, SyncDirection::Bidirectional)
+        };
+        let mut sync = CloudSync::new(store, config);
+        assert_eq!(counts(&clean(&mut sync).await), (0, 2, 0));
+
+        write(root, "a.txt", "a, edited here");
+        sync.provider.put("/b.txt", "b, edited remotely");
+        let mut sync = again(sync);
+        let r = clean(&mut sync).await;
+        assert_eq!(counts(&r), (1, 1, 0));
+        assert!(r.conflicts.is_empty(), "{:?}", r.conflicts);
+        assert_eq!(
+            sync.provider.content("/a.txt").as_deref(),
+            Some("a, edited here")
+        );
+        assert_eq!(read(root, "b.txt"), "b, edited remotely");
+
+        // Download-only doesn't upload the next local edit, nor forget it.
+        write(root, "a.txt", "a, edited here again");
+        let mut sync = again_with(sync, |c| c.direction = SyncDirection::Download);
+        assert_eq!(counts(&clean(&mut sync).await), (0, 0, 0));
+        // Upload-only sends it, and doesn't download the next remote edit.
+        sync.provider.put("/b.txt", "b, edited remotely again");
+        let mut sync = again_with(sync, |c| c.direction = SyncDirection::Upload);
+        assert_eq!(counts(&clean(&mut sync).await), (1, 0, 0));
+        assert_eq!(read(root, "b.txt"), "b, edited remotely");
+        // Both ways, that one comes down.
+        let mut sync = again_with(sync, |c| c.direction = SyncDirection::Bidirectional);
+        let r = clean(&mut sync).await;
+        assert_eq!(counts(&r), (0, 1, 0));
+        assert!(r.conflicts.is_empty(), "{:?}", r.conflicts);
+        assert_eq!(read(root, "b.txt"), "b, edited remotely again");
+        assert_eq!(
+            sync.provider.content("/a.txt").as_deref(),
+            Some("a, edited here again")
+        );
+    }
+
+    /// A file changed on both sides since the last sync goes through the conflict strategy:
+    /// reported by `AskUser` and left as it was in the manifest, so it is reported again until
+    /// resolved (here by `LocalWins`). Changed on both sides to the same content (as the
+    /// provider vouches), it is no conflict.
+    #[tokio::test]
+    async fn a_change_on_both_sides_goes_through_the_conflict_strategy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = Store::hashed();
+        store.put("/a.txt", "a");
+        let config = SyncConfig {
+            conflict_strategy: ConflictStrategy::AskUser,
+            ..kept(root, SyncDirection::Bidirectional)
+        };
+        let mut sync = CloudSync::new(store, config);
+        clean(&mut sync).await;
+
+        write(root, "a.txt", "a, edited here");
+        sync.provider.put("/a.txt", "a, edited remotely");
+        for _ in 0..2 {
+            sync = again(sync);
+            let r = clean(&mut sync).await;
+            assert_eq!(counts(&r), (0, 0, 0));
+            assert_eq!(r.conflicts.len(), 1, "{:?}", r.conflicts);
+        }
+        let mut sync = again_with(sync, |c| c.conflict_strategy = ConflictStrategy::LocalWins);
+        assert_eq!(counts(&clean(&mut sync).await), (1, 0, 0));
+        assert_eq!(
+            sync.provider.content("/a.txt").as_deref(),
+            Some("a, edited here")
+        );
+
+        let mut sync = again_with(sync, |c| c.conflict_strategy = ConflictStrategy::AskUser);
+        let r = clean(&mut sync).await;
+        assert_eq!(counts(&r), (0, 0, 0));
+        assert!(r.conflicts.is_empty(), "{:?}", r.conflicts);
+
+        write(root, "a.txt", "the same on both sides");
+        sync.provider.put("/a.txt", "the same on both sides");
+        let mut sync = again(sync);
+        let r = clean(&mut sync).await;
+        assert_eq!(counts(&r), (0, 0, 0));
+        assert!(r.conflicts.is_empty(), "{:?}", r.conflicts);
+    }
+
+    /// Moving a local copy aside stays inside the sync root: with the quarantine directory a
+    /// symlink to elsewhere, the copy is left where it is (an error, and it stays in the
+    /// manifest, so it is neither forgotten nor uploaded) and nothing is written elsewhere. The
+    /// sync's own entries (the manifest, what was moved aside) are never uploaded or written
+    /// over by a remote file of that name, even with hidden files synced.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn moving_aside_stays_inside_the_sync_root() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("root");
+        let elsewhere = outer.path().join("elsewhere");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&elsewhere).unwrap();
+        let store = Store::hashed();
+        store.put("/gone.txt", "gone");
+        let mut sync = CloudSync::new(store, kept(&root, SyncDirection::Bidirectional));
+        assert_eq!(counts(&clean(&mut sync).await), (0, 1, 0));
+
+        std::os::unix::fs::symlink(&elsewhere, root.join(QUARANTINE_DIR)).unwrap();
+        sync.provider.remove("/gone.txt");
+        for _ in 0..2 {
+            sync = again(sync);
+            let r = sync.sync().await.unwrap();
+            assert_eq!(counts(&r), (0, 0, 0));
+            assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+            assert!(
+                r.errors[0].starts_with("Moving aside /gone.txt (deleted remotely) failed: ")
+                    && r.errors[0].contains("resolves outside sync root"),
+                "{:?}",
+                r.errors
+            );
+            assert_eq!(read(&root, "gone.txt"), "gone");
+            assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+            assert!(sync.provider.uploads().is_empty());
+        }
+        std::fs::remove_file(root.join(QUARANTINE_DIR)).unwrap();
+
+        for path in [
+            "/.rms-sync-state.json",
+            "/.RMS-REMOTE-DELETED/x/gone.txt",
+            "/sub/.rms-sync-state.json",
+        ] {
+            sync.provider.put(path, "remote");
+        }
+        let mut sync = again_with(sync, |c| c.sync_hidden = true);
+        let r = clean(&mut sync).await;
+        assert_eq!(counts(&r), (0, 0, 1));
+        assert_eq!(quarantined(&root), vec!["gone.txt"]);
+        assert!(sync.provider.uploads().is_empty());
+        assert_eq!(sync.provider.downloads(), vec!["/gone.txt"]);
+        assert!(!root.join("sub").exists());
+        assert!(!root.join(".RMS-REMOTE-DELETED").exists());
+        let stored = std::fs::read(root.join(MANIFEST_FILE)).unwrap();
+        serde_json::from_slice::<ManifestFile>(&stored).expect("the manifest");
+    }
+
+    /// `quarantine` moves only a file inside the root, named by a safe sync path, and never over
+    /// a file already moved aside.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quarantine_moves_only_files_inside_the_root() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("root");
+        write(&root, "dir/a.txt", "a");
+        write(&root, "b.txt", "first");
+        write(outer.path(), "elsewhere/x.txt", "x");
+        std::os::unix::fs::symlink(outer.path().join("elsewhere"), root.join("link")).unwrap();
+
+        let err = quarantine(&root, "run", "/link/x.txt", &root.join("link/x.txt"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, IntegrationError::InvalidPath(_)), "{err}");
+        assert_eq!(read(outer.path(), "elsewhere/x.txt"), "x");
+        for bad in ["/../b.txt", "/dir/../b.txt", ""] {
+            let err = quarantine(&root, "run", bad, &root.join("b.txt"))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, IntegrationError::InvalidPath(_)),
+                "{bad:?}: {err}"
+            );
+        }
+        let err = quarantine(&root, "run", "/dir", &root.join("dir"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, IntegrationError::LocalPathUnusable(_)),
+            "{err}"
+        );
+
+        let to = quarantine(&root, "run", "/b.txt", &root.join("b.txt")).await;
+        assert_eq!(to.unwrap(), Path::new(QUARANTINE_DIR).join("run/b.txt"));
+        write(&root, "b.txt", "second");
+        let to = quarantine(&root, "run", "/b.txt", &root.join("b.txt")).await;
+        assert_eq!(to.unwrap(), Path::new(QUARANTINE_DIR).join("run/b.txt (2)"));
+        assert_eq!(read(&root, ".rms-remote-deleted/run/b.txt"), "first");
+        assert_eq!(read(&root, ".rms-remote-deleted/run/b.txt (2)"), "second");
+        // The directory it leaves empty goes; the root never does.
+        quarantine(&root, "run", "/dir/a.txt", &root.join("dir/a.txt"))
+            .await
+            .unwrap();
+        assert!(!root.join("dir").exists() && root.is_dir());
+    }
+
+    /// A sync that fails as a whole (here the listing) changes nothing and leaves the saved
+    /// manifest as it was. One that fails for some files records the rest and keeps the failed
+    /// files' old entries, so the next sync sees the same change and tries again (rather than
+    /// take the file for unchanged, or for a conflict).
+    #[tokio::test]
+    async fn failures_never_record_what_did_not_happen() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = Store::hashed();
+        store.put("/a.txt", "a");
+        store.put("/b.txt", "b");
+        let config = SyncConfig {
+            conflict_strategy: ConflictStrategy::AskUser,
+            ..kept(root, SyncDirection::Bidirectional)
+        };
+        let mut sync = CloudSync::new(store, config);
+        clean(&mut sync).await;
+        let saved = std::fs::read(root.join(MANIFEST_FILE)).unwrap();
+
+        sync.provider
+            .list_fails
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        sync.provider.remove("/a.txt");
+        let mut sync = again(sync);
+        let r = sync.sync().await.unwrap();
+        assert_eq!(r.status, SyncStatus::Failed);
+        assert_eq!(std::fs::read(root.join(MANIFEST_FILE)).unwrap(), saved);
+        assert_eq!(read(root, "a.txt"), "a");
+
+        sync.provider
+            .list_fails
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        sync.provider.put("/b.txt", "b, edited remotely");
+        sync.provider.put("/c.txt", "c");
+        sync.provider.fail.lock().unwrap().insert("/b.txt".into());
+        let mut sync = again(sync);
+        let r = sync.sync().await.unwrap();
+        assert_eq!(r.status, SyncStatus::PartialSuccess);
+        assert_eq!(counts(&r), (0, 1, 1));
+        assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+        assert!(
+            r.errors[0].starts_with("Download /b.txt failed"),
+            "{:?}",
+            r.errors
+        );
+        assert_eq!(read(root, "b.txt"), "b");
+        assert_eq!(quarantined(root), vec!["a.txt"]);
+
+        sync.provider.fail.lock().unwrap().clear();
+        let mut sync = again(sync);
+        let r = clean(&mut sync).await;
+        assert_eq!(counts(&r), (0, 1, 0));
+        assert!(r.conflicts.is_empty(), "{:?}", r.conflicts);
+        assert_eq!(read(root, "b.txt"), "b, edited remotely");
+    }
+
+    /// The manifest is kept per account and cloud folder (a trailing slash aside): when the
+    /// provider is connected to another account, whose files these aren't, or another folder is
+    /// synced into the same directory, that sync infers no deletions, and each keeps its own.
+    #[tokio::test]
+    async fn manifests_are_kept_per_account_and_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = Store {
+            account: Some("alice".into()),
+            ..Store::hashed()
+        };
+        store.put("/a.txt", "a");
+        let mut sync = CloudSync::new(store, kept(root, SyncDirection::Bidirectional));
+        assert_eq!(counts(&clean(&mut sync).await), (0, 1, 0));
+
+        sync.provider.account = Some("bob".into());
+        sync.provider.remove("/a.txt");
+        let mut sync = again(sync);
+        assert_eq!(counts(&clean(&mut sync).await), (1, 0, 0));
+
+        sync.provider.remove("/a.txt");
+        let mut sync = again_with(sync, |c| c.cloud_folder = Some("/Other".into()));
+        assert_eq!(counts(&clean(&mut sync).await), (1, 0, 0));
+        let mut sync = again_with(sync, |c| c.cloud_folder = Some("/Other/".into()));
+        assert_eq!(counts(&clean(&mut sync).await), (0, 0, 0));
+        assert!(quarantined(root).is_empty());
+
+        let stored: ManifestFile =
+            serde_json::from_slice(&std::fs::read(root.join(MANIFEST_FILE)).unwrap()).unwrap();
+        let keys: Vec<(&str, &str)> = stored
+            .syncs
+            .iter()
+            .map(|s| (s.account.as_str(), s.cloud_folder.as_str()))
+            .collect();
+        assert_eq!(keys, vec![("alice", ""), ("bob", ""), ("bob", "/Other")]);
+        assert_eq!(stored.version, MANIFEST_VERSION);
+    }
+
+    /// A file over the size limit on either side is out of view, not deleted: the local copy of
+    /// a remote file that grew past the limit isn't moved aside, and a local file past it is
+    /// neither uploaded nor written over by the remote file. Back under the limit, it syncs
+    /// against the manifest as before.
+    #[tokio::test]
+    async fn files_over_the_size_limit_are_out_of_view_not_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = Store::hashed();
+        store.put("/big.txt", "small");
+        let config = SyncConfig {
+            max_file_size: Some(16),
+            ..kept(root, SyncDirection::Bidirectional)
+        };
+        let mut sync = CloudSync::new(store, config);
+        assert_eq!(counts(&clean(&mut sync).await), (0, 1, 0));
+
+        sync.provider.put("/big.txt", &"x".repeat(100));
+        let mut sync = again(sync);
+        assert_eq!(counts(&clean(&mut sync).await), (0, 0, 0));
+        assert_eq!(read(root, "big.txt"), "small");
+        assert!(quarantined(root).is_empty());
+
+        sync.provider.put("/big.txt", "tiny");
+        let mut sync = again(sync);
+        assert_eq!(counts(&clean(&mut sync).await), (0, 1, 0));
+        assert_eq!(read(root, "big.txt"), "tiny");
+
+        write(root, "big.txt", &"y".repeat(100));
+        sync.provider.put("/big.txt", "remote edit");
+        let mut sync = again(sync);
+        assert_eq!(counts(&clean(&mut sync).await), (0, 0, 0));
+        assert_eq!(read(root, "big.txt"), "y".repeat(100));
+        assert_eq!(
+            sync.provider.content("/big.txt").as_deref(),
+            Some("remote edit")
+        );
+    }
+
+    /// Upload-only never touches local files: the local copy of a file deleted remotely stays,
+    /// and isn't uploaded again unless it changes.
+    #[tokio::test]
+    async fn upload_only_keeps_the_local_copy_of_a_remote_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "a.txt", "a");
+        let mut sync = CloudSync::new(Store::hashed(), kept(root, SyncDirection::Upload));
+        assert_eq!(counts(&clean(&mut sync).await), (1, 0, 0));
+
+        sync.provider.remove("/a.txt");
+        for _ in 0..2 {
+            sync = again(sync);
+            assert_eq!(counts(&clean(&mut sync).await), (0, 0, 0));
+            assert_eq!(read(root, "a.txt"), "a");
+        }
+        assert!(quarantined(root).is_empty());
+
+        write(root, "a.txt", "a, edited here");
+        let mut sync = again(sync);
+        assert_eq!(counts(&clean(&mut sync).await), (1, 0, 0));
+        assert_eq!(
+            sync.provider.content("/a.txt").as_deref(),
+            Some("a, edited here")
+        );
+    }
+
+    /// Delta sync records its downloads in the manifest, so the next full sync finds those files
+    /// unchanged on both sides, not changed on both (which `AskUser` would report: this
+    /// provider's listing has no hash to vouch for the content).
+    #[tokio::test]
+    async fn delta_downloads_are_recorded_for_the_next_full_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = Store::default();
+        store.put("/a.txt", "a");
+        // A delta takes a local file stamped after the last sync for a local edit; the remote
+        // version wins that here.
+        let config = SyncConfig {
+            conflict_strategy: ConflictStrategy::CloudWins,
+            ..kept(root, SyncDirection::Bidirectional)
+        };
+        let mut sync = CloudSync::new(store, config);
+        let r = sync.delta_sync().await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(sync.state().cursor.as_deref(), Some("c1"));
+
+        sync.provider.put("/a.txt", "a, edited remotely");
+        let r = sync.delta_sync().await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(r.downloaded, 1);
+        assert_eq!(read(root, "a.txt"), "a, edited remotely");
+
+        let mut sync = again_with(sync, |c| c.conflict_strategy = ConflictStrategy::AskUser);
+        let r = clean(&mut sync).await;
+        assert_eq!(counts(&r), (0, 0, 0));
+        assert!(r.conflicts.is_empty(), "{:?}", r.conflicts);
+    }
+
+    /// A manifest this server can't read stops the sync rather than sync without it (which would
+    /// bring back what was deleted), and is left as it is.
+    #[tokio::test]
+    async fn an_unreadable_manifest_stops_the_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "a.txt", "a");
+        for bad in ["not json", r#"{"version":2,"syncs":[]}"#] {
+            write(root, MANIFEST_FILE, bad);
+            let mut sync =
+                CloudSync::new(Store::hashed(), kept(root, SyncDirection::Bidirectional));
+            let r = sync.sync().await.unwrap();
+            assert_eq!(r.status, SyncStatus::Failed);
+            assert!(
+                r.errors[0].starts_with("Failed to load the sync state: "),
+                "{:?}",
+                r.errors
+            );
+            assert!(sync.provider.uploads().is_empty());
+            assert_eq!(read(root, MANIFEST_FILE), bad);
+        }
+    }
+
+    /// The sync that moves the old layout aside (see `move_legacy_layout`) goes without the
+    /// manifest: the files it moved aren't deletions made here, so the remote copies of those
+    /// the manifest knew come down again.
+    #[tokio::test]
+    async fn moving_the_old_layout_aside_starts_a_fresh_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = Store::hashed();
+        store.put("/Notes/a.txt", "a");
+        let mut sync = CloudSync::new(store, kept(root, SyncDirection::Bidirectional));
+        assert_eq!(counts(&clean(&mut sync).await), (0, 1, 0));
+
+        sync.provider.legacy = Some(vec!["Notes".into()]);
+        let mut sync = again(sync);
+        let r = clean(&mut sync).await;
+        assert!(
+            has_notice(&r, "Moved Notes to .rms-old-layout/Notes"),
+            "{:?}",
+            r.notices
+        );
+        assert_eq!(counts(&r), (0, 1, 0));
+        assert_eq!(read(root, "Notes/a.txt"), "a");
+        assert_eq!(read(root, ".rms-old-layout/Notes/a.txt"), "a");
+
+        let mut sync = again(sync);
+        assert_eq!(counts(&clean(&mut sync).await), (0, 0, 0));
     }
 
     #[test]

@@ -597,6 +597,18 @@ impl CloudProvider for Dropbox {
         Ok(parts.iter().all(|p| is_safe_name(p)).then_some(parts))
     }
 
+    /// `users/get_current_account`'s `account_id` (`dbid:…`).
+    async fn account_id(&self) -> Result<Option<String>> {
+        #[derive(Serialize)]
+        struct Null;
+        #[derive(Deserialize)]
+        struct Account {
+            account_id: String,
+        }
+        let account: Account = self.api_request("users/get_current_account", &Null).await?;
+        Ok(Some(account.account_id))
+    }
+
     /// Compares `content_hash` with the [Dropbox content hash](content_hash) of `content`.
     fn content_matches(&self, file: &CloudFile, content: &[u8]) -> bool {
         file.content_hash
@@ -1716,6 +1728,8 @@ mod tests {
 
         #[derive(Default)]
         struct Remote {
+            /// What `users/get_current_account` answers.
+            account: String,
             /// By `path_lower`: the entry and the file's content.
             entries: BTreeMap<String, (Value, Vec<u8>)>,
             /// Paths uploaded to, in order.
@@ -1791,6 +1805,12 @@ mod tests {
                         }),
                     )
                     .route(
+                        "/users/get_current_account",
+                        post(|State(r): State<Shared>| async move {
+                            Json(json!({ "account_id": r.lock().unwrap().account }))
+                        }),
+                    )
+                    .route(
                         "/files/list_folder",
                         post(|State(r): State<Shared>, Json(b): Json<Value>| async move {
                             let root = key(b["path"].as_str().unwrap());
@@ -1836,6 +1856,20 @@ mod tests {
         }
 
         async fn sync(base: &str, root: &Path, folder: &str) -> SyncResult {
+            sync_with(base, root, folder, false).await
+        }
+
+        /// [`sync`], keeping the state between syncs as `POST /sync` does.
+        async fn sync_kept(base: &str, root: &Path, folder: &str) -> SyncResult {
+            sync_with(base, root, folder, true).await
+        }
+
+        async fn sync_with(
+            base: &str,
+            root: &Path,
+            folder: &str,
+            persist_state: bool,
+        ) -> SyncResult {
             let config = OAuthConfig::dropbox("id".into(), None, "http://localhost/cb".into());
             let token = OAuthToken {
                 access_token: "t".into(),
@@ -1849,6 +1883,7 @@ mod tests {
                 local_path: root.to_path_buf(),
                 cloud_folder: Some(folder.into()),
                 direction: SyncDirection::Bidirectional,
+                persist_state,
                 ..Default::default()
             };
             let r = CloudSync::new(dropbox, config).sync().await.unwrap();
@@ -1944,6 +1979,54 @@ mod tests {
             let r = sync(&base, root, "/Notes").await;
             assert_eq!((r.uploaded, r.downloaded), (0, 0));
             assert!(!root.join("Notes").exists());
+        }
+
+        /// With the state kept between syncs, as `POST /sync` keeps it: a file deleted in
+        /// Dropbox isn't uploaded again, its local copy is moved aside (and the folder it leaves
+        /// empty goes); one deleted here isn't downloaded again, nor deleted in Dropbox. The state
+        /// is the signed-in account's.
+        #[tokio::test]
+        async fn kept_state_keeps_deletions_deleted() {
+            let remote = Shared::default();
+            {
+                let mut r = remote.lock().unwrap();
+                r.account = "dbid:alice".into();
+                put(&mut r, "/Notes/a.pdf", b"A");
+                put(&mut r, "/Notes/Sub/b.pdf", b"B");
+                put(&mut r, "/Notes/c.pdf", b"C");
+            }
+            let base = fake(remote.clone()).await;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let r = sync_kept(&base, root, "/Notes").await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 3, 0));
+
+            remote.lock().unwrap().entries.remove("/notes/sub/b.pdf");
+            std::fs::remove_file(root.join("c.pdf")).unwrap();
+            let r = sync_kept(&base, root, "/Notes").await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 0, 1));
+            assert_eq!(r.notices.len(), 2, "{:?}", r.notices);
+            assert!(!root.join("Sub").exists() && !root.join("c.pdf").exists());
+            let runs: Vec<_> = std::fs::read_dir(root.join(".rms-remote-deleted"))
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            assert_eq!(runs.len(), 1);
+            assert_eq!(std::fs::read(runs[0].join("Sub/b.pdf")).unwrap(), b"B");
+
+            for _ in 0..2 {
+                let r = sync_kept(&base, root, "/Notes").await;
+                assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 0, 0));
+                assert!(r.notices.is_empty(), "{:?}", r.notices);
+            }
+            assert!(uploads(&remote).is_empty());
+            assert_eq!(remote.lock().unwrap().downloads, 3);
+            assert!(remote.lock().unwrap().entries.contains_key("/notes/c.pdf"));
+            let state: Value =
+                serde_json::from_slice(&std::fs::read(root.join(".rms-sync-state.json")).unwrap())
+                    .unwrap();
+            assert_eq!(state["syncs"][0]["account"], "dbid:alice");
+            assert_eq!(state["syncs"][0]["cloud_folder"], "/Notes");
         }
 
         /// A tree that hasn't changed isn't sent again by the next sync, however deep; an edit
