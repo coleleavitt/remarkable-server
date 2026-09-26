@@ -14,6 +14,7 @@ pub mod gentree;
 pub mod handwriting;
 pub mod hw_search;
 pub mod integrations;
+mod json_scan;
 pub mod mdm;
 pub mod mqtt_ws;
 pub mod notifications;
@@ -22,6 +23,7 @@ pub mod passcode;
 pub mod protocol;
 pub mod readlater;
 pub mod readlater_api;
+pub mod readlater_sync;
 pub mod reports;
 pub mod screenshare;
 pub mod screenshare_rest;
@@ -138,61 +140,46 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/v1/signed-urls/uploads", post(sync15::signed_upload))
         .route("/api/v1/sync-complete", post(sync15::sync_complete))
-        // Handwriting conversion (local tesseract; see handwriting.rs)
-        .route(
-            "/convert/v1/handwriting",
-            post(handwriting::convert).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
-        )
+        // Handwriting conversion (local tesseract; see handwriting.rs). The handler reads
+        // the body itself after auth, limited to `handwriting::MAX_BODY` (a `Body`
+        // extractor ignores `DefaultBodyLimit`, so no layer here).
+        .route("/convert/v1/handwriting", post(handwriting::convert))
         .route("/handwriting/v1/search", get(hw_search::search))
-        .route(
-            "/api/v1/page",
-            post(handwriting::convert).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
-        )
+        .route("/api/v1/page", post(handwriting::convert))
         // Share a page as a link (3.27+)
         .route(
             "/share/v1/link",
             post(share_link::create).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
         )
         .route("/share/v1/link/{name}", get(share_link::get))
-        // Send by email (SMTP via env)
-        .route(
-            "/share/v1/email",
-            post(share_email::send).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
-        )
+        // Send by email (SMTP via env); limited to `share_email::MAX_BODY`.
+        .route("/share/v1/email", share_email::route())
         // Read on reMarkable / desktop uploads (PDF, EPUB)
         .route(
             "/doc/v1/files",
             post(documents::upload_v1).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
         )
-        .route(
-            "/doc/v2/files",
-            post(documents::upload_v2).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
-        )
-        .route(
-            "/blobstorage",
-            get(sync15::blob_get)
-                .put(sync15::blob_put)
-                .layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
-        )
+        // The raw-body uploads below (`/doc/v2/files`, `/blobstorage` PUT and
+        // `/sync/v3/files/{hash}` PUT) stream to disk through `upload::stage_body`, which
+        // enforces MAX_BLOB_BYTES. They take a `Body` extractor, which ignores
+        // `DefaultBodyLimit`, so they carry no such layer.
+        .route("/doc/v2/files", post(documents::upload_v2))
+        .route("/blobstorage", get(sync15::blob_get).put(sync15::blob_put))
         // V3 Protocol (hash-based CRDT - current production)
         .route("/sync/v3/root", get(api::get_root).put(api::put_root))
         .route("/sync/v3/check-files", post(api::check_files))
         .route("/sync/v3/missing", get(api::missing_blobs))
         .route("/sync/v3/files-list", get(api::files_list))
         .route("/sync/v3/files/{hash}", get(api::get_file))
-        .route(
-            "/sync/v3/files/{hash}",
-            put(api::put_file).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
-        )
+        .route("/sync/v3/files/{hash}", put(api::put_file))
         // V4 Protocol (extended metadata - future)
         // gentree/v1 delta sync (rm-sync, software 3.28+); /sync/v3/{missing,check-files} are reused above.
         .route("/gentree/v1/GetEntries", post(gentree::get_entries))
         .route("/gentree/v1/GetFiles", post(gentree::get_files))
         .route("/gentree/v1/GetFile", post(gentree::get_file))
-        .route(
-            "/gentree/v1/PutFile",
-            post(gentree::put_file).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
-        )
+        // PutFile streams its body and enforces MAX_BLOB_BYTES itself (a `Body` extractor
+        // ignores `DefaultBodyLimit`, so a layer here would be a no-op).
+        .route("/gentree/v1/PutFile", post(gentree::put_file))
         .route("/gentree/v1/DeleteEntry", post(gentree::delete_entry))
         .route("/gentree/v1/EntrySession", post(gentree::entry_session))
         .route("/sync/v4/root", get(protocol::v4_get_root))
@@ -375,10 +362,8 @@ pub fn create_router_with_all(
     let sync_router = Router::new()
         .route("/sync/v3/root", get(api::get_root))
         .route("/sync/v3/files/{hash}", get(api::get_file))
-        .route(
-            "/sync/v3/files/{hash}",
-            put(api::put_file).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
-        )
+        // `api::put_file` enforces MAX_BLOB_BYTES itself (see `create_router`).
+        .route("/sync/v3/files/{hash}", put(api::put_file))
         .route("/devices/v1", post(api::create_pairing_code))
         .route("/devices/v1", get(api::list_devices))
         .route("/devices/v1/{id}", delete(api::delete_device))
@@ -412,10 +397,8 @@ pub fn create_router_with_calendar(state: AppState, calendar_state: CalendarStat
     let sync_router = Router::new()
         .route("/sync/v3/root", get(api::get_root))
         .route("/sync/v3/files/{hash}", get(api::get_file))
-        .route(
-            "/sync/v3/files/{hash}",
-            put(api::put_file).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
-        )
+        // `api::put_file` enforces MAX_BLOB_BYTES itself (see `create_router`).
+        .route("/sync/v3/files/{hash}", put(api::put_file))
         .route("/devices/v1", post(api::create_pairing_code))
         .route("/devices/v1", get(api::list_devices))
         .route("/devices/v1/{id}", delete(api::delete_device))
@@ -449,10 +432,8 @@ pub fn create_router_with_integrations(
     Router::new()
         .route("/sync/v3/root", get(api::get_root))
         .route("/sync/v3/files/{hash}", get(api::get_file))
-        .route(
-            "/sync/v3/files/{hash}",
-            put(api::put_file).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
-        )
+        // `api::put_file` enforces MAX_BLOB_BYTES itself (see `create_router`).
+        .route("/sync/v3/files/{hash}", put(api::put_file))
         .route("/devices/v1", post(api::create_pairing_code))
         .route("/devices/v1", get(api::list_devices))
         .route("/devices/v1/{id}", delete(api::delete_device))
@@ -489,10 +470,8 @@ pub fn create_full_router(
     Router::new()
         .route("/sync/v3/root", get(api::get_root))
         .route("/sync/v3/files/{hash}", get(api::get_file))
-        .route(
-            "/sync/v3/files/{hash}",
-            put(api::put_file).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
-        )
+        // `api::put_file` enforces MAX_BLOB_BYTES itself (see `create_router`).
+        .route("/sync/v3/files/{hash}", put(api::put_file))
         .route("/devices/v1", post(api::create_pairing_code))
         .route("/devices/v1", get(api::list_devices))
         .route("/devices/v1/{id}", delete(api::delete_device))
@@ -560,9 +539,7 @@ impl Default for ServerConfig {
 }
 
 pub fn init_readlater_manager(storage_path: &Path) -> anyhow::Result<ReadLaterManager> {
-    let db_path = storage_path.join("readlater.db");
-    std::fs::create_dir_all(storage_path.join("articles"))?;
-    Ok(ReadLaterManager::new(&db_path, storage_path)?)
+    Ok(ReadLaterManager::new(&storage_path.join("readlater.db"))?)
 }
 
 /// Reject requests without a valid device/user token. Applied to every feature API
@@ -613,6 +590,16 @@ pub fn feature_routes(
         .is_ok()
         .then(|| feeds.clone().start_scheduler(FEED_CHECK_SECS));
 
+    // Read-later articles go into the device's sync tree. Scheduled syncs run only inside a
+    // Tokio runtime (not in unit tests) and unless READLATER_AUTO_SYNC turns them off; a pass
+    // with no accounts does nothing.
+    let readlater = ReadLaterState::new(
+        init_readlater_manager(storage_path)?,
+        state.storage.clone(),
+        state.notification_tx.clone(),
+    )
+    .with_scheduler(readlater_sync::SchedulerConfig::from_env());
+
     // Cloud syncs may only touch directories under <storage>/integrations.
     let cloud = IntegrationState::with_sync_base(storage_path.join("integrations"));
     let mut router = Router::new()
@@ -630,10 +617,7 @@ pub fn feature_routes(
             "/integrations/v2/calendars",
             calendar_router(CalendarState::new(init_calendar_manager(storage_path)?)),
         )
-        .nest(
-            "/integrations/v2/readlater",
-            readlater_router(ReadLaterState::new(init_readlater_manager(storage_path)?)),
-        )
+        .nest("/integrations/v2/readlater", readlater_router(readlater))
         // xochitl 3.29 uses /storage/; older builds use /cloud. Share one state so both see the same accounts.
         .nest(
             "/integrations/v2/cloud",

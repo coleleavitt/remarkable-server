@@ -10,6 +10,10 @@
 //!
 //! Auth: the device/user JWT in the CONNECT password (or username). ACL: a client may
 //! only touch `user/{uid}/...` and `remarkable/screenshare/signaling/user/{uid}/...`.
+//! A connection lives only as long as the registration its token was minted under: once
+//! that device is revoked (deleted, self-unregistered, or re-paired to another user) the
+//! broker closes it, drops its subscriptions and leaves its rooms. In-process clients
+//! ([`Broker::local_client`]) present no token and are not tied to a device.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -36,7 +40,7 @@ use serde_json::{Map, Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-use crate::device::DeviceManager;
+use crate::device::{DeviceManager, SESSION_RECHECK};
 
 const MAX_PACKET: usize = 1024 * 1024;
 /// Rooms without activity for this long are dropped (rmfakecloud `roomTimeout`).
@@ -45,6 +49,39 @@ const ROOM_SWEEP: Duration = Duration::from_secs(15);
 const SIGNALING_PREFIX: &str = "remarkable/screenshare/signaling/user/";
 /// Outbound queue per client; messages to a client that can't keep up are dropped.
 const CLIENT_QUEUE: usize = 256;
+/// How long to wait for a TLS close_notify to go out to a revoked client before dropping it.
+const REVOKED_SHUTDOWN: Duration = Duration::from_secs(5);
+
+/// How a connected session's loop ends when it doesn't fail.
+enum Exit {
+    /// The client disconnected (DISCONNECT or EOF).
+    Left,
+    /// The client's device was revoked: the broker closes the connection.
+    Revoked,
+}
+
+/// Write `out` to a client in full, and flush it, within `limit`. A client that stops reading
+/// (zero TCP window) would otherwise hold its session in `write_all` for good, and with it its
+/// broker registration, room memberships and revocation handling.
+///
+/// The flush is what puts the bytes on the socket: tokio-rustls reports a write done once the
+/// TLS records are in its send buffer, even when the socket is full, and reading never sends
+/// them. Unflushed, a reply (a PINGRESP, or the CONNACK refusing a client just before the
+/// connection drops) waits for the session's next write, which may never come.
+async fn write_within<S: tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+    out: &[u8],
+    limit: Duration,
+) -> anyhow::Result<()> {
+    let write = async {
+        stream.write_all(out).await?;
+        stream.flush().await
+    };
+    match tokio::time::timeout(limit, write).await {
+        Ok(written) => Ok(written?),
+        Err(_) => anyhow::bail!("client stopped reading: write timed out after {limit:?}"),
+    }
+}
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -101,6 +138,9 @@ struct Inner {
     clients: Mutex<HashMap<String, Client>>,
     rooms: Mutex<HashMap<String, Room>>,
     next_session: std::sync::atomic::AtomicU64,
+    /// How often a connection re-checks its device's registration, as a backstop for a
+    /// missed revocation event ([`SESSION_RECHECK`]; shorter in tests).
+    session_recheck: Duration,
 }
 
 fn acl_allows(user_id: &str, topic: &str, write: bool) -> bool {
@@ -112,6 +152,14 @@ fn acl_allows(user_id: &str, topic: &str, write: bool) -> bool {
 impl Broker {
     /// `ice_servers`: list for `room-joined` (xochitl wants each entry's key as singular `url`).
     pub fn new(devices: DeviceManager, ice_servers: Value) -> Self {
+        Self::with_session_recheck(devices, ice_servers, SESSION_RECHECK)
+    }
+
+    fn with_session_recheck(
+        devices: DeviceManager,
+        ice_servers: Value,
+        session_recheck: Duration,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 devices,
@@ -119,6 +167,7 @@ impl Broker {
                 clients: Mutex::default(),
                 rooms: Mutex::default(),
                 next_session: Default::default(),
+                session_recheck,
             }),
         }
     }
@@ -489,20 +538,40 @@ impl Broker {
                 }
             })
             .unwrap_or_default();
-        let Ok(user_id) = self
+        // MQTT keepalive: disconnect after 1.5x the negotiated interval with no traffic. A write
+        // gets as long: a client that can't take a packet in that time can't have got a PINGRESP
+        // either, so by its own keepalive it has already given up on the connection.
+        let idle = Duration::from_secs(u64::from(connect.keep_alive.max(1)) * 3 / 2);
+        // Same acceptance as `validate_token`, keeping the device and epoch as well.
+        let Ok(identity) = self
             .inner
             .devices
-            .validate_token(&format!("Bearer {token}"))
+            .session_identity(&format!("Bearer {token}"))
         else {
             ConnAck::new(ConnectReturnCode::BadUserNamePassword, false).write(&mut out)?;
-            stream.write_all(&out).await?;
+            write_within(&mut stream, &out, idle).await?;
             anyhow::bail!("auth failed for client {}", connect.client_id);
         };
+        // Resolves once that device is revoked (its event, or the periodic re-check, where only
+        // a definite "not registered" counts: a DB hiccup keeps the session). It subscribes to
+        // revocations here, before its first registration check, so none slips in between.
+        let revoked = self
+            .inner
+            .devices
+            .session_revoked_every(&identity, self.inner.session_recheck);
+        tokio::pin!(revoked);
+        let user_id = identity.user_id.clone();
         let client_id = if connect.client_id.is_empty() {
             uuid::Uuid::new_v4().to_string()
         } else {
             connect.client_id.clone()
         };
+        // CONNACK before joining the broker: past the insert, only `remove_client` below may end
+        // the session, so a failed write here can't leave the client registered for good. Packets
+        // the client sends meanwhile wait in `buf` or the socket until the loop below reads them.
+        ConnAck::new(ConnectReturnCode::Success, false).write(&mut out)?;
+        write_within(&mut stream, &out, idle).await?;
+        out.clear();
         let (tx, mut rx) = mpsc::channel::<Publish>(CLIENT_QUEUE);
         // A reconnect with the same client id replaces the old session.
         let session = self.new_session();
@@ -515,23 +584,18 @@ impl Broker {
                 tx,
             },
         );
-        ConnAck::new(ConnectReturnCode::Success, false).write(&mut out)?;
-        stream.write_all(&out).await?;
-        tracing::info!(client = %client_id, user = %user_id, "mqtt client connected");
+        tracing::info!(client = %client_id, user = %user_id, device = %identity.device_id, "mqtt client connected");
 
-        // MQTT keepalive: disconnect after 1.5x the negotiated interval with no traffic.
-        let idle = Duration::from_secs(u64::from(connect.keep_alive.max(1)) * 3 / 2);
         let mut next_pkid: u16 = 0;
-        let result: anyhow::Result<()> = async {
+        let exit: anyhow::Result<Exit> = async {
             loop {
-                // Drain any complete packets already buffered.
+                // Answer every complete packet already buffered (the answers go out below).
                 loop {
                     let packet = match v4::read(&mut buf, MAX_PACKET) {
                         Ok(p) => p,
                         Err(rumqttc::mqttbytes::Error::InsufficientBytes(_)) => break,
                         Err(e) => anyhow::bail!("bad packet: {e:?}"),
                     };
-                    out.clear();
                     match packet {
                         Packet::Publish(p) => {
                             if !acl_allows(&user_id, &p.topic, true) {
@@ -567,17 +631,30 @@ impl Broker {
                             self.touch_user_room(&user_id);
                             PingResp.write(&mut out)?;
                         }
-                        Packet::Disconnect => return Ok(()),
+                        Packet::Disconnect => return Ok(Exit::Left),
                         Packet::PubAck(_) => {}
                         other => tracing::debug!(client = %client_id, "ignoring mqtt packet {other:?}"),
                     }
-                    if !out.is_empty() { stream.write_all(&out).await?; }
+                }
+                // Send those answers, or the delivery queued below. Bounded, and raced against
+                // revocation, so a client that has stopped reading holds off neither.
+                if !out.is_empty() {
+                    tokio::select! {
+                        biased;
+                        () = &mut revoked => return Ok(Exit::Revoked),
+                        written = write_within(&mut stream, &out, idle) => written?,
+                    }
+                    out.clear();
                 }
 
+                // Biased so a revocation already known wins over queued deliveries and further
+                // reads: a revoked device gets nothing more once its session could know.
                 tokio::select! {
+                    biased;
+                    () = &mut revoked => return Ok(Exit::Revoked),
                     read = tokio::time::timeout(idle, stream.read_buf(&mut buf)) => {
                         match read {
-                            Ok(Ok(0)) => return Ok(()),
+                            Ok(Ok(0)) => return Ok(Exit::Left),
                             Ok(Ok(_)) => {}
                             Ok(Err(e)) => return Err(e.into()),
                             Err(_) => anyhow::bail!("keepalive timeout"),
@@ -588,15 +665,25 @@ impl Broker {
                             next_pkid = next_pkid.checked_add(1).unwrap_or(1);
                             p.pkid = next_pkid;
                         }
-                        out.clear();
                         p.write(&mut out)?;
-                        stream.write_all(&out).await?;
                     }
                 }
             }
         }.await;
 
+        // Leave the broker and its rooms on every exit, and before the close below: a revoked
+        // client is out at once, however long its close_notify takes.
         self.remove_client(&client_id, session);
+        let result = match exit {
+            Ok(Exit::Revoked) => {
+                tracing::info!(client = %client_id, device = %identity.device_id, "device revoked, closing screenshare mqtt session");
+                // MQTT 3.1.1 has no server DISCONNECT: closing the connection ends the session.
+                let _ = tokio::time::timeout(REVOKED_SHUTDOWN, stream.shutdown()).await;
+                Ok(())
+            }
+            Ok(Exit::Left) => Ok(()),
+            Err(e) => Err(e),
+        };
         tracing::info!(client = %client_id, "mqtt client disconnected");
         result
     }
@@ -642,6 +729,11 @@ impl Drop for LocalClient {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll, ready};
+
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
     use super::*;
 
     fn broker() -> (Broker, tempfile::TempDir) {
@@ -705,6 +797,532 @@ mod tests {
         );
         drop(new);
         assert!(broker.active_room("u").is_none());
+    }
+
+    fn broker_with_recheck(recheck: Duration) -> (Broker, DeviceManager, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let devices =
+            DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        let broker = Broker::with_session_recheck(devices.clone(), json!([]), recheck);
+        (broker, devices, tmp)
+    }
+
+    /// Pair `device` to `user` the way the tablet does: (device token, user token).
+    fn pair(dm: &DeviceManager, user: &str, device: &str) -> (String, String) {
+        let code = dm.create_pairing_code(user).unwrap();
+        dm.exchange_code(&code, device, "remarkable").unwrap()
+    }
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    /// A remote broker client, as xochitl drives it, over an in-memory stream in place of
+    /// the TLS connection (the session code is the same).
+    struct Remote {
+        io: tokio::io::DuplexStream,
+        buf: BytesMut,
+        session: tokio::task::JoinHandle<anyhow::Result<()>>,
+    }
+
+    impl Remote {
+        /// CONNECT with `token` as the password; `None` if the broker refuses it.
+        async fn connect(broker: &Broker, client_id: &str, token: &str) -> Option<Remote> {
+            Self::connect_with(broker, client_id, token, 64 * 1024).await
+        }
+
+        /// [`connect`](Self::connect) over a pipe that holds at most `capacity` unread bytes
+        /// each way.
+        async fn connect_with(
+            broker: &Broker,
+            client_id: &str,
+            token: &str,
+            capacity: usize,
+        ) -> Option<Remote> {
+            let (io, server) = tokio::io::duplex(capacity);
+            Self::connect_over(broker, client_id, token, io, server).await
+        }
+
+        /// [`connect_with`](Self::connect_with), with the broker writing through a
+        /// [`SendBuffered`] layer as it does through TLS: whatever doesn't fit in the pipe is
+        /// left in that layer's buffer.
+        async fn connect_buffered(
+            broker: &Broker,
+            client_id: &str,
+            token: &str,
+            capacity: usize,
+        ) -> Option<Remote> {
+            let (io, server) = tokio::io::duplex(capacity);
+            let server = SendBuffered {
+                io: server,
+                pending: Vec::new(),
+            };
+            Self::connect_over(broker, client_id, token, io, server).await
+        }
+
+        async fn connect_over<S>(
+            broker: &Broker,
+            client_id: &str,
+            token: &str,
+            io: tokio::io::DuplexStream,
+            server: S,
+        ) -> Option<Remote>
+        where
+            S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        {
+            let broker = broker.clone();
+            let session = tokio::spawn(async move { broker.session(server).await });
+            let mut remote = Remote {
+                io,
+                buf: BytesMut::new(),
+                session,
+            };
+            let mut connect = v4::Connect::new(client_id);
+            connect.keep_alive = 600;
+            connect.set_login("tablet", token);
+            assert!(remote.send(|o| connect.write(o).map(drop)).await);
+            match remote.next().await {
+                Some(Packet::ConnAck(a)) if a.code == ConnectReturnCode::Success => Some(remote),
+                Some(Packet::ConnAck(_)) => None,
+                other => panic!("expected CONNACK, got {other:?}"),
+            }
+        }
+
+        /// Write one packet; false once the broker has gone.
+        async fn send(
+            &mut self,
+            write: impl FnOnce(&mut BytesMut) -> Result<(), rumqttc::mqttbytes::Error>,
+        ) -> bool {
+            let mut out = BytesMut::new();
+            write(&mut out).unwrap();
+            self.io.write_all(&out).await.is_ok()
+        }
+
+        /// Next packet from the broker; `None` once it has closed the connection.
+        async fn next(&mut self) -> Option<Packet> {
+            tokio::time::timeout(WAIT, async {
+                loop {
+                    match v4::read(&mut self.buf, MAX_PACKET) {
+                        Ok(p) => return Some(p),
+                        Err(rumqttc::mqttbytes::Error::InsufficientBytes(_)) => {}
+                        Err(e) => panic!("bad packet from broker: {e:?}"),
+                    }
+                    if !matches!(self.io.read_buf(&mut self.buf).await, Ok(n) if n > 0) {
+                        return None;
+                    }
+                }
+            })
+            .await
+            .expect("broker neither answered nor closed the connection")
+        }
+
+        async fn subscribe(&mut self, filter: &str) {
+            let mut sub = v4::Subscribe::new(filter, QoS::AtMostOnce);
+            sub.pkid = 1;
+            assert!(self.send(|o| sub.write(o).map(drop)).await);
+            assert!(matches!(self.next().await, Some(Packet::SubAck(_))));
+        }
+
+        async fn publish(&mut self, topic: &str, payload: &[u8]) {
+            let p = Publish::new(topic, QoS::AtMostOnce, payload.to_vec());
+            assert!(self.send(|o| p.write(o).map(drop)).await);
+        }
+
+        /// Whether the session is still up: a PINGREQ is answered.
+        async fn alive(&mut self) -> bool {
+            if !self.send(|o| v4::PingReq.write(o).map(drop)).await {
+                return false;
+            }
+            loop {
+                match self.next().await {
+                    Some(Packet::PingResp) => return true,
+                    Some(_) => {} // a message for a subscription
+                    None => return false,
+                }
+            }
+        }
+
+        /// The broker closes the connection, and the session (including leaving the broker and
+        /// its rooms) ends without error.
+        async fn closed(mut self) {
+            while self.next().await.is_some() {}
+            tokio::time::timeout(WAIT, self.session)
+                .await
+                .expect("session did not end after closing")
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    /// The broker's side of a connection, written the way tokio-rustls writes (0.26,
+    /// `common::Stream::poll_write`/`poll_flush`): a write succeeds once the bytes are in the
+    /// TLS send buffer, even when the socket behind it is full, and what's left goes out only
+    /// on a flush, a shutdown or the next write. Reading never sends it.
+    struct SendBuffered {
+        io: tokio::io::DuplexStream,
+        pending: Vec<u8>,
+    }
+
+    /// rustls's default send buffer limit.
+    const SEND_BUFFER: usize = 64 * 1024;
+
+    impl SendBuffered {
+        /// Move buffered bytes to the pipe until none are left; pending while the pipe is full.
+        fn push(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            while !self.pending.is_empty() {
+                let n = ready!(Pin::new(&mut self.io).poll_write(cx, &self.pending))?;
+                if n == 0 {
+                    return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
+                }
+                self.pending.drain(..n);
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncRead for SendBuffered {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for SendBuffered {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            if buf.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+            loop {
+                let taken = buf.len().min(SEND_BUFFER - this.pending.len());
+                this.pending.extend_from_slice(&buf[..taken]);
+                match this.push(cx) {
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    // Taken is written, whether or not the pipe had room for it.
+                    _ if taken > 0 => return Poll::Ready(Ok(taken)),
+                    Poll::Pending => return Poll::Pending,
+                    // The buffer was full and has just gone out: take the bytes now.
+                    Poll::Ready(Ok(())) => {}
+                }
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            ready!(this.push(cx))?;
+            Pin::new(&mut this.io).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            ready!(this.push(cx))?;
+            Pin::new(&mut this.io).poll_shutdown(cx)
+        }
+    }
+
+    // Paused clock: a reply left in the send buffer never arrives, and `Remote::next` then gives
+    // up at its virtual deadline instead of after real seconds.
+    #[tokio::test(start_paused = true)]
+    async fn replies_are_flushed_through_the_tls_send_buffer() {
+        let (broker, dm, _tmp) = broker_with_recheck(Duration::from_secs(3600));
+        let uid = "local-user";
+        let (dt, _) = pair(&dm, uid, "RM110-1");
+        // A refusal's CONNACK arrives in full before the broker drops the connection, so the
+        // client reads "bad credentials", not a reset.
+        assert!(
+            Remote::connect_buffered(&broker, "tablet", "not-a-token", 1)
+                .await
+                .is_none()
+        );
+        // Each reply below arrives while the session is back waiting on the client: CONNACK,
+        // SUBACK, PINGRESP, and a delivery.
+        // A one-byte pipe: nearly every byte the broker writes waits in the send buffer.
+        let mut tablet = Remote::connect_buffered(&broker, "tablet", &dt, 1)
+            .await
+            .expect("tablet connects");
+        let topic = format!("user/{uid}/signaling");
+        tablet.subscribe(&topic).await;
+        assert!(tablet.alive().await);
+        broker.publish(&topic, b"hello".to_vec(), QoS::AtMostOnce);
+        assert!(
+            matches!(tablet.next().await, Some(Packet::Publish(p)) if p.topic == topic && p.payload[..] == b"hello"[..])
+        );
+        assert!(tablet.send(|o| v4::Disconnect.write(o).map(drop)).await);
+        tablet.closed().await;
+        assert!(broker.inner.clients.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn revoked_devices_session_is_closed_and_others_stay() {
+        use remarkable_mqtt::screenshare::{signaling_topic, subscriptions};
+        // No periodic re-check within the test: the revocation event alone must close it.
+        let (broker, dm, _tmp) = broker_with_recheck(Duration::from_secs(3600));
+        let uid = "local-user";
+        let (_, ut_a) = pair(&dm, uid, "RM110-1");
+        let (dt_b, _) = pair(&dm, uid, "RM110-2");
+        let admin = dm.create_user_token(uid).unwrap();
+
+        // Tablet A shares its screen (user token, as xochitl logs in)...
+        let mut a = Remote::connect(&broker, "tablet-a", &ut_a)
+            .await
+            .expect("tablet a connects");
+        a.subscribe(&format!("user/{uid}/signaling")).await;
+        a.publish(
+            &signaling_topic(uid, "tablet-a"),
+            br#"{"type":"create-room"}"#,
+        )
+        .await;
+        assert!(
+            matches!(a.next().await, Some(Packet::Publish(p)) if p.topic == format!("user/{uid}/signaling"))
+        );
+        let room = broker.active_room(uid).expect("room created");
+        // ...the in-process browser viewer (no token) watches it...
+        let mut viewer = broker.local_client(uid, "viewer", &subscriptions(uid, "viewer"));
+        viewer
+            .publish(
+                &signaling_topic("local-user", "viewer"),
+                br#"{"type":"join-active-room"}"#.to_vec(),
+            )
+            .unwrap();
+        let joined = tokio::time::timeout(WAIT, viewer.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&joined.payload).contains("room-joined"));
+        // ...and another tablet (device token) and an admin-token client are connected too.
+        let mut b = Remote::connect(&broker, "tablet-b", &dt_b).await.unwrap();
+        let mut adm = Remote::connect(&broker, "admin", &admin).await.unwrap();
+        // Tablet B's routine token churn (user-token refresh, 3.28 OAuth refresh and bundle, a
+        // same-account re-pair) is not a revocation: its session stays up through all of it.
+        dm.refresh_user_token(&dt_b).unwrap();
+        dm.refresh_oauth(&dt_b).unwrap();
+        dm.oauth_bundle(uid, "RM110-2", "remarkable").unwrap();
+        pair(&dm, uid, "RM110-2");
+        tokio::task::yield_now().await;
+        assert!(b.alive().await, "token churn closed the tablet's session");
+
+        assert!(dm.delete_device("RM110-1", None).unwrap());
+        a.closed().await;
+        assert!(!broker.inner.clients.lock().contains_key("tablet-a"));
+        assert_eq!(
+            broker.inner.rooms.lock()[&room].participants,
+            ["viewer"],
+            "the revoked tablet left its room; the viewer is still in it"
+        );
+        assert!(b.alive().await, "another device's session stays");
+        assert!(adm.alive().await, "admin sessions are not tied to a device");
+        // The viewer is unaffected: still in the broker and still receiving its signaling.
+        b.publish(
+            &signaling_topic(uid, "tablet-b"),
+            format!(
+                r#"{{"type":"direct","clientId":"viewer","roomId":"{room}","payload":{{"x":1}}}}"#
+            )
+            .as_bytes(),
+        )
+        .await;
+        let direct = tokio::time::timeout(WAIT, viewer.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            direct.topic,
+            format!("user/{uid}/client/viewer/signaling/{room}")
+        );
+        // The revoked token no longer connects.
+        assert!(Remote::connect(&broker, "tablet-a", &ut_a).await.is_none());
+
+        // Re-pairing tablet B to another account revokes it for this one.
+        pair(&dm, "other-user", "RM110-2");
+        b.closed().await;
+        assert!(adm.alive().await);
+        assert!(broker.inner.clients.lock().contains_key("viewer"));
+        assert_eq!(broker.active_room(uid).as_deref(), Some(room.as_str()));
+    }
+
+    // Paused clock: each sleep below runs every 20 ms re-check tick inside it, however loaded the
+    // machine (the clock only moves once all tasks are idle).
+    #[tokio::test(start_paused = true)]
+    async fn db_error_keeps_session_open_and_recheck_catches_silent_revocation() {
+        let (broker, dm, tmp) = broker_with_recheck(Duration::from_millis(20));
+        let (dt, _) = pair(&dm, "local-user", "RM110-1");
+        let mut tablet = Remote::connect(&broker, "tablet", &dt).await.unwrap();
+        let side = rusqlite::Connection::open(tmp.path().join("devices.db")).unwrap();
+
+        // The ~10 re-checks in this window fail with "no such table": none may drop the tablet.
+        side.execute_batch("ALTER TABLE devices RENAME TO devices_gone")
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(tablet.alive().await, "a DB error closed the session");
+        // Re-checks that succeed again keep it too.
+        side.execute_batch("ALTER TABLE devices_gone RENAME TO devices")
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(tablet.alive().await);
+
+        // A registration that vanishes without an event is caught by the periodic re-check.
+        side.execute("DELETE FROM devices WHERE device_id = 'RM110-1'", [])
+            .unwrap();
+        tablet.closed().await;
+        assert!(broker.inner.clients.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn known_revocation_wins_over_queued_deliveries() {
+        let (broker, dm, _tmp) = broker_with_recheck(Duration::from_secs(3600));
+        let (dt, _) = pair(&dm, "local-user", "RM110-1");
+        let mut tablet = Remote::connect(&broker, "tablet", &dt).await.unwrap();
+        tablet.subscribe("user/local-user/signaling").await;
+        // Single-threaded runtime: the session only runs again once this test awaits, and by then
+        // the revocation and a backlog of messages for the device are both waiting.
+        assert!(dm.delete_device("RM110-1", None).unwrap());
+        for i in 0..16 {
+            broker.publish(
+                "user/local-user/signaling",
+                format!("{i}").into_bytes(),
+                QoS::AtMostOnce,
+            );
+        }
+        if let Some(p) = tablet.next().await {
+            panic!("a revoked device was sent {p:?}");
+        }
+        tablet.closed().await;
+        assert!(broker.inner.clients.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_connack_leaves_no_client_behind() {
+        let (broker, dm, _tmp) = broker_with_recheck(Duration::from_secs(3600));
+        let (dt, _) = pair(&dm, "local-user", "RM110-1");
+        let mut a = Remote::connect(&broker, "tablet", &dt).await.unwrap();
+        // A reconnect under the same client id that resets before its CONNACK goes out.
+        let (mut io, server) = tokio::io::duplex(64 * 1024);
+        let mut connect = v4::Connect::new("tablet");
+        connect.set_login("tablet", &dt);
+        let mut out = BytesMut::new();
+        connect.write(&mut out).unwrap();
+        io.write_all(&out).await.unwrap();
+        drop(io);
+        assert!(broker.session(server).await.is_err());
+        // The failed session never joined, so the live one still holds the id and, on leaving,
+        // takes it out of the broker.
+        assert!(a.alive().await);
+        assert!(a.send(|o| v4::Disconnect.write(o).map(drop)).await);
+        a.closed().await;
+        assert!(broker.inner.clients.lock().is_empty());
+    }
+
+    /// `Remote::connect`'s keepalive (600 s) times 1.5: how long the broker waits on a client.
+    const REMOTE_IDLE: Duration = Duration::from_secs(900);
+
+    /// Connect a tablet over a 1 KiB pipe and [`stall`] it.
+    async fn stalled_tablet(broker: &Broker, dm: &DeviceManager, uid: &str) -> Remote {
+        let (dt, _) = pair(dm, uid, "RM110-1");
+        let tablet = Remote::connect_with(broker, "tablet", &dt, 1024)
+            .await
+            .unwrap();
+        stall(broker, uid, tablet).await
+    }
+
+    /// Leave `tablet` (connected over a 1 KiB pipe) subscribed to its signaling topic, in a
+    /// room, then stop reading and queue a delivery bigger than the pipe: the session is stuck
+    /// writing it.
+    async fn stall(broker: &Broker, uid: &str, mut tablet: Remote) -> Remote {
+        use remarkable_mqtt::screenshare::signaling_topic;
+        let topic = format!("user/{uid}/signaling");
+        tablet.subscribe(&topic).await;
+        tablet
+            .publish(
+                &signaling_topic(uid, "tablet"),
+                br#"{"type":"create-room"}"#,
+            )
+            .await;
+        assert!(matches!(tablet.next().await, Some(Packet::Publish(p)) if p.topic == topic));
+        assert!(broker.active_room(uid).is_some());
+        broker.publish(&topic, vec![b'x'; 4096], QoS::AtMostOnce);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(!tablet.session.is_finished());
+        tablet
+    }
+
+    // Paused clock: time only moves once every task is idle, so the session is stuck in its write
+    // for the whole of each sleep, and its timeout fires at exactly the virtual deadline.
+    #[tokio::test(start_paused = true)]
+    async fn client_that_stops_reading_leaves_the_broker() {
+        let (broker, dm, _tmp) = broker_with_recheck(Duration::from_secs(3600));
+        let uid = "local-user";
+        let start = tokio::time::Instant::now();
+        let mut tablet = stalled_tablet(&broker, &dm, uid).await;
+        tokio::time::sleep(REMOTE_IDLE - Duration::from_secs(61)).await;
+        assert!(
+            !tablet.session.is_finished(),
+            "gave up before the keepalive"
+        );
+        assert!(broker.inner.clients.lock().contains_key("tablet"));
+
+        let err = tokio::time::timeout(REMOTE_IDLE, &mut tablet.session)
+            .await
+            .expect("a session stuck writing to a client that never reads is kept for good")
+            .unwrap()
+            .unwrap_err();
+        assert!(err.to_string().contains("stopped reading"), "{err}");
+        assert!(start.elapsed() >= REMOTE_IDLE);
+        // It left the broker and its room, which closed as it was the only participant.
+        assert!(broker.inner.clients.lock().is_empty());
+        assert!(broker.inner.rooms.lock().is_empty());
+    }
+
+    // Paused clock, as above.
+    #[tokio::test(start_paused = true)]
+    async fn client_that_pings_but_never_reads_leaves_the_broker_behind_a_tls_buffer() {
+        let (broker, dm, _tmp) = broker_with_recheck(Duration::from_secs(3600));
+        let uid = "local-user";
+        let (dt, _) = pair(&dm, uid, "RM110-1");
+        let tablet = Remote::connect_buffered(&broker, "tablet", &dt, 1024)
+            .await
+            .unwrap();
+        // The delivery "succeeds" into the send buffer at once; the pipe holds only 1 KiB of it.
+        let written = tokio::time::Instant::now();
+        let mut tablet = stall(&broker, uid, tablet).await;
+        // The client keeps its side of the keepalive going but never reads, so the read timeout
+        // never fires, and PINGRESPs would take 64 KiB of pings to fill the send buffer. Only the
+        // bound on the (flushed) write ends the session.
+        while !tablet.session.is_finished() && written.elapsed() < REMOTE_IDLE * 2 {
+            // Fails once the session has gone; the loop then ends.
+            tablet.send(|o| v4::PingReq.write(o).map(drop)).await;
+            tokio::time::sleep(Duration::from_secs(300)).await;
+        }
+        let err = tokio::time::timeout(WAIT, &mut tablet.session)
+            .await
+            .expect("a client that pings but never reads kept its session")
+            .unwrap()
+            .unwrap_err();
+        assert!(err.to_string().contains("stopped reading"), "{err}");
+        assert!(written.elapsed() >= REMOTE_IDLE);
+        assert!(broker.inner.clients.lock().is_empty());
+        assert!(broker.inner.rooms.lock().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn revocation_reaches_a_session_stuck_writing() {
+        let (broker, dm, _tmp) = broker_with_recheck(Duration::from_secs(3600));
+        let mut tablet = stalled_tablet(&broker, &dm, "local-user").await;
+
+        let revoked_at = tokio::time::Instant::now();
+        assert!(dm.delete_device("RM110-1", None).unwrap());
+        // Closed as revoked (`Ok`), at once: not by the write timeout (an error, 900 s later).
+        tokio::time::timeout(WAIT, &mut tablet.session)
+            .await
+            .expect("revocation waited for a write the client never takes")
+            .unwrap()
+            .unwrap();
+        assert_eq!(revoked_at.elapsed(), Duration::ZERO);
+        assert!(broker.inner.clients.lock().is_empty());
+        assert!(broker.inner.rooms.lock().is_empty());
     }
 
     #[test]

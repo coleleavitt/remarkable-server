@@ -64,8 +64,9 @@ xochitl ──/etc/hosts──▶ 127.0.0.1:443 / 127.0.0.2:443  (rm-proxy on ta
   takes it **or** a paired device's device token. Unset = all of these are disabled (401).
 - Deleting a device (`DELETE /devices/v1/{id}` by its owner, or the tablet's own
   `/token/json/{2,3}/device/delete`) revokes every device and user token it minted, even across a
-  later re-pair, and closes its open `/notifications/ws` and `/mqtt` sessions. Open sessions on the
-  screenshare broker (:8883) are **not** closed by a revocation.
+  later re-pair, and closes its open `/notifications/ws`, `/mqtt` and screenshare broker (:8883)
+  sessions; REST screenshare rooms it owns close too. Re-pairing it to another user does the same
+  for the previous owner.
 - Upstream TLS from the tablet relay is verified against webpki roots, so a
   MITM on the WiFi can't impersonate the Linode.
 

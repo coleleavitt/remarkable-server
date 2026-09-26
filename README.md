@@ -43,7 +43,7 @@ Everything lives under `--storage`:
 - `root.json` — human-readable mirror of the root, rewritten after every commit (also lets an older binary take over after a rollback).
 - `devices.db`, `jwt_secret` — pairing state.
 - `.uploads/` — staging for streamed uploads. Request bodies are written here as they arrive (checksummed on the way, never held whole in memory) and moved into the store once verified; failed uploads are removed, and leftovers older than 24 h are swept.
-- `readlater.db` (+ `articles/`), `calendars.db`, `feeds.db`, `versions/`, `integrations/` — feature state; see below.
+- `readlater.db`, `calendars.db`, `feeds.db`, `versions/`, `integrations/` — feature state; see below.
 
 Upgrading from the file-only layout is automatic: the first start imports `root.json` and `meta/*.meta`; every start reconciles the blob table with the files on disk and indexes the current tree. Old `meta/` files are left in place but no longer written. Back up `sync.db` with `sqlite3 sync.db ".backup '…'"` (or with the server stopped), not a live `cp`.
 
@@ -127,7 +127,7 @@ V4 root response includes capability flags:
 | `/token/json/3/device/delete` | POST | Unregister the calling device (self-revoke) |
 | `/discovery/v1/endpoints` | GET | Service discovery |
 
-Deleting a device (either route above) revokes every device token and every user token it has minted, even if it is paired again later, and closes its open `/notifications/ws` and `/mqtt` sessions (immediately, plus a 60 s re-check). Re-pairing a device to a different user revokes the previous owner's tokens the same way. Admin-minted user tokens (`/admin/create-user`) have no device and are not affected. The screenshare MQTT broker (`SCREENSHARE_BIND`) is not tied to this: its open sessions survive a revocation.
+Deleting a device (either route above) revokes every device token and every user token it has minted, even if it is paired again later, and closes its open `/notifications/ws` and `/mqtt` sessions (immediately, plus a 60 s re-check). Re-pairing a device to a different user revokes the previous owner's tokens the same way. Admin-minted user tokens (`/admin/create-user`) have no device and are not affected. Sessions on the screenshare MQTT broker (`SCREENSHARE_BIND`) are closed the same way (the device also leaves its rooms); the in-process browser viewer is not tied to a device.
 
 ## Search API
 
@@ -206,9 +206,18 @@ Prefix `/integrations/v2/readlater`.
 | `/accounts/{id}` | GET, PUT, DELETE | Get / update / remove a service |
 | `/oauth/start`, `/oauth/complete` | POST | Provider OAuth |
 | `/articles`, `/articles/{id}` | GET, PUT, DELETE | Articles |
-| `/accounts/{id}/sync`, `/sync` | POST | Placeholders: they answer `queued` / zero counts and do not run a sync yet |
+| `/accounts/{id}/sync` | POST | Sync one account now; answers its result (counts and per-step `errors`), 404 if unknown, 409 while it is already syncing |
+| `/sync` | POST | Sync every enabled account in turn; answers `total_fetched`, `total_synced`, `total_errors`, per-account `results` and `already_running` |
 
-Supported services: Pocket, Instapaper, Wallabag (Omnivore was removed after the service shut down in November 2024; adding one is 400). Credentials (tokens, Wallabag password) are stored in `readlater.db` separately from the account config, survive restarts (refreshed tokens are saved right away), and are never returned by the API.
+Supported services: Pocket, Instapaper, Wallabag (Omnivore was removed after the service shut down in November 2024; adding one is 400). Credentials (tokens, Wallabag password) are stored in `readlater.db` separately from the account config, survive restarts (refreshed tokens are saved right away), and are never returned by the API. `readlater.db` is readable by the server's user only (mode 0600, also applied at startup to a database created before).
+
+A sync fetches the articles changed since the account's last successful sync, applies its `sync_settings` filters and `max_articles` (newest first, per sync), and puts each article not yet on the tablet into the sync tree as an EPUB (or PDF) document: at the top level, or in the folder named (or identified) by `folder_id`, created if missing. Documents are added in batches of up to 20 per root commit, so a first import moves the root generation a few times rather than once per article (a tablet syncing meanwhile retries its root update less). A root index the server doesn't fully understand is never rewritten; such a root is found before any article is fetched, and those syncs fail instead. Each article is recorded with its document's id just before the commit and marked delivered just after it, so if the server stops in between, the next sync finds the document on the tablet and doesn't add it again. Devices get a SyncComplete when the tree changed. Articles already delivered are never added again, and `last_sync` only moves forward once the fetch and every delivery succeeded, so failures are retried on the next sync; an article the provider or converter keeps rejecting stops holding it back after 3 syncs in a row (it is still retried while the provider lists it). `convert_format: "html"` records articles without delivering them (the tablet opens only PDF and EPUB). Articles are unique per account and provider id, so two accounts of one provider (say two Wallabag instances) that list the same id each get their own. An article recorded for no account (by older versions) or by a deleted account is taken over, with its on-the-tablet state, only by an account that lists the same id for the same page (URL); a row for a different page with that id is left alone, and the listing account gets its own row. Databases from before are re-keyed once, in one transaction, on the first start.
+
+With `sync_read_status`, a status set here (`PUT /articles/{id}`) is sent to the provider by the next sync of the account that recorded the article, once, before the fetch; until it is sent it is kept over the provider's status, and one the provider refuses 3 syncs in a row is dropped.
+
+PDF needs WeasyPrint 67 or later (the first with `--allowed-protocols`; distribution packages are often older, e.g. Ubuntu 24.04's 61.x, so install it with `pipx install weasyprint`) or `wkhtmltopdf`, on the server's `PATH`. Since the HTML comes from arbitrary web pages, WeasyPrint may only fetch `http`/`https`/`data:` URLs (no `file:`, so nothing from the server's disk ends up in a PDF), wkhtmltopdf runs without JavaScript or local file access, and either is killed after 2 minutes. A converter that exits successfully without writing a PDF counts as failing, and the next is tried. When no converter prints an article, the ones that ran are tried on a test page: if one prints it, the article is at fault (and handled like any rejected article); if none does (none installed, too old, broken), the sync fails as a whole and keeps `last_sync`, so the articles are delivered once a converter works.
+
+The scheduler syncs each enabled account with `auto_sync` every `sync_interval_minutes` (at least 5), oldest account first, one at a time, never two syncs of one account at once. An account whose syncs keep failing as a whole (credentials, fetch, the tree refusing documents, no working PDF converter, the provider unreachable) is retried at doubling intervals, up to a day; a single article or status change failing doesn't delay it. Provider requests time out (10 s to connect, 30 s per request), so a hung provider can't stall the scheduler. Each account is checked again right before its sync and before each delivery: disabling it (or turning off its `auto_sync`) stops a scheduled sync in progress. The scheduler logs every account's schedule when it starts, first looks one tick after startup, and does nothing while there are no accounts. A sync request waits for the sync, which runs to completion even if the client disconnects.
 
 ## Versions API
 
@@ -317,6 +326,7 @@ No other route checks the admin token; `/debug/files`, for instance, takes an or
 | `HWR_COMMAND` | Replace `tesseract` with another recogniser (e.g. `contrib/hwr/trocr_hwr.py`) |
 | `CRASH_DIR` (`./crash-dumps`, relative to the working directory), `CRASH_MAX_TOTAL_BYTES` (512 MiB), `CRASH_MAX_REPORTS` (200) | Crash-report sink storage and quota (see below) |
 | `PUBLIC_URL` (e.g. `https://remarkable.unwrap.rs`) | Public base URL for links a person opens: the OAuth `verification_uri`/`verification_uri_complete` (default `https://<--host>`) and firmware archive downloads |
+| `READLATER_AUTO_SYNC` (on), `READLATER_SYNC_TICK_SECS` (60) | Scheduled read-later syncs (`0`/`false`/`off` turns them off; `POST .../sync` still works) and how often due accounts are looked for |
 
 Handwriting conversion (`POST /convert/v1/handwriting`) and handwriting search (`/handwriting/v1/search`) run the
 local `tesseract` binary, which must be installed (`apt install tesseract-ocr`); without it both fail. Fine for neat
@@ -328,8 +338,10 @@ parts are kept per report, and after each report the oldest reports are deleted 
 `CRASH_MAX_TOTAL_BYTES` and `CRASH_MAX_REPORTS`. New reports are never rejected, so the tablet stops retrying.
 
 Uploads (sync v3 / sync15 / v2 / v4 blob PUTs, document uploads, share links, gentree `PutFile`) are streamed to
-`<storage>/.uploads/` rather than buffered, up to 1 GiB per blob. gentree `PutFile` still buffers its JSON body
-(the blob is base64 inside it), and handwriting convert and share-by-email still buffer the request.
+`<storage>/.uploads/` rather than buffered, up to 1 GiB per blob. gentree `PutFile` reads its JSON body
+incrementally and decodes the base64 blob inside it straight to disk. Handwriting convert (stroke JSON, read only
+after auth) is capped at 64 MiB and share-by-email at 25 MiB (attachments included; over it is a 413): both are still
+read into memory.
 
 Authenticated feature APIs (Bearer token): `/search/v1/*`, `/versions/v1/*`, `/feeds/v1/*` (RSS/Atom to EPUB), `/integrations/v2/{calendars,readlater,cloud}/*`, `/email/v1/*` (when inbound email is on).
 
@@ -361,7 +373,10 @@ verified against a real 3.28 device. They are additive and do not affect 3.3.2 s
 `POST .../messages/broadcast`, `POST .../messages/direct`. Signalling is relayed to the
 user's other clients as `ScreenshareMessage` / `ScreenshareRoomCreated` events on the
 notifications channel (data = base64 inner JSON). ICE servers come from
-`SCREENSHARE_ICE_SERVERS`. Rooms expire 60 s after the last keepalive.
+`SCREENSHARE_ICE_SERVERS`. Rooms expire 60 s after the last keepalive. When a device is
+revoked, rooms it created or joined under that registration are cleaned up (immediately, plus a
+60 s re-check): rooms it owns close and it is dropped from rooms it joined. Rooms it makes after
+being paired again to the same account are not affected.
 
 ### gentree/v1 delta sync (rm-sync)
 `POST /gentree/v1/{GetEntries,GetFiles,GetFile,PutFile,DeleteEntry,EntrySession}`
