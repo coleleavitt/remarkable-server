@@ -245,7 +245,7 @@ Enter the code on the tablet under Settings → General → Account → Connect.
 
 Without shell access, the owner can get a code from `POST /devices/v1` with `x-admin-token`
 (see Admin endpoints). The code pairs `local-user` (like `--pair`) unless `?user=<id>` names another
-account (1-254 printable ASCII chars without spaces, `/` or `\\`, e.g. an email; send `+` as `%2B`; anything else is 400). Device and user tokens cannot mint pairing codes: a second paired device
+account (1-254 printable ASCII chars without spaces, `/` or `\`, e.g. an email; send `+` as `%2B`; anything else is 400). Device and user tokens cannot mint pairing codes: a second paired device
 could otherwise approve the first one's passcode reset.
 
 ### Admin endpoints
