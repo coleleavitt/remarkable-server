@@ -23,9 +23,9 @@ const USER_SCOPES: &str = "intgr docedit screenshare sync:fox hwc:-1 mail:-1";
 /// `device-id` of user tokens minted by `create_user_token` (admin/test); they are not tied to
 /// a registration, so they skip the device check. Reserved: no device may register under it.
 const ADMIN_DEVICE_ID: &str = "admin";
-/// How often an open notification session re-checks its registration, as a backstop for a
-/// missed revocation event.
-const SESSION_RECHECK: std::time::Duration = std::time::Duration::from_secs(60);
+/// How often an open session (notifications WebSocket, `/mqtt`, screenshare broker) re-checks
+/// its registration, as a backstop for a missed revocation event.
+pub(crate) const SESSION_RECHECK: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct DeviceManager {
@@ -380,6 +380,12 @@ impl DeviceManager {
             device_id: device_id.into(),
         });
     }
+    /// Send a revocation event without changing any registration: lets a test overflow the
+    /// channel without a DB round-trip per event.
+    #[cfg(test)]
+    pub(crate) fn announce_revoked_for_test(&self, user_id: &str, device_id: &str) {
+        self.announce_revoked(user_id.into(), device_id);
+    }
     /// Revocation events for open sessions. Subscribe before checking a session's registration,
     /// so a revocation landing in between is not missed.
     pub fn subscribe_revocations(&self) -> tokio::sync::broadcast::Receiver<DeviceRevoked> {
@@ -661,7 +667,8 @@ impl DeviceManager {
     }
     /// Whether the registration a session was opened under still stands (token expiry is not
     /// re-checked: a session outliving its 3h user token is the tablet's normal behaviour).
-    /// Fails closed on a DB error; the client just reconnects.
+    /// Keeps the session on a DB error (only a definite `InvalidToken` ends it); real revocations
+    /// still arrive through the broadcast event.
     pub fn session_still_valid(&self, s: &SessionIdentity) -> bool {
         if s.device_id == ADMIN_DEVICE_ID {
             return true;
@@ -1349,6 +1356,31 @@ mod revocation_tests {
         let other_dt = other;
         assert!(dm.revoke_device_token(&other_dt).unwrap());
         assert!(dm.validate_token(&bearer(&other_ut)).is_err());
+    }
+
+    #[test]
+    fn only_revocations_are_announced() {
+        use tokio::sync::broadcast::error::TryRecvError;
+        let (dm, _tmp) = setup();
+        let mut events = dm.subscribe_revocations();
+        let dt = pair(&dm, "local-user", "RM110-1");
+        // The tablet's routine token churn is not a revocation: its open sessions (screenshare
+        // broker, notifications, /mqtt) close on these events alone, so none may be sent.
+        dm.refresh_user_token(&dt).unwrap();
+        dm.refresh_oauth(&dt).unwrap();
+        dm.exchange_device_token(&dt).unwrap();
+        dm.oauth_bundle("local-user", "RM110-1", "remarkable")
+            .unwrap();
+        pair(&dm, "local-user", "RM110-1");
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+        // An owner change is announced for the previous owner, a self-unregister for the device.
+        let dt_b = pair(&dm, "user-b", "RM110-1");
+        let ev = events.try_recv().unwrap();
+        assert_eq!((&*ev.user_id, &*ev.device_id), ("local-user", "RM110-1"));
+        assert!(dm.revoke_device_token(&dt_b).unwrap());
+        let ev = events.try_recv().unwrap();
+        assert_eq!((&*ev.user_id, &*ev.device_id), ("user-b", "RM110-1"));
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
     }
 
     #[test]

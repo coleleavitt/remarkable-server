@@ -76,17 +76,34 @@ pub enum IntegrationError {
     /// editor file, or the owner disabled downloads).
     #[error("Not downloadable: {0}")]
     NotDownloadable(String),
+
+    /// The provider no longer accepts the delta cursor (Dropbox `reset`, Graph `410 Gone`):
+    /// changes since it can't be listed, so the only way to catch up is a full listing.
+    #[error("Delta cursor expired, full resync required: {0}")]
+    ResyncRequired(String),
+
+    /// A remote file can't be written locally however often it is retried: something on
+    /// disk is in the way (a local directory where the file goes, e.g. after a remote folder
+    /// was replaced by a file of the same name) or the local filesystem rejects the name.
+    #[error("Local path unusable: {0}")]
+    LocalPathUnusable(String),
 }
 
 impl IntegrationError {
     /// Retrying can never succeed: the remote name is rejected by path validation (traversal,
-    /// symlink escape), the item no longer exists, or its content can't be downloaded. Everything else (network, I/O, rate limit,
-    /// auth, API errors) may be transient. Delta sync advances its cursor past permanent
-    /// failures but holds it for transient ones so the change is fetched again next time.
+    /// symlink escape, too long), the item no longer exists, its content can't be downloaded,
+    /// or the local path can't take it ([`LocalPathUnusable`](Self::LocalPathUnusable)).
+    /// Everything else (network, rate limit, auth, API errors, and other I/O errors such as a
+    /// full disk or a permission problem, which can be fixed on the server) may be transient.
+    /// Delta sync advances its cursor past permanent failures but holds it for transient ones
+    /// so the change is fetched again next time.
     pub fn is_permanent(&self) -> bool {
         matches!(
             self,
-            Self::InvalidPath(_) | Self::NotFound(_) | Self::NotDownloadable(_)
+            Self::InvalidPath(_)
+                | Self::NotFound(_)
+                | Self::NotDownloadable(_)
+                | Self::LocalPathUnusable(_)
         )
     }
 }
@@ -129,6 +146,11 @@ pub struct CloudFile {
     pub is_folder: bool,
     /// Full path in cloud storage
     pub path: String,
+    /// A change-feed entry saying this path was deleted remotely. Never set by full listings.
+    /// The other fields are best effort for such entries: `id` may be the path and
+    /// `is_folder` is only known when the provider reports it.
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 /// Cloud folder for selective sync
@@ -250,8 +272,12 @@ pub trait CloudProvider: Send + Sync {
     async fn get_changes(&self, cursor: Option<&str>) -> Result<(Vec<CloudFile>, Option<String>)>;
 
     /// Changes since `cursor` under `folder_id` (default: the drive root), with paths relative
-    /// to that folder like [`list_files`](Self::list_files). Providers whose change feed is
-    /// already scoped and pathed that way can rely on the default, which ignores `folder_id`.
+    /// to that folder like [`list_files`](Self::list_files); remote deletions come back with
+    /// [`CloudFile::deleted`] set. With no cursor, providers return no changes and a cursor for
+    /// "now", so what already exists must come from a full listing taken after it (as
+    /// [`CloudSync::delta_sync`] does). A cursor the provider no longer accepts yields
+    /// [`IntegrationError::ResyncRequired`]. Providers whose change feed is already scoped and
+    /// pathed that way can rely on the default, which ignores `folder_id`.
     async fn get_changes_in(
         &self,
         folder_id: Option<&str>,
@@ -263,6 +289,27 @@ pub trait CloudProvider: Send + Sync {
 
     /// Get storage quota info
     async fn get_quota(&self) -> Result<StorageQuota>;
+
+    /// The local directory, as components under the sync directory, where a full sync of
+    /// `folder_id` by this server before #34 kept the folder's files, when that isn't where they
+    /// go now. Dropbox and OneDrive listings were pathed from the drive root then, so a folder
+    /// other than the root was laid out under its own path from the drive root: `["Notes"]`
+    /// for Dropbox `/Notes` (`<local>/Notes/a.pdf`, now `<local>/a.pdf`), `["Documents",
+    /// "Notes"]` for a OneDrive folder there. `None` when the layout didn't change (the drive
+    /// root; Google Drive, the default). Full sync moves that directory aside once (see
+    /// [`CloudSync::sync`]).
+    async fn legacy_layout_dir(&self, folder_id: Option<&str>) -> Result<Option<Vec<String>>> {
+        let _ = folder_id;
+        Ok(None)
+    }
+
+    /// Whether `content` is the content of the remote file `file`, going by the hash its listing
+    /// carries ([`CloudFile::content_hash`]). `false` when that can't be told (the default).
+    /// Full sync leaves a file that is the same on both sides alone.
+    fn content_matches(&self, file: &CloudFile, content: &[u8]) -> bool {
+        let _ = (file, content);
+        false
+    }
 }
 
 /// Storage quota information

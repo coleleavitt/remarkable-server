@@ -118,6 +118,12 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Take revoked devices out of REST screenshare rooms.
+    remarkable_server::screenshare_rest::spawn_revocation_cleanup(
+        state.devices.clone(),
+        state.screenshare.clone(),
+    );
+
     // Keep the handwriting-search cache warm (recognises new pages after each sync).
     remarkable_server::hw_search::spawn_indexer(state.storage.clone());
 

@@ -64,8 +64,9 @@ xochitl ──/etc/hosts──▶ 127.0.0.1:443 / 127.0.0.2:443  (rm-proxy on ta
   takes it **or** a paired device's device token. Unset = all of these are disabled (401).
 - Deleting a device (`DELETE /devices/v1/{id}` by its owner, or the tablet's own
   `/token/json/{2,3}/device/delete`) revokes every device and user token it minted, even across a
-  later re-pair, and closes its open `/notifications/ws` and (if enabled) `/mqtt` sessions. Open sessions on the
-  screenshare broker (:8883) are **not** closed by a revocation.
+  later re-pair, and closes its open `/notifications/ws`, (if enabled) `/mqtt` and screenshare broker (:8883)
+  sessions; REST screenshare rooms it owns close too. Re-pairing it to another user does the same
+  for the previous owner.
 - Upstream TLS from the tablet relay is verified against webpki roots, so a
   MITM on the WiFi can't impersonate the Linode.
 
@@ -261,6 +262,31 @@ rollback is also safe: if `root.json` is at a higher generation than `sync.db`,
 the server adopts it (and logs a warning) instead of serving the older tree; if
 both are at the same generation with different hashes it refuses to start until
 one is fixed by hand.
+
+Cloud sync folders after upgrading past #34 (Dropbox and OneDrive only): a sync of
+a `cloud_folder` other than the drive root used to keep the folder under
+`integrations/<local_path>/` at the folder's own path from the drive root
+(`Notes/a.pdf` for the Dropbox folder `/Notes`; for OneDrive, the folder's whole
+path, e.g. `Documents/Notes/a.pdf`). Files now go at their path inside the folder
+(`a.pdf`). The first full sync of each such folder moves the old directory to
+`integrations/<local_path>/.rms-old-layout/` before it syncs anything, records that
+in `.rms-sync-layout` beside it, and lists what it moved in the response's
+`notices`. It does this once per folder, so leave `.rms-sync-layout` in place.
+Afterwards:
+
+- Copy anything edited in the old directory since the last sync before the upgrade
+  over the new copy, then delete `.rms-old-layout/`.
+- From their second bidirectional or upload sync on, versions before #34 uploaded
+  every file of the folder into the folder one level down (`/Notes/Notes/…`; for
+  OneDrive, `/Documents/Notes/Documents/Notes/…`). If the folder has a subfolder at
+  that path, the upgrade sync says so in `notices` and (unless it only uploads)
+  downloads it to `integrations/<local_path>/Notes/`. If it is that duplicate,
+  delete it in Dropbox or OneDrive and delete the local copy before the next sync.
+  A full sync uploads files that exist only locally and downloads files that exist
+  only remotely, so whichever copy is left brings the other back.
+
+Before the first sync after deploying, look under `integrations/` for directories
+named after a synced folder's path, so the notices hold no surprises.
 
 Migrating storage from a local server: stop both, `rsync -a test-storage/ linode:/var/lib/remarkable-server/`,
 `chown -R remarkable:remarkable`, start. `sync.db` (with its `-wal`/`-shm`
