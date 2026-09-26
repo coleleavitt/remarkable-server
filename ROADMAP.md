@@ -48,7 +48,10 @@ These are done and, in several cases, ahead of rmfakecloud:
   scaffolding; sync confined to `<storage>/integrations`, path-traversal and
   symlink-safe, provider grants revoked on disconnect (#16). Google Drive
   listings are paged and recursive, its delta is scoped to the sync folder, and
-  a delta cursor only advances once every change applied (#26).
+  a delta cursor only advances once every change applied (#26). Dropbox and
+  OneDrive got the same (recursive listings relative to the sync folder, deltas
+  scoped to it, a rejected cursor falls back to a full resync), and remote files
+  over the size limit are skipped (#34).
 - ✅ **Read-later credentials persist** — provider tokens (and the optional
   Wallabag password) are stored in `readlater.db` apart from the config, survive
   restarts, refreshed tokens are saved at once, never returned by the API;
@@ -127,9 +130,13 @@ The community's top *concrete* pains. Small, bounded, high-value.
 
 ### Known follow-ups (from the #23–#29 reviews)
 
-- ⬜ **Dropbox / OneDrive listings** — full listings are non-recursive, and
-  their delta (change feed) ignores the configured sync folder (Drive got both
-  fixes in #26).
+- ✅ **Dropbox / OneDrive listings** — full listings are recursive and relative
+  to the sync folder, and their deltas are scoped to it (#34).
+- ⬜ **Cloud full sync keeps no state** — `POST /integrations/v2/cloud/sync`
+  runs a fresh full sync every time, so a file deleted remotely is uploaded again
+  from its local copy, and Google Drive files present on both sides go through
+  the conflict strategy on every run (Dropbox and OneDrive skip files whose
+  content hash matches, #34). Needs per-folder sync state kept between runs.
 - ✅ **Screenshare MQTT broker vs revocation** *(#31)* — sessions on the
   `SCREENSHARE_BIND` broker now close when their device is revoked, like the
   `/notifications/ws` and `/mqtt` ones, and a revoked device leaves its REST
