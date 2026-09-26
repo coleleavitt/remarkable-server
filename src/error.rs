@@ -44,6 +44,8 @@ pub enum ServerError {
     Forbidden(String),
     #[error("Bad request: {0}")]
     BadRequest(String),
+    #[error("Payload too large: {0}")]
+    PayloadTooLarge(String),
 }
 
 impl From<rusqlite::Error> for ServerError {
@@ -108,6 +110,11 @@ impl IntoResponse for ServerError {
             Self::Config(m) => (StatusCode::BAD_REQUEST, "config_error", Some(m.clone())),
             Self::Forbidden(m) => (StatusCode::FORBIDDEN, "forbidden", Some(m.clone())),
             Self::BadRequest(m) => (StatusCode::BAD_REQUEST, "bad_request", Some(m.clone())),
+            Self::PayloadTooLarge(m) => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                Some(m.clone()),
+            ),
         };
         (
             status,

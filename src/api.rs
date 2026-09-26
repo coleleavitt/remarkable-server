@@ -1,5 +1,5 @@
 use axum::Json;
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -213,21 +213,34 @@ pub async fn put_file(
     State(state): State<AppState>,
     Path(hash): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Json<UploadResponse>> {
     let _user_id = state.auth_user(&headers)?;
+    // Reject a bad hash before streaming up to MAX_BLOB_BYTES to disk for nothing.
+    if !crate::storage::is_valid_hash(&hash) {
+        return Err(ServerError::InvalidHash(hash));
+    }
     let filename = headers
         .get("rm-filename")
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| ServerError::MissingHeader("rm-filename".into()))?;
     // Verify transport integrity via crc32c when the client sends it; the sha256 in
     // the URL can't be checked against the body (index hashes are over child hashes).
-    checksum::verify_goog_hash_header(&headers, &body)?;
-    state.storage.put_with_hash(&body, &hash, filename)?;
-    Ok(Json(UploadResponse {
-        hash,
-        size: body.len() as u64,
-    }))
+    // The header is parsed before the body is read; the body streams to a staged file.
+    let expected = checksum::GoogHash::from_headers(&headers)?;
+    let staged = crate::upload::stage_body(
+        &state.storage,
+        &headers,
+        body,
+        crate::MAX_BLOB_BYTES as u64,
+        false,
+    )
+    .await?;
+    if let Some(expected) = expected {
+        expected.verify(staged.crc32c())?;
+    }
+    let size = staged.commit(&state.storage, &hash, filename)?;
+    Ok(Json(UploadResponse { hash, size }))
 }
 
 /// Default account for pairing codes: the single local account, as `--pair` (main.rs `PAIRING_USER`) issues codes for.

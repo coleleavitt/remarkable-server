@@ -119,10 +119,12 @@ pub async fn send(
         msg = msg.reply_to(r);
     }
     let mut parts = MultiPart::mixed().singlepart(SinglePart::html(strip_ad(&html).to_owned()));
-    for (name, ct, data) in &attachments {
-        let ct = ContentType::parse(ct)
+    let attachment_count = attachments.len();
+    // By value: `Vec::from(Bytes)` reuses the buffer instead of copying each attachment.
+    for (name, ct, data) in attachments {
+        let ct = ContentType::parse(&ct)
             .unwrap_or(ContentType::parse("application/octet-stream").map_err(bad)?);
-        parts = parts.singlepart(Attachment::new(name.clone()).body(data.to_vec(), ct));
+        parts = parts.singlepart(Attachment::new(name).body(Vec::from(data), ct));
     }
     let email = msg.multipart(parts).map_err(bad)?;
 
@@ -135,6 +137,6 @@ pub async fn send(
         .send(email)
         .await
         .map_err(|e| ServerError::Email(e.to_string()))?;
-    tracing::info!(recipients = %to, attachments = attachments.len(), "shared by email");
+    tracing::info!(recipients = %to, attachments = attachment_count, "shared by email");
     Ok(StatusCode::OK)
 }

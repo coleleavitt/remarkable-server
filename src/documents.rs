@@ -6,7 +6,7 @@
 //! An index's hash is sha256 over its entries' binary hashes, sorted by name
 //! (verified against device-written trees).
 
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::{Multipart, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use base64::Engine;
@@ -110,6 +110,42 @@ fn put_leaf(storage: &Storage, name: String, data: &[u8]) -> Result<Entry> {
     })
 }
 
+/// A new document's file: bytes in memory, or an upload streamed to a staged file
+/// (staged with its sha256, which names the blob).
+pub(crate) enum DocFile<'a> {
+    Bytes(&'a [u8]),
+    Staged(crate::upload::Staged),
+}
+
+impl DocFile<'_> {
+    fn len(&self) -> u64 {
+        match self {
+            Self::Bytes(d) => d.len() as u64,
+            Self::Staged(s) => s.len(),
+        }
+    }
+}
+
+/// [`put_leaf`] for a [`DocFile`]; a staged file is renamed into the store, not copied.
+fn put_doc_file(storage: &Storage, name: String, file: DocFile<'_>) -> Result<Entry> {
+    let staged = match file {
+        DocFile::Bytes(data) => return put_leaf(storage, name, data),
+        DocFile::Staged(staged) => staged,
+    };
+    let hash = staged
+        .sha256_hex()
+        .ok_or_else(|| ServerError::Internal("staged document has no sha256".into()))?
+        .to_owned();
+    let size = staged.commit(storage, &hash, &name)?;
+    Ok(Entry {
+        hash,
+        kind: FILE_TYPE.into(),
+        name,
+        subfiles: 0,
+        size,
+    })
+}
+
 /// Map an upload content type to the document's file extension.
 fn file_type(content_type: &str) -> Result<&'static str> {
     match content_type.split(';').next().unwrap_or_default().trim() {
@@ -152,6 +188,17 @@ pub fn create_document_in(
     data: &[u8],
     parent: &str,
 ) -> Result<(String, u64)> {
+    create_document_from(storage, name, ext, DocFile::Bytes(data), parent)
+}
+
+/// [`create_document_in`] for a [`DocFile`], so uploads needn't be held in memory.
+pub(crate) fn create_document_from(
+    storage: &Storage,
+    name: &str,
+    ext: &str,
+    file: DocFile<'_>,
+    parent: &str,
+) -> Result<(String, u64)> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().timestamp_millis().to_string();
     let metadata = serde_json::json!({
@@ -178,7 +225,7 @@ pub fn create_document_in(
             format!("{id}.content"),
             &serde_json::to_vec_pretty(&content)?,
         )?,
-        put_leaf(storage, format!("{id}.{ext}"), data)?,
+        put_doc_file(storage, format!("{id}.{ext}"), file)?,
     ];
     let doc_hash = index_hash(&mut files)?;
     storage.put_with_hash(&render_index(&files), &doc_hash, &format!("{id}.docSchema"))?;
@@ -306,10 +353,11 @@ fn finish(
     user_id: &str,
     name: &str,
     ext: &str,
-    data: &[u8],
+    file: DocFile<'_>,
 ) -> Result<StatusCode> {
-    let (id, generation) = create_document(&state.storage, name, ext, data)?;
-    tracing::info!(%id, name, ext, bytes = data.len(), generation, "document uploaded");
+    let bytes = file.len();
+    let (id, generation) = create_document_from(&state.storage, name, ext, file, "")?;
+    tracing::info!(%id, name, ext, bytes, generation, "document uploaded");
     // Tell connected devices to pull the new root.
     let _ = state.notification_tx.send(WsMessage::sync_complete(
         generation,
@@ -348,12 +396,10 @@ pub async fn upload_v1(
             }
             Some("file") => {
                 let ct = field.content_type().unwrap_or_default().to_owned();
+                // Streamed to disk (hashed on the way) rather than buffered.
                 file = Some((
                     ct,
-                    field
-                        .bytes()
-                        .await
-                        .map_err(|e| ServerError::Config(e.to_string()))?,
+                    crate::upload::stage_field(&state.storage, field, true).await?,
                 ));
             }
             _ => {}
@@ -362,14 +408,20 @@ pub async fn upload_v1(
     let meta: UploadMeta =
         serde_json::from_str(&meta.ok_or_else(|| ServerError::Config("missing 'meta'".into()))?)?;
     let (ct, data) = file.ok_or_else(|| ServerError::Config("missing 'file'".into()))?;
-    finish(&state, &user_id, &meta.file_name, file_type(&ct)?, &data)
+    finish(
+        &state,
+        &user_id,
+        &meta.file_name,
+        file_type(&ct)?,
+        DocFile::Staged(data),
+    )
 }
 
 /// `POST /doc/v2/files`: raw body, `rm-meta` header = base64 JSON `{"file_name": ...}`.
 pub async fn upload_v2(
     State(state): State<AppState>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<StatusCode> {
     let user_id = state.auth_user(&headers)?;
     let meta = headers
@@ -384,7 +436,23 @@ pub async fn upload_v2(
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| ServerError::MissingHeader("content-type".into()))?;
-    finish(&state, &user_id, &meta.file_name, file_type(ct)?, &body)
+    // Validated before the body is read, so an unsupported upload is never staged.
+    let ext = file_type(ct)?;
+    let staged = crate::upload::stage_body(
+        &state.storage,
+        &headers,
+        body,
+        crate::MAX_BLOB_BYTES as u64,
+        true,
+    )
+    .await?;
+    finish(
+        &state,
+        &user_id,
+        &meta.file_name,
+        ext,
+        DocFile::Staged(staged),
+    )
 }
 
 #[cfg(test)]

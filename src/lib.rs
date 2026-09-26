@@ -34,6 +34,7 @@ pub mod share_link;
 pub mod storage;
 pub mod sync15;
 pub mod types;
+pub mod upload;
 pub mod versions;
 
 use std::path::Path;
@@ -80,7 +81,7 @@ use tower_http::trace::TraceLayer;
 
 /// Max upload body for blob routes. Axum's 2 MB default rejects PDFs/EPUBs and large
 /// notebook pages with 413, which the device reports as "Failed uploading".
-const MAX_BLOB_BYTES: usize = 1024 * 1024 * 1024;
+pub(crate) const MAX_BLOB_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Bind a TCP listener, waiting while the address doesn't exist yet (e.g. the tablet's
 /// USB network is down because it's asleep or unplugged) instead of failing startup.
