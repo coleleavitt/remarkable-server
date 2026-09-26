@@ -81,6 +81,19 @@ ssh linode 'tar -C /var/lib -czf - remarkable-server' > rms-backup-$(date +%F).t
 # 500 with a reason if part of the current tree couldn't be parsed
 curl -H "x-admin-token: $ADMIN_TOKEN" 'https://remarkable.unwrap.rs/admin/storage/unreachable?grace_secs=86400'
 
+# garbage-collect those blobs (storage otherwise only grows). Never automatic.
+# Storage is the tablet's only cloud copy: take the backup above first, then dry-run.
+# dry_run defaults to true and grace_secs to 604800 (7 days); a dry run lists the
+# candidates and their total bytes without deleting anything.
+curl -X POST -H "x-admin-token: $ADMIN_TOKEN" 'https://remarkable.unwrap.rs/admin/storage/gc'
+# after reviewing the dry run, delete for real (each deleted hash is logged: "gc: deleted unreachable blob")
+curl -X POST -H "x-admin-token: $ADMIN_TOKEN" 'https://remarkable.unwrap.rs/admin/storage/gc?dry_run=false&grace_secs=604800'
+# 500 = refused (no root, or part of the current tree missing/unparsed): nothing deleted.
+# 409 = a sync committed a new root mid-run: deletion stopped, body is the partial report;
+#       just run it again. Live = current + previous root trees, version history, and
+#       anything written or checked (check-files) within grace; each blob is re-checked
+#       under the sync.db write lock right before it is removed.
+
 # after a tablet software update (/etc may be reset)
 #   re-check /etc/hosts entries and that the local CA is still trusted,
 #   then re-apply the hosts edit above and `systemctl enable --now rm-proxy`.
@@ -270,6 +283,14 @@ submit it with `ADMIN_TOKEN`, or:
 curl -X POST https://remarkable.unwrap.rs/admin/oauth/approve -H "x-admin-token: $ADMIN_TOKEN" \
   -H 'content-type: application/json' -d '{"user_code":"1234-5678"}'
 ```
+
+Set `PUBLIC_URL=https://remarkable.unwrap.rs` in `/etc/remarkable-server/env`
+so the `verification_uri` the client shows points at the public site instead of
+`https://<--host>` (the tablet-internal `local.tectonic.remarkable.com`).
+`/oauth/device/code` is rate limited per client (5 per 10 min per IP, 20/min
+overall; 429 `slow_down` past that). nginx is on loopback, so the limiter keys
+on the last `X-Forwarded-For` hop, which `$proxy_add_x_forwarded_for` sets to
+the real peer; keep that header in the nginx config.
 
 ## A. Tablet proxy (`rm-proxy/`)
 

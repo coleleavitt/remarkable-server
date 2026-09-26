@@ -331,6 +331,7 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/admin/reports", get(reports::list))
         .route("/admin/storage/unreachable", get(api::unreachable_blobs))
+        .route("/admin/storage/gc", post(api::storage_gc))
         // Third-party integrations (none configured)
         .route("/integrations/v1/", get(service::list_integrations))
         .route(
@@ -798,6 +799,137 @@ mod router_tests {
             "other user's SyncComplete was not forwarded"
         );
         assert_eq!(body["message"]["attributes"]["event"], "SyncComplete");
+    }
+
+    /// Open notification sessions (JSON WebSocket and `/mqtt`, token in the header or in the
+    /// MQTT CONNECT) close when their device is deleted; another device's sessions stay open.
+    #[tokio::test]
+    async fn notification_sessions_close_when_their_device_is_revoked() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        type Ws = tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let devices =
+            DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        // A: user token from an OAuth bundle; B: its device token.
+        let (a_user, ..) = devices
+            .oauth_bundle("u1@test", "RM110-A", "remarkable")
+            .unwrap();
+        let (_, b_device, _) = devices
+            .oauth_bundle("u1@test", "RM110-B", "remarkable")
+            .unwrap();
+        let state = AppState::new(Storage::new(tmp.path().join("storage")).unwrap(), devices);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("ws://{}", listener.local_addr().unwrap());
+        let router = create_router(state.clone());
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let open = |path: &str, token: Option<&str>| {
+            let mut req = format!("{base}{path}").into_client_request().unwrap();
+            if let Some(t) = token {
+                req.headers_mut()
+                    .insert("authorization", format!("Bearer {t}").parse().unwrap());
+            }
+            async move { tokio_tungstenite::connect_async(req).await.unwrap().0 }
+        };
+        async fn next(ws: &mut Ws) -> Option<Message> {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+                .await
+                .expect("timed out")
+            {
+                Some(Ok(m)) => Some(m),
+                _ => None,
+            }
+        }
+        /// The session ends: a Close frame (or EOF) and nothing else.
+        async fn closed(ws: &mut Ws) {
+            loop {
+                match next(ws).await {
+                    None | Some(Message::Close(_)) => return,
+                    Some(Message::Text(t)) => panic!("unexpected {t}"),
+                    Some(_) => {}
+                }
+            }
+        }
+        async fn mqtt_connect(ws: &mut Ws, password: Option<&str>) {
+            let mut p = vec![0, 4, b'M', b'Q', b'T', b'T', 4, 2, 0, 60, 0, 1, b'c'];
+            if let Some(pw) = password {
+                p[7] = 0xC2; // username + password
+                p.extend_from_slice(&[0, 1, b'u']);
+                p.extend_from_slice(&(pw.len() as u16).to_be_bytes());
+                p.extend_from_slice(pw.as_bytes());
+            }
+            let mut packet = vec![0x10];
+            let mut len = p.len();
+            loop {
+                let byte = (len % 128) as u8;
+                len /= 128;
+                packet.push(if len > 0 { byte | 0x80 } else { byte });
+                if len == 0 {
+                    break;
+                }
+            }
+            packet.extend_from_slice(&p);
+            ws.send(Message::Binary(packet.into())).await.unwrap();
+            assert_eq!(
+                next(ws).await,
+                Some(Message::Binary(vec![0x20, 2, 0, 0].into())),
+                "CONNACK accepted"
+            );
+        }
+        async fn mqtt_alive(ws: &mut Ws) {
+            ws.send(Message::Binary(vec![0xC0, 0].into()))
+                .await
+                .unwrap(); // PINGREQ
+            assert_eq!(
+                next(ws).await,
+                Some(Message::Binary(vec![0xD0, 0].into())),
+                "PINGRESP"
+            );
+        }
+
+        let mut json_a = open("/notifications/ws/json/1", Some(&a_user)).await;
+        let mut json_b = open("/notifications/ws/json/1", Some(&b_device)).await;
+        for ws in [&mut json_a, &mut json_b] {
+            assert!(
+                matches!(next(ws).await, Some(Message::Text(_))),
+                "initial SyncComplete"
+            );
+        }
+        let mut mqtt_a_header = open("/mqtt", Some(&a_user)).await;
+        mqtt_connect(&mut mqtt_a_header, None).await;
+        let mut mqtt_a_connect = open("/mqtt", None).await;
+        mqtt_connect(&mut mqtt_a_connect, Some(&a_user)).await;
+        let mut mqtt_b = open("/mqtt", Some(&b_device)).await;
+        mqtt_connect(&mut mqtt_b, None).await;
+
+        assert!(state.devices.delete_device("RM110-A", None).unwrap());
+
+        closed(&mut json_a).await;
+        closed(&mut mqtt_a_header).await;
+        closed(&mut mqtt_a_connect).await;
+        // B's sessions are untouched.
+        mqtt_alive(&mut mqtt_b).await;
+        state
+            .notification_tx
+            .send(notifications::WsMessage::sync_complete(9, "d", "u1@test"))
+            .unwrap();
+        match next(&mut json_b).await {
+            Some(Message::Text(t)) => assert!(t.contains("SyncComplete")),
+            other => panic!("B's JSON session should still be open, got {other:?}"),
+        }
+        // Revoked A can't open a new session either.
+        let mut req = format!("{base}/notifications/ws/json/1")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", format!("Bearer {a_user}").parse().unwrap());
+        match tokio_tungstenite::connect_async(req).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(r)) => assert_eq!(r.status(), 401),
+            other => panic!("revoked token must be refused, got {:?}", other.map(|_| ())),
+        }
     }
 
     /// A browser returning from the OAuth provider carries no device token: the callback and
