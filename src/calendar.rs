@@ -20,6 +20,7 @@ pub use self::ics::{
     UNTITLED_EVENT,
     parse_ics_expanded,
     parse_ics_file,
+    parse_ics_server_expanded,
     parse_ics_str,
 };
 

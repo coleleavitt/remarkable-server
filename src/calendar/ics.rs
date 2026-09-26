@@ -7,7 +7,8 @@
 //! [`parse_ics_str`] yields one event per VEVENT, a recurring event as its first occurrence.
 //! [`parse_ics_expanded`] expands recurring events into their occurrences in a time window,
 //! for CalDAV servers that return the master with its RRULE (or its list of RDATEs) instead of
-//! expanding it.
+//! expanding it. [`parse_ics_server_expanded`] reads an answer the server was asked to expand,
+//! and names the data it cannot trust to be whole.
 //!
 //! Both are budgeted, so hostile calendar data costs bounded CPU and memory. A time whose
 //! VTIMEZONE rules are too costly to go through (or whose TZID is too long to look up) is
@@ -115,7 +116,8 @@ pub fn parse_ics_str(content: &str, calendar_id: &str) -> IcsEvents {
 }
 
 /// How far [`parse_ics_expanded`] may expand recurring events: the window, and budgets shared
-/// by every calendar object of one CalDAV answer.
+/// by every calendar object of one CalDAV sync (its answer, and the objects fetched again
+/// whole, see [`parse_ics_server_expanded`]).
 #[derive(Debug)]
 pub struct Expansion {
     start: DateTime<Utc>,
@@ -193,11 +195,43 @@ pub fn parse_ics_expanded(
     etag: Option<&str>,
     expansion: &mut Expansion,
 ) -> Vec<CalendarEvent> {
-    // Each VEVENT is an event, a moved occurrence (one event too) or a series (at least one
-    // occurrence, unless each is moved or cancelled): an object with more than twice the
-    // events still allowed would run out of them anyway. Its VEVENTs past that are not kept,
-    // so a server cannot make the parsed components ten times larger than its answer.
-    let doc = Document::parse(content, expansion.instances_left.saturating_mul(2));
+    let doc = Document::parse_for(content, expansion);
+    expand_document(doc, calendar_id, etag, expansion)
+}
+
+/// [`parse_ics_expanded`] for the calendar data of an answer the server was asked to expand
+/// (a CalDAV `calendar-query` with `<C:expand>`): `None`, with nothing paid for, when the data
+/// holds a series of RDATEs without an RRULE. A server that expands sends no series at all
+/// (RFC 4791 section 9.6.5), so this one was sent as is, and possibly without the VEVENTs
+/// that move or cancel its occurrences: Radicale sends such a series' master alone. Expanding
+/// that master would store a moved occurrence at its old time, and a cancelled one as still
+/// on. The caller fetches the object whole and reads it with [`parse_ics_expanded`] instead.
+/// A series with an RRULE sent as is is expanded here, as [`parse_ics_expanded`] does: the
+/// servers that send one unexpanded (those ignoring `expand`) send the whole object.
+pub fn parse_ics_server_expanded(
+    content: &str,
+    calendar_id: &str,
+    etag: Option<&str>,
+    expansion: &mut Expansion,
+) -> Option<Vec<CalendarEvent>> {
+    let doc = Document::parse_for(content, expansion);
+    if doc
+        .events
+        .iter()
+        .any(|e| e.series_uid().is_some() && e.rrule.is_none())
+    {
+        return None;
+    }
+    Some(expand_document(doc, calendar_id, etag, expansion))
+}
+
+/// The events of `doc`, expanded as [`parse_ics_expanded`] says.
+fn expand_document(
+    doc: Document,
+    calendar_id: &str,
+    etag: Option<&str>,
+    expansion: &mut Expansion,
+) -> Vec<CalendarEvent> {
     expansion.truncated |= doc.events_dropped;
     doc.zones.steps_left.set(expansion.zone_steps_left);
     // Occurrences with a VEVENT of their own, by UID, and the series with one whose
@@ -219,28 +253,24 @@ pub fn parse_ics_expanded(
     }
     let mut events = Vec::new();
     for e in &doc.events {
-        // A series is a master (no RECURRENCE-ID) with an RRULE, RDATEs, or both.
-        let uid = match (&e.recurrence_id, &e.uid) {
-            (None, Some(uid)) if e.rrule.is_some() || !e.rdates.is_empty() => uid,
-            _ => {
-                // An event, or an occurrence with a VEVENT of its own.
-                if let Some(event) = e.event(calendar_id, &doc.zones) {
-                    push_event(&mut events, event, etag, expansion);
-                }
-                continue;
+        let Some(uid) = e.series_uid() else {
+            // An event, or an occurrence with a VEVENT of its own.
+            if let Some(event) = e.event(calendar_id, &doc.zones) {
+                push_event(&mut events, event, etag, expansion);
             }
+            continue;
         };
         let rule = e.rrule.as_deref().map(Rule::parse);
         if let Some(None) = rule {
             expansion
                 .unexpanded
-                .entry(uid.clone())
+                .entry(uid.to_string())
                 .or_insert_with(|| e.label());
         }
-        if unresolved.contains(uid.as_str()) {
+        if unresolved.contains(uid) {
             continue;
         }
-        let skip = overridden.get(uid.as_str());
+        let skip = overridden.get(uid);
         match rule {
             // An RRULE outside the supported subset: the first occurrence only.
             Some(None) => {
@@ -619,6 +649,15 @@ impl VEventFields {
         Some((start, end, all_day))
     }
 
+    /// The UID of the series this VEVENT is the master of: one without a RECURRENCE-ID, with
+    /// an RRULE, RDATEs, or both. `None` for an event, or an occurrence with a VEVENT of its
+    /// own.
+    fn series_uid(&self) -> Option<&str> {
+        let series =
+            self.recurrence_id.is_none() && (self.rrule.is_some() || !self.rdates.is_empty());
+        self.uid.as_deref().filter(|_| series)
+    }
+
     /// Bytes of text each occurrence of this event holds (see [`text_bytes`]): its id
     /// (`calendar:uid:key`), calendar id, UID, summary, description, location and `etag`.
     fn occurrence_bytes(&self, uid: &str, calendar_id: &str, etag: Option<&str>) -> usize {
@@ -876,6 +915,15 @@ enum State {
 }
 
 impl Document {
+    /// Parse `content` for `expansion`. Each VEVENT is an event, a moved occurrence (one event
+    /// too) or a series (at least one occurrence, unless each is moved or cancelled): an object
+    /// with more than twice the events still allowed would run out of them anyway. Its VEVENTs
+    /// past that are not kept, so a server cannot make the parsed components ten times larger
+    /// than its answer.
+    fn parse_for(content: &str, expansion: &Expansion) -> Document {
+        Self::parse(content, expansion.instances_left.saturating_mul(2))
+    }
+
     /// Parse `content`, keeping its first `max_events` VEVENTs.
     fn parse(content: &str, max_events: usize) -> Document {
         let mut doc = Document {
@@ -1969,6 +2017,89 @@ mod tests {
                 .status,
             EventStatus::Cancelled
         );
+    }
+
+    #[test]
+    fn a_series_of_rdates_in_an_answer_meant_to_be_expanded_is_left_to_be_fetched_whole() {
+        let window = || Expansion::new(utc("2026-03-01T00:00:00Z"), utc("2026-04-01T00:00:00Z"));
+        let spent = |e: &Expansion| {
+            (
+                e.instances_left,
+                e.bytes_left,
+                e.rule_steps_left,
+                e.zone_steps_left,
+                e.truncated,
+            )
+        };
+        // Radicale's answer to `expand` for a series of RDATEs: its master alone (with the
+        // VTIMEZONE), without the VEVENTs that move one occurrence and cancel another.
+        // Expanded here, the moved one would come at its old time and the cancelled one as on.
+        let master = format!(
+            "{}BEGIN:VEVENT\r\nUID:tasting\r\nSUMMARY:Tasting\r\nDTSTART;TZID=Europe/Berlin:20260303T190000\r\nDURATION:PT2H\r\nRDATE;TZID=Europe/Berlin:20260310T190000,20260317T190000\r\nEND:VEVENT\r\n",
+            BERLIN
+        );
+        let overrides = "BEGIN:VEVENT\r\nUID:tasting\r\nRECURRENCE-ID;TZID=Europe/Berlin:20260310T190000\r\nSUMMARY:Tasting (moved)\r\nDTSTART;TZID=Europe/Berlin:20260311T200000\r\nDURATION:PT2H\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:tasting\r\nRECURRENCE-ID:20260317T180000Z\r\nSTATUS:CANCELLED\r\nDTSTART:20260317T180000Z\r\nEND:VEVENT\r\n";
+        // Not read, and nothing paid for. With its VEVENTs sent along (a server ignoring
+        // `expand`), the same: an answer cannot show whether any were left out.
+        for ics in [master.clone(), format!("{}{}", master, overrides)] {
+            let mut expansion = window();
+            let before = spent(&expansion);
+            assert!(parse_ics_server_expanded(&ics, "c", None, &mut expansion).is_none());
+            assert_eq!(spent(&expansion), before);
+            assert_eq!(expansion.unknown_zones().count(), 0);
+        }
+        // Whole, it is what `parse_ics_expanded` makes of it.
+        let whole = parse_ics_expanded(
+            &format!("{}{}", master, overrides),
+            "c",
+            None,
+            &mut window(),
+        );
+        assert_eq!(
+            occurrences(&whole),
+            [
+                occurrence(
+                    "c:tasting:20260303T180000Z",
+                    "2026-03-03T18:00",
+                    Duration::hours(2),
+                    "Tasting"
+                ),
+                occurrence(
+                    "c:tasting:20260310T180000Z",
+                    "2026-03-11T19:00",
+                    Duration::hours(2),
+                    "Tasting (moved)"
+                ),
+                occurrence(
+                    "c:tasting:20260317T180000Z",
+                    "2026-03-17T18:00",
+                    Duration::hours(1),
+                    UNTITLED_EVENT
+                ),
+            ]
+        );
+
+        // Everything else is read as `parse_ics_expanded` reads it: occurrences the server
+        // expanded, a series with an RRULE sent as is (RDATEs too), an occurrence of its own
+        // that lists an RDATE, an event, a zone whose observances use RDATE, and a series of
+        // RDATEs without a UID (nothing to fetch; it has no events either way).
+        let others = [
+            "BEGIN:VEVENT\r\nUID:w\r\nRECURRENCE-ID:20260302T090000Z\r\nDTSTART:20260302T090000Z\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:w\r\nRECURRENCE-ID:20260309T090000Z\r\nDTSTART:20260309T100000Z\r\nEND:VEVENT\r\n".to_string(),
+            "BEGIN:VEVENT\r\nUID:r\r\nDTSTART:20260302T090000Z\r\nRRULE:FREQ=WEEKLY;COUNT=3\r\nRDATE:20260320T090000Z\r\nEND:VEVENT\r\n".to_string(),
+            "BEGIN:VEVENT\r\nUID:o\r\nRECURRENCE-ID:20260302T090000Z\r\nDTSTART:20260303T090000Z\r\nRDATE:20260320T090000Z\r\nEND:VEVENT\r\n".to_string(),
+            "BEGIN:VEVENT\r\nUID:e\r\nDTSTART:20260305T090000Z\r\nEND:VEVENT\r\n".to_string(),
+            "BEGIN:VTIMEZONE\r\nTZID:Old\r\nBEGIN:STANDARD\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0100\r\nDTSTART:19700101T000000\r\nRDATE:19800101T000000\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:z\r\nDTSTART;TZID=Old:20260305T090000\r\nEND:VEVENT\r\n".to_string(),
+            "BEGIN:VEVENT\r\nDTSTART:20260302T090000Z\r\nRDATE:20260320T090000Z\r\nEND:VEVENT\r\n".to_string(),
+        ];
+        for ics in others {
+            let (mut here, mut there) = (window(), window());
+            let expected = parse_ics_expanded(&ics, "c", Some("\"e1\""), &mut here);
+            let read = parse_ics_server_expanded(&ics, "c", Some("\"e1\""), &mut there)
+                .unwrap_or_else(|| panic!("left to be fetched: {}", ics));
+            assert_eq!(occurrences(&read), occurrences(&expected), "{}", ics);
+            assert!(read.iter().all(|e| e.etag.as_deref() == Some("\"e1\"")));
+            assert_eq!(spent(&there), spent(&here), "{}", ics);
+        }
     }
 
     #[test]
