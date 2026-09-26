@@ -71,15 +71,23 @@ pub enum IntegrationError {
 
     #[error("Unsafe path rejected: {0}")]
     InvalidPath(String),
+
+    /// The item exists but its content can never be downloaded as-is (e.g. a Google Docs
+    /// editor file, or the owner disabled downloads).
+    #[error("Not downloadable: {0}")]
+    NotDownloadable(String),
 }
 
 impl IntegrationError {
     /// Retrying can never succeed: the remote name is rejected by path validation (traversal,
-    /// symlink escape) or the item no longer exists. Everything else (network, I/O, rate limit,
+    /// symlink escape), the item no longer exists, or its content can't be downloaded. Everything else (network, I/O, rate limit,
     /// auth, API errors) may be transient. Delta sync advances its cursor past permanent
     /// failures but holds it for transient ones so the change is fetched again next time.
     pub fn is_permanent(&self) -> bool {
-        matches!(self, Self::InvalidPath(_) | Self::NotFound(_))
+        matches!(
+            self,
+            Self::InvalidPath(_) | Self::NotFound(_) | Self::NotDownloadable(_)
+        )
     }
 }
 
@@ -240,6 +248,18 @@ pub trait CloudProvider: Send + Sync {
 
     /// Get changes since last sync (delta API if supported)
     async fn get_changes(&self, cursor: Option<&str>) -> Result<(Vec<CloudFile>, Option<String>)>;
+
+    /// Changes since `cursor` under `folder_id` (default: the drive root), with paths relative
+    /// to that folder like [`list_files`](Self::list_files). Providers whose change feed is
+    /// already scoped and pathed that way can rely on the default, which ignores `folder_id`.
+    async fn get_changes_in(
+        &self,
+        folder_id: Option<&str>,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<CloudFile>, Option<String>)> {
+        let _ = folder_id;
+        self.get_changes(cursor).await
+    }
 
     /// Get storage quota info
     async fn get_quota(&self) -> Result<StorageQuota>;

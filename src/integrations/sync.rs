@@ -695,7 +695,10 @@ impl<P: CloudProvider> CloudSync<P> {
         // Get changes since last cursor
         let (changes, new_cursor) = self
             .provider
-            .get_changes(self.state.cursor.as_deref())
+            .get_changes_in(
+                self.config.cloud_folder.as_deref(),
+                self.state.cursor.as_deref(),
+            )
             .await?;
 
         // Set when a change failed for a reason that may go away (network, I/O, rate limit);
@@ -1126,6 +1129,7 @@ mod tests {
     fn error_permanence() {
         assert!(IntegrationError::InvalidPath("x".into()).is_permanent());
         assert!(IntegrationError::NotFound("x".into()).is_permanent());
+        assert!(IntegrationError::NotDownloadable("x".into()).is_permanent());
         for e in [
             IntegrationError::Network("x".into()),
             IntegrationError::Io(std::io::Error::other("x")),

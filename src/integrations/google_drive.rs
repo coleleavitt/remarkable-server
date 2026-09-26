@@ -2,7 +2,7 @@
 //!
 //! Full read/write access via Drive API v3.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use async_trait::async_trait;
 use reqwest::Client;
@@ -154,39 +154,162 @@ impl GoogleDrive {
         &self,
         response: reqwest::Response,
     ) -> Result<T> {
-        let status = response.status();
-
-        if status.is_success() {
+        if response.status().is_success() {
             response
                 .json()
                 .await
                 .map_err(|e| IntegrationError::Serialization(e.to_string()))
-        } else if status.as_u16() == 401 {
-            Err(IntegrationError::TokenExpired)
-        } else if status.as_u16() == 429 {
-            let retry_after = response
+        } else {
+            Err(response_error(response).await)
+        }
+    }
+
+    /// Metadata of folder `id` for path resolution; `None` if it's gone or not visible.
+    async fn folder_meta(&self, id: &str) -> Result<Option<DriveFile>> {
+        let url = format!(
+            "{}/files/{}?fields=id,name,mimeType,parents,trashed",
+            self.api_base,
+            urlencoding::encode(id)
+        );
+        let response = self
+            .request(reqwest::Method::GET, &url)
+            .await?
+            .send()
+            .await
+            .map_err(|e| IntegrationError::Network(e.to_string()))?;
+        match self.handle_response(response).await {
+            Ok(f) => Ok(Some(f)),
+            Err(IntegrationError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Path of folder `id` relative to the sync root (`""` for the root itself, `"/A/B"`
+    /// below it), or `None` if no chain of parents within [`MAX_LIST_DEPTH`] reaches the root.
+    /// Memoized per call in `cache`; a folder being resolved is provisionally `None`, which
+    /// also breaks parent cycles.
+    async fn folder_path(
+        &self,
+        id: &str,
+        root: &SyncRoot,
+        cache: &mut HashMap<String, Option<String>>,
+        depth: usize,
+    ) -> Result<Option<String>> {
+        if root.is(id) {
+            return Ok(Some(String::new()));
+        }
+        if let Some(hit) = cache.get(id) {
+            return Ok(hit.clone());
+        }
+        if depth >= MAX_LIST_DEPTH {
+            return Ok(None);
+        }
+        cache.insert(id.to_string(), None);
+        let resolved = match self.folder_meta(id).await? {
+            Some(f) if f.trashed != Some(true) && is_safe_name(&f.name) => {
+                Box::pin(self.path_under(&f, root, cache, depth + 1)).await?
+            }
+            _ => None,
+        };
+        cache.insert(id.to_string(), resolved.clone());
+        Ok(resolved)
+    }
+
+    /// Path of `f` relative to the sync root via the first of its parents that reaches it.
+    async fn path_under(
+        &self,
+        f: &DriveFile,
+        root: &SyncRoot,
+        cache: &mut HashMap<String, Option<String>>,
+        depth: usize,
+    ) -> Result<Option<String>> {
+        for parent in f.parents.iter().flatten() {
+            if let Some(prefix) = self.folder_path(parent, root, cache, depth).await? {
+                return Ok(Some(format!("{}/{}", prefix, f.name)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The sync root for change resolution: the configured folder, or My Drive whose real id
+    /// (the one that appears in `parents`) is looked up, since `root` is only an alias.
+    async fn sync_root(&self, folder_id: Option<&str>) -> Result<SyncRoot> {
+        match folder_id {
+            Some(id) if id != "root" => Ok(SyncRoot(id.to_string(), None)),
+            _ => {
+                let url = format!("{}/files/root?fields=id", self.api_base);
+                let response = self
+                    .request(reqwest::Method::GET, &url)
+                    .await?
+                    .send()
+                    .await
+                    .map_err(|e| IntegrationError::Network(e.to_string()))?;
+                let f: FileId = self.handle_response(response).await?;
+                Ok(SyncRoot("root".into(), Some(f.id)))
+            }
+        }
+    }
+}
+
+/// Map a non-success Drive response to an error. 404 is [`IntegrationError::NotFound`] and a
+/// 403 for content that can never be downloaded (Docs editor files, downloads disabled by the
+/// owner) is [`IntegrationError::NotDownloadable`], both permanent; auth, rate limits, other
+/// 403s and 5xx stay retryable.
+async fn response_error(response: reqwest::Response) -> IntegrationError {
+    let status = response.status();
+    match status.as_u16() {
+        401 => IntegrationError::TokenExpired,
+        429 => IntegrationError::RateLimited {
+            retry_after_secs: response
                 .headers()
                 .get("Retry-After")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(60);
-            Err(IntegrationError::RateLimited {
-                retry_after_secs: retry_after,
-            })
-        } else if status.as_u16() == 403 {
+                .unwrap_or(60),
+        },
+        403 => {
             let body = response.text().await.unwrap_or_default();
             if body.contains("storageQuotaExceeded") {
-                Err(IntegrationError::QuotaExceeded)
+                IntegrationError::QuotaExceeded
+            } else if [
+                "fileNotDownloadable",
+                "cannotDownloadFile",
+                "cannotDownloadAbusiveFile",
+            ]
+            .iter()
+            .any(|r| body.contains(r))
+            {
+                IntegrationError::NotDownloadable(body)
             } else {
-                Err(IntegrationError::Api(format!("Forbidden: {}", body)))
+                IntegrationError::Api(format!("Forbidden: {}", body))
             }
-        } else if status.as_u16() == 404 {
-            Err(IntegrationError::NotFound("File not found".into()))
-        } else {
+        }
+        404 => IntegrationError::NotFound("File not found".into()),
+        _ => {
             let body = response.text().await.unwrap_or_default();
-            Err(IntegrationError::Api(format!("{}: {}", status, body)))
+            IntegrationError::Api(format!("{}: {}", status, body))
         }
     }
+}
+
+/// Whether a Drive name is usable as one local path segment (same rule as the full listing).
+fn is_safe_name(name: &str) -> bool {
+    matches!(safe_components(name).as_deref(), Ok([_]))
+}
+
+/// Folder that change paths are resolved against: its id as configured, plus the real id when
+/// that is the `root` alias.
+struct SyncRoot(String, Option<String>);
+
+impl SyncRoot {
+    fn is(&self, id: &str) -> bool {
+        self.0 == id || self.1.as_deref() == Some(id)
+    }
+}
+
+#[derive(Deserialize)]
+struct FileId {
+    id: String,
 }
 
 /// Google Drive file response
@@ -203,6 +326,8 @@ struct DriveFile {
     md5_checksum: Option<String>,
     #[serde(default)]
     parents: Option<Vec<String>>,
+    #[serde(default)]
+    trashed: Option<bool>,
 }
 
 impl DriveFile {
@@ -317,7 +442,7 @@ impl CloudProvider for GoogleDrive {
         while let Some((folder, prefix, depth)) = queue.pop_front() {
             let query = format!("'{}' in parents and trashed = false", escape_query(&folder));
             for f in self.list_query(&query).await? {
-                if !matches!(safe_components(&f.name).as_deref(), Ok([_])) {
+                if !is_safe_name(&f.name) {
                     tracing::warn!(
                         "google drive: skipping unsafe name {:?} in {}",
                         f.name,
@@ -394,9 +519,7 @@ impl CloudProvider for GoogleDrive {
             .map_err(|e| IntegrationError::Network(e.to_string()))?;
 
         if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(IntegrationError::Api(format!("{}: {}", status, body)));
+            return Err(response_error(response).await);
         }
 
         response
@@ -584,6 +707,19 @@ impl CloudProvider for GoogleDrive {
     }
 
     async fn get_changes(&self, cursor: Option<&str>) -> Result<(Vec<CloudFile>, Option<String>)> {
+        self.get_changes_in(None, cursor).await
+    }
+
+    /// Changes since `cursor`, keeping only items under `folder_id` (default: My Drive) and
+    /// giving each the same relative path [`list_files`](CloudProvider::list_files) would, by
+    /// walking `parents` up to the sync root. Items outside it, trashed, or whose chain can't be
+    /// resolved (unsafe names, too deep, cycles) are skipped; with several parents the first
+    /// one that reaches the root wins.
+    async fn get_changes_in(
+        &self,
+        folder_id: Option<&str>,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<CloudFile>, Option<String>)> {
         // Get start page token if no cursor
         let page_token = if let Some(c) = cursor {
             c.to_string()
@@ -606,8 +742,9 @@ impl CloudProvider for GoogleDrive {
         };
 
         let url = format!(
-            "{}/changes?pageToken={}&fields=changes(fileId,file(id,name,mimeType,size,modifiedTime,md5Checksum,parents),removed),newStartPageToken,nextPageToken",
-            self.api_base, page_token
+            "{}/changes?pageToken={}&fields=changes(fileId,file(id,name,mimeType,size,modifiedTime,md5Checksum,parents,trashed),removed),newStartPageToken,nextPageToken",
+            self.api_base,
+            urlencoding::encode(&page_token)
         );
 
         let response = self
@@ -619,17 +756,36 @@ impl CloudProvider for GoogleDrive {
 
         let changes: ChangesResponse = self.handle_response(response).await?;
 
-        let files: Vec<CloudFile> = changes
+        let live: Vec<DriveFile> = changes
             .changes
             .into_iter()
-            .filter_map(|c| {
-                if c.removed == Some(true) {
-                    None
-                } else {
-                    c.file.map(|f| f.to_cloud_file(format!("/{}", f.name)))
-                }
-            })
+            .filter(|c| c.removed != Some(true))
+            .filter_map(|c| c.file)
+            .filter(|f| f.trashed != Some(true))
             .collect();
+
+        let mut files = Vec::new();
+        if !live.is_empty() {
+            let root = self.sync_root(folder_id).await?;
+            let mut cache = HashMap::new();
+            for f in live {
+                if !is_safe_name(&f.name) {
+                    tracing::warn!(
+                        "google drive: skipping change with unsafe name {:?}",
+                        f.name
+                    );
+                    continue;
+                }
+                match self.path_under(&f, &root, &mut cache, 0).await? {
+                    Some(path) => files.push(f.to_cloud_file(path)),
+                    None => tracing::debug!(
+                        "google drive: skipping change {:?} ({}): not under the sync folder",
+                        f.name,
+                        f.id
+                    ),
+                }
+            }
+        }
 
         let next_cursor = changes.new_start_page_token.or(changes.next_page_token);
 
@@ -808,6 +964,247 @@ mod tests {
             matches!(err, IntegrationError::Api(ref m) if m.contains("repeated")),
             "{err}"
         );
+    }
+
+    fn item(id: &str, name: &str, parents: &[&str]) -> Value {
+        let mime = if name.ends_with(".pdf") {
+            "application/pdf"
+        } else {
+            FOLDER_MIME
+        };
+        json!({ "id": id, "name": name, "mimeType": mime, "parents": parents })
+    }
+
+    /// Folder metadata served by the fake `files.get`. `ROOTID` is My Drive's real id; `ext`
+    /// isn't under it; `c1`/`c2` are parents of each other; `lost` is 404.
+    fn folder_meta(id: &str) -> Option<Value> {
+        Some(match id {
+            "A" => item("A", "A", &["ROOTID"]),
+            "B" => item("B", "B", &["ROOTID"]),
+            "sub" => item("sub", "sub", &["A"]),
+            "ext" => item("ext", "Shared", &[]),
+            "c1" => item("c1", "c1", &["c2"]),
+            "c2" => item("c2", "c2", &["c1"]),
+            "bad" => item("bad", "..", &["ROOTID"]),
+            _ => return None,
+        })
+    }
+
+    /// The change page for `pageToken`.
+    fn changes_page(token: &str) -> Vec<Value> {
+        let change = |f: Value| json!({ "fileId": f["id"], "file": f });
+        match token {
+            "all" => vec![
+                change(item("top", "f.pdf", &["ROOTID"])),
+                change(item("nested", "f.pdf", &["A"])),
+                change(item("b", "f.pdf", &["B"])),
+                change(item("deep", "f.pdf", &["sub"])),
+                change(item("outside", "f.pdf", &["ext"])),
+                change(item("multi", "m.pdf", &["ext", "A"])),
+                change(item("cyc", "f.pdf", &["c1"])),
+                change(item("orphan", "f.pdf", &["lost"])),
+                change(item("unsafe", "f.pdf", &["bad"])),
+                change(
+                    json!({ "id": "t", "name": "t.pdf", "mimeType": "application/pdf",
+                               "parents": ["ROOTID"], "trashed": true }),
+                ),
+                json!({ "fileId": "gone", "removed": true }),
+            ],
+            "nested" => vec![
+                change(item("nested", "f.pdf", &["A"])),
+                change(item("outside", "f.pdf", &["ext"])),
+            ],
+            "dl" => vec![
+                change(item("missing", "missing.pdf", &["ROOTID"])),
+                change(item("gdoc", "doc.pdf", &["ROOTID"])),
+                change(item("ok", "ok.pdf", &["ROOTID"])),
+            ],
+            "flaky" => vec![
+                change(item("ok", "ok.pdf", &["ROOTID"])),
+                change(item("flaky", "flaky.pdf", &["ROOTID"])),
+            ],
+            _ => vec![],
+        }
+    }
+
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    /// Fake Drive changes / files.get / download endpoints; logs every `files.get` id.
+    async fn fake_changes() -> (String, Log) {
+        use axum::extract::Path;
+        use axum::http::StatusCode;
+        use axum::response::{IntoResponse, Response};
+
+        async fn get_file(
+            State(log): State<Log>,
+            Path(id): Path<String>,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> Response {
+            log.lock().unwrap().push(id.clone());
+            if q.get("alt").map(String::as_str) == Some("media") {
+                return match id.as_str() {
+                    "missing" => StatusCode::NOT_FOUND.into_response(),
+                    "gdoc" => (
+                        StatusCode::FORBIDDEN,
+                        r#"{"error":{"errors":[{"reason":"fileNotDownloadable"}]}}"#,
+                    )
+                        .into_response(),
+                    "flaky" => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                    _ => id.into_bytes().into_response(),
+                };
+            }
+            if id == "root" {
+                return Json(json!({ "id": "ROOTID" })).into_response();
+            }
+            match folder_meta(&id) {
+                Some(v) => Json(v).into_response(),
+                None => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
+
+        let log = Log::default();
+        let app = axum::Router::new()
+            .route(
+                "/changes",
+                get(|Query(q): Query<HashMap<String, String>>| async move {
+                    Json(json!({
+                        "changes": changes_page(&q["pageToken"]),
+                        "newStartPageToken": "next",
+                    }))
+                }),
+            )
+            .route("/files/{id}", get(get_file))
+            .with_state(log.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{}", addr), log)
+    }
+
+    fn paths(files: &[CloudFile]) -> Vec<(&str, &str)> {
+        let mut v: Vec<_> = files
+            .iter()
+            .map(|f| (f.path.as_str(), f.id.as_str()))
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[tokio::test]
+    async fn changes_get_full_paths_under_my_drive() {
+        let (base, log) = fake_changes().await;
+        let (files, cursor) = drive(&base).get_changes(Some("all")).await.unwrap();
+        assert_eq!(cursor.as_deref(), Some("next"));
+        // Same-name files in different folders keep distinct paths; items outside the root,
+        // in a parent cycle, under a missing or unsafe folder, trashed or removed are dropped.
+        assert_eq!(
+            paths(&files),
+            vec![
+                ("/A/f.pdf", "nested"),
+                ("/A/m.pdf", "multi"), // first parent (`ext`) doesn't reach root; `A` does
+                ("/A/sub/f.pdf", "deep"),
+                ("/B/f.pdf", "b"),
+                ("/f.pdf", "top"),
+            ]
+        );
+        // Every folder is fetched at most once per call.
+        let mut log = log.lock().unwrap().clone();
+        let n = log.len();
+        log.sort();
+        log.dedup();
+        assert_eq!(n, log.len(), "folder metadata not cached: {log:?}");
+    }
+
+    #[tokio::test]
+    async fn changes_relative_to_sync_folder() {
+        let (base, log) = fake_changes().await;
+        let (files, _) = drive(&base)
+            .get_changes_in(Some("A"), Some("all"))
+            .await
+            .unwrap();
+        assert_eq!(
+            paths(&files),
+            vec![
+                ("/f.pdf", "nested"),
+                ("/m.pdf", "multi"),
+                ("/sub/f.pdf", "deep")
+            ]
+        );
+        // A configured folder id needs no lookup of My Drive's id.
+        assert!(!log.lock().unwrap().contains(&"root".to_string()));
+    }
+
+    fn sync_state(cursor: &str) -> crate::integrations::sync::SyncState {
+        crate::integrations::sync::SyncState {
+            cursor: Some(cursor.into()),
+            ..Default::default()
+        }
+    }
+
+    fn sync_for(
+        base: &str,
+        root: &std::path::Path,
+        cursor: &str,
+    ) -> crate::integrations::sync::CloudSync<GoogleDrive> {
+        use crate::integrations::sync::{CloudSync, SyncConfig, SyncDirection};
+        let config = SyncConfig {
+            local_path: root.to_path_buf(),
+            direction: SyncDirection::Download,
+            ..Default::default()
+        };
+        CloudSync::with_state(drive(base), config, sync_state(cursor))
+    }
+
+    /// A delta change to `/A/f.pdf` lands there, never on the unrelated root-level `/f.pdf`,
+    /// and a change outside the sync folder writes nothing.
+    #[tokio::test]
+    async fn delta_sync_applies_nested_change_at_its_path() {
+        let (base, _) = fake_changes().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.pdf"), "keep").unwrap();
+        let mut sync = sync_for(&base, dir.path(), "nested");
+        let r = sync.delta_sync().await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(r.downloaded, 1);
+        assert_eq!(
+            std::fs::read(dir.path().join("A/f.pdf")).unwrap(),
+            b"nested"
+        );
+        assert_eq!(std::fs::read(dir.path().join("f.pdf")).unwrap(), b"keep");
+        assert_eq!(sync.state().cursor.as_deref(), Some("next"));
+    }
+
+    /// Deleted files (404) and Docs editor files (403 fileNotDownloadable) fail permanently,
+    /// so the cursor advances; a 5xx is transient and holds it.
+    #[tokio::test]
+    async fn delta_sync_download_errors_permanent_vs_transient() {
+        let (base, _) = fake_changes().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut sync = sync_for(&base, dir.path(), "dl");
+        let r = sync.delta_sync().await.unwrap();
+        assert_eq!((r.downloaded, r.errors.len()), (1, 2), "{:?}", r.errors);
+        assert_eq!(sync.state().cursor.as_deref(), Some("next"));
+        assert!(dir.path().join("ok.pdf").exists());
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut sync = sync_for(&base, dir.path(), "flaky");
+        let r = sync.delta_sync().await.unwrap();
+        assert_eq!((r.downloaded, r.errors.len()), (1, 1), "{:?}", r.errors);
+        assert_eq!(sync.state().cursor.as_deref(), Some("flaky"));
+    }
+
+    #[tokio::test]
+    async fn download_error_mapping() {
+        let (base, _) = fake_changes().await;
+        let d = drive(&base);
+        let err = d.download_file("missing").await.unwrap_err();
+        assert!(matches!(err, IntegrationError::NotFound(_)), "{err}");
+        let err = d.download_file("gdoc").await.unwrap_err();
+        assert!(matches!(err, IntegrationError::NotDownloadable(_)), "{err}");
+        assert!(err.is_permanent());
+        let err = d.download_file("flaky").await.unwrap_err();
+        assert!(!err.is_permanent(), "{err}");
+        assert_eq!(d.download_file("ok").await.unwrap(), b"ok");
     }
 
     #[test]
