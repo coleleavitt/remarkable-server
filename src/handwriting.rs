@@ -32,14 +32,16 @@ const PEN: f32 = 5.0;
 const MAX_SIDE: f32 = 3000.0;
 const TESSERACT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Largest request body (the route's `DefaultBodyLimit`; over it is a 413). A request is
-/// the ink of one conversion (a selection, at most a page): per stroke, `x`/`y` (and
-/// optionally `t`/`p`) arrays of JSON numbers of roughly 10 bytes each, so at most ~40
-/// bytes a point. Even a very dense page is some 200k points (its .rm file, at 14 bytes a
-/// point, runs to a few MB), which is about 8 MB of JSON. 32 MiB leaves several times
-/// that; the body and its parse into point vectors are held in memory, so the 1 GiB of
-/// the blob routes is no limit for it.
-pub(crate) const MAX_BODY: usize = 32 * 1024 * 1024;
+/// Largest request body (over it is a 413; read only once the caller is authenticated).
+/// A request is the ink of one conversion (a selection, at most a page): per stroke,
+/// `x`/`y` (and optionally `t`/`p`) arrays of JSON numbers. Written as shortest
+/// round-trip doubles, as Qt's JSON writer does with a float widened to double
+/// (`123.45f` becomes `123.44999694824219`), a number is up to ~20 bytes, so a point is
+/// up to ~80. A very dense page is some 200k-500k points (its .rm file, at 14 bytes a
+/// point, runs to a few MB), which is 16-40 MB of JSON at worst. 64 MiB covers that;
+/// the body and its parse into point vectors are held in memory, so the 1 GiB of the
+/// blob routes is no limit for it.
+pub(crate) const MAX_BODY: usize = 64 * 1024 * 1024;
 
 #[derive(Deserialize)]
 struct Request {
@@ -288,9 +290,10 @@ fn capture(name: &str, body: &[u8]) {
 pub async fn convert(
     State(state): State<AppState>,
     headers: HeaderMap,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> Result<Response> {
     state.auth_user(&headers)?;
+    let body = crate::upload::read_body(&headers, body, MAX_BODY as u64).await?;
     capture("request.json", &body);
     let req: Request = serde_json::from_slice(&body)?;
     let strokes: Vec<Points> = req
@@ -392,15 +395,25 @@ mod tests {
     }
 
     mod route {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
         use axum::body::Body;
         use axum::http::Request;
+        use futures_util::StreamExt;
         use tower::ServiceExt;
 
         use super::*;
         use crate::device::DeviceManager;
         use crate::storage::Storage;
 
-        async fn post(uri: &str, auth: &str, body: Vec<u8>) -> (StatusCode, String) {
+        /// `body` to `uri`; `auth` "" means a valid token.
+        async fn post(
+            uri: &str,
+            auth: &str,
+            len: Option<usize>,
+            body: Body,
+        ) -> (StatusCode, String) {
             let tmp = tempfile::TempDir::new().unwrap();
             let storage = Storage::new(tmp.path().join("storage")).unwrap();
             let devices =
@@ -409,13 +422,14 @@ mod tests {
                 "" => format!("Bearer {}", devices.create_user_token("u@test").unwrap()),
                 a => a.to_owned(),
             };
-            let req = Request::post(uri)
+            let mut req = Request::post(uri)
                 .header("authorization", auth)
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .unwrap();
+                .header("content-type", "application/json");
+            if let Some(len) = len {
+                req = req.header("content-length", len);
+            }
             let resp = crate::create_router(AppState::new(storage, devices))
-                .oneshot(req)
+                .oneshot(req.body(body).unwrap())
                 .await
                 .unwrap();
             let status = resp.status();
@@ -435,17 +449,40 @@ mod tests {
             body
         }
 
+        /// `body` as a request body that notes whether it was ever read.
+        fn watched(body: Vec<u8>) -> (Body, Arc<AtomicBool>) {
+            let read = Arc::new(AtomicBool::new(false));
+            let flag = read.clone();
+            let frames = futures_util::stream::iter([body]).map(move |frame| {
+                flag.store(true, Ordering::SeqCst);
+                Ok::<_, std::io::Error>(frame)
+            });
+            (Body::from_stream(frames), read)
+        }
+
         #[tokio::test]
-        async fn body_limit_is_explicit() {
+        async fn body_limit_is_explicit_and_read_after_auth() {
             for uri in ["/convert/v1/handwriting", "/api/v1/page"] {
-                // Over the limit: 413, before auth (the body is buffered by the extractor).
-                let (status, _) = post(uri, "Bearer nope", no_strokes(MAX_BODY + 1)).await;
+                // Unauthenticated: 401 without reading the body at all.
+                let (body, read) = watched(no_strokes(1024));
+                let (status, _) = post(uri, "Bearer nope", None, body).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+                assert!(!read.load(Ordering::SeqCst), "{uri}: body read before auth");
+                // Declared over the limit: 413 before the body is read.
+                let (body, read) = watched(no_strokes(1024));
+                let (status, _) = post(uri, "", Some(MAX_BODY + 1), body).await;
                 assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{uri}");
-                // At the limit (far past axum's 2 MiB default): parsed as before.
-                let (status, body) = post(uri, "", no_strokes(MAX_BODY)).await;
-                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
-                assert!(body.contains("no strokes"), "{uri}: {body}");
+                assert!(!read.load(Ordering::SeqCst), "{uri}");
             }
+            // Both routes share the handler; the full-size cases once.
+            let uri = "/convert/v1/handwriting";
+            // Over the limit while reading (no content-length): 413.
+            let (status, body) = post(uri, "", None, Body::from(no_strokes(MAX_BODY + 1))).await;
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+            // At the limit (far past axum's 2 MiB default): parsed as before.
+            let (status, body) = post(uri, "", None, Body::from(no_strokes(MAX_BODY))).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("no strokes"), "{body}");
         }
     }
 }

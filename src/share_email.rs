@@ -278,6 +278,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_form_is_still_a_400() {
+        let (state, auth, _tmp) = setup();
+        // No closing boundary: the multipart reader's own error, a 400 as before (not
+        // the 413, and not the later recipient or SMTP check).
+        let mut body = form(1024);
+        body.truncate(body.len() - format!("\r\n--{B}--\r\n").len());
+        let (status, body) = post(&state, &auth, None, Body::from(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("config_error"), "{body}");
+        assert!(body.contains("multipart/form-data"), "{body}");
+        assert!(!body.contains("payload_too_large"), "{body}");
+    }
+
+    #[tokio::test]
     async fn attachments_past_axums_default_are_read() {
         let (state, auth, _tmp) = setup();
         // 3 MiB (over axum's 2 MiB default): the form is read in full and the request

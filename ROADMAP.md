@@ -127,9 +127,9 @@ The community's top *concrete* pains. Small, bounded, high-value.
   broker are not closed when their device is revoked (the `/notifications/ws`
   and `/mqtt` sessions are).
 - ✅ **Remaining buffered bodies** — gentree `PutFile` streams its JSON body
-  (the base64 blob is decoded to disk as it arrives); handwriting convert (32
-  MiB) and share-by-email (25 MiB, 413 over it) still read the request into
-  memory, but with limits sized to what they carry instead of 1 GiB.
+  (the base64 blob is decoded to disk as it arrives); handwriting convert (64
+  MiB, read after auth) and share-by-email (25 MiB, 413 over it) still read the
+  request into memory, but with limits sized to what they carry instead of 1 GiB.
 - ⬜ **Remote calendar providers** — only local ICS files sync; CalDAV, Google
   and Office 365 calendars answer "not implemented".
 - 🧪 **`/mqtt` topic** — MQTT-over-WebSocket push publishes on whatever concrete

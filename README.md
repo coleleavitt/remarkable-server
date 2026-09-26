@@ -327,8 +327,9 @@ parts are kept per report, and after each report the oldest reports are deleted 
 
 Uploads (sync v3 / sync15 / v2 / v4 blob PUTs, document uploads, share links, gentree `PutFile`) are streamed to
 `<storage>/.uploads/` rather than buffered, up to 1 GiB per blob. gentree `PutFile` reads its JSON body
-incrementally and decodes the base64 blob inside it straight to disk. Handwriting convert (stroke JSON) is capped at
-32 MiB and share-by-email at 25 MiB (attachments included; over it is a 413): both are still read into memory.
+incrementally and decodes the base64 blob inside it straight to disk. Handwriting convert (stroke JSON, read only
+after auth) is capped at 64 MiB and share-by-email at 25 MiB (attachments included; over it is a 413): both are still
+read into memory.
 
 Authenticated feature APIs (Bearer token): `/search/v1/*`, `/versions/v1/*`, `/feeds/v1/*` (RSS/Atom to EPUB), `/integrations/v2/{calendars,readlater,cloud}/*`, `/email/v1/*` (when inbound email is on).
 

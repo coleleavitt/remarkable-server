@@ -216,6 +216,24 @@ pub async fn stage_body(
     stager.finish().await
 }
 
+/// Read a whole request body into memory, for handlers that parse it whole but should
+/// authenticate before reading it (axum's `Bytes` extractor reads first). Refuses more
+/// than `limit` bytes (413, up front when `content-length` already says so); a read
+/// error is a 400, as in [`stage_body`].
+pub(crate) async fn read_body(headers: &HeaderMap, body: Body, limit: u64) -> Result<Vec<u8>> {
+    check_declared_length(headers, limit)?;
+    let mut buf = Vec::new();
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(body_read_error)?;
+        if (buf.len() + chunk.len()) as u64 > limit {
+            return Err(too_large(limit));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 /// 413 up front when `content-length` already exceeds `limit`.
 fn check_declared_length(headers: &HeaderMap, limit: u64) -> Result<()> {
     let declared = headers
@@ -360,6 +378,18 @@ impl Base64Stager {
         })
     }
 
+    /// Start over on a new string in the same staged file, if nothing has been written
+    /// to it yet (the decoder writes a step of [`B64_STEP`] characters at a time, so
+    /// until then only its in-memory state has to be reset). `false`: the file holds
+    /// data, so the caller needs a fresh stager.
+    fn restart_in_place(&mut self) -> bool {
+        if self.stager.len > 0 {
+            return false;
+        }
+        self.dec = Base64Decoder::new(B64_STEP);
+        true
+    }
+
     /// The next base64 characters (any split). Invalid input is noted, not an error:
     /// see [`Self::finish`].
     pub(crate) async fn push(&mut self, chars: &[u8]) -> Result<()> {
@@ -425,8 +455,14 @@ pub(crate) async fn stage_json_base64(
         for piece in chunk.chunks(FEED_STEP) {
             scanner.feed(piece, &mut out).map_err(scan_error)?;
             if std::mem::take(&mut out.restart) {
-                // A (new) occurrence of `key`: whatever an earlier one staged is dropped.
-                blob = Some(Base64Stager::new(storage, false).await?);
+                // A (new) occurrence of `key`: whatever an earlier one staged is dropped
+                // (the last one wins). Its file is reused while still empty, so a body
+                // of many short duplicates costs one staged file, not a create, delete
+                // and staging-directory sweep each; a new file takes at least one
+                // written decode step, so at most one per `B64_STEP` body bytes.
+                if !blob.as_mut().is_some_and(Base64Stager::restart_in_place) {
+                    blob = Some(Base64Stager::new(storage, false).await?);
+                }
             }
             if let Some(blob) = &mut blob {
                 blob.push(&out.bytes).await?;

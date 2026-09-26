@@ -139,16 +139,12 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/v1/signed-urls/uploads", post(sync15::signed_upload))
         .route("/api/v1/sync-complete", post(sync15::sync_complete))
-        // Handwriting conversion (local tesseract; see handwriting.rs)
-        .route(
-            "/convert/v1/handwriting",
-            post(handwriting::convert).layer(DefaultBodyLimit::max(handwriting::MAX_BODY)),
-        )
+        // Handwriting conversion (local tesseract; see handwriting.rs). The handler reads
+        // the body itself after auth, limited to `handwriting::MAX_BODY` (a `Body`
+        // extractor ignores `DefaultBodyLimit`, so no layer here).
+        .route("/convert/v1/handwriting", post(handwriting::convert))
         .route("/handwriting/v1/search", get(hw_search::search))
-        .route(
-            "/api/v1/page",
-            post(handwriting::convert).layer(DefaultBodyLimit::max(handwriting::MAX_BODY)),
-        )
+        .route("/api/v1/page", post(handwriting::convert))
         // Share a page as a link (3.27+)
         .route(
             "/share/v1/link",
@@ -190,10 +186,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/gentree/v1/GetEntries", post(gentree::get_entries))
         .route("/gentree/v1/GetFiles", post(gentree::get_files))
         .route("/gentree/v1/GetFile", post(gentree::get_file))
-        .route(
-            "/gentree/v1/PutFile",
-            post(gentree::put_file).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
-        )
+        // PutFile streams its body and enforces MAX_BLOB_BYTES itself (a `Body` extractor
+        // ignores `DefaultBodyLimit`, so a layer here would be a no-op).
+        .route("/gentree/v1/PutFile", post(gentree::put_file))
         .route("/gentree/v1/DeleteEntry", post(gentree::delete_entry))
         .route("/gentree/v1/EntrySession", post(gentree::entry_session))
         .route("/sync/v4/root", get(protocol::v4_get_root))

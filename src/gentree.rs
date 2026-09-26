@@ -401,6 +401,7 @@ mod tests {
 /// Streaming PutFile against the buffered handler it replaced, through the real router.
 #[cfg(test)]
 mod put_file_tests {
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use axum::Router;
@@ -410,6 +411,7 @@ mod put_file_tests {
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
     use bytes::Bytes;
+    use futures_util::StreamExt;
     use proptest::prelude::*;
     use proptest::test_runner::{Config, TestRunner};
     use sha2::{Digest, Sha256};
@@ -506,6 +508,35 @@ mod put_file_tests {
         std::fs::read_dir(state.storage.staging_dir())
             .map(|d| d.count() == 0)
             .unwrap_or(true)
+    }
+
+    /// Names in the staging directory, sorted.
+    fn staged_names(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// Staging-directory contents, one entry per frame the body was asked for.
+    type Seen = Arc<Mutex<Vec<Vec<String>>>>;
+
+    /// `frames` as a body that, whenever a frame is asked for (so once the previous one
+    /// has been handled), records the staging directory's contents.
+    fn watched(state: &AppState, frames: Vec<Vec<u8>>) -> (Body, Seen) {
+        let dir = state.storage.staging_dir();
+        let seen = Seen::default();
+        let log = seen.clone();
+        let stream = futures_util::stream::iter(frames).map(move |frame| {
+            log.lock().unwrap().push(staged_names(&dir));
+            Ok::<_, std::io::Error>(Bytes::from(frame))
+        });
+        (Body::from_stream(stream), seen)
     }
 
     /// JSON string literal for `s`, each char escaped or not as `choices` says: raw,
@@ -821,9 +852,12 @@ mod put_file_tests {
             "Expected request with `Content-Type: application/json`".as_bytes()
         );
 
-        // Unauthenticated: refused before anything is staged.
-        let (s, _, _) = send(&router, request("Bearer nope", Body::from(doc.clone()))).await;
+        // Unauthenticated: refused before the body is read, so nothing is staged.
+        let (body, seen) = watched(&state, vec![doc.clone().into_bytes()]);
+        let (s, _, _) = send(&router, request("Bearer nope", body)).await;
         assert_eq!(s, StatusCode::UNAUTHORIZED);
+        assert!(seen.lock().unwrap().is_empty(), "body read before auth");
+        assert!(staging_empty(&state));
 
         // Declared over the 1 GiB limit: 413 up front.
         let mut req = request(&auth, Body::from(doc.clone()));
@@ -856,34 +890,86 @@ mod put_file_tests {
         assert!(!state.storage.exists(&hash));
         assert!(staging_empty(&state));
 
+        // A numeral too long to hold: 413.
+        let digits = "1".repeat(crate::json_scan::MAX_NUMBER + 1);
+        let body = format!(r#"{{"fileHash":"{hash}","sizeBytes":{digits},"payload":"QUJD"}}"#);
+        assert_eq!(
+            send(&router, request(&auth, Body::from(body))).await.0,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        // A fileHash too long to hold: the 400 invalid_hash any bad hash gets.
+        let long = "a".repeat(crate::upload::MAX_JSON_FIELD + 1);
+        let body = format!(r#"{{"fileHash":"{long}","payload":"QUJD"}}"#);
+        let (s, _, b) = send(&router, request(&auth, Body::from(body))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(
+            String::from_utf8_lossy(&b).contains("invalid_hash"),
+            "{b:?}"
+        );
+        assert!(!state.storage.exists(&hash));
+        assert!(staging_empty(&state));
+
         // Still fine afterwards.
         let (s, _, _) = send(&router, request(&auth, Body::from(doc))).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(state.storage.get(&hash).unwrap(), b"ABC");
+
+        // A filePath of exactly the capture cap is still held and catalogued.
+        let path = "p".repeat(crate::upload::MAX_JSON_FIELD);
+        let other = "9".repeat(64);
+        let body = format!(r#"{{"fileHash":"{other}","filePath":"{path}","payload":"QUJD"}}"#);
+        let (s, _, b) = send(&router, request(&auth, Body::from(body))).await;
+        assert_eq!(s, StatusCode::OK, "{b:?}");
+        assert_eq!(
+            state.storage.filename_for_hash(&other).as_deref(),
+            Some(path.as_str())
+        );
     }
 
     #[tokio::test]
     async fn body_limit_applies_while_streaming() {
         let (state, _auth, _tmp) = setup();
+        let data: Vec<u8> = (0..6000u32).map(|i| (i * 7 % 251) as u8).collect();
         let doc = format!(
-            r#"{{"fileHash":"{}","payload":"QUJDREVG"}}"#,
-            "f".repeat(64)
+            r#"{{"fileHash":"{}","payload":"{}"}}"#,
+            "f".repeat(64),
+            STANDARD.encode(&data)
         );
+        let start = doc.find(r#""payload":""#).unwrap() + r#""payload":""#.len();
+        // Cut inside the blob, so it is being staged when the last frame trips the limit.
+        let frames = |doc: &str| {
+            let (a, b) = (start + 8, start + 4096);
+            vec![
+                doc.as_bytes()[..a].to_vec(),
+                doc.as_bytes()[a..b].to_vec(),
+                doc.as_bytes()[b..].to_vec(),
+            ]
+        };
+        let (body, seen) = watched(&state, frames(&doc));
         let staged = crate::upload::stage_json_base64(
             &state.storage,
             &HeaderMap::new(),
-            framed(doc.as_bytes(), &[10, 40]),
+            body,
             doc.len() as u64 - 1,
             BLOB_FIELD,
             PUT_FIELDS,
         )
         .await;
         assert!(matches!(staged, Err(ServerError::PayloadTooLarge(_))));
+        // A staged file existed when the over-limit frame was asked for, and is gone.
+        assert_eq!(
+            seen.lock().unwrap()[2].len(),
+            1,
+            "{:?}",
+            seen.lock().unwrap()
+        );
         assert!(staging_empty(&state));
+
+        let (body, _) = watched(&state, frames(&doc));
         let (scanned, blob) = crate::upload::stage_json_base64(
             &state.storage,
             &HeaderMap::new(),
-            framed(doc.as_bytes(), &[10, 40]),
+            body,
             doc.len() as u64,
             BLOB_FIELD,
             PUT_FIELDS,
@@ -891,6 +977,77 @@ mod put_file_tests {
         .await
         .unwrap();
         assert_eq!(scanned.streamed, Streamed::Text);
-        assert_eq!(blob.unwrap().finish().await.unwrap().unwrap().len(), 6);
+        let staged = blob.unwrap().finish().await.unwrap().unwrap();
+        assert_eq!(staged.crc32c(), crc32c::crc32c(&data));
+        drop(staged);
+        assert!(staging_empty(&state));
+    }
+
+    /// `frames` through [`crate::upload::stage_json_base64`]; the staged blob, committed
+    /// as `hash`, and what the staging directory held as each frame was asked for.
+    async fn stage_frames(state: &AppState, frames: Vec<Vec<u8>>, hash: &str) -> Vec<Vec<String>> {
+        let (body, seen) = watched(state, frames);
+        let (scanned, blob) = crate::upload::stage_json_base64(
+            &state.storage,
+            &HeaderMap::new(),
+            body,
+            crate::MAX_BLOB_BYTES as u64,
+            BLOB_FIELD,
+            PUT_FIELDS,
+        )
+        .await
+        .unwrap();
+        assert_eq!(scanned.streamed, Streamed::Text);
+        let staged = blob.unwrap().finish().await.unwrap().unwrap();
+        // Exactly one staged file remains: the blob's.
+        assert_eq!(staged_names(&state.storage.staging_dir()).len(), 1);
+        staged.commit(&state.storage, hash, "dup").unwrap();
+        assert!(staging_empty(state));
+        Arc::try_unwrap(seen).unwrap().into_inner().unwrap()
+    }
+
+    #[tokio::test]
+    async fn duplicate_blob_keys_reuse_the_staged_file() {
+        let (state, _auth, _tmp) = setup();
+
+        // Many short duplicates, one per frame: the last wins, and they all share the
+        // first staged file instead of creating and deleting one each.
+        let mut frames = vec![br#"{"payload":"QUJD""#.to_vec()];
+        frames.extend(std::iter::repeat_n(br#","payload":"WFla""#.to_vec(), 200));
+        frames.push(br#","payload":"REVG"}"#.to_vec());
+        let hash = "1".repeat(64);
+        let seen = stage_frames(&state, frames, &hash).await;
+        assert!(seen[0].is_empty());
+        let files: std::collections::BTreeSet<&String> = seen[1..].iter().flatten().collect();
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert!(seen[1..].iter().all(|names| names.len() == 1));
+        assert_eq!(state.storage.get(&hash).unwrap(), b"DEF");
+
+        // An occurrence long enough to have been written is replaced by a new file (the
+        // old one removed), and a later short one still wins.
+        let big: Vec<u8> = (0..200_000u32).map(|i| (i * 13 % 251) as u8).collect();
+        let frames = vec![
+            format!(r#"{{"payload":"{}""#, STANDARD.encode(&big)).into_bytes(),
+            br#","payload":"QUJD""#.to_vec(),
+            br#"}"#.to_vec(),
+        ];
+        let hash = "2".repeat(64);
+        let seen = stage_frames(&state, frames, &hash).await;
+        assert_eq!(seen[1].len(), 1);
+        assert_eq!(seen[2].len(), 1);
+        assert_ne!(
+            seen[1], seen[2],
+            "the written file should have been replaced"
+        );
+        assert_eq!(state.storage.get(&hash).unwrap(), b"ABC");
+
+        // And the other way round: a short occurrence, then a long one.
+        let frames = vec![
+            br#"{"payload":"QUJD""#.to_vec(),
+            format!(r#","payload":"{}"}}"#, STANDARD.encode(&big)).into_bytes(),
+        ];
+        let hash = "3".repeat(64);
+        stage_frames(&state, frames, &hash).await;
+        assert!(state.storage.get(&hash).unwrap() == big);
     }
 }
