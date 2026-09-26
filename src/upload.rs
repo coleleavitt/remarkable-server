@@ -804,7 +804,9 @@ mod route_tests {
         let calendar =
             |name: &str| crate::CalendarState::new(crate::CalendarManager::new(&db(name)).unwrap());
         let readlater = crate::readlater_api::ReadLaterState::new(
-            crate::readlater::ReadLaterManager::new(&db("rl.db"), &db("rl")).unwrap(),
+            crate::readlater::ReadLaterManager::new(&db("rl.db")).unwrap(),
+            state.storage.clone(),
+            state.notification_tx.clone(),
         );
         let integrations = crate::IntegrationState::new;
         let routers = [
