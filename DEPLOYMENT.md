@@ -229,6 +229,17 @@ Pairing code on the Linode:
 ssh linode 'sudo -u remarkable /opt/remarkable-server/bin/remarkable-server --storage /var/lib/remarkable-server --pair'
 ```
 
+OAuth device-code sign-in (3.28 `auth.remarkable.com` flow; the legacy pairing
+above does not use it) needs an explicit owner approval. The client shows a
+`user_code` (also logged at WARN as `OAuth device code requested`); within 10
+minutes open `https://remarkable.unwrap.rs/oauth/verify?user_code=<code>` and
+submit it with `ADMIN_TOKEN`, or:
+
+```sh
+curl -X POST https://remarkable.unwrap.rs/admin/oauth/approve -H "x-admin-token: $ADMIN_TOKEN" \
+  -H 'content-type: application/json' -d '{"user_code":"1234-5678"}'
+```
+
 ## A. Tablet proxy (`rm-proxy/`)
 
 Small static Rust binary (tokio + rustls, ~1.1 MB armv7 musl):

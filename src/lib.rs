@@ -176,6 +176,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/oauth/device/code", post(oauth::device_code))
         .route("/oauth/token", post(oauth::token))
         .route("/oauth/revoke", post(oauth::revoke))
+        .route("/oauth/verify", get(oauth::verify_page).post(oauth::verify))
+        .route("/admin/oauth/approve", post(oauth::admin_approve))
         .route("/token/json/4/device/exchange", post(oauth::device_exchange))
         // Settings and updates
         .route("/settings/v1/beta", get(service::get_beta).post(service::post_beta).delete(service::delete_beta))

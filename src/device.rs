@@ -2,7 +2,7 @@ use crate::error::{Result, ServerError};
 use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{encode, decode, Algorithm, Header, Validation};
 use rand::Rng;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -320,6 +320,15 @@ impl DeviceManager {
     pub fn exchange_device_token(&self, device: &str) -> Result<(String, String, String)> {
         let c = self.decode_device_token(device)?;
         self.oauth_bundle(&c.auth0_userid, &c.device_id, &c.device_desc)
+    }
+
+    /// Owner of a device (refresh) auth data; lets a paired device approve an OAuth device code.
+    /// The device must still be registered to that user, so a deleted device's credential can't approve.
+    pub fn device_token_user(&self, device: &str) -> Result<String> {
+        let c = self.decode_device_token(device)?;
+        let conn = self.inner.conn.lock();
+        let registered = conn.query_row("SELECT 1 FROM devices WHERE device_id = ? AND user_id = ?", params![c.device_id, c.auth0_userid], |_| Ok(())).optional()?.is_some();
+        if registered { Ok(c.auth0_userid) } else { Err(ServerError::Unauthorized) }
     }
 
     fn issue_id_token(&self, user_id: &str) -> Result<String> {
