@@ -271,6 +271,14 @@ curl -X POST https://remarkable.unwrap.rs/admin/oauth/approve -H "x-admin-token:
   -H 'content-type: application/json' -d '{"user_code":"1234-5678"}'
 ```
 
+Set `PUBLIC_URL=https://remarkable.unwrap.rs` in `/etc/remarkable-server/env`
+so the `verification_uri` the client shows points at the public site instead of
+`https://<--host>` (the tablet-internal `local.tectonic.remarkable.com`).
+`/oauth/device/code` is rate limited per client (5 per 10 min per IP, 20/min
+overall; 429 `slow_down` past that). nginx is on loopback, so the limiter keys
+on the last `X-Forwarded-For` hop, which `$proxy_add_x_forwarded_for` sets to
+the real peer; keep that header in the nginx config.
+
 ## A. Tablet proxy (`rm-proxy/`)
 
 Small static Rust binary (tokio + rustls, ~1.1 MB armv7 musl):
