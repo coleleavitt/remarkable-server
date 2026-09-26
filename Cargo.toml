@@ -64,6 +64,8 @@ diffy = "0.5.2"
 
 [dev-dependencies]
 tokio-test = "0.4"
+# WebSocket client for the /mqtt route test (same version axum's ws uses)
+tokio-tungstenite = "0.29"
 # Fake tablet peer for the screen share viewer test
 webrtc = { git = "https://github.com/coleleavitt/webrtc", branch = "fix/datachannel-max-message-size" }
 flate2 = "1"

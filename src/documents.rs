@@ -35,6 +35,9 @@ impl Entry {
         if f.next().is_some() { return None; }
         Some(e)
     }
+
+    /// The node id of a root entry; some trees name it `<id>.docSchema` (cf. gentree).
+    fn id(&self) -> &str { self.name.strip_suffix(".docSchema").unwrap_or(&self.name) }
 }
 
 /// Parse the current root index for rewriting. Refuses anything not fully understood
@@ -99,11 +102,16 @@ fn current_root_entries(storage: &Storage) -> Result<(crate::types::SyncRoot, Ve
 
 /// Add a new PDF/EPUB document at the top level and commit a new root. Returns the document id.
 pub fn create_document(storage: &Storage, name: &str, ext: &str, data: &[u8]) -> Result<(String, u64)> {
+    create_document_in(storage, name, ext, data, "")
+}
+
+/// Like [`create_document`], but inside the collection `parent` (a CollectionType id; "" = top level).
+pub fn create_document_in(storage: &Storage, name: &str, ext: &str, data: &[u8], parent: &str) -> Result<(String, u64)> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().timestamp_millis().to_string();
     let metadata = serde_json::json!({
         "createdTime": now, "lastModified": now, "lastOpened": "", "lastOpenedPage": 0,
-        "parent": "", "pinned": false, "type": "DocumentType", "visibleName": name,
+        "parent": parent, "pinned": false, "type": "DocumentType", "visibleName": name,
     });
     let content = serde_json::json!({
         "fileType": ext, "coverPageNumber": 0, "extraMetadata": {}, "fontName": "",
@@ -138,6 +146,75 @@ pub fn create_document(storage: &Storage, name: &str, ext: &str, data: &[u8]) ->
         }
     }
     Err(ServerError::Internal("root kept changing while adding document".into()))
+}
+
+/// Resolve `folder` to a collection id: "" is the top level; otherwise a live
+/// CollectionType whose id equals `folder`, else one whose visible name equals it
+/// (top-level ones first). If none exists, a top-level collection named `folder`
+/// is created. Names are matched whole; "/" is not treated as a path separator.
+pub fn ensure_folder(storage: &Storage, folder: &str) -> Result<String> {
+    if folder.is_empty() {
+        return Ok(String::new());
+    }
+    for _ in 0..ROOT_RETRIES {
+        let root = storage.get_root();
+        let entries = root_entries(storage, &root.hash)?;
+        let collections: Vec<(String, serde_json::Value)> = entries.iter().filter(|e| e.kind == DOC_TYPE)
+            .filter_map(|e| Some((e.id().to_owned(), node_metadata(storage, e)?)))
+            .filter(|(_, m)| m["type"] == "CollectionType" && m["deleted"] != true && m["parent"] != "trash")
+            .collect();
+        if collections.iter().any(|(id, _)| id == folder) {
+            return Ok(folder.to_owned());
+        }
+        let mut named: Vec<&(String, serde_json::Value)> = collections.iter().filter(|(_, m)| m["visibleName"] == folder).collect();
+        named.sort_by_key(|(_, m)| m["parent"].as_str().unwrap_or_default() != "");
+        if let Some((id, _)) = named.first() {
+            return Ok(id.clone());
+        }
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp_millis().to_string();
+        let metadata = serde_json::json!({
+            "createdTime": now, "lastModified": now, "parent": "", "pinned": false,
+            "type": "CollectionType", "visibleName": folder,
+        });
+        let mut files = vec![
+            put_leaf(storage, format!("{id}.metadata"), &serde_json::to_vec_pretty(&metadata)?)?,
+            put_leaf(storage, format!("{id}.content"), br#"{"tags": []}"#)?,
+        ];
+        let hash = index_hash(&mut files)?;
+        storage.put_with_hash(&render_index(&files), &hash, &format!("{id}.docSchema"))?;
+        let mut entries = entries;
+        entries.push(Entry { hash, kind: DOC_TYPE.into(), name: id.clone(), subfiles: files.len() as u64, size: files.iter().map(|f| f.size).sum() });
+        let root_hash = index_hash(&mut entries)?;
+        storage.put_with_hash(&render_index(&entries), &root_hash, "root.docSchema")?;
+        match storage.set_root_if(root_hash, Some(root.generation)) {
+            Ok(_) => { tracing::info!(%id, folder, "created collection"); return Ok(id) }
+            // Re-scan: whoever moved the root may have created the folder.
+            Err(ServerError::GenerationMismatch { .. }) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(ServerError::Internal("root kept changing while adding folder".into()))
+}
+
+fn root_entries(storage: &Storage, root_hash: &str) -> Result<Vec<Entry>> {
+    if root_hash.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Same strict rule as create_document: never rewrite a root with lines we'd drop.
+    parse_root(&storage.get(root_hash)?).map_err(|why| {
+        tracing::error!(%root_hash, %why, "refusing to rewrite root index: not understood");
+        ServerError::Internal(format!("refusing to modify root index: {why}"))
+    })
+}
+
+/// A node's parsed `<id>.metadata`, if its index and metadata blob are readable.
+fn node_metadata(storage: &Storage, node: &Entry) -> Option<serde_json::Value> {
+    let index = storage.get(&node.hash).ok()?;
+    let name = format!("{}.metadata", node.id());
+    let meta = String::from_utf8_lossy(&index).lines().skip(1).filter_map(Entry::parse).find(|e| e.name == name)?;
+    serde_json::from_slice(&storage.get(&meta.hash).ok()?).ok()
 }
 
 fn finish(state: &AppState, user_id: &str, name: &str, ext: &str, data: &[u8]) -> Result<StatusCode> {
@@ -183,6 +260,73 @@ pub async fn upload_v2(State(state): State<AppState>, headers: HeaderMap, body: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn meta(storage: &Storage, id: &str) -> serde_json::Value {
+        let root = storage.get_root();
+        let node = root_entries(storage, &root.hash).unwrap().into_iter().find(|e| e.name == id).expect("node in root");
+        node_metadata(storage, &node).expect("metadata")
+    }
+
+    #[test]
+    fn unparseable_root_is_never_rewritten() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        let index = b"3\nnot a valid entry\n";
+        let hash = "a".repeat(64);
+        storage.put_with_hash(index, &hash, "root.docSchema").unwrap();
+        let before = storage.set_root(hash.clone()).unwrap();
+
+        assert!(create_document(&storage, "a", "pdf", b"%PDF").is_err());
+        assert!(ensure_folder(&storage, "News").is_err());
+        let after = storage.get_root();
+        assert_eq!((after.hash, after.generation), (hash, before.generation));
+    }
+
+    #[test]
+    fn create_document_stays_top_level() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        let (id, _) = create_document(&storage, "a", "pdf", b"%PDF").unwrap();
+        assert_eq!(meta(&storage, &id)["parent"], "");
+    }
+
+    #[test]
+    fn ensure_folder_creates_once_then_resolves_by_name_or_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        assert_eq!(ensure_folder(&storage, "").unwrap(), "");
+        let folder = ensure_folder(&storage, "News").unwrap();
+        let m = meta(&storage, &folder);
+        assert_eq!((m["type"].as_str(), m["visibleName"].as_str(), m["parent"].as_str()), (Some("CollectionType"), Some("News"), Some("")));
+        let generation = storage.get_root().generation;
+        assert_eq!(ensure_folder(&storage, "News").unwrap(), folder, "resolved by visible name");
+        assert_eq!(ensure_folder(&storage, &folder).unwrap(), folder, "resolved by id");
+        assert_eq!(storage.get_root().generation, generation, "no new folder committed");
+
+        let (doc, _) = create_document_in(&storage, "article", "epub", b"PK", &folder).unwrap();
+        assert_eq!(meta(&storage, &doc)["parent"], folder.as_str());
+        // A document with the folder's name isn't a folder.
+        assert_ne!(ensure_folder(&storage, "article").unwrap(), doc);
+    }
+
+    #[test]
+    fn ensure_folder_finds_collection_listed_with_docschema_suffix() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        let id = "11111111-2222-3333-4444-555555555555";
+        let metadata = serde_json::json!({"parent": "", "type": "CollectionType", "visibleName": "News"});
+        let mut files = vec![put_leaf(&storage, format!("{id}.metadata"), &serde_json::to_vec(&metadata).unwrap()).unwrap()];
+        let hash = index_hash(&mut files).unwrap();
+        storage.put_with_hash(&render_index(&files), &hash, &format!("{id}.docSchema")).unwrap();
+        let mut entries = vec![Entry { hash, kind: DOC_TYPE.into(), name: format!("{id}.docSchema"), subfiles: 1, size: files[0].size }];
+        let root_hash = index_hash(&mut entries).unwrap();
+        storage.put_with_hash(&render_index(&entries), &root_hash, "root.docSchema").unwrap();
+        let generation = storage.set_root(root_hash).unwrap().generation;
+
+        assert_eq!(ensure_folder(&storage, "News").unwrap(), id, "resolved by visible name");
+        assert_eq!(ensure_folder(&storage, id).unwrap(), id, "resolved by id");
+        assert_eq!(storage.get_root().generation, generation, "no duplicate folder committed");
+    }
 
     fn storage_with_root(index: &str) -> (Storage, String, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().unwrap();
