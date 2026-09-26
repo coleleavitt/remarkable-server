@@ -319,6 +319,16 @@ pub trait CloudProvider: Send + Sync {
         Ok(None)
     }
 
+    /// Whether the provider takes paths that differ only in letter case for one path, as
+    /// Dropbox and OneDrive do: a single file answers to every spelling, and a write to it by
+    /// another spelling (an upload after a case-only rename here, or into a folder spelled
+    /// otherwise) may leave it listed under the spelling it had. Full sync then matches local
+    /// paths to listed ones ignoring case (see [`CloudSync::sync`]). `false`, the default:
+    /// Google Drive tells `a.pdf` and `A.pdf` apart.
+    fn ignores_case(&self) -> bool {
+        false
+    }
+
     /// Whether `content` is the content of the remote file `file`, going by the hash its listing
     /// carries ([`CloudFile::content_hash`]). `false` when that can't be told (the default).
     /// Full sync leaves a file that is the same on both sides alone.

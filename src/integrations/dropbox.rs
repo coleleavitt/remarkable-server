@@ -642,6 +642,12 @@ impl CloudProvider for Dropbox {
             .is_some_and(|h| h.eq_ignore_ascii_case(&content_hash(content)))
     }
 
+    /// Dropbox paths are case-insensitive (`path_lower` identifies an item), and an item keeps
+    /// the casing it was created with.
+    fn ignores_case(&self) -> bool {
+        true
+    }
+
     async fn list_folders(&self) -> Result<Vec<CloudFolder>> {
         let first = self
             .api_request("files/list_folder", &ListFolderArg::recursive(""))
@@ -1883,9 +1889,14 @@ mod tests {
                             |State(r): State<Shared>,
                              headers: HeaderMap,
                              body: axum::body::Bytes| async move {
-                                let path = api_arg(&headers)["path"].as_str().unwrap().to_string();
+                                let mut path = api_arg(&headers)["path"].as_str().unwrap().to_string();
                                 let mut r = r.lock().unwrap();
                                 r.uploads.push(path.clone());
+                                // A file overwritten by another spelling keeps its own, as the
+                                // folders above it do (`put`).
+                                if let Some((e, _)) = r.entries.get(&path.to_lowercase()) {
+                                    path = e["path_display"].as_str().unwrap().to_string();
+                                }
                                 put(&mut r, &path, &body);
                                 Json(entry("file", &path, &body))
                             },
@@ -2183,6 +2194,113 @@ mod tests {
             let r = sync(&base, root, "/Notes").await;
             assert_eq!((r.uploaded, r.downloaded), (1, 0));
             assert_eq!(uploads(&remote), vec!["/Notes/Sub/b.pdf"]);
+        }
+
+        /// Dropbox ignores case, and a file or folder keeps the spelling it was created with. A
+        /// case-only rename here (of a file, or of a directory) is the same file under another
+        /// spelling, and a new file in a directory spelled otherwise than its Dropbox folder goes
+        /// into that folder: no sync after takes the local spelling for deleted in Dropbox and
+        /// moves the file aside, and an edit goes to the file Dropbox has.
+        #[tokio::test]
+        async fn case_only_differences_are_the_same_file() {
+            let remote = Shared::default();
+            {
+                let mut r = remote.lock().unwrap();
+                put(&mut r, "/Notes/report.pdf", b"R");
+                put(&mut r, "/Notes/sub/a.pdf", b"A");
+            }
+            let base = fake(remote.clone()).await;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let r = sync_kept(&base, root, "/Notes").await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 2, 0));
+
+            std::fs::rename(root.join("report.pdf"), root.join("Report.pdf")).unwrap();
+            std::fs::rename(root.join("sub"), root.join("Sub")).unwrap();
+            write(root, "Sub/c.pdf", "c, new here");
+            let r = sync_kept(&base, root, "/Notes").await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (1, 0, 0));
+            assert!(r.notices.is_empty(), "{:?}", r.notices);
+            assert_eq!(uploads(&remote), vec!["/Notes/Sub/c.pdf"]);
+
+            write(root, "Report.pdf", "R, edited here");
+            let r = sync_kept(&base, root, "/Notes").await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (1, 0, 0));
+            for _ in 0..2 {
+                let r = sync_kept(&base, root, "/Notes").await;
+                assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 0, 0));
+                assert!(r.notices.is_empty(), "{:?}", r.notices);
+            }
+
+            assert_eq!(
+                std::fs::read(root.join("Report.pdf")).unwrap(),
+                b"R, edited here"
+            );
+            assert_eq!(std::fs::read(root.join("Sub/a.pdf")).unwrap(), b"A");
+            assert_eq!(
+                std::fs::read(root.join("Sub/c.pdf")).unwrap(),
+                b"c, new here"
+            );
+            for gone in ["report.pdf", "sub", ".rms-remote-deleted"] {
+                assert!(!root.join(gone).exists(), "{gone}");
+            }
+            let r = remote.lock().unwrap();
+            let keys: Vec<&str> = r.entries.keys().map(String::as_str).collect();
+            assert_eq!(
+                keys,
+                [
+                    "/notes",
+                    "/notes/report.pdf",
+                    "/notes/sub",
+                    "/notes/sub/a.pdf",
+                    "/notes/sub/c.pdf"
+                ]
+            );
+            let (report, content) = &r.entries["/notes/report.pdf"];
+            assert_eq!(report["path_display"], "/Notes/report.pdf");
+            assert_eq!(content, b"R, edited here");
+            assert_eq!(r.downloads, 2);
+        }
+
+        /// A local name Dropbox listings skip (one starting with a letter and a colon, below the
+        /// top, or a path deeper than [`MAX_LIST_DEPTH`]) is never listed after its upload. It is
+        /// uploaded by every sync, as before sync kept state, and never taken for deleted in
+        /// Dropbox and moved aside.
+        #[tokio::test]
+        async fn names_the_listing_skips_are_never_moved_aside() {
+            let remote = Shared::default();
+            put(&mut remote.lock().unwrap(), "/Notes/x.pdf", b"X");
+            let base = fake(remote.clone()).await;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let deep = format!("{}x.pdf", "d/".repeat(MAX_LIST_DEPTH));
+            write(root, "sub/Q:A notes.pdf", "mine");
+            write(root, &deep, "deep");
+            for round in 0..3 {
+                let r = sync_kept(&base, root, "/Notes").await;
+                let expected = (2, usize::from(round == 0), 0);
+                assert_eq!(
+                    (r.uploaded, r.downloaded, r.deleted),
+                    expected,
+                    "round {round}"
+                );
+                assert!(r.notices.is_empty(), "round {round}: {:?}", r.notices);
+                assert_eq!(
+                    std::fs::read(root.join("sub/Q:A notes.pdf")).unwrap(),
+                    b"mine"
+                );
+                assert_eq!(std::fs::read(root.join(&deep)).unwrap(), b"deep");
+            }
+            assert!(!root.join(".rms-remote-deleted").exists());
+            let state: Value =
+                serde_json::from_slice(&std::fs::read(root.join(".rms-sync-state.json")).unwrap())
+                    .unwrap();
+            let files: Vec<&String> = state["syncs"][0]["files"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect();
+            assert_eq!(files, ["/x.pdf"]);
         }
     }
 

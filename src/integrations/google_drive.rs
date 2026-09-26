@@ -1352,6 +1352,12 @@ mod tests {
         );
     }
 
+    /// Drive tells `a.pdf` and `A.pdf` apart, so full sync matches paths as they are spelled.
+    #[test]
+    fn paths_tell_case_apart() {
+        assert!(!drive("http://localhost").ignores_case());
+    }
+
     /// Uploads, folder lookups, the sync folder check and full syncs with kept state, against a
     /// Drive that keeps what is written to it, with Drive's semantics: items are addressed by
     /// id, a folder may hold several items of one name, `files.create` always adds an item,
@@ -1955,6 +1961,41 @@ mod tests {
             );
             assert_eq!(d.items.len(), 2);
             assert_eq!(d.content(&a), "remote A");
+        }
+
+        /// A local name Google Drive listings skip (`Q:A.pdf` below the top: a drive prefix,
+        /// taken as a name on its own) is never listed after its upload. Every sync uploads it
+        /// again, over the same Drive file, as before sync kept state; none takes it for deleted
+        /// in Drive and moves it aside.
+        #[tokio::test]
+        async fn names_the_listing_skips_are_never_moved_aside() {
+            let d = Shared::default();
+            let notes = {
+                let mut d = d.lock().unwrap();
+                let notes = d.folder("root", "Notes");
+                d.file(&notes, "x.pdf", b"X");
+                notes
+            };
+            let base = serve(d.clone()).await;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            write(root, "sub/Q:A.pdf", "mine");
+            for round in 0..3 {
+                let expected = (1, usize::from(round == 0), 0);
+                assert_eq!(clean(&base, root, &notes).await, expected, "round {round}");
+                assert_eq!(read(root, "sub/Q:A.pdf"), "mine");
+            }
+            assert!(
+                !root
+                    .join(crate::integrations::sync::QUARANTINE_DIR)
+                    .exists()
+            );
+            let d = d.lock().unwrap();
+            let sub = d.named(&notes, "sub");
+            assert_eq!(sub.len(), 1);
+            let copies = d.named(&sub[0].id, "Q:A.pdf");
+            assert_eq!(copies.len(), 1, "updated in place, not duplicated");
+            assert_eq!(d.content(&copies[0].id), "mine");
         }
     }
 

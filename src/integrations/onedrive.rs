@@ -669,6 +669,12 @@ impl CloudProvider for OneDrive {
         })
     }
 
+    /// OneDrive names are case-insensitive: a folder can't hold two items whose names differ
+    /// only in letter case.
+    fn ignores_case(&self) -> bool {
+        true
+    }
+
     async fn list_folders(&self) -> Result<Vec<CloudFolder>> {
         // Use search to find all folders
         let url = format!(
@@ -2099,6 +2105,13 @@ mod tests {
         };
         let d = OneDrive::with_token(config, token).with_base_url(&base);
         assert_eq!(d.account_id().await.unwrap().as_deref(), Some("b!drive"));
+    }
+
+    /// OneDrive names are case-insensitive, so full sync matches paths ignoring case.
+    #[test]
+    fn paths_ignore_case() {
+        let config = OAuthConfig::onedrive("id".into(), None, "http://localhost/cb".into());
+        assert!(OneDrive::new(config).ignores_case());
     }
 
     /// Graph's `sha256Hash` (upper-case hex) or `quickXorHash`, whichever the listing kept.

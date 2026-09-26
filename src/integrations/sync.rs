@@ -89,6 +89,15 @@ pub(crate) fn is_safe_name(name: &str) -> bool {
 /// items are skipped, so a pathological tree can't make a sync walk forever.
 pub(crate) const MAX_LIST_DEPTH: usize = 64;
 
+/// Whether a provider listing can return a file at the sync path of `parts` (as
+/// [`cloud_path_components`] splits it): no deeper than [`MAX_LIST_DEPTH`], and every
+/// component a [safe name](is_safe_name) on its own. Listings check each name alone, so they
+/// skip `Q:A.pdf` (a drive prefix) at any depth, while [`safe_components`] only takes one at
+/// the start of a path for a drive prefix and so lets `sub/Q:A.pdf` be uploaded.
+fn listable(parts: &[&str]) -> bool {
+    parts.len() <= MAX_LIST_DEPTH && parts.iter().all(|p| is_safe_name(p))
+}
+
 /// Components of a provider path. Providers root paths at `/` (e.g. `/Notes/a.pdf`), meaning
 /// the sync root, so exactly one leading slash is stripped before validation.
 pub(crate) fn cloud_path_components(cloud_path: &str) -> Result<Vec<&str>> {
@@ -557,6 +566,94 @@ async fn quarantine(root: &Path, run: &str, path: &str, src: &Path) -> Result<Pa
     Ok(to.strip_prefix(&root).unwrap_or(&to).to_path_buf())
 }
 
+/// For a provider whose paths ignore letter case ([`CloudProvider::ignores_case`]), line the
+/// listing `cloud` and the last sync's manifest `base` up with the local tree, which tells
+/// case apart, so that a file spelled otherwise on one side is taken for the same file rather
+/// than for one deleted and another new. Such a provider can go on listing a file (or a folder
+/// above it) under its old spelling after a case-only rename here or an upload into a folder
+/// spelled otherwise, so a path recorded with the local spelling would look deleted remotely
+/// at the next sync, and its local copy would be moved aside.
+///
+/// Paths are grouped by their lowercase form: the local files (`local`, and those over the
+/// size limit, `local_too_large`), the listed files and the manifest entries. Where one local
+/// file has the path, the listed file and the entry (one of each at most) take its spelling;
+/// where no local file has it, the entry takes the listed file's spelling.
+///
+/// Several local files with the path are a clash: the provider keeps one file for them all, so
+/// each upload would replace the others' content there. Only the one spelled as the listing
+/// spells the file, if any, is synced. Every other spelling in the group is left out of the
+/// sync (taken out of `local` and `cloud` and put in `out_of_view`, so its entry is kept as it
+/// was) until renamed. Returns the local paths of each clash, for an error.
+fn match_case(
+    local: &mut HashMap<String, LocalFile>,
+    local_too_large: &[String],
+    cloud: &mut HashMap<String, CloudFile>,
+    mut base: Option<&mut SyncManifest>,
+    out_of_view: &mut HashSet<String>,
+) -> Vec<Vec<String>> {
+    #[derive(Default)]
+    struct Spellings {
+        local: BTreeSet<String>,
+        cloud: BTreeSet<String>,
+        recorded: BTreeSet<String>,
+    }
+    fn group<'a>(groups: &'a mut BTreeMap<String, Spellings>, path: &str) -> &'a mut Spellings {
+        groups.entry(path.to_lowercase()).or_default()
+    }
+    let mut groups: BTreeMap<String, Spellings> = BTreeMap::new();
+    for path in local.keys().chain(local_too_large) {
+        group(&mut groups, path).local.insert(path.clone());
+    }
+    for (path, f) in cloud.iter() {
+        if !f.is_folder {
+            group(&mut groups, path).cloud.insert(path.clone());
+        }
+    }
+    for path in base.iter().flat_map(|b| b.files.keys()) {
+        group(&mut groups, path).recorded.insert(path.clone());
+    }
+
+    let mut clashes = Vec::new();
+    for g in groups.into_values() {
+        let spellings: BTreeSet<&String> =
+            g.local.iter().chain(&g.cloud).chain(&g.recorded).collect();
+        if spellings.len() < 2 {
+            continue;
+        }
+        if g.local.len() > 1 || g.cloud.len() > 1 {
+            let listed = match (g.cloud.first(), g.cloud.len()) {
+                (Some(c), 1) if g.local.contains(c) => Some(c),
+                _ => None,
+            };
+            for path in spellings.into_iter().filter(|p| Some(*p) != listed) {
+                local.remove(path);
+                cloud.remove(path);
+                out_of_view.insert(path.clone());
+            }
+            clashes.push(g.local.union(&g.cloud).cloned().collect());
+            continue;
+        }
+        let Some(spelling) = g.local.first().or(g.cloud.first()) else {
+            continue;
+        };
+        let listed = g.cloud.first().filter(|c| *c != spelling);
+        if let Some(mut f) = listed.and_then(|c| cloud.remove(c)) {
+            f.path = spelling.clone();
+            cloud.insert(spelling.clone(), f);
+        }
+        let recorded = match (g.recorded.first(), g.recorded.len()) {
+            (Some(r), 1) if r != spelling => Some(r),
+            _ => None,
+        };
+        if let (Some(base), Some(recorded)) = (base.as_deref_mut(), recorded) {
+            if let Some(entry) = base.files.remove(recorded) {
+                base.files.insert(spelling.clone(), entry);
+            }
+        }
+    }
+    clashes
+}
+
 /// Sync direction
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyncDirection {
@@ -746,8 +843,16 @@ impl<P: CloudProvider> CloudSync<P> {
     /// out), so the next sync tries again; so does a file uploaded over the one listed at its
     /// path that the provider stored as another file (a new id), since the listing would go on
     /// showing the old one. A path out of view (over the size limit on either side, hidden,
-    /// excluded) keeps its entry as it was. Nothing is recorded, or saved, when
-    /// the sync fails as a whole (the listing, the local scan, the old-layout move below).
+    /// excluded, one no listing returns, see [`visible`](Self::visible)) keeps its entry as it
+    /// was. Nothing is recorded, or saved, when the sync fails as a whole (the listing, the
+    /// local scan, the old-layout move below).
+    ///
+    /// With a provider that [ignores case](CloudProvider::ignores_case), a local path and a
+    /// listed or recorded one that differ only in letter case are one file, kept under the
+    /// local spelling (see [`match_case`]): a case-only rename here is neither a deletion nor
+    /// an upload of a new file, and a remote one changes nothing here. Local files that differ
+    /// only in case from each other are left alone, with an error, but for the one spelled as
+    /// listed.
     ///
     /// The first full sync of a folder the provider kept elsewhere locally before #34 (see
     /// [`CloudProvider::legacy_layout_dir`]) moves that directory aside first; see
@@ -816,10 +921,18 @@ impl<P: CloudProvider> CloudSync<P> {
     /// the size limit): not one of the sync's own entries, no hidden component unless hidden
     /// files are synced, and none excluded by pattern or by selective sync. Only such paths are
     /// kept in the manifest: for any other, a missing local copy tells nothing.
+    ///
+    /// So must a provider listing be able to return a file there ([`listable`]): a file the
+    /// listing never shows would look deleted remotely right after its upload, and be moved
+    /// aside. A local file at such a path is synced as with no state (uploaded by every sync
+    /// that uploads, as before there was any), and never taken for deleted.
     fn visible(&self, path: &str) -> bool {
         let Ok(parts) = cloud_path_components(path) else {
             return false;
         };
+        if !listable(&parts) {
+            return false;
+        }
         let mut dir = self.config.local_path.clone();
         for (i, part) in parts.iter().enumerate() {
             if (!self.config.sync_hidden && part.starts_with('.')) || self.should_exclude(part) {
@@ -1043,11 +1156,35 @@ impl<P: CloudProvider> CloudSync<P> {
             Err(e) => return failed(result, format!("Failed to list local files: {}", e)),
         };
 
+        // Moving the old layout aside changed the local tree the manifest describes, so that
+        // sync goes without one (as a first sync does) and records a fresh one.
+        let mut base = match moved_old_layout {
+            true => None,
+            false => self.state.manifest.take(),
+        };
+
+        // Paths left alone in both directions, whose manifest entries stay as they were: they
+        // are never taken for deleted.
+        let mut out_of_view: HashSet<String> = HashSet::new();
+
+        // A provider that ignores case may list a file under another spelling than the local
+        // one; before the size limit is applied, so that applies to the file whatever its
+        // spelling on each side.
+        let case_clashes = match self.provider.ignores_case() {
+            true => match_case(
+                &mut local_files,
+                &local_too_large,
+                &mut cloud_map,
+                base.as_mut(),
+                &mut out_of_view,
+            ),
+            false => Vec::new(),
+        };
+
         // A path whose file is too large on either side is left alone in both directions: a
         // remote one isn't downloaded and a local file there isn't uploaded over it, a local one
         // isn't uploaded and a remote file there isn't downloaded over it. Out of view this way,
         // it isn't taken for deleted either: its manifest entry stays as it was.
-        let mut out_of_view: HashSet<String> = HashSet::new();
         cloud_map.retain(|path, f| {
             let keep = !self.too_large(f);
             if !keep {
@@ -1075,12 +1212,6 @@ impl<P: CloudProvider> CloudSync<P> {
         // keeps its old cursor so the fetch is retried (see `resync`).
         let mut retry_needed = false;
 
-        // Moving the old layout aside changed the local tree the manifest describes, so that
-        // sync goes without one (as a first sync does) and records a fresh one.
-        let base = match moved_old_layout {
-            true => None,
-            false => self.state.manifest.take(),
-        };
         let can_upload = self.config.direction != SyncDirection::Download;
         let can_download = self.config.direction != SyncDirection::Upload;
         let upload_new = can_upload && local_only == LocalOnly::Upload;
@@ -1312,6 +1443,20 @@ impl<P: CloudProvider> CloudSync<P> {
                  were deleted remotely, delete the local copies: {}",
                 count(not_moved.len()),
                 some_of(&not_moved)
+            ));
+        }
+        if !case_clashes.is_empty() {
+            let shown: Vec<String> = case_clashes.iter().map(|c| c.join(" and ")).collect();
+            tracing::warn!(
+                "cloud sync: paths that differ only in letter case, left alone: {}",
+                shown.join("; ")
+            );
+            result.errors.push(format!(
+                "The cloud folder takes paths that differ only in letter case for one file, but \
+                 here they name different files: {}. Of each such set, only the file spelled as \
+                 the cloud folder lists it, if any, is synced; the others are left alone (not \
+                 uploaded, downloaded or moved aside) until renamed",
+                some_of(&shown)
             ));
         }
         if !kept_remotely.is_empty() {
@@ -3257,10 +3402,15 @@ mod tests {
     /// With `creates_new`, an upload to a path already there is stored as another file (a new
     /// id) in `shadowed`, and the listing goes on showing the old one: what Google Drive did
     /// when every upload created a file, and its listing kept the oldest of same-named ones.
+    ///
+    /// With `ignores_case`, paths are compared ignoring letter case, as Dropbox and OneDrive
+    /// compare them: an upload to a path spelled otherwise than a file there is a new revision
+    /// of that file, which keeps its spelling.
     #[derive(Default)]
     struct Store {
         hashed: bool,
         creates_new: bool,
+        ignores_case: bool,
         shadowed: Mutex<Vec<(CloudFile, Vec<u8>)>>,
         account: Option<String>,
         legacy: Option<Vec<String>>,
@@ -3386,9 +3536,18 @@ mod tests {
             content: &[u8],
             _: Option<&str>,
         ) -> Result<CloudFile> {
-            let path = format!("/{name}");
+            let mut path = format!("/{name}");
             self.uploads.lock().unwrap().push(path.clone());
             let content = std::str::from_utf8(content).unwrap();
+            if self.ignores_case {
+                let files = self.files.lock().unwrap();
+                if let Some(there) = files
+                    .keys()
+                    .find(|p| p.to_lowercase() == path.to_lowercase())
+                {
+                    path = there.clone();
+                }
+            }
             let there = self.files.lock().unwrap().contains_key(&path);
             if self.creates_new && there {
                 let (mut file, content) = self.revision_of(&path, content);
@@ -3435,6 +3594,9 @@ mod tests {
         }
         fn content_matches(&self, file: &CloudFile, content: &[u8]) -> bool {
             self.hashed && file.content_hash.as_deref() == Some(sha256_hex(content).as_str())
+        }
+        fn ignores_case(&self) -> bool {
+            self.ignores_case
         }
     }
 
@@ -4191,6 +4353,183 @@ mod tests {
 
         let mut sync = again(sync);
         assert_eq!(counts(&clean(&mut sync).await), (0, 0, 0));
+    }
+
+    /// A provider that ignores case lists a file under the spelling it was created with, however
+    /// it is written to later. A case-only rename here (of a file, or of a directory above one)
+    /// is the same file under another spelling: nothing is transferred or moved aside, and no
+    /// deletion is recorded. An edit then goes to that file, and its remote deletion is still
+    /// seen. A case-only rename there changes nothing here.
+    #[tokio::test]
+    async fn a_case_only_rename_is_the_same_file_where_case_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = Store {
+            hashed: true,
+            ignores_case: true,
+            ..Default::default()
+        };
+        store.put("/report.pdf", "report");
+        store.put("/sub/a.txt", "a");
+        store.put("/other.txt", "other");
+        let mut sync = CloudSync::new(store, kept(root, SyncDirection::Bidirectional));
+        assert_eq!(counts(&clean(&mut sync).await), (0, 3, 0));
+
+        std::fs::rename(root.join("report.pdf"), root.join("Report.pdf")).unwrap();
+        std::fs::rename(root.join("sub"), root.join("Sub")).unwrap();
+        for _ in 0..3 {
+            sync = again(sync);
+            let r = clean(&mut sync).await;
+            assert_eq!(counts(&r), (0, 0, 0));
+            assert!(r.notices.is_empty(), "{:?}", r.notices);
+        }
+        assert_eq!(read(root, "Report.pdf"), "report");
+        assert_eq!(read(root, "Sub/a.txt"), "a");
+        assert!(!root.join("report.pdf").exists() && !root.join("sub").exists());
+        assert!(quarantined(root).is_empty());
+        assert!(sync.provider.uploads().is_empty());
+        assert_eq!(sync.provider.downloads().len(), 3);
+
+        // Renamed there, only in case: still the same file.
+        {
+            let mut files = sync.provider.files.lock().unwrap();
+            let (file, content) = files.remove("/sub/a.txt").unwrap();
+            let path = "/SUB/A.txt".to_string();
+            files.insert(path.clone(), (CloudFile { path, ..file }, content));
+        }
+        sync = again(sync);
+        let r = clean(&mut sync).await;
+        assert_eq!(counts(&r), (0, 0, 0));
+        assert!(r.notices.is_empty(), "{:?}", r.notices);
+        assert_eq!(read(root, "Sub/a.txt"), "a");
+
+        // Edited here: uploaded over the one file, which keeps its spelling there.
+        write(root, "Report.pdf", "report, edited here");
+        sync = again(sync);
+        assert_eq!(counts(&clean(&mut sync).await), (1, 0, 0));
+        assert_eq!(sync.provider.uploads(), vec!["/Report.pdf"]);
+        assert_eq!(
+            sync.provider.content("/report.pdf").as_deref(),
+            Some("report, edited here")
+        );
+        sync = again(sync);
+        assert_eq!(counts(&clean(&mut sync).await), (0, 0, 0));
+
+        // Deleted there: the local copy, unchanged since, is moved aside.
+        sync.provider.remove("/report.pdf");
+        sync = again(sync);
+        let r = clean(&mut sync).await;
+        assert_eq!(counts(&r), (0, 0, 1));
+        assert!(r.notices[0].ends_with(": /Report.pdf"), "{:?}", r.notices);
+        assert_eq!(quarantined(root), vec!["Report.pdf"]);
+
+        // Renamed here and deleted there since the last sync: the entry follows the rename, so
+        // the local copy is moved aside as deleted remotely, not uploaded as a new file.
+        std::fs::rename(root.join("Sub/a.txt"), root.join("Sub/A.TXT")).unwrap();
+        sync.provider.remove("/SUB/A.txt");
+        sync = again(sync);
+        let r = clean(&mut sync).await;
+        assert_eq!(counts(&r), (0, 0, 1));
+        assert!(r.notices[0].ends_with(": /Sub/A.TXT"), "{:?}", r.notices);
+        assert_eq!(quarantined(root), vec!["Report.pdf", "Sub/A.TXT"]);
+        assert_eq!(sync.provider.uploads(), vec!["/Report.pdf"]);
+        assert_eq!(sync.provider.downloads().len(), 3);
+    }
+
+    /// Local files whose paths differ only in letter case would all be written to one file
+    /// where the provider ignores case, each over the others. The one spelled as the listing
+    /// spells it is synced; the others are left alone, with an error, until renamed: never
+    /// uploaded or moved aside. With no such spelling, none is synced, and the listed file isn't
+    /// downloaded as yet another. A provider that tells case apart syncs each as its own file.
+    #[tokio::test]
+    async fn local_files_differing_only_in_case_are_left_alone_where_case_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = Store {
+            hashed: true,
+            ignores_case: true,
+            ..Default::default()
+        };
+        store.put("/report.pdf", "report");
+        store.put("/y.txt", "y");
+        write(root, "report.pdf", "report");
+        write(root, "Report.pdf", "another report, here");
+        write(root, "x.txt", "x");
+        write(root, "X.txt", "another x");
+        write(root, "Y.txt", "y");
+        write(root, "y.TXT", "another y");
+        let mut sync = CloudSync::new(store, kept(root, SyncDirection::Bidirectional));
+        for round in 0..3 {
+            let r = sync.sync().await.unwrap();
+            assert_eq!(counts(&r), (0, 0, 0), "round {round}");
+            assert_eq!(r.errors.len(), 1, "round {round}: {:?}", r.errors);
+            assert!(
+                r.errors[0].contains(
+                    "here they name different files: /Report.pdf and /report.pdf, /X.txt and \
+                     /x.txt, /Y.txt and /y.TXT and /y.txt. "
+                ),
+                "{:?}",
+                r.errors
+            );
+            assert!(r.notices.is_empty(), "round {round}: {:?}", r.notices);
+            assert!(sync.provider.uploads().is_empty());
+            assert!(sync.provider.downloads().is_empty());
+            sync = again(sync);
+        }
+        assert!(quarantined(root).is_empty());
+        assert_eq!(read(root, "Report.pdf"), "another report, here");
+        assert_eq!(
+            sync.provider.content("/report.pdf").as_deref(),
+            Some("report")
+        );
+
+        // Renamed apart: each is synced as its own file from then on.
+        std::fs::rename(root.join("Report.pdf"), root.join("Report 2.pdf")).unwrap();
+        std::fs::rename(root.join("X.txt"), root.join("x2.txt")).unwrap();
+        std::fs::remove_file(root.join("y.TXT")).unwrap();
+        let r = clean(&mut sync).await;
+        assert_eq!(counts(&r), (3, 0, 0));
+        let mut uploaded = sync.provider.uploads();
+        uploaded.sort();
+        assert_eq!(uploaded, vec!["/Report 2.pdf", "/x.txt", "/x2.txt"]);
+        sync = again(sync);
+        assert_eq!(counts(&clean(&mut sync).await), (0, 0, 0));
+
+        // Where case tells files apart, they were never one file.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = Store::hashed();
+        store.put("/report.pdf", "report");
+        write(root, "report.pdf", "report");
+        write(root, "Report.pdf", "another report, here");
+        let mut sync = CloudSync::new(store, kept(root, SyncDirection::Bidirectional));
+        assert_eq!(counts(&clean(&mut sync).await), (1, 0, 0));
+        assert_eq!(sync.provider.uploads(), vec!["/Report.pdf"]);
+        assert_eq!(
+            sync.provider.content("/report.pdf").as_deref(),
+            Some("report")
+        );
+    }
+
+    /// Only paths a provider listing can return are tracked (see [`listable`]); a file uploaded
+    /// where no listing shows it would look deleted remotely at the next sync. A drive prefix
+    /// is only an unsafe path at the start of one, but listings check each name on its own.
+    #[test]
+    fn only_paths_a_listing_can_return_are_tracked() {
+        let sync = CloudSync::new(
+            MockProvider::default(),
+            kept(Path::new("/nonexistent"), SyncDirection::Bidirectional),
+        );
+        assert!(cloud_path_components("/sub/Q:A.pdf").is_ok());
+        for path in ["/a.pdf", "/sub/a.pdf", "/sub/10:30.pdf", "/sub/QA:.pdf"] {
+            assert!(sync.visible(path), "{path}");
+        }
+        let deepest = format!("{}/x.pdf", "/d".repeat(MAX_LIST_DEPTH - 1));
+        assert!(sync.visible(&deepest));
+        let too_deep = format!("{}/x.pdf", "/d".repeat(MAX_LIST_DEPTH));
+        for path in ["/Q:A.pdf", "/sub/Q:A.pdf", "/Q:/a.pdf", too_deep.as_str()] {
+            assert!(!sync.visible(path), "{path}");
+        }
     }
 
     #[test]

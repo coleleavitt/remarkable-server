@@ -302,9 +302,12 @@ that one last time. Local copies of files deleted remotely are moved to
 through it now and then and delete what isn't needed, as nothing else does. A sync
 whose listing comes back empty moves nothing aside and reports an error listing the
 local files it left in place: check that the folder still exists and is shared with
-the account, and if its files really were deleted, delete the local copies. A state
-file the server can't read (not JSON, or written by a newer version) fails the sync
-with an error naming it; delete it to start over with a first sync. Rolling back to
+the account, and if its files really were deleted, delete the local copies. Dropbox
+and OneDrive paths ignore letter case: a sync that reports local files whose paths
+differ only in case syncs just the one spelled as the cloud folder lists it (if
+any) and leaves the others alone; rename them apart. A state file the server can't
+read (not JSON, or written by a newer version) fails the sync with an error naming
+it; delete it to start over with a first sync. Rolling back to
 an older binary is safe: it ignores both (hidden entries). Upgrading again after
 syncs by the older binary is safe too: files changed while it synced are compared
 by content, and otherwise go through the conflict strategy, as before this change.
