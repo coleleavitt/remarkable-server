@@ -184,8 +184,10 @@ pub async fn list_files(State(state): State<AppState>, headers: HeaderMap) -> Re
     Ok(Json(state.storage.list().into_iter().map(|(hash, filename, size)| FileInfo { hash, filename, size }).collect()))
 }
 
+/// Admin: delete every blob and reset the root. A device token is not enough: any paired
+/// tablet or client could otherwise wipe the cloud.
 pub async fn clear_storage(State(state): State<AppState>, headers: HeaderMap) -> Result<StatusCode> {
-    state.auth_user(&headers)?;
+    require_admin(&headers)?;
     state.storage.clear()?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -195,8 +197,15 @@ pub struct CreateUserRequest { pub email: String }
 
 /// Admin-only endpoints are disabled unless `ADMIN_TOKEN` is set; callers must send it
 /// in `x-admin-token`.
-pub(crate) fn require_admin(headers: &HeaderMap) -> Result<()> {
-    let expected = std::env::var("ADMIN_TOKEN").ok().filter(|t| !t.is_empty()).ok_or(ServerError::Unauthorized)?;
+pub(crate) fn require_admin(headers: &HeaderMap) -> Result<()> { check_admin(admin_token().as_deref(), headers) }
+
+/// The configured `ADMIN_TOKEN`, if set and non-empty.
+pub(crate) fn admin_token() -> Option<String> { std::env::var("ADMIN_TOKEN").ok().filter(|t| !t.is_empty()) }
+
+/// `require_admin` against an explicit expected token (`None` = admin disabled), so callers
+/// can be tested without touching the process environment.
+pub(crate) fn check_admin(expected: Option<&str>, headers: &HeaderMap) -> Result<()> {
+    let expected = expected.filter(|t| !t.is_empty()).ok_or(ServerError::Unauthorized)?;
     let given = headers.get("x-admin-token").and_then(|v| v.to_str().ok()).ok_or(ServerError::Unauthorized)?;
     if given.as_bytes() != expected.as_bytes() { return Err(ServerError::Unauthorized); }
     Ok(())
@@ -292,5 +301,27 @@ mod device_ownership_tests {
         assert!(matches!(delete_device(State(state.clone()), Path("RM110-A".into()), hdrs(&a)).await, Err(ServerError::NotFound(_))));
         // Admin-side (owner = None) still sees everything.
         assert_eq!(state.devices.list_devices(None).unwrap().iter().map(|d| d.device_id.as_str()).collect::<Vec<_>>(), ["RM110-B"]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[tokio::test]
+    async fn non_admin_token_cannot_clear_storage() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        let hash = storage.put(b"keep me", "doc.pdf").unwrap();
+        let devices = DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        let token = devices.create_user_token("user").unwrap();
+        let state = AppState::new(storage, devices);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {token}")).unwrap());
+
+        let result = clear_storage(State(state.clone()), headers).await;
+        assert!(matches!(result, Err(ServerError::Unauthorized)));
+        assert!(state.storage.exists(&hash));
     }
 }

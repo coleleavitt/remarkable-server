@@ -382,6 +382,17 @@ impl DeviceManager {
         self.mint_bundle(&c.auth0_userid, &c.device_id, &c.device_desc, c.epoch)
     }
 
+    /// Owner of a device (refresh) auth data; lets a paired device approve an OAuth device code.
+    /// The device must still be registered to that user, so a deleted device's credential can't approve.
+    pub fn device_token_user(&self, device: &str) -> Result<String> {
+        // decode_device_token checks registration and the revocation epoch.
+        match self.decode_device_token(device) {
+            Ok(c) => Ok(c.auth0_userid),
+            Err(ServerError::InvalidToken) => Err(ServerError::Unauthorized),
+            Err(e) => Err(e),
+        }
+    }
+
     fn issue_id_token(&self, user_id: &str) -> Result<String> {
         let now = Utc::now();
         let claims = IdTokenClaims {
