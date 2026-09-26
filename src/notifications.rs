@@ -1,5 +1,5 @@
 //! WebSocket Notifications Handler
-//! 
+//!
 //! Implements the /notifications/ws/json/1 endpoint that devices connect to
 //! for real-time sync notifications.
 //!
@@ -21,13 +21,9 @@
 //! }
 //! ```
 
-use axum::{
-    extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
-    },
-    response::IntoResponse,
-};
+use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -46,22 +42,22 @@ pub struct WsMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationMessage {
     pub attributes: NotificationAttributes,
-    
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<String>,
-    
+
     #[serde(rename = "messageId", skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
-    
+
     #[serde(rename = "message_id", skip_serializing_if = "Option::is_none")]
     pub message_id_2: Option<String>,
-    
+
     #[serde(rename = "messageid", skip_serializing_if = "Option::is_none")]
     pub message_id_3: Option<String>,
-    
+
     #[serde(rename = "publishTime", skip_serializing_if = "Option::is_none")]
     pub publish_time: Option<String>,
-    
+
     #[serde(rename = "publish_time", skip_serializing_if = "Option::is_none")]
     pub publish_time_2: Option<String>,
 }
@@ -71,9 +67,9 @@ pub struct NotificationMessage {
 pub struct NotificationAttributes {
     #[serde(rename = "auth0UserID")]
     pub auth0_user_id: String,
-    
+
     pub event: String,
-    
+
     #[serde(rename = "sourceDeviceID")]
     pub source_device_id: String,
 
@@ -82,22 +78,22 @@ pub struct NotificationAttributes {
 
     #[serde(rename = "deviceName", skip_serializing_if = "Option::is_none")]
     pub device_name: Option<String>,
-    
+
     #[serde(rename = "sourceDeviceDesc", skip_serializing_if = "Option::is_none")]
     pub source_device_desc: Option<String>,
-    
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
-    
+
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub doc_type: Option<String>,
-    
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    
+
     #[serde(rename = "vissibleName", skip_serializing_if = "Option::is_none")]
     pub visible_name: Option<String>,
 
@@ -121,7 +117,11 @@ impl WsMessage {
 
     /// Screenshare: a room was created; other clients should join. `source_device_id`
     /// is the creator's device, so the creator's own client drops it.
-    pub fn screenshare_room_created(auth0_user_id: &str, source_device_id: &str, room_id: &str) -> Self {
+    pub fn screenshare_room_created(
+        auth0_user_id: &str,
+        source_device_id: &str,
+        room_id: &str,
+    ) -> Self {
         let mut msg = Self::event("ScreenshareRoomCreated", source_device_id, auth0_user_id);
         msg.message.attributes.room_id = Some(room_id.into());
         msg
@@ -129,7 +129,13 @@ impl WsMessage {
 
     /// Screenshare: relay a signalling message to the user's other clients. `data_b64`
     /// is base64 of the inner JSON object the sender posted.
-    pub fn screenshare_message(auth0_user_id: &str, source_device_id: &str, room_id: &str, target_client_id: Option<&str>, data_b64: &str) -> Self {
+    pub fn screenshare_message(
+        auth0_user_id: &str,
+        source_device_id: &str,
+        room_id: &str,
+        target_client_id: Option<&str>,
+        data_b64: &str,
+    ) -> Self {
         let mut msg = Self::event("ScreenshareMessage", source_device_id, auth0_user_id);
         msg.message.attributes.room_id = Some(room_id.into());
         msg.message.attributes.target_client_id = target_client_id.map(|s| s.to_string());
@@ -145,7 +151,12 @@ impl WsMessage {
     }
 
     /// Tell the device its passcode reset request was approved (rmfakecloud `NotifyPasscodeReset`).
-    pub fn passcode_reset_approved(auth0_user_id: &str, device_id: &str, device_name: &str, request_id: &str) -> Self {
+    pub fn passcode_reset_approved(
+        auth0_user_id: &str,
+        device_id: &str,
+        device_name: &str,
+        request_id: &str,
+    ) -> Self {
         use base64::Engine;
         let mut msg = Self::sync_complete(0, "local-server", auth0_user_id);
         let attrs = &mut msg.message.attributes;
@@ -154,7 +165,8 @@ impl WsMessage {
         attrs.device_name = Some(device_name.into());
         attrs.id = Some(request_id.into());
         attrs.version = Some("1".into());
-        msg.message.data = Some(base64::engine::general_purpose::STANDARD.encode("PasscodeResetApproved"));
+        msg.message.data =
+            Some(base64::engine::general_purpose::STANDARD.encode("PasscodeResetApproved"));
         msg
     }
 
@@ -164,9 +176,9 @@ impl WsMessage {
             .unwrap()
             .as_nanos()
             .to_string();
-        
+
         let publish_time = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-        
+
         Self {
             message: NotificationMessage {
                 attributes: NotificationAttributes {
@@ -201,7 +213,7 @@ impl WsMessage {
 pub struct ClientMessage {
     #[serde(rename = "messageType", default)]
     pub message_type: Option<String>,
-    
+
     #[serde(default)]
     pub attributes: Option<serde_json::Value>,
 }
@@ -215,7 +227,10 @@ pub async fn notifications_ws(
     // Same as the cloud: only authenticated devices/clients may subscribe.
     let user_id = state.auth_user(&headers)?;
     // For filtering direct screen share messages; unknown means no filtering.
-    let auth = headers.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or_default();
+    let auth = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
     let device_id = state.devices.caller(auth).ok().map(|(_, device, _)| device);
     info!("WebSocket upgrade request for notifications");
     Ok(ws.on_upgrade(move |socket| handle_notifications_socket(socket, state, user_id, device_id)))
@@ -237,12 +252,17 @@ fn delivers_to(msg: &WsMessage, user_id: &str, device_id: Option<&str>) -> bool 
     a.auth0_user_id == user_id && for_device
 }
 
-async fn handle_notifications_socket(socket: WebSocket, state: AppState, user_id: String, device_id: Option<String>) {
+async fn handle_notifications_socket(
+    socket: WebSocket,
+    state: AppState,
+    user_id: String,
+    device_id: Option<String>,
+) {
     let session_id = uuid::Uuid::new_v4().to_string();
     info!(session_id = %session_id, "New notifications WebSocket connection");
-    
+
     let (mut sender, mut receiver) = socket.split();
-    
+
     // Send initial SyncComplete notification immediately to trigger sync
     let initial_notif = WsMessage::sync_complete(
         state.storage.get_root().generation,
@@ -253,10 +273,10 @@ async fn handle_notifications_socket(socket: WebSocket, state: AppState, user_id
         info!(session_id = %session_id, "Sending initial SyncComplete notification");
         let _ = sender.send(Message::Text(json.into())).await;
     }
-    
+
     // Subscribe to broadcast channel for sync notifications
     let mut rx = state.notification_tx.subscribe();
-    
+
     // Spawn task to forward broadcasts to this client
     let session_id_clone = session_id.clone();
     let storage = state.storage.clone();
@@ -269,7 +289,11 @@ async fn handle_notifications_socket(socket: WebSocket, state: AppState, user_id
                 // fresh one in place of whatever was lost.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     warn!(session_id = %session_id_clone, "notification client lagged, skipped {n} events");
-                    WsMessage::sync_complete(storage.get_root().generation, "local-server", "local-user")
+                    WsMessage::sync_complete(
+                        storage.get_root().generation,
+                        "local-server",
+                        "local-user",
+                    )
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
@@ -285,13 +309,13 @@ async fn handle_notifications_socket(socket: WebSocket, state: AppState, user_id
         }
         debug!(session_id = %session_id_clone, "Forward task ended");
     });
-    
+
     // Handle incoming messages
     while let Some(result) = receiver.next().await {
         match result {
             Ok(Message::Text(text)) => {
                 debug!(session_id = %session_id, "Received text: {}", text);
-                
+
                 if let Ok(msg) = serde_json::from_str::<ClientMessage>(&text) {
                     if let Some(msg_type) = &msg.message_type {
                         match msg_type.as_str() {
@@ -340,7 +364,7 @@ async fn handle_notifications_socket(socket: WebSocket, state: AppState, user_id
             }
         }
     }
-    
+
     forward_task.abort();
     info!(session_id = %session_id, "WebSocket connection closed");
 }
@@ -355,7 +379,10 @@ mod delivery_tests {
         assert!(delivers_to(&direct, "u", Some("viewer-a")));
         assert!(!delivers_to(&direct, "u", Some("viewer-b")));
         assert!(!delivers_to(&direct, "other-user", Some("viewer-a")));
-        assert!(delivers_to(&direct, "u", None), "unknown device keeps the old behaviour");
+        assert!(
+            delivers_to(&direct, "u", None),
+            "unknown device keeps the old behaviour"
+        );
         let broadcast = WsMessage::screenshare_message("u", "viewer-a", "r", None, "e30=");
         assert!(delivers_to(&broadcast, "u", Some("tablet")));
         let sync = WsMessage::sync_complete(1, "local-server", "local-user");

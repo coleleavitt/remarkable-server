@@ -1,5 +1,5 @@
 //! Multi-version sync protocol support
-//! 
+//!
 //! Implements all reMarkable sync protocol versions:
 //! - V1: Original document-storage JSON API (firmware 1.x-2.x)
 //! - V1.5: Transitional with batch operations
@@ -7,12 +7,10 @@
 //! - V3: Current production (hash-based, CRDT)
 //! - V4: Future protocol (extended metadata)
 
-use axum::{
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode},
-    body::Bytes,
-    Json,
-};
+use axum::Json;
+use axum::body::Bytes;
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use crate::api::AppState;
@@ -85,14 +83,18 @@ pub async fn v1_list_docs(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<V1Document>>, StatusCode> {
-    state.auth_user(&headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    state
+        .auth_user(&headers)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
     // Convert storage files to V1 document format
     // Sync v3 blobs aren't v1 documents; listing them as such invites a v1 client to
     // delete live sync data, so this stays empty as it always has.
     let files: Vec<(String, String, usize)> = Vec::new();
-    
-    let v1_docs: Vec<V1Document> = files.iter().enumerate().map(|(i, (hash, filename, _size))| {
-        V1Document {
+
+    let v1_docs: Vec<V1Document> = files
+        .iter()
+        .enumerate()
+        .map(|(i, (hash, filename, _size))| V1Document {
             id: hash.clone(),
             version: 1,
             message: String::new(),
@@ -101,14 +103,18 @@ pub async fn v1_list_docs(
             blob_url_get_expires: "2099-12-31T23:59:59Z".to_string(),
             blob_url_put: Some(format!("/document-storage/json/2/upload/{}", hash)),
             modified_client: chrono::Utc::now().to_rfc3339(),
-            doc_type: if filename.ends_with(".rm") { "DocumentType".to_string() } else { "CollectionType".to_string() },
+            doc_type: if filename.ends_with(".rm") {
+                "DocumentType".to_string()
+            } else {
+                "CollectionType".to_string()
+            },
             visible_name: filename.clone(),
             current_page: 0,
             bookmarked: false,
             parent: String::new(),
-        }
-    }).collect();
-    
+        })
+        .collect();
+
     Ok(Json(v1_docs))
 }
 
@@ -144,16 +150,21 @@ pub async fn v1_upload_request(
     headers: HeaderMap,
     Json(docs): Json<Vec<V1UploadRequest>>,
 ) -> Result<Json<Vec<V1UploadResponse>>, StatusCode> {
-    state.auth_user(&headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let responses: Vec<V1UploadResponse> = docs.iter().map(|d| V1UploadResponse {
-        id: d.id.clone(),
-        version: d.version,
-        message: String::new(),
-        success: true,
-        blob_url_put: format!("/document-storage/json/2/upload/{}", d.id),
-        blob_url_put_expires: "2099-12-31T23:59:59Z".to_string(),
-    }).collect();
-    
+    state
+        .auth_user(&headers)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let responses: Vec<V1UploadResponse> = docs
+        .iter()
+        .map(|d| V1UploadResponse {
+            id: d.id.clone(),
+            version: d.version,
+            message: String::new(),
+            success: true,
+            blob_url_put: format!("/document-storage/json/2/upload/{}", d.id),
+            blob_url_put_expires: "2099-12-31T23:59:59Z".to_string(),
+        })
+        .collect();
+
     Ok(Json(responses))
 }
 
@@ -183,14 +194,19 @@ pub async fn v1_update_status(
     headers: HeaderMap,
     Json(updates): Json<Vec<V1StatusUpdate>>,
 ) -> Result<Json<Vec<V1StatusResponse>>, StatusCode> {
-    state.auth_user(&headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let responses: Vec<V1StatusResponse> = updates.iter().map(|u| V1StatusResponse {
-        id: u.id.clone(),
-        version: u.version,
-        message: String::new(),
-        success: true,
-    }).collect();
-    
+    state
+        .auth_user(&headers)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let responses: Vec<V1StatusResponse> = updates
+        .iter()
+        .map(|u| V1StatusResponse {
+            id: u.id.clone(),
+            version: u.version,
+            message: String::new(),
+            success: true,
+        })
+        .collect();
+
     Ok(Json(responses))
 }
 
@@ -208,7 +224,9 @@ pub async fn v1_delete(
     headers: HeaderMap,
     Json(ids): Json<Vec<V1DeleteRequest>>,
 ) -> Result<Json<Vec<V1StatusResponse>>, StatusCode> {
-    state.auth_user(&headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    state
+        .auth_user(&headers)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
     // v1 ids aren't documents here, and blobs are shared by the sync tree: never delete
     // one the current root still references.
     for req in &ids {
@@ -216,14 +234,17 @@ pub async fn v1_delete(
             let _ = state.storage.delete(&req.id);
         }
     }
-    
-    let responses: Vec<V1StatusResponse> = ids.iter().map(|r| V1StatusResponse {
-        id: r.id.clone(),
-        version: r.version,
-        message: String::new(),
-        success: true,
-    }).collect();
-    
+
+    let responses: Vec<V1StatusResponse> = ids
+        .iter()
+        .map(|r| V1StatusResponse {
+            id: r.id.clone(),
+            version: r.version,
+            message: String::new(),
+            success: true,
+        })
+        .collect();
+
     Ok(Json(responses))
 }
 
@@ -269,22 +290,31 @@ pub async fn v15_batch_sync(
     headers: HeaderMap,
     Json(_batch): Json<V15BatchRequest>,
 ) -> Result<Json<V15BatchResponse>, StatusCode> {
-    state.auth_user(&headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    state
+        .auth_user(&headers)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
     // Sync v3 blobs aren't v1 documents; listing them as such invites a v1 client to
     // delete live sync data, so this stays empty as it always has.
     let files: Vec<(String, String, usize)> = Vec::new();
     let root = state.storage.get_root();
-    
-    let v15_docs: Vec<V15Document> = files.iter().map(|(hash, filename, _size)| V15Document {
-        id: hash.clone(),
-        hash: hash.clone(),
-        doc_type: if filename.ends_with(".rm") { "DocumentType".to_string() } else { "CollectionType".to_string() },
-        visible_name: filename.clone(),
-        parent: None,
-        version: 1,
-        modified_client: chrono::Utc::now().to_rfc3339(),
-    }).collect();
-    
+
+    let v15_docs: Vec<V15Document> = files
+        .iter()
+        .map(|(hash, filename, _size)| V15Document {
+            id: hash.clone(),
+            hash: hash.clone(),
+            doc_type: if filename.ends_with(".rm") {
+                "DocumentType".to_string()
+            } else {
+                "CollectionType".to_string()
+            },
+            visible_name: filename.clone(),
+            parent: None,
+            version: 1,
+            modified_client: chrono::Utc::now().to_rfc3339(),
+        })
+        .collect();
+
     Ok(Json(V15BatchResponse {
         documents: v15_docs,
         generation: root.generation as i64,
@@ -308,9 +338,11 @@ pub async fn v2_get_root(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<V2Root>, StatusCode> {
-    state.auth_user(&headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    state
+        .auth_user(&headers)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
     let root = state.storage.get_root();
-    
+
     Ok(Json(V2Root {
         hash: root.hash,
         generation: root.generation as i64,
@@ -324,8 +356,12 @@ pub async fn v2_get_file(
     Path(hash): Path<String>,
     headers: HeaderMap,
 ) -> Result<Bytes, StatusCode> {
-    state.auth_user(&headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
-    state.storage.get(&hash)
+    state
+        .auth_user(&headers)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    state
+        .storage
+        .get(&hash)
         .map(Bytes::from)
         .map_err(|_| StatusCode::NOT_FOUND)
 }
@@ -337,13 +373,18 @@ pub async fn v2_put_file(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, StatusCode> {
-    state.auth_user(&headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let filename = headers.get("rm-filename")
+    state
+        .auth_user(&headers)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let filename = headers
+        .get("rm-filename")
         .and_then(|v| v.to_str().ok())
         .unwrap_or(&hash)
         .to_string();
-    
-    state.storage.put_with_hash(&body, &hash, &filename)
+
+    state
+        .storage
+        .put_with_hash(&body, &hash, &filename)
         .map(|_| StatusCode::OK)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
@@ -375,16 +416,18 @@ pub async fn v4_get_root(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<V4Root>, StatusCode> {
-    state.auth_user(&headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    state
+        .auth_user(&headers)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
     let root = state.storage.get_root();
-    
+
     Ok(Json(V4Root {
         hash: root.hash,
         generation: root.generation as i64,
         schema_version: 4,
         features: vec![
             "crdt".to_string(),
-            "sharing".to_string(), 
+            "sharing".to_string(),
             "tags".to_string(),
             "search".to_string(),
             "calendar".to_string(),
@@ -405,14 +448,18 @@ pub async fn v4_get_file(
     Path(hash): Path<String>,
     headers: HeaderMap,
 ) -> Result<(HeaderMap, Bytes), StatusCode> {
-    state.auth_user(&headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let content = state.storage.get(&hash)
+    state
+        .auth_user(&headers)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let content = state
+        .storage
+        .get(&hash)
         .map_err(|_| StatusCode::NOT_FOUND)?;
-    
+
     let mut headers = HeaderMap::new();
     headers.insert("x-rm-schema-version", "4".parse().unwrap());
     headers.insert("x-rm-features", "crdt,sharing,tags".parse().unwrap());
-    
+
     Ok((headers, Bytes::from(content)))
 }
 
@@ -423,13 +470,18 @@ pub async fn v4_put_file(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, StatusCode> {
-    state.auth_user(&headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let filename = headers.get("rm-filename")
+    state
+        .auth_user(&headers)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let filename = headers
+        .get("rm-filename")
         .and_then(|v| v.to_str().ok())
         .unwrap_or(&hash)
         .to_string();
-    
-    state.storage.put_with_hash(&body, &hash, &filename)
+
+    state
+        .storage
+        .put_with_hash(&body, &hash, &filename)
         .map(|_| StatusCode::OK)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }

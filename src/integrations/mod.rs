@@ -15,14 +15,19 @@ pub mod oauth;
 pub mod onedrive;
 pub mod sync;
 
-pub use api::{IntegrationState, integration_api_router, integration_oauth_router, integration_router};
+use std::path::PathBuf;
+
+pub use api::{
+    IntegrationState,
+    integration_api_router,
+    integration_oauth_router,
+    integration_router,
+};
+use async_trait::async_trait;
 pub use conflict::{ConflictResolution, ConflictResolver, ConflictStrategy};
 pub use oauth::{OAuthConfig, OAuthProvider, OAuthToken, PkceFlow};
-pub use sync::{CloudSync, SyncConfig, SyncDirection, SyncResult, SyncStatus};
-
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+pub use sync::{CloudSync, SyncConfig, SyncDirection, SyncResult, SyncStatus};
 use thiserror::Error;
 
 /// Errors from cloud integrations
@@ -202,7 +207,8 @@ pub trait CloudProvider: Send + Sync {
         content: &[u8],
         mime_type: Option<&str>,
     ) -> Result<CloudFile> {
-        self.upload_file(parent_id, &components.join("/"), content, mime_type).await
+        self.upload_file(parent_id, &components.join("/"), content, mime_type)
+            .await
     }
 
     /// Create folder

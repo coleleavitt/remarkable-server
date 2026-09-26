@@ -9,9 +9,13 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use axum::{extract::{Multipart, Query}, http::StatusCode};
+use axum::extract::{Multipart, Query};
+use axum::http::StatusCode;
 
-pub async fn upload(Query(params): Query<HashMap<String, String>>, mut mp: Multipart) -> StatusCode {
+pub async fn upload(
+    Query(params): Query<HashMap<String, String>>,
+    mut mp: Multipart,
+) -> StatusCode {
     let dir = std::env::var("CRASH_DIR").unwrap_or_else(|_| "./crash-dumps".into());
     let id = uuid::Uuid::new_v4().to_string();
     let base = Path::new(&dir).join(&id);
@@ -23,16 +27,30 @@ pub async fn upload(Query(params): Query<HashMap<String, String>>, mut mp: Multi
     }
     let mut parts = 0usize;
     while let Ok(Some(field)) = mp.next_field().await {
-        let raw = field.file_name().or(field.name()).unwrap_or("part").to_string();
+        let raw = field
+            .file_name()
+            .or(field.name())
+            .unwrap_or("part")
+            .to_string();
         // sanitise: no path separators / traversal
-        let safe: String = raw.chars().filter(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-')).collect();
-        let name = if safe.is_empty() || safe == "." || safe == ".." { format!("part{parts}") } else { safe };
+        let safe: String = raw
+            .chars()
+            .filter(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            .collect();
+        let name = if safe.is_empty() || safe == "." || safe == ".." {
+            format!("part{parts}")
+        } else {
+            safe
+        };
         if let Ok(bytes) = field.bytes().await {
             let _ = std::fs::write(base.join(&name), &bytes);
             parts += 1;
         }
     }
-    tracing::info!("crash report stored id={id} parts={parts} format={:?}", params.get("format"));
+    tracing::info!(
+        "crash report stored id={id} parts={parts} format={:?}",
+        params.get("format")
+    );
     StatusCode::OK
 }
 
@@ -42,7 +60,10 @@ mod tests {
     #[test]
     fn filename_sanitised() {
         let raw = "../../etc/passwd";
-        let safe: String = raw.chars().filter(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-')).collect();
+        let safe: String = raw
+            .chars()
+            .filter(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            .collect();
         assert!(!safe.contains('/'));
     }
 }

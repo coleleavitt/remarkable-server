@@ -15,16 +15,18 @@
 //!       {version}.content  (archived content snapshots)
 //! ```
 
-use crate::error::{Result, ServerError};
-use crate::storage::Storage;
-use chrono::{DateTime, Duration, Utc};
-use parking_lot::RwLock;
-use rusqlite::{params, Connection, OptionalExtension};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::{Arc, Mutex};
+
+use chrono::{DateTime, Duration, Utc};
+use parking_lot::RwLock;
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::error::{Result, ServerError};
+use crate::storage::Storage;
 
 /// Version retention policy
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,7 +37,10 @@ pub enum RetentionPolicy {
     /// Keep versions newer than duration
     TimeBased { max_age_days: u32 },
     /// Keep both: last N versions AND anything within time window
-    Combined { max_versions: usize, max_age_days: u32 },
+    Combined {
+        max_versions: usize,
+        max_age_days: u32,
+    },
     /// Keep everything (no automatic cleanup)
     Unlimited,
 }
@@ -136,7 +141,11 @@ unsafe impl Sync for VersionManagerInner {}
 
 impl VersionManager {
     /// Create new version manager
-    pub fn new<P: AsRef<StdPath>>(path: P, storage: Storage, config: VersionConfig) -> Result<Self> {
+    pub fn new<P: AsRef<StdPath>>(
+        path: P,
+        storage: Storage,
+        config: VersionConfig,
+    ) -> Result<Self> {
         let base_path = path.as_ref().to_path_buf();
         fs::create_dir_all(&base_path)?;
         fs::create_dir_all(base_path.join("versions"))?;
@@ -188,7 +197,11 @@ impl VersionManager {
         // Copy what we need out of the config first so a queued
         // `set_retention` writer can never deadlock against `apply_retention`.
         let store_content_snapshots = self.inner.config.read().store_content_snapshots;
-        let db = self.inner.db.lock().map_err(|e| ServerError::Internal(e.to_string()))?;
+        let db = self
+            .inner
+            .db
+            .lock()
+            .map_err(|e| ServerError::Internal(e.to_string()))?;
 
         // Calculate content hash
         let mut hasher = Sha256::new();
@@ -282,7 +295,11 @@ impl VersionManager {
 
     /// List all versions for a document
     pub fn list_versions(&self, doc_id: &str) -> Result<Vec<VersionInfo>> {
-        let db = self.inner.db.lock().map_err(|e| ServerError::Internal(e.to_string()))?;
+        let db = self
+            .inner
+            .db
+            .lock()
+            .map_err(|e| ServerError::Internal(e.to_string()))?;
         let mut stmt = db.prepare(
             r#"
             SELECT version, doc_id, content_hash, created_at, device_id, size, message
@@ -313,7 +330,11 @@ impl VersionManager {
 
     /// Get a specific version
     pub fn get_version(&self, doc_id: &str, version: u64) -> Result<VersionInfo> {
-        let db = self.inner.db.lock().map_err(|e| ServerError::Internal(e.to_string()))?;
+        let db = self
+            .inner
+            .db
+            .lock()
+            .map_err(|e| ServerError::Internal(e.to_string()))?;
         db.query_row(
             r#"
             SELECT version, doc_id, content_hash, created_at, device_id, size, message
@@ -340,7 +361,11 @@ impl VersionManager {
 
     /// Get content for a specific version
     pub fn get_version_content(&self, doc_id: &str, version: u64) -> Result<Vec<u8>> {
-        let db = self.inner.db.lock().map_err(|e| ServerError::Internal(e.to_string()))?;
+        let db = self
+            .inner
+            .db
+            .lock()
+            .map_err(|e| ServerError::Internal(e.to_string()))?;
 
         // Get version info
         let (content_hash, has_snapshot): (String, bool) = db
@@ -349,7 +374,9 @@ impl VersionManager {
                 params![doc_id, version],
                 |row| Ok((row.get(0)?, row.get::<_, i32>(1)? != 0)),
             )
-            .map_err(|_| ServerError::NotFound(format!("version {} for doc {}", version, doc_id)))?;
+            .map_err(|_| {
+                ServerError::NotFound(format!("version {} for doc {}", version, doc_id))
+            })?;
 
         drop(db);
 
@@ -366,7 +393,12 @@ impl VersionManager {
     }
 
     /// Compute diff between two versions
-    pub fn diff_versions(&self, doc_id: &str, from_version: u64, to_version: u64) -> Result<VersionDiff> {
+    pub fn diff_versions(
+        &self,
+        doc_id: &str,
+        from_version: u64,
+        to_version: u64,
+    ) -> Result<VersionDiff> {
         let from = self.get_version(doc_id, from_version)?;
         let to = self.get_version(doc_id, to_version)?;
 
@@ -422,7 +454,11 @@ impl VersionManager {
         // Snapshot the policy and release the config lock before taking `db`
         // (see lock-order note in `create_version`).
         let retention = self.inner.config.read().retention.clone();
-        let db = self.inner.db.lock().map_err(|e| ServerError::Internal(e.to_string()))?;
+        let db = self
+            .inner
+            .db
+            .lock()
+            .map_err(|e| ServerError::Internal(e.to_string()))?;
         let mut deleted = 0;
 
         match &retention {
@@ -464,9 +500,12 @@ impl VersionManager {
                     deleted += 1;
                 }
             }
-            RetentionPolicy::Combined { max_versions, max_age_days } => {
+            RetentionPolicy::Combined {
+                max_versions,
+                max_age_days,
+            } => {
                 let cutoff = Utc::now() - Duration::days(*max_age_days as i64);
-                
+
                 // Keep versions that are either in the last N OR within time window
                 let mut stmt = db.prepare(
                     r#"
@@ -531,7 +570,11 @@ impl VersionManager {
 
     /// Get all document IDs with versions
     pub fn list_documents(&self) -> Result<Vec<String>> {
-        let db = self.inner.db.lock().map_err(|e| ServerError::Internal(e.to_string()))?;
+        let db = self
+            .inner
+            .db
+            .lock()
+            .map_err(|e| ServerError::Internal(e.to_string()))?;
         let mut stmt = db.prepare("SELECT DISTINCT doc_id FROM versions ORDER BY doc_id")?;
         let docs = stmt
             .query_map([], |row| row.get(0))?
@@ -541,7 +584,11 @@ impl VersionManager {
 
     /// Get version count for a document
     pub fn version_count(&self, doc_id: &str) -> Result<usize> {
-        let db = self.inner.db.lock().map_err(|e| ServerError::Internal(e.to_string()))?;
+        let db = self
+            .inner
+            .db
+            .lock()
+            .map_err(|e| ServerError::Internal(e.to_string()))?;
         let count: i64 = db.query_row(
             "SELECT COUNT(*) FROM versions WHERE doc_id = ?",
             params![doc_id],
@@ -552,16 +599,19 @@ impl VersionManager {
 
     /// Get storage statistics
     pub fn stats(&self) -> Result<VersionStats> {
-        let db = self.inner.db.lock().map_err(|e| ServerError::Internal(e.to_string()))?;
+        let db = self
+            .inner
+            .db
+            .lock()
+            .map_err(|e| ServerError::Internal(e.to_string()))?;
 
         let total_versions: i64 =
             db.query_row("SELECT COUNT(*) FROM versions", [], |row| row.get(0))?;
 
-        let total_documents: i64 = db.query_row(
-            "SELECT COUNT(DISTINCT doc_id) FROM versions",
-            [],
-            |row| row.get(0),
-        )?;
+        let total_documents: i64 =
+            db.query_row("SELECT COUNT(DISTINCT doc_id) FROM versions", [], |row| {
+                row.get(0)
+            })?;
 
         let total_size: i64 = db.query_row(
             "SELECT COALESCE(SUM(size), 0) FROM versions WHERE has_snapshot = 1",
@@ -570,20 +620,12 @@ impl VersionManager {
         )?;
 
         let oldest: Option<String> = db
-            .query_row(
-                "SELECT MIN(created_at) FROM versions",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT MIN(created_at) FROM versions", [], |row| row.get(0))
             .optional()?
             .flatten();
 
         let newest: Option<String> = db
-            .query_row(
-                "SELECT MAX(created_at) FROM versions",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT MAX(created_at) FROM versions", [], |row| row.get(0))
             .optional()?
             .flatten();
 
@@ -593,8 +635,16 @@ impl VersionManager {
             total_versions: total_versions as usize,
             total_documents: total_documents as usize,
             total_snapshot_bytes: total_size as u64,
-            oldest_version: oldest.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))),
-            newest_version: newest.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))),
+            oldest_version: oldest.and_then(|s| {
+                DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            }),
+            newest_version: newest.and_then(|s| {
+                DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            }),
             retention_policy: self.inner.config.read().retention.clone(),
         })
     }
@@ -635,7 +685,7 @@ fn compute_diff_stats(from: &[u8], to: &[u8]) -> DiffStats {
             matched += 1;
         }
     }
-    
+
     let total_bytes = from.len().max(to.len());
     let similarity = if total_bytes > 0 {
         matched as f64 / total_bytes as f64
@@ -668,11 +718,9 @@ fn compute_diff_stats(from: &[u8], to: &[u8]) -> DiffStats {
 // API Handlers
 // ============================================================================
 
-use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    Json,
-};
+use axum::Json;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
 
 /// Shared state for version API
 #[derive(Clone)]
@@ -702,7 +750,7 @@ pub async fn list_versions(
 ) -> Result<Json<VersionListResponse>> {
     let versions = state.manager.list_versions(&doc_id)?;
     let total = versions.len();
-    
+
     Ok(Json(VersionListResponse {
         doc_id,
         versions,
@@ -733,7 +781,7 @@ pub async fn restore_version(
     Path((doc_id, version)): Path<(String, u64)>,
 ) -> Result<Json<RestoreResponse>> {
     let new_version = state.manager.restore_version(&doc_id, version)?;
-    
+
     Ok(Json(RestoreResponse {
         restored_from: version,
         new_version,
@@ -772,7 +820,9 @@ pub async fn set_retention(
 /// POST /versions/v1/prune - prune all documents
 pub async fn prune_all(State(state): State<VersionState>) -> Result<Json<PruneResponse>> {
     let pruned = state.manager.prune_all()?;
-    Ok(Json(PruneResponse { versions_pruned: pruned }))
+    Ok(Json(PruneResponse {
+        versions_pruned: pruned,
+    }))
 }
 
 #[derive(Debug, Serialize)]
@@ -783,7 +833,7 @@ pub struct PruneResponse {
 /// Create router for version API
 pub fn version_router(state: VersionState) -> axum::Router {
     use axum::routing::{get, post, put};
-    
+
     axum::Router::new()
         .route("/stats", get(get_stats))
         .route("/retention", get(get_retention))
@@ -799,8 +849,9 @@ pub fn version_router(state: VersionState) -> axum::Router {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
+
+    use super::*;
 
     fn setup() -> (TempDir, VersionManager) {
         let tmp = TempDir::new().unwrap();
@@ -868,8 +919,12 @@ mod tests {
     fn test_diff_versions() {
         let (_tmp, manager) = setup();
 
-        manager.create_version("doc1", b"hello", None, None).unwrap();
-        manager.create_version("doc1", b"hello world", None, None).unwrap();
+        manager
+            .create_version("doc1", b"hello", None, None)
+            .unwrap();
+        manager
+            .create_version("doc1", b"hello world", None, None)
+            .unwrap();
 
         let diff = manager.diff_versions("doc1", 1, 2).unwrap();
         assert!(diff.content_changed);
@@ -880,8 +935,12 @@ mod tests {
     fn test_restore_version() {
         let (_tmp, manager) = setup();
 
-        manager.create_version("doc1", b"original", None, None).unwrap();
-        manager.create_version("doc1", b"modified", None, None).unwrap();
+        manager
+            .create_version("doc1", b"original", None, None)
+            .unwrap();
+        manager
+            .create_version("doc1", b"modified", None, None)
+            .unwrap();
 
         let restored = manager.restore_version("doc1", 1).unwrap();
         assert_eq!(restored.version, 3);
@@ -912,9 +971,15 @@ mod tests {
     fn test_stats() {
         let (_tmp, manager) = setup();
 
-        manager.create_version("doc1", b"content1", None, None).unwrap();
-        manager.create_version("doc1", b"content2", None, None).unwrap();
-        manager.create_version("doc2", b"other", None, None).unwrap();
+        manager
+            .create_version("doc1", b"content1", None, None)
+            .unwrap();
+        manager
+            .create_version("doc1", b"content2", None, None)
+            .unwrap();
+        manager
+            .create_version("doc2", b"other", None, None)
+            .unwrap();
 
         let stats = manager.stats().unwrap();
         assert_eq!(stats.total_versions, 3);
@@ -934,7 +999,13 @@ mod tests {
             let m = manager.clone();
             handles.push(std::thread::spawn(move || {
                 for i in 0..40 {
-                    m.create_version(&format!("doc{}", t % 2), format!("c{} {}", t, i).as_bytes(), None, None).unwrap();
+                    m.create_version(
+                        &format!("doc{}", t % 2),
+                        format!("c{} {}", t, i).as_bytes(),
+                        None,
+                        None,
+                    )
+                    .unwrap();
                 }
             }));
         }
@@ -942,7 +1013,11 @@ mod tests {
             let m = manager.clone();
             handles.push(std::thread::spawn(move || {
                 for i in 0..300 {
-                    let p = if (i + t) % 2 == 0 { RetentionPolicy::Count { max_versions: 3 } } else { RetentionPolicy::Unlimited };
+                    let p = if (i + t) % 2 == 0 {
+                        RetentionPolicy::Count { max_versions: 3 }
+                    } else {
+                        RetentionPolicy::Unlimited
+                    };
                     m.set_retention(p);
                     let _ = m.get_retention();
                     let _ = m.stats().unwrap();
@@ -950,9 +1025,18 @@ mod tests {
             }));
         }
         let m = manager.clone();
-        handles.push(std::thread::spawn(move || { for _ in 0..10 { m.prune_all().unwrap(); } }));
-        std::thread::spawn(move || { let ok = handles.into_iter().all(|h| h.join().is_ok()); let _ = done_tx.send(ok); });
-        let ok = done_rx.recv_timeout(std::time::Duration::from_secs(60)).expect("create_version/set_retention deadlocked");
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..10 {
+                m.prune_all().unwrap();
+            }
+        }));
+        std::thread::spawn(move || {
+            let ok = handles.into_iter().all(|h| h.join().is_ok());
+            let _ = done_tx.send(ok);
+        });
+        let ok = done_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("create_version/set_retention deadlocked");
         assert!(ok, "a worker thread panicked");
     }
 }

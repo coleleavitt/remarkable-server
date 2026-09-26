@@ -2,7 +2,8 @@
 //!
 //! reMarkable sync API uses GCS which requires CRC32C in x-goog-hash header.
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 
 /// Calculate CRC32C checksum using the crc32c crate
 pub fn crc32c(data: &[u8]) -> u32 {
@@ -42,10 +43,14 @@ pub fn parse_goog_hash_strict(header: &str) -> Option<u32> {
     let mut crc = None;
     for part in header.split(',') {
         let (key, value) = part.trim().split_once('=')?;
-        if key.trim().is_empty() || value.trim().is_empty() { return None; }
+        if key.trim().is_empty() || value.trim().is_empty() {
+            return None;
+        }
         if key.trim().eq_ignore_ascii_case("crc32c") {
             let bytes: [u8; 4] = STANDARD.decode(value.trim()).ok()?.try_into().ok()?;
-            if crc.replace(u32::from_be_bytes(bytes)).is_some() { return None; }
+            if crc.replace(u32::from_be_bytes(bytes)).is_some() {
+                return None;
+            }
         }
     }
     crc
@@ -53,16 +58,26 @@ pub fn parse_goog_hash_strict(header: &str) -> Option<u32> {
 
 /// Check an upload body against its `x-goog-hash` header. Absent header: nothing to
 /// check (GCS semantics). Present but without a usable crc32c: 400, never silently skipped.
-pub fn verify_goog_hash_header(headers: &axum::http::HeaderMap, body: &[u8]) -> crate::error::Result<()> {
+pub fn verify_goog_hash_header(
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> crate::error::Result<()> {
     use crate::error::ServerError;
-    let Some(raw) = headers.get("x-goog-hash") else { return Ok(()) };
+    let Some(raw) = headers.get("x-goog-hash") else {
+        return Ok(());
+    };
     let goog = raw.to_str().ok().filter(|v| !v.trim().is_empty());
     let Some(crc) = goog.and_then(parse_goog_hash_strict) else {
         tracing::warn!(header = ?raw, "rejected malformed x-goog-hash");
-        return Err(ServerError::InvalidHeader(format!("x-goog-hash: {raw:?} (expected crc32c=<base64>)")));
+        return Err(ServerError::InvalidHeader(format!(
+            "x-goog-hash: {raw:?} (expected crc32c=<base64>)"
+        )));
     };
     if crc != crc32c(body) {
-        return Err(ServerError::ChecksumMismatch { expected: goog.unwrap_or_default().to_string(), actual: format_goog_hash(body) });
+        return Err(ServerError::ChecksumMismatch {
+            expected: goog.unwrap_or_default().to_string(),
+            actual: format_goog_hash(body),
+        });
     }
     Ok(())
 }
@@ -110,10 +125,26 @@ mod tests {
     #[test]
     fn test_parse_goog_hash_strict() {
         assert_eq!(parse_goog_hash_strict("crc32c=4waSgw=="), Some(0xE3069283));
-        assert_eq!(parse_goog_hash_strict("crc32c=4waSgw==,md5=XUFAKrxLKna5cZ2REBfFkg=="), Some(0xE3069283));
-        assert_eq!(parse_goog_hash_strict("md5=XUFAKrxLKna5cZ2REBfFkg==, crc32c=4waSgw=="), Some(0xE3069283));
-        for bad in ["", "invalid", "crc32c=", "crc32c=!!!", "crc32c=AAAAAAAA", "md5=XUFAKrxLKna5cZ2REBfFkg==",
-                    "crc32c=4waSgw==,crc32c=4waSgw==", "crc32c=4waSgw==,junk", "crc32c=4waSgw==,=anything", "crc32c=4waSgw==, =x"] {
+        assert_eq!(
+            parse_goog_hash_strict("crc32c=4waSgw==,md5=XUFAKrxLKna5cZ2REBfFkg=="),
+            Some(0xE3069283)
+        );
+        assert_eq!(
+            parse_goog_hash_strict("md5=XUFAKrxLKna5cZ2REBfFkg==, crc32c=4waSgw=="),
+            Some(0xE3069283)
+        );
+        for bad in [
+            "",
+            "invalid",
+            "crc32c=",
+            "crc32c=!!!",
+            "crc32c=AAAAAAAA",
+            "md5=XUFAKrxLKna5cZ2REBfFkg==",
+            "crc32c=4waSgw==,crc32c=4waSgw==",
+            "crc32c=4waSgw==,junk",
+            "crc32c=4waSgw==,=anything",
+            "crc32c=4waSgw==, =x",
+        ] {
             assert_eq!(parse_goog_hash_strict(bad), None, "{bad:?}");
         }
     }
@@ -122,12 +153,24 @@ mod tests {
     fn test_verify_goog_hash_header() {
         use axum::http::{HeaderMap, HeaderValue};
         let mut h = HeaderMap::new();
-        assert!(verify_goog_hash_header(&h, b"123456789").is_ok(), "absent header is unconditional");
-        h.insert("x-goog-hash", HeaderValue::from_static("crc32c=4waSgw==,md5=xxx"));
+        assert!(
+            verify_goog_hash_header(&h, b"123456789").is_ok(),
+            "absent header is unconditional"
+        );
+        h.insert(
+            "x-goog-hash",
+            HeaderValue::from_static("crc32c=4waSgw==,md5=xxx"),
+        );
         assert!(verify_goog_hash_header(&h, b"123456789").is_ok());
-        assert!(matches!(verify_goog_hash_header(&h, b"other"), Err(crate::error::ServerError::ChecksumMismatch { .. })));
+        assert!(matches!(
+            verify_goog_hash_header(&h, b"other"),
+            Err(crate::error::ServerError::ChecksumMismatch { .. })
+        ));
         h.insert("x-goog-hash", HeaderValue::from_static("crc32c=garbage"));
-        assert!(matches!(verify_goog_hash_header(&h, b"123456789"), Err(crate::error::ServerError::InvalidHeader(_))));
+        assert!(matches!(
+            verify_goog_hash_header(&h, b"123456789"),
+            Err(crate::error::ServerError::InvalidHeader(_))
+        ));
     }
 
     #[test]

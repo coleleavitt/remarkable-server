@@ -2,13 +2,20 @@
 //!
 //! Full read/write access via Drive API v3.
 
-use crate::integrations::{
-    oauth::{refresh_token, OAuthConfig, OAuthToken},
-    CloudFile, CloudFolder, CloudProvider, IntegrationError, ProviderType, Result, StorageQuota,
-};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+
+use crate::integrations::oauth::{OAuthConfig, OAuthToken, refresh_token};
+use crate::integrations::{
+    CloudFile,
+    CloudFolder,
+    CloudProvider,
+    IntegrationError,
+    ProviderType,
+    Result,
+    StorageQuota,
+};
 
 const API_BASE: &str = "https://www.googleapis.com/drive/v3";
 const UPLOAD_BASE: &str = "https://www.googleapis.com/upload/drive/v3";
@@ -55,10 +62,19 @@ impl GoogleDrive {
         let esc = |s: &str| s.replace('\\', "\\\\").replace('\'', "\\'");
         let query = format!(
             "name = '{}' and '{}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
-            esc(name), esc(parent)
+            esc(name),
+            esc(parent)
         );
-        let url = format!("{}/files?q={}&fields=files(id,name,mimeType,parents)", API_BASE, urlencoding::encode(&query));
-        let response = self.request(reqwest::Method::GET, &url).await?.send().await
+        let url = format!(
+            "{}/files?q={}&fields=files(id,name,mimeType,parents)",
+            API_BASE,
+            urlencoding::encode(&query)
+        );
+        let response = self
+            .request(reqwest::Method::GET, &url)
+            .await?
+            .send()
+            .await
             .map_err(|e| IntegrationError::Network(e.to_string()))?;
         let list: ListFilesResponse = self.handle_response(response).await?;
         Ok(list.files.into_iter().next().map(|f| f.id))
@@ -70,7 +86,7 @@ impl GoogleDrive {
         response: reqwest::Response,
     ) -> Result<T> {
         let status = response.status();
-        
+
         if status.is_success() {
             response
                 .json()
@@ -217,7 +233,7 @@ impl CloudProvider for GoogleDrive {
     async fn list_files(&self, folder_id: Option<&str>) -> Result<Vec<CloudFile>> {
         let parent = folder_id.unwrap_or("root");
         let query = format!("'{}' in parents and trashed = false", parent);
-        
+
         let url = format!(
             "{}/files?q={}&fields=files(id,name,mimeType,size,modifiedTime,md5Checksum,parents),nextPageToken",
             API_BASE,
@@ -232,7 +248,7 @@ impl CloudProvider for GoogleDrive {
             .map_err(|e| IntegrationError::Network(e.to_string()))?;
 
         let list: ListFilesResponse = self.handle_response(response).await?;
-        
+
         Ok(list
             .files
             .into_iter()
@@ -256,7 +272,7 @@ impl CloudProvider for GoogleDrive {
             .map_err(|e| IntegrationError::Network(e.to_string()))?;
 
         let list: ListFilesResponse = self.handle_response(response).await?;
-        
+
         Ok(list
             .files
             .into_iter()
@@ -317,7 +333,7 @@ impl CloudProvider for GoogleDrive {
         mime_type: Option<&str>,
     ) -> Result<CloudFile> {
         let mime = mime_type.unwrap_or("application/octet-stream");
-        
+
         // Use multipart upload for simplicity
         #[derive(Serialize)]
         struct FileMetadata<'a> {
@@ -337,13 +353,13 @@ impl CloudProvider for GoogleDrive {
         // Build multipart body
         let boundary = "remarkable_upload_boundary";
         let mut body = Vec::new();
-        
+
         // Metadata part
         body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
         body.extend_from_slice(b"Content-Type: application/json; charset=UTF-8\r\n\r\n");
         body.extend_from_slice(metadata_json.as_bytes());
         body.extend_from_slice(b"\r\n");
-        
+
         // Content part
         body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
         body.extend_from_slice(format!("Content-Type: {}\r\n\r\n", mime).as_bytes());
@@ -382,7 +398,9 @@ impl CloudProvider for GoogleDrive {
         mime_type: Option<&str>,
     ) -> Result<CloudFile> {
         // Drive addresses folders by ID, not path: walk (find or create) each directory.
-        let (name, dirs) = components.split_last().ok_or_else(|| IntegrationError::InvalidPath("empty path".into()))?;
+        let (name, dirs) = components
+            .split_last()
+            .ok_or_else(|| IntegrationError::InvalidPath("empty path".into()))?;
         let mut parent = parent_id.unwrap_or("root").to_string();
         for dir in dirs {
             parent = match self.find_folder(&parent, dir).await? {
@@ -390,7 +408,9 @@ impl CloudProvider for GoogleDrive {
                 None => self.create_folder(Some(&parent), dir).await?.id,
             };
         }
-        let mut file = self.upload_file(Some(&parent), name, content, mime_type).await?;
+        let mut file = self
+            .upload_file(Some(&parent), name, content, mime_type)
+            .await?;
         file.path = format!("/{}", components.join("/")); // full relative path, not just the basename
         Ok(file)
     }
@@ -412,7 +432,7 @@ impl CloudProvider for GoogleDrive {
         };
 
         let url = format!("{}/files?fields=id,name,parents", API_BASE);
-        
+
         let response = self
             .request(reqwest::Method::POST, &url)
             .await?
@@ -422,7 +442,7 @@ impl CloudProvider for GoogleDrive {
             .map_err(|e| IntegrationError::Network(e.to_string()))?;
 
         let file: DriveFile = self.handle_response(response).await?;
-        
+
         Ok(CloudFolder {
             id: file.id,
             name: file.name.clone(),
@@ -517,7 +537,7 @@ impl CloudProvider for GoogleDrive {
             .map_err(|e| IntegrationError::Network(e.to_string()))?;
 
         let changes: ChangesResponse = self.handle_response(response).await?;
-        
+
         let files: Vec<CloudFile> = changes
             .changes
             .into_iter()
@@ -530,9 +550,7 @@ impl CloudProvider for GoogleDrive {
             })
             .collect();
 
-        let next_cursor = changes
-            .new_start_page_token
-            .or(changes.next_page_token);
+        let next_cursor = changes.new_start_page_token.or(changes.next_page_token);
 
         Ok((files, next_cursor))
     }
@@ -548,7 +566,7 @@ impl CloudProvider for GoogleDrive {
             .map_err(|e| IntegrationError::Network(e.to_string()))?;
 
         let about: AboutResponse = self.handle_response(response).await?;
-        
+
         Ok(StorageQuota {
             used: about.storage_quota.usage.parse().unwrap_or(0),
             total: about.storage_quota.limit.and_then(|l| l.parse().ok()),

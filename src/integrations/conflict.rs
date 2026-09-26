@@ -2,9 +2,11 @@
 //!
 //! Handles cases where both local and cloud have changes to the same file.
 
-use crate::integrations::CloudFile;
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+use crate::integrations::CloudFile;
 
 /// How a conflict was resolved
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,14 +99,14 @@ impl ConflictResolver {
     /// Resolve a conflict using the configured strategy
     pub fn resolve(&mut self, conflict: &mut Conflict) -> ConflictResolution {
         let resolution = match self.strategy {
-            ConflictStrategy::NewerWins => {
-                self.resolve_by_time(conflict)
-            }
+            ConflictStrategy::NewerWins => self.resolve_by_time(conflict),
             ConflictStrategy::LocalWins => ConflictResolution::UseLocal,
             ConflictStrategy::CloudWins => ConflictResolution::UseCloud,
             ConflictStrategy::KeepBoth => {
                 let renamed = self.generate_conflict_name(&conflict.cloud_file.name);
-                ConflictResolution::KeepBoth { renamed_to: renamed }
+                ConflictResolution::KeepBoth {
+                    renamed_to: renamed,
+                }
             }
             ConflictStrategy::AskUser => {
                 self.pending_conflicts.push(conflict.clone());
@@ -127,7 +129,9 @@ impl ConflictResolver {
                 } else {
                     // Same time, keep both
                     let renamed = self.generate_conflict_name(&conflict.cloud_file.name);
-                    ConflictResolution::KeepBoth { renamed_to: renamed }
+                    ConflictResolution::KeepBoth {
+                        renamed_to: renamed,
+                    }
                 }
             }
             ConflictType::LocalDeletedCloudModified => {
@@ -141,7 +145,9 @@ impl ConflictResolver {
             ConflictType::TypeChanged => {
                 // Keep both and let user sort it out
                 let renamed = self.generate_conflict_name(&conflict.cloud_file.name);
-                ConflictResolution::KeepBoth { renamed_to: renamed }
+                ConflictResolution::KeepBoth {
+                    renamed_to: renamed,
+                }
             }
         }
     }
@@ -149,7 +155,7 @@ impl ConflictResolver {
     /// Generate a conflict filename
     fn generate_conflict_name(&self, original: &str) -> String {
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-        
+
         // Split extension
         if let Some(dot_pos) = original.rfind('.') {
             let (name, ext) = original.split_at(dot_pos);
@@ -170,7 +176,11 @@ impl ConflictResolver {
     }
 
     /// Manually resolve a pending conflict
-    pub fn resolve_manual(&mut self, index: usize, resolution: ConflictResolution) -> Option<Conflict> {
+    pub fn resolve_manual(
+        &mut self,
+        index: usize,
+        resolution: ConflictResolution,
+    ) -> Option<Conflict> {
         if index < self.pending_conflicts.len() {
             let mut conflict = self.pending_conflicts.remove(index);
             conflict.resolution = Some(resolution);
@@ -193,7 +203,7 @@ impl ConflictResolver {
             (true, Some(cloud)) => {
                 // Both exist - check if both modified since last sync
                 let last_sync = last_sync_time.unwrap_or(0);
-                
+
                 let local_changed = local_modified_at > last_sync;
                 let cloud_changed = cloud.modified_at > last_sync;
 
@@ -235,7 +245,8 @@ impl ConflictResolver {
                         local_path: local_path.clone(),
                         cloud_file: CloudFile {
                             id: String::new(),
-                            name: local_path.file_name()
+                            name: local_path
+                                .file_name()
                                 .map(|n| n.to_string_lossy().into_owned())
                                 .unwrap_or_default(),
                             mime_type: None,
@@ -372,7 +383,7 @@ mod tests {
     #[test]
     fn test_conflict_resolution_newer_wins() {
         let mut resolver = ConflictResolver::new(ConflictStrategy::NewerWins);
-        
+
         let mut conflict = Conflict {
             local_path: PathBuf::from("/test.txt"),
             cloud_file: CloudFile {
@@ -399,7 +410,7 @@ mod tests {
     #[test]
     fn test_conflict_name_generation() {
         let resolver = ConflictResolver::new(ConflictStrategy::KeepBoth);
-        
+
         let name = resolver.generate_conflict_name("document.pdf");
         assert!(name.starts_with("document_conflict_"));
         assert!(name.ends_with(".pdf"));

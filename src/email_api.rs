@@ -2,12 +2,10 @@
 //!
 //! Provides REST endpoints for email management and statistics.
 
-use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
+use axum::Json;
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
 use crate::email::{EmailRecord, EmailServer, EmailStats};
@@ -31,7 +29,9 @@ pub struct ListEmailsQuery {
     pub limit: usize,
 }
 
-fn default_limit() -> usize { 50 }
+fn default_limit() -> usize {
+    50
+}
 
 /// List emails for a device
 pub async fn list_emails(
@@ -44,9 +44,7 @@ pub async fn list_emails(
 }
 
 /// Get email server statistics
-pub async fn stats(
-    State(state): State<EmailState>,
-) -> Result<Json<EmailStats>> {
+pub async fn stats(State(state): State<EmailState>) -> Result<Json<EmailStats>> {
     let stats = state.server.stats()?;
     Ok(Json(stats))
 }
@@ -60,14 +58,15 @@ pub struct EmailConfigResponse {
     pub supported_formats: Vec<&'static str>,
 }
 
-pub async fn config(
-    State(state): State<EmailState>,
-) -> Json<EmailConfigResponse> {
+pub async fn config(State(state): State<EmailState>) -> Json<EmailConfigResponse> {
     let cfg = state.server.config();
-    let port = cfg.smtp_bind.split(':').last()
+    let port = cfg
+        .smtp_bind
+        .split(':')
+        .last()
         .and_then(|p| p.parse().ok())
         .unwrap_or(2525);
-    
+
     Json(EmailConfigResponse {
         smtp_port: port,
         domain: cfg.domain.clone(),

@@ -1,0 +1,5 @@
+# Formatting-only commits, skipped by `git blame` (git config blame.ignoreRevsFile .git-blame-ignore-revs)
+# style: cargo fmt
+c1f32c2a311d478d84ea83791835c78e318f2b34
+# style: cargo fmt (regenerated on current master)
+4da2b969504fc48dd5d6d4a615d702d6cadd5b8f

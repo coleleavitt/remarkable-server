@@ -6,12 +6,18 @@
 //! An index's hash is sha256 over its entries' binary hashes, sorted by name
 //! (verified against device-written trees).
 
-use axum::{body::Bytes, extract::{Multipart, State}, http::{header, HeaderMap, StatusCode}};
-use base64::{engine::general_purpose::STANDARD, Engine};
+use axum::body::Bytes;
+use axum::extract::{Multipart, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::{api::AppState, error::{Result, ServerError}, notifications::WsMessage, storage::{is_valid_hash, Storage}};
+use crate::api::AppState;
+use crate::error::{Result, ServerError};
+use crate::notifications::WsMessage;
+use crate::storage::{Storage, is_valid_hash};
 
 const SCHEMA: &str = "3";
 const FILE_TYPE: &str = "0";
@@ -19,7 +25,13 @@ const DOC_TYPE: &str = "80000000";
 /// Retries when another client moves the root while we're inserting.
 const ROOT_RETRIES: usize = 5;
 
-struct Entry { hash: String, kind: String, name: String, subfiles: u64, size: u64 }
+struct Entry {
+    hash: String,
+    kind: String,
+    name: String,
+    subfiles: u64,
+    size: u64,
+}
 
 impl Entry {
     /// Strict: exactly `hash:type:name:subfiles:size` with a valid hash and non-empty fields.
@@ -32,12 +44,16 @@ impl Entry {
             subfiles: f.next()?.parse().ok()?,
             size: f.next()?.parse().ok()?,
         };
-        if f.next().is_some() { return None; }
+        if f.next().is_some() {
+            return None;
+        }
         Some(e)
     }
 
     /// The node id of a root entry; some trees name it `<id>.docSchema` (cf. gentree).
-    fn id(&self) -> &str { self.name.strip_suffix(".docSchema").unwrap_or(&self.name) }
+    fn id(&self) -> &str {
+        self.name.strip_suffix(".docSchema").unwrap_or(&self.name)
+    }
 }
 
 /// Parse the current root index for rewriting. Refuses anything not fully understood
@@ -49,9 +65,14 @@ fn parse_root(data: &[u8]) -> std::result::Result<Vec<Entry>, String> {
     let mut lines = text.lines();
     match lines.next() {
         Some(SCHEMA) => {}
-        other => return Err(format!("unsupported root index schema {other:?} (only {SCHEMA:?})")),
+        other => {
+            return Err(format!(
+                "unsupported root index schema {other:?} (only {SCHEMA:?})"
+            ));
+        }
     }
-    lines.filter(|l| !l.trim().is_empty())
+    lines
+        .filter(|l| !l.trim().is_empty())
         .map(|l| Entry::parse(l).ok_or_else(|| format!("unparseable root index line {l:?}")))
         .collect()
 }
@@ -68,7 +89,10 @@ fn index_hash(entries: &mut [Entry]) -> Result<String> {
 fn render_index(entries: &[Entry]) -> Vec<u8> {
     let mut out = format!("{SCHEMA}\n");
     for e in entries {
-        out.push_str(&format!("{}:{}:{}:{}:{}\n", e.hash, e.kind, e.name, e.subfiles, e.size));
+        out.push_str(&format!(
+            "{}:{}:{}:{}:{}\n",
+            e.hash, e.kind, e.name, e.subfiles, e.size
+        ));
     }
     out.into_bytes()
 }
@@ -77,7 +101,13 @@ fn render_index(entries: &[Entry]) -> Vec<u8> {
 fn put_leaf(storage: &Storage, name: String, data: &[u8]) -> Result<Entry> {
     let hash = hex::encode(Sha256::digest(data));
     storage.put_with_hash(data, &hash, &name)?;
-    Ok(Entry { hash, kind: FILE_TYPE.into(), name, subfiles: 0, size: data.len() as u64 })
+    Ok(Entry {
+        hash,
+        kind: FILE_TYPE.into(),
+        name,
+        subfiles: 0,
+        size: data.len() as u64,
+    })
 }
 
 /// Map an upload content type to the document's file extension.
@@ -85,14 +115,18 @@ fn file_type(content_type: &str) -> Result<&'static str> {
     match content_type.split(';').next().unwrap_or_default().trim() {
         "application/pdf" => Ok("pdf"),
         "application/epub+zip" => Ok("epub"),
-        other => Err(ServerError::Config(format!("unsupported content type {other:?} (pdf or epub only)"))),
+        other => Err(ServerError::Config(format!(
+            "unsupported content type {other:?} (pdf or epub only)"
+        ))),
     }
 }
 
 /// The current root and its entries, or an error if the root index isn't one we can safely rewrite.
 fn current_root_entries(storage: &Storage) -> Result<(crate::types::SyncRoot, Vec<Entry>)> {
     let root = storage.get_root();
-    if root.hash.is_empty() { return Ok((root, Vec::new())); }
+    if root.hash.is_empty() {
+        return Ok((root, Vec::new()));
+    }
     let entries = parse_root(&storage.get(&root.hash)?).map_err(|why| {
         tracing::error!(root = %root.hash, generation = root.generation, %why, "refusing to add document: root index not understood");
         ServerError::Internal(format!("refusing to modify root index: {why}"))
@@ -101,12 +135,23 @@ fn current_root_entries(storage: &Storage) -> Result<(crate::types::SyncRoot, Ve
 }
 
 /// Add a new PDF/EPUB document at the top level and commit a new root. Returns the document id.
-pub fn create_document(storage: &Storage, name: &str, ext: &str, data: &[u8]) -> Result<(String, u64)> {
+pub fn create_document(
+    storage: &Storage,
+    name: &str,
+    ext: &str,
+    data: &[u8],
+) -> Result<(String, u64)> {
     create_document_in(storage, name, ext, data, "")
 }
 
 /// Like [`create_document`], but inside the collection `parent` (a CollectionType id; "" = top level).
-pub fn create_document_in(storage: &Storage, name: &str, ext: &str, data: &[u8], parent: &str) -> Result<(String, u64)> {
+pub fn create_document_in(
+    storage: &Storage,
+    name: &str,
+    ext: &str,
+    data: &[u8],
+    parent: &str,
+) -> Result<(String, u64)> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().timestamp_millis().to_string();
     let metadata = serde_json::json!({
@@ -123,15 +168,26 @@ pub fn create_document_in(storage: &Storage, name: &str, ext: &str, data: &[u8],
     // an orphaned document behind on every rejected upload. (Re-checked on each attempt below.)
     current_root_entries(storage)?;
     let mut files = vec![
-        put_leaf(storage, format!("{id}.metadata"), &serde_json::to_vec_pretty(&metadata)?)?,
-        put_leaf(storage, format!("{id}.content"), &serde_json::to_vec_pretty(&content)?)?,
+        put_leaf(
+            storage,
+            format!("{id}.metadata"),
+            &serde_json::to_vec_pretty(&metadata)?,
+        )?,
+        put_leaf(
+            storage,
+            format!("{id}.content"),
+            &serde_json::to_vec_pretty(&content)?,
+        )?,
         put_leaf(storage, format!("{id}.{ext}"), data)?,
     ];
     let doc_hash = index_hash(&mut files)?;
     storage.put_with_hash(&render_index(&files), &doc_hash, &format!("{id}.docSchema"))?;
     let doc_entry = || Entry {
-        hash: doc_hash.clone(), kind: DOC_TYPE.into(), name: id.clone(),
-        subfiles: files.len() as u64, size: files.iter().map(|f| f.size).sum(),
+        hash: doc_hash.clone(),
+        kind: DOC_TYPE.into(),
+        name: id.clone(),
+        subfiles: files.len() as u64,
+        size: files.iter().map(|f| f.size).sum(),
     };
 
     for _ in 0..ROOT_RETRIES {
@@ -145,7 +201,9 @@ pub fn create_document_in(storage: &Storage, name: &str, ext: &str, data: &[u8],
             Err(e) => return Err(e),
         }
     }
-    Err(ServerError::Internal("root kept changing while adding document".into()))
+    Err(ServerError::Internal(
+        "root kept changing while adding document".into(),
+    ))
 }
 
 /// Resolve `folder` to a collection id: "" is the top level; otherwise a live
@@ -159,14 +217,21 @@ pub fn ensure_folder(storage: &Storage, folder: &str) -> Result<String> {
     for _ in 0..ROOT_RETRIES {
         let root = storage.get_root();
         let entries = root_entries(storage, &root.hash)?;
-        let collections: Vec<(String, serde_json::Value)> = entries.iter().filter(|e| e.kind == DOC_TYPE)
+        let collections: Vec<(String, serde_json::Value)> = entries
+            .iter()
+            .filter(|e| e.kind == DOC_TYPE)
             .filter_map(|e| Some((e.id().to_owned(), node_metadata(storage, e)?)))
-            .filter(|(_, m)| m["type"] == "CollectionType" && m["deleted"] != true && m["parent"] != "trash")
+            .filter(|(_, m)| {
+                m["type"] == "CollectionType" && m["deleted"] != true && m["parent"] != "trash"
+            })
             .collect();
         if collections.iter().any(|(id, _)| id == folder) {
             return Ok(folder.to_owned());
         }
-        let mut named: Vec<&(String, serde_json::Value)> = collections.iter().filter(|(_, m)| m["visibleName"] == folder).collect();
+        let mut named: Vec<&(String, serde_json::Value)> = collections
+            .iter()
+            .filter(|(_, m)| m["visibleName"] == folder)
+            .collect();
         named.sort_by_key(|(_, m)| m["parent"].as_str().unwrap_or_default() != "");
         if let Some((id, _)) = named.first() {
             return Ok(id.clone());
@@ -179,23 +244,38 @@ pub fn ensure_folder(storage: &Storage, folder: &str) -> Result<String> {
             "type": "CollectionType", "visibleName": folder,
         });
         let mut files = vec![
-            put_leaf(storage, format!("{id}.metadata"), &serde_json::to_vec_pretty(&metadata)?)?,
+            put_leaf(
+                storage,
+                format!("{id}.metadata"),
+                &serde_json::to_vec_pretty(&metadata)?,
+            )?,
             put_leaf(storage, format!("{id}.content"), br#"{"tags": []}"#)?,
         ];
         let hash = index_hash(&mut files)?;
         storage.put_with_hash(&render_index(&files), &hash, &format!("{id}.docSchema"))?;
         let mut entries = entries;
-        entries.push(Entry { hash, kind: DOC_TYPE.into(), name: id.clone(), subfiles: files.len() as u64, size: files.iter().map(|f| f.size).sum() });
+        entries.push(Entry {
+            hash,
+            kind: DOC_TYPE.into(),
+            name: id.clone(),
+            subfiles: files.len() as u64,
+            size: files.iter().map(|f| f.size).sum(),
+        });
         let root_hash = index_hash(&mut entries)?;
         storage.put_with_hash(&render_index(&entries), &root_hash, "root.docSchema")?;
         match storage.set_root_if(root_hash, Some(root.generation)) {
-            Ok(_) => { tracing::info!(%id, folder, "created collection"); return Ok(id) }
+            Ok(_) => {
+                tracing::info!(%id, folder, "created collection");
+                return Ok(id);
+            }
             // Re-scan: whoever moved the root may have created the folder.
             Err(ServerError::GenerationMismatch { .. }) => continue,
             Err(e) => return Err(e),
         }
     }
-    Err(ServerError::Internal("root kept changing while adding folder".into()))
+    Err(ServerError::Internal(
+        "root kept changing while adding folder".into(),
+    ))
 }
 
 fn root_entries(storage: &Storage, root_hash: &str) -> Result<Vec<Entry>> {
@@ -213,47 +293,97 @@ fn root_entries(storage: &Storage, root_hash: &str) -> Result<Vec<Entry>> {
 fn node_metadata(storage: &Storage, node: &Entry) -> Option<serde_json::Value> {
     let index = storage.get(&node.hash).ok()?;
     let name = format!("{}.metadata", node.id());
-    let meta = String::from_utf8_lossy(&index).lines().skip(1).filter_map(Entry::parse).find(|e| e.name == name)?;
+    let meta = String::from_utf8_lossy(&index)
+        .lines()
+        .skip(1)
+        .filter_map(Entry::parse)
+        .find(|e| e.name == name)?;
     serde_json::from_slice(&storage.get(&meta.hash).ok()?).ok()
 }
 
-fn finish(state: &AppState, user_id: &str, name: &str, ext: &str, data: &[u8]) -> Result<StatusCode> {
+fn finish(
+    state: &AppState,
+    user_id: &str,
+    name: &str,
+    ext: &str,
+    data: &[u8],
+) -> Result<StatusCode> {
     let (id, generation) = create_document(&state.storage, name, ext, data)?;
     tracing::info!(%id, name, ext, bytes = data.len(), generation, "document uploaded");
     // Tell connected devices to pull the new root.
-    let _ = state.notification_tx.send(WsMessage::sync_complete(generation, "local-server", user_id));
+    let _ = state.notification_tx.send(WsMessage::sync_complete(
+        generation,
+        "local-server",
+        user_id,
+    ));
     Ok(StatusCode::OK)
 }
 
 #[derive(Deserialize)]
-struct UploadMeta { file_name: String }
+struct UploadMeta {
+    file_name: String,
+}
 
 /// `POST /doc/v1/files`: multipart form with `meta` (JSON `{"file_name": ...}`) and `file`.
-pub async fn upload_v1(State(state): State<AppState>, headers: HeaderMap, mut form: Multipart) -> Result<StatusCode> {
+pub async fn upload_v1(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut form: Multipart,
+) -> Result<StatusCode> {
     let user_id = state.auth_user(&headers)?;
     let (mut meta, mut file) = (None, None);
-    while let Some(field) = form.next_field().await.map_err(|e| ServerError::Config(e.to_string()))? {
+    while let Some(field) = form
+        .next_field()
+        .await
+        .map_err(|e| ServerError::Config(e.to_string()))?
+    {
         match field.name() {
-            Some("meta") => meta = Some(field.text().await.map_err(|e| ServerError::Config(e.to_string()))?),
+            Some("meta") => {
+                meta = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|e| ServerError::Config(e.to_string()))?,
+                )
+            }
             Some("file") => {
                 let ct = field.content_type().unwrap_or_default().to_owned();
-                file = Some((ct, field.bytes().await.map_err(|e| ServerError::Config(e.to_string()))?));
+                file = Some((
+                    ct,
+                    field
+                        .bytes()
+                        .await
+                        .map_err(|e| ServerError::Config(e.to_string()))?,
+                ));
             }
             _ => {}
         }
     }
-    let meta: UploadMeta = serde_json::from_str(&meta.ok_or_else(|| ServerError::Config("missing 'meta'".into()))?)?;
+    let meta: UploadMeta =
+        serde_json::from_str(&meta.ok_or_else(|| ServerError::Config("missing 'meta'".into()))?)?;
     let (ct, data) = file.ok_or_else(|| ServerError::Config("missing 'file'".into()))?;
     finish(&state, &user_id, &meta.file_name, file_type(&ct)?, &data)
 }
 
 /// `POST /doc/v2/files`: raw body, `rm-meta` header = base64 JSON `{"file_name": ...}`.
-pub async fn upload_v2(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<StatusCode> {
+pub async fn upload_v2(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode> {
     let user_id = state.auth_user(&headers)?;
-    let meta = headers.get("rm-meta").and_then(|v| v.to_str().ok()).ok_or_else(|| ServerError::MissingHeader("rm-meta".into()))?;
-    let meta = STANDARD.decode(meta).map_err(|_| ServerError::Config("rm-meta is not base64".into()))?;
+    let meta = headers
+        .get("rm-meta")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ServerError::MissingHeader("rm-meta".into()))?;
+    let meta = STANDARD
+        .decode(meta)
+        .map_err(|_| ServerError::Config("rm-meta is not base64".into()))?;
     let meta: UploadMeta = serde_json::from_slice(&meta)?;
-    let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).ok_or_else(|| ServerError::MissingHeader("content-type".into()))?;
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ServerError::MissingHeader("content-type".into()))?;
     finish(&state, &user_id, &meta.file_name, file_type(ct)?, &body)
 }
 
@@ -263,7 +393,11 @@ mod tests {
 
     fn meta(storage: &Storage, id: &str) -> serde_json::Value {
         let root = storage.get_root();
-        let node = root_entries(storage, &root.hash).unwrap().into_iter().find(|e| e.name == id).expect("node in root");
+        let node = root_entries(storage, &root.hash)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == id)
+            .expect("node in root");
         node_metadata(storage, &node).expect("metadata")
     }
 
@@ -273,7 +407,9 @@ mod tests {
         let storage = Storage::new(tmp.path()).unwrap();
         let index = b"3\nnot a valid entry\n";
         let hash = "a".repeat(64);
-        storage.put_with_hash(index, &hash, "root.docSchema").unwrap();
+        storage
+            .put_with_hash(index, &hash, "root.docSchema")
+            .unwrap();
         let before = storage.set_root(hash.clone()).unwrap();
 
         assert!(create_document(&storage, "a", "pdf", b"%PDF").is_err());
@@ -297,11 +433,30 @@ mod tests {
         assert_eq!(ensure_folder(&storage, "").unwrap(), "");
         let folder = ensure_folder(&storage, "News").unwrap();
         let m = meta(&storage, &folder);
-        assert_eq!((m["type"].as_str(), m["visibleName"].as_str(), m["parent"].as_str()), (Some("CollectionType"), Some("News"), Some("")));
+        assert_eq!(
+            (
+                m["type"].as_str(),
+                m["visibleName"].as_str(),
+                m["parent"].as_str()
+            ),
+            (Some("CollectionType"), Some("News"), Some(""))
+        );
         let generation = storage.get_root().generation;
-        assert_eq!(ensure_folder(&storage, "News").unwrap(), folder, "resolved by visible name");
-        assert_eq!(ensure_folder(&storage, &folder).unwrap(), folder, "resolved by id");
-        assert_eq!(storage.get_root().generation, generation, "no new folder committed");
+        assert_eq!(
+            ensure_folder(&storage, "News").unwrap(),
+            folder,
+            "resolved by visible name"
+        );
+        assert_eq!(
+            ensure_folder(&storage, &folder).unwrap(),
+            folder,
+            "resolved by id"
+        );
+        assert_eq!(
+            storage.get_root().generation,
+            generation,
+            "no new folder committed"
+        );
 
         let (doc, _) = create_document_in(&storage, "article", "epub", b"PK", &folder).unwrap();
         assert_eq!(meta(&storage, &doc)["parent"], folder.as_str());
@@ -314,30 +469,60 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let storage = Storage::new(tmp.path()).unwrap();
         let id = "11111111-2222-3333-4444-555555555555";
-        let metadata = serde_json::json!({"parent": "", "type": "CollectionType", "visibleName": "News"});
-        let mut files = vec![put_leaf(&storage, format!("{id}.metadata"), &serde_json::to_vec(&metadata).unwrap()).unwrap()];
+        let metadata =
+            serde_json::json!({"parent": "", "type": "CollectionType", "visibleName": "News"});
+        let mut files = vec![
+            put_leaf(
+                &storage,
+                format!("{id}.metadata"),
+                &serde_json::to_vec(&metadata).unwrap(),
+            )
+            .unwrap(),
+        ];
         let hash = index_hash(&mut files).unwrap();
-        storage.put_with_hash(&render_index(&files), &hash, &format!("{id}.docSchema")).unwrap();
-        let mut entries = vec![Entry { hash, kind: DOC_TYPE.into(), name: format!("{id}.docSchema"), subfiles: 1, size: files[0].size }];
+        storage
+            .put_with_hash(&render_index(&files), &hash, &format!("{id}.docSchema"))
+            .unwrap();
+        let mut entries = vec![Entry {
+            hash,
+            kind: DOC_TYPE.into(),
+            name: format!("{id}.docSchema"),
+            subfiles: 1,
+            size: files[0].size,
+        }];
         let root_hash = index_hash(&mut entries).unwrap();
-        storage.put_with_hash(&render_index(&entries), &root_hash, "root.docSchema").unwrap();
+        storage
+            .put_with_hash(&render_index(&entries), &root_hash, "root.docSchema")
+            .unwrap();
         let generation = storage.set_root(root_hash).unwrap().generation;
 
-        assert_eq!(ensure_folder(&storage, "News").unwrap(), id, "resolved by visible name");
+        assert_eq!(
+            ensure_folder(&storage, "News").unwrap(),
+            id,
+            "resolved by visible name"
+        );
         assert_eq!(ensure_folder(&storage, id).unwrap(), id, "resolved by id");
-        assert_eq!(storage.get_root().generation, generation, "no duplicate folder committed");
+        assert_eq!(
+            storage.get_root().generation,
+            generation,
+            "no duplicate folder committed"
+        );
     }
 
     fn storage_with_root(index: &str) -> (Storage, String, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().unwrap();
         let storage = Storage::new(tmp.path()).unwrap();
         let root_hash = hex::encode(Sha256::digest(index.as_bytes()));
-        storage.put_with_hash(index.as_bytes(), &root_hash, "root.docSchema").unwrap();
+        storage
+            .put_with_hash(index.as_bytes(), &root_hash, "root.docSchema")
+            .unwrap();
         storage.set_root(root_hash.clone()).unwrap();
         (storage, root_hash, tmp)
     }
 
-    fn entry_line(c: char, name: &str) -> String { format!("{}:{DOC_TYPE}:{name}:3:100", c.to_string().repeat(64)) }
+    fn entry_line(c: char, name: &str) -> String {
+        format!("{}:{DOC_TYPE}:{name}:3:100", c.to_string().repeat(64))
+    }
 
     #[test]
     fn refuses_root_with_unparseable_line() {
@@ -350,10 +535,21 @@ mod tests {
         for index in bad {
             let (storage, root_hash, _tmp) = storage_with_root(&index);
             let (before, blobs) = (storage.get_root(), storage.list_hashes().unwrap().len());
-            assert!(create_document(&storage, "Book", "pdf", b"%PDF-1.4").is_err(), "{index:?}");
-            assert_eq!(storage.list_hashes().unwrap().len(), blobs, "rejected upload must not leave orphan blobs");
+            assert!(
+                create_document(&storage, "Book", "pdf", b"%PDF-1.4").is_err(),
+                "{index:?}"
+            );
+            assert_eq!(
+                storage.list_hashes().unwrap().len(),
+                blobs,
+                "rejected upload must not leave orphan blobs"
+            );
             let after = storage.get_root();
-            assert_eq!((after.hash.as_str(), after.generation), (root_hash.as_str(), before.generation), "root must be unchanged");
+            assert_eq!(
+                (after.hash.as_str(), after.generation),
+                (root_hash.as_str(), before.generation),
+                "root must be unchanged"
+            );
             assert_eq!(storage.get(&root_hash).unwrap(), index.as_bytes());
         }
     }
@@ -368,7 +564,9 @@ mod tests {
         let entries = parse_root(&storage.get(&storage.get_root().hash).unwrap()).unwrap();
         let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names.len(), 3);
-        assert!(names.contains(&"doc-a") && names.contains(&"doc-b") && names.contains(&id.as_str()));
+        assert!(
+            names.contains(&"doc-a") && names.contains(&"doc-b") && names.contains(&id.as_str())
+        );
         let text = String::from_utf8(storage.get(&storage.get_root().hash).unwrap()).unwrap();
         assert!(text.contains(&a) && text.contains(&b));
     }

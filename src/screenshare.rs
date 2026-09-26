@@ -11,14 +11,30 @@
 //! Auth: the device/user JWT in the CONNECT password (or username). ACL: a client may
 //! only touch `user/{uid}/...` and `remarkable/screenshare/signaling/user/{uid}/...`.
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::{Duration, Instant}};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use parking_lot::Mutex;
-use rumqttc::mqttbytes::{matches, v4::{self, ConnAck, ConnectReturnCode, Packet, PingResp, PubAck, Publish, SubAck, SubscribeReasonCode, UnsubAck}, QoS};
+use rumqttc::mqttbytes::v4::{
+    self,
+    ConnAck,
+    ConnectReturnCode,
+    Packet,
+    PingResp,
+    PubAck,
+    Publish,
+    SubAck,
+    SubscribeReasonCode,
+    UnsubAck,
+};
+use rumqttc::mqttbytes::{QoS, matches};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::mpsc};
+use serde_json::{Map, Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 use crate::device::DeviceManager;
 
@@ -96,24 +112,51 @@ fn acl_allows(user_id: &str, topic: &str, write: bool) -> bool {
 impl Broker {
     /// `ice_servers`: list for `room-joined` (xochitl wants each entry's key as singular `url`).
     pub fn new(devices: DeviceManager, ice_servers: Value) -> Self {
-        Self { inner: Arc::new(Inner { devices, ice_servers, clients: Mutex::default(), rooms: Mutex::default(), next_session: Default::default() }) }
+        Self {
+            inner: Arc::new(Inner {
+                devices,
+                ice_servers,
+                clients: Mutex::default(),
+                rooms: Mutex::default(),
+                next_session: Default::default(),
+            }),
+        }
     }
 
     /// Deliver to every subscribed, authorised client (QoS = min(publish, subscription)).
     pub fn publish(&self, topic: &str, payload: Vec<u8>, qos: QoS) {
         let clients = self.inner.clients.lock();
         for (id, c) in clients.iter() {
-            let Some(sub_qos) = c.subscriptions.iter().filter(|(f, _)| matches(topic, f)).map(|(_, q)| *q).max_by_key(|q| *q as u8) else { continue };
-            if !acl_allows(&c.user_id, topic, false) { continue; }
-            let qos = if (qos as u8) < (sub_qos as u8) { qos } else { sub_qos };
-            if c.tx.try_send(Publish::new(topic, qos, payload.clone())).is_err() {
+            let Some(sub_qos) = c
+                .subscriptions
+                .iter()
+                .filter(|(f, _)| matches(topic, f))
+                .map(|(_, q)| *q)
+                .max_by_key(|q| *q as u8)
+            else {
+                continue;
+            };
+            if !acl_allows(&c.user_id, topic, false) {
+                continue;
+            }
+            let qos = if (qos as u8) < (sub_qos as u8) {
+                qos
+            } else {
+                sub_qos
+            };
+            if c.tx
+                .try_send(Publish::new(topic, qos, payload.clone()))
+                .is_err()
+            {
                 tracing::warn!(client = %id, %topic, "screenshare: client queue full, dropping message");
             }
         }
     }
 
     fn reply(&self, topic: String, reply: &Reply, qos: QoS) {
-        if let Ok(body) = serde_json::to_vec(reply) { self.publish(&topic, body, qos); }
+        if let Ok(body) = serde_json::to_vec(reply) {
+            self.publish(&topic, body, qos);
+        }
     }
 
     /// Like [`active_room`](Self::active_room), with how long ago it was created.
@@ -125,58 +168,135 @@ impl Broker {
 
     /// Newest room of `user_id`, if any.
     pub fn active_room(&self, user_id: &str) -> Option<String> {
-        self.inner.rooms.lock().iter().filter(|(_, r)| r.user_id == user_id)
-            .max_by_key(|(_, r)| r.created).map(|(id, _)| id.clone())
+        self.inner
+            .rooms
+            .lock()
+            .iter()
+            .filter(|(_, r)| r.user_id == user_id)
+            .max_by_key(|(_, r)| r.created)
+            .map(|(id, _)| id.clone())
     }
 
     fn touch_user_room(&self, user_id: &str) {
         if let Some(id) = self.active_room(user_id) {
-            if let Some(r) = self.inner.rooms.lock().get_mut(&id) { r.last_activity = Instant::now(); }
+            if let Some(r) = self.inner.rooms.lock().get_mut(&id) {
+                r.last_activity = Instant::now();
+            }
         }
     }
 
     fn join(&self, room_id: &str, client_id: &str) -> bool {
         let mut rooms = self.inner.rooms.lock();
-        let Some(r) = rooms.get_mut(room_id) else { return false };
-        if !r.participants.iter().any(|p| p == client_id) { r.participants.push(client_id.into()); }
+        let Some(r) = rooms.get_mut(room_id) else {
+            return false;
+        };
+        if !r.participants.iter().any(|p| p == client_id) {
+            r.participants.push(client_id.into());
+        }
         r.last_activity = Instant::now();
         true
     }
 
     fn peers(&self, room_id: &str, except: &str) -> Vec<String> {
-        self.inner.rooms.lock().get(room_id)
-            .map(|r| r.participants.iter().filter(|p| *p != except).cloned().collect()).unwrap_or_default()
+        self.inner
+            .rooms
+            .lock()
+            .get(room_id)
+            .map(|r| {
+                r.participants
+                    .iter()
+                    .filter(|p| *p != except)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn handle_signal(&self, user_id: &str, sender: &str, msg: Signal, qos: QoS) {
         match msg.kind.as_str() {
             "create-room" => {
                 let room_id = match self.active_room(user_id) {
-                    Some(existing) => { self.join(&existing, sender); existing }
+                    Some(existing) => {
+                        self.join(&existing, sender);
+                        existing
+                    }
                     None => {
                         let id = uuid::Uuid::new_v4().to_string();
                         let now = Instant::now();
-                        self.inner.rooms.lock().insert(id.clone(), Room { user_id: user_id.into(), participants: vec![sender.into()], created: now, last_activity: now });
+                        self.inner.rooms.lock().insert(
+                            id.clone(),
+                            Room {
+                                user_id: user_id.into(),
+                                participants: vec![sender.into()],
+                                created: now,
+                                last_activity: now,
+                            },
+                        );
                         tracing::info!(room = %id, client = %sender, "screenshare room created");
                         id
                     }
                 };
-                self.reply(format!("user/{user_id}/signaling"), &Reply { kind: "room-created", room: &msg.room, room_id: &room_id, ice_servers: None, message: "" }, qos);
+                self.reply(
+                    format!("user/{user_id}/signaling"),
+                    &Reply {
+                        kind: "room-created",
+                        room: &msg.room,
+                        room_id: &room_id,
+                        ice_servers: None,
+                        message: "",
+                    },
+                    qos,
+                );
             }
             "join-auth-room" | "join-active-room" => {
-                let room_id = if msg.room_id.is_empty() { self.active_room(user_id).unwrap_or_default() } else { msg.room_id };
+                let room_id = if msg.room_id.is_empty() {
+                    self.active_room(user_id).unwrap_or_default()
+                } else {
+                    msg.room_id
+                };
                 if room_id.is_empty() || !self.join(&room_id, sender) {
-                    self.reply(format!("user/{user_id}/client/{sender}/signaling/{room_id}"), &Reply { kind: "room-not-found", room: "", room_id: "", ice_servers: None, message: "no active screen share room" }, qos);
+                    self.reply(
+                        format!("user/{user_id}/client/{sender}/signaling/{room_id}"),
+                        &Reply {
+                            kind: "room-not-found",
+                            room: "",
+                            room_id: "",
+                            ice_servers: None,
+                            message: "no active screen share room",
+                        },
+                        qos,
+                    );
                     return;
                 }
                 let ice = json!({ "ice_servers": self.inner.ice_servers });
-                self.reply(format!("user/{user_id}/client/{sender}/signaling/room/{room_id}"), &Reply { kind: "room-joined", room: "", room_id: &room_id, ice_servers: Some(ice), message: "" }, qos);
+                self.reply(
+                    format!("user/{user_id}/client/{sender}/signaling/room/{room_id}"),
+                    &Reply {
+                        kind: "room-joined",
+                        room: "",
+                        room_id: &room_id,
+                        ice_servers: Some(ice),
+                        message: "",
+                    },
+                    qos,
+                );
             }
             "broadcast" => {
-                let room_id = if msg.room_id.is_empty() { self.active_room(user_id).unwrap_or_default() } else { msg.room_id };
-                let body = serde_json::to_vec(&json!({ "type": "broadcast", "clientId": sender, "payload": msg.payload })).unwrap_or_default();
+                let room_id = if msg.room_id.is_empty() {
+                    self.active_room(user_id).unwrap_or_default()
+                } else {
+                    msg.room_id
+                };
+                let body = serde_json::to_vec(
+                    &json!({ "type": "broadcast", "clientId": sender, "payload": msg.payload }),
+                )
+                .unwrap_or_default();
                 for peer in self.peers(&room_id, sender) {
-                    self.publish(&format!("user/{user_id}/client/{peer}/signaling/{room_id}"), body.clone(), qos);
+                    self.publish(
+                        &format!("user/{user_id}/client/{peer}/signaling/{room_id}"),
+                        body.clone(),
+                        qos,
+                    );
                 }
             }
             "direct" => {
@@ -184,11 +304,27 @@ impl Broker {
                     tracing::warn!(client = %sender, "screenshare direct message without clientId");
                     return;
                 }
-                let room_id = if msg.room_id.is_empty() { self.active_room(user_id).unwrap_or_default() } else { msg.room_id };
-                let body = serde_json::to_vec(&json!({ "type": "direct", "clientId": sender, "payload": msg.payload })).unwrap_or_default();
-                self.publish(&format!("user/{user_id}/client/{}/signaling/{room_id}", msg.client_id), body, qos);
+                let room_id = if msg.room_id.is_empty() {
+                    self.active_room(user_id).unwrap_or_default()
+                } else {
+                    msg.room_id
+                };
+                let body = serde_json::to_vec(
+                    &json!({ "type": "direct", "clientId": sender, "payload": msg.payload }),
+                )
+                .unwrap_or_default();
+                self.publish(
+                    &format!(
+                        "user/{user_id}/client/{}/signaling/{room_id}",
+                        msg.client_id
+                    ),
+                    body,
+                    qos,
+                );
             }
-            other => tracing::warn!(kind = other, client = %sender, "unknown screenshare signaling message"),
+            other => {
+                tracing::warn!(kind = other, client = %sender, "unknown screenshare signaling message")
+            }
         }
     }
 
@@ -200,7 +336,9 @@ impl Broker {
             if parts.len() >= 3 && parts[1] == "client" {
                 match serde_json::from_slice::<Signal>(&p.payload) {
                     Ok(msg) => self.handle_signal(parts[0], parts[2], msg, p.qos),
-                    Err(e) => tracing::warn!(topic = %p.topic, "bad screenshare signaling payload: {e}"),
+                    Err(e) => {
+                        tracing::warn!(topic = %p.topic, "bad screenshare signaling payload: {e}")
+                    }
                 }
             }
         }
@@ -208,7 +346,9 @@ impl Broker {
     }
 
     fn new_session(&self) -> u64 {
-        self.inner.next_session.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        self.inner
+            .next_session
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Unregister `client_id` if it is still registration `session`. A client
@@ -219,13 +359,19 @@ impl Broker {
         // can't register in between and lose its memberships. (Lock order is
         // always clients, then rooms.)
         let mut clients = self.inner.clients.lock();
-        if clients.get(client_id).is_none_or(|c| c.session != session) { return; }
+        if clients.get(client_id).is_none_or(|c| c.session != session) {
+            return;
+        }
         clients.remove(client_id);
         let mut rooms = self.inner.rooms.lock();
-        for r in rooms.values_mut() { r.participants.retain(|p| p != client_id); }
+        for r in rooms.values_mut() {
+            r.participants.retain(|p| p != client_id);
+        }
         rooms.retain(|id, r| {
             let keep = !r.participants.is_empty();
-            if !keep { tracing::info!(room = %id, "screenshare room closed (no participants)"); }
+            if !keep {
+                tracing::info!(room = %id, "screenshare room closed (no participants)");
+            }
             keep
         });
     }
@@ -236,13 +382,31 @@ impl Broker {
     /// (and any rooms) when dropped.
     pub fn local_client(&self, user_id: &str, client_id: &str, filters: &[String]) -> LocalClient {
         let (tx, rx) = mpsc::channel::<Publish>(CLIENT_QUEUE);
-        let subscriptions = filters.iter()
-            .filter(|f| acl_allows(user_id, &f.replace(['+', '#'], "x"), false) || f.starts_with(&format!("user/{user_id}/")))
+        let subscriptions = filters
+            .iter()
+            .filter(|f| {
+                acl_allows(user_id, &f.replace(['+', '#'], "x"), false)
+                    || f.starts_with(&format!("user/{user_id}/"))
+            })
             .map(|f| (f.clone(), QoS::AtLeastOnce))
             .collect();
         let session = self.new_session();
-        self.inner.clients.lock().insert(client_id.into(), Client { session, user_id: user_id.into(), subscriptions, tx });
-        LocalClient { broker: self.clone(), session, user_id: user_id.into(), client_id: client_id.into(), rx }
+        self.inner.clients.lock().insert(
+            client_id.into(),
+            Client {
+                session,
+                user_id: user_id.into(),
+                subscriptions,
+                tx,
+            },
+        );
+        LocalClient {
+            broker: self.clone(),
+            session,
+            user_id: user_id.into(),
+            client_id: client_id.into(),
+            rx,
+        }
     }
 
     /// Drop rooms that have been idle for [`ROOM_TIMEOUT`] and have nobody
@@ -250,38 +414,54 @@ impl Broker {
     /// viewers; its room lives as long as its MQTT session (`remove_client`
     /// closes rooms whose participants have all left).
     fn sweep_rooms(&self) {
-        let connected: std::collections::HashSet<String> = self.inner.clients.lock().keys().cloned().collect();
+        let connected: std::collections::HashSet<String> =
+            self.inner.clients.lock().keys().cloned().collect();
         self.inner.rooms.lock().retain(|id, r| {
-            let keep = r.participants.iter().any(|p| connected.contains(p)) || r.last_activity.elapsed() < ROOM_TIMEOUT;
-            if !keep { tracing::info!(room = %id, "screenshare room expired"); }
+            let keep = r.participants.iter().any(|p| connected.contains(p))
+                || r.last_activity.elapsed() < ROOM_TIMEOUT;
+            if !keep {
+                tracing::info!(room = %id, "screenshare room expired");
+            }
             keep
         });
     }
 
     /// Accept TLS connections on `bind` until the process exits.
-    pub async fn serve(self, bind: SocketAddr, tls: tokio_rustls::TlsAcceptor) -> std::io::Result<()> {
+    pub async fn serve(
+        self,
+        bind: SocketAddr,
+        tls: tokio_rustls::TlsAcceptor,
+    ) -> std::io::Result<()> {
         let listener = crate::bind_when_available(bind).await?;
         tracing::info!(%bind, "screenshare MQTT broker listening (TLS)");
         let sweeper = self.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(ROOM_SWEEP);
-            loop { tick.tick().await; sweeper.sweep_rooms(); }
+            loop {
+                tick.tick().await;
+                sweeper.sweep_rooms();
+            }
         });
         loop {
             let (tcp, peer) = listener.accept().await?;
             let (broker, tls) = (self.clone(), tls.clone());
             tokio::spawn(async move {
                 match tls.accept(tcp).await {
-                    Ok(stream) => if let Err(e) = broker.session(stream).await {
-                        tracing::debug!(%peer, "mqtt session ended: {e}");
-                    },
+                    Ok(stream) => {
+                        if let Err(e) = broker.session(stream).await {
+                            tracing::debug!(%peer, "mqtt session ended: {e}");
+                        }
+                    }
                     Err(e) => tracing::warn!(%peer, "mqtt TLS handshake failed: {e}"),
                 }
             });
         }
     }
 
-    async fn session<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(&self, mut stream: S) -> anyhow::Result<()> {
+    async fn session<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+        &self,
+        mut stream: S,
+    ) -> anyhow::Result<()> {
         let mut buf = BytesMut::with_capacity(4096);
         let mut out = BytesMut::new();
 
@@ -291,22 +471,50 @@ impl Broker {
                 Ok(Packet::Connect(c)) => break c,
                 Ok(other) => anyhow::bail!("expected CONNECT, got {other:?}"),
                 Err(rumqttc::mqttbytes::Error::InsufficientBytes(_)) => {
-                    if stream.read_buf(&mut buf).await? == 0 { anyhow::bail!("closed before CONNECT"); }
+                    if stream.read_buf(&mut buf).await? == 0 {
+                        anyhow::bail!("closed before CONNECT");
+                    }
                 }
                 Err(e) => anyhow::bail!("bad packet: {e:?}"),
             }
         };
-        let token = connect.login.as_ref().map(|l| if l.password.is_empty() { l.username.clone() } else { l.password.clone() }).unwrap_or_default();
-        let Ok(user_id) = self.inner.devices.validate_token(&format!("Bearer {token}")) else {
+        let token = connect
+            .login
+            .as_ref()
+            .map(|l| {
+                if l.password.is_empty() {
+                    l.username.clone()
+                } else {
+                    l.password.clone()
+                }
+            })
+            .unwrap_or_default();
+        let Ok(user_id) = self
+            .inner
+            .devices
+            .validate_token(&format!("Bearer {token}"))
+        else {
             ConnAck::new(ConnectReturnCode::BadUserNamePassword, false).write(&mut out)?;
             stream.write_all(&out).await?;
             anyhow::bail!("auth failed for client {}", connect.client_id);
         };
-        let client_id = if connect.client_id.is_empty() { uuid::Uuid::new_v4().to_string() } else { connect.client_id.clone() };
+        let client_id = if connect.client_id.is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            connect.client_id.clone()
+        };
         let (tx, mut rx) = mpsc::channel::<Publish>(CLIENT_QUEUE);
         // A reconnect with the same client id replaces the old session.
         let session = self.new_session();
-        self.inner.clients.lock().insert(client_id.clone(), Client { session, user_id: user_id.clone(), subscriptions: Vec::new(), tx });
+        self.inner.clients.lock().insert(
+            client_id.clone(),
+            Client {
+                session,
+                user_id: user_id.clone(),
+                subscriptions: Vec::new(),
+                tx,
+            },
+        );
         ConnAck::new(ConnectReturnCode::Success, false).write(&mut out)?;
         stream.write_all(&out).await?;
         tracing::info!(client = %client_id, user = %user_id, "mqtt client connected");
@@ -413,7 +621,10 @@ impl LocalClient {
         if !acl_allows(&self.user_id, topic, true) {
             anyhow::bail!("publish to {topic} not allowed");
         }
-        self.broker.on_publish(&self.user_id, &Publish::new(topic, QoS::AtLeastOnce, payload));
+        self.broker.on_publish(
+            &self.user_id,
+            &Publish::new(topic, QoS::AtLeastOnce, payload),
+        );
         Ok(())
     }
 
@@ -435,26 +646,37 @@ mod tests {
 
     fn broker() -> (Broker, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().unwrap();
-        let devices = DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        let devices =
+            DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
         (Broker::new(devices, json!([])), tmp)
     }
 
     fn age_all_rooms(broker: &Broker) {
         let old = Instant::now().checked_sub(ROOM_TIMEOUT * 2).unwrap();
-        for r in broker.inner.rooms.lock().values_mut() { r.last_activity = old; }
+        for r in broker.inner.rooms.lock().values_mut() {
+            r.last_activity = old;
+        }
     }
 
     #[tokio::test]
     async fn sharing_tablets_room_survives_idle_sweeps() {
         let (broker, _tmp) = broker();
         let tablet = broker.local_client("u", "tablet", &["user/u/signaling".into()]);
-        tablet.publish("remarkable/screenshare/signaling/user/u/client/tablet", br#"{"type":"create-room"}"#.to_vec()).unwrap();
+        tablet
+            .publish(
+                "remarkable/screenshare/signaling/user/u/client/tablet",
+                br#"{"type":"create-room"}"#.to_vec(),
+            )
+            .unwrap();
         assert!(broker.active_room("u").is_some());
 
         // Idle for longer than ROOM_TIMEOUT, but the tablet is still connected.
         age_all_rooms(&broker);
         broker.sweep_rooms();
-        assert!(broker.active_room("u").is_some(), "room of a connected tablet was expired");
+        assert!(
+            broker.active_room("u").is_some(),
+            "room of a connected tablet was expired"
+        );
 
         // The tablet disconnects: its room goes with it.
         drop(tablet);
@@ -467,10 +689,20 @@ mod tests {
         let old = broker.local_client("u", "tablet", &["user/u/signaling".into()]);
         // The tablet reconnects with the same client id before the old session ends.
         let new = broker.local_client("u", "tablet", &["user/u/signaling".into()]);
-        new.publish("remarkable/screenshare/signaling/user/u/client/tablet", br#"{"type":"create-room"}"#.to_vec()).unwrap();
+        new.publish(
+            "remarkable/screenshare/signaling/user/u/client/tablet",
+            br#"{"type":"create-room"}"#.to_vec(),
+        )
+        .unwrap();
         drop(old);
-        assert!(broker.inner.clients.lock().contains_key("tablet"), "old session removed the new registration");
-        assert!(broker.active_room("u").is_some(), "old session closed the new session's room");
+        assert!(
+            broker.inner.clients.lock().contains_key("tablet"),
+            "old session removed the new registration"
+        );
+        assert!(
+            broker.active_room("u").is_some(),
+            "old session closed the new session's room"
+        );
         drop(new);
         assert!(broker.active_room("u").is_none());
     }
@@ -479,7 +711,15 @@ mod tests {
     fn orphaned_idle_rooms_are_swept() {
         let (broker, _tmp) = broker();
         let now = Instant::now();
-        broker.inner.rooms.lock().insert("r".into(), Room { user_id: "u".into(), participants: vec!["gone".into()], created: now, last_activity: now });
+        broker.inner.rooms.lock().insert(
+            "r".into(),
+            Room {
+                user_id: "u".into(),
+                participants: vec!["gone".into()],
+                created: now,
+                last_activity: now,
+            },
+        );
         age_all_rooms(&broker);
         broker.sweep_rooms();
         assert!(broker.active_room("u").is_none());

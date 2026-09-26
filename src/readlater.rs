@@ -1,13 +1,14 @@
 //! Read-it-later integrations module
 //! Supports Pocket, Instapaper, Wallabag, and Omnivore
 
-use chrono::{DateTime, Duration, Utc};
-use parking_lot::RwLock;
-use rusqlite::{params, Connection};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use chrono::{DateTime, Duration, Utc};
+use parking_lot::RwLock;
+use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -303,16 +304,38 @@ pub enum SortOrder {
 #[async_trait::async_trait]
 pub trait ReadLaterProviderTrait: Send + Sync {
     fn provider_type(&self) -> ReadLaterProvider;
-    
+
     async fn start_oauth(&self, redirect_uri: &str) -> Result<OAuthState>;
-    async fn complete_oauth(&self, callback: &OAuthCallback, state: &OAuthState) -> Result<ProviderConfig>;
+    async fn complete_oauth(
+        &self,
+        callback: &OAuthCallback,
+        state: &OAuthState,
+    ) -> Result<ProviderConfig>;
     async fn refresh_auth(&self, config: &ProviderConfig) -> Result<ProviderConfig>;
     fn is_authenticated(&self, config: &ProviderConfig) -> bool;
-    
-    async fn fetch_articles(&self, config: &ProviderConfig, since: Option<DateTime<Utc>>) -> Result<Vec<Article>>;
-    async fn fetch_article_content(&self, config: &ProviderConfig, article: &Article) -> Result<ArticleContent>;
-    async fn update_read_status(&self, config: &ProviderConfig, provider_id: &str, status: ReadStatus) -> Result<()>;
-    async fn add_article(&self, config: &ProviderConfig, url: &str, tags: &[String]) -> Result<Article>;
+
+    async fn fetch_articles(
+        &self,
+        config: &ProviderConfig,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<Article>>;
+    async fn fetch_article_content(
+        &self,
+        config: &ProviderConfig,
+        article: &Article,
+    ) -> Result<ArticleContent>;
+    async fn update_read_status(
+        &self,
+        config: &ProviderConfig,
+        provider_id: &str,
+        status: ReadStatus,
+    ) -> Result<()>;
+    async fn add_article(
+        &self,
+        config: &ProviderConfig,
+        url: &str,
+        tags: &[String],
+    ) -> Result<Article>;
     async fn delete_article(&self, config: &ProviderConfig, provider_id: &str) -> Result<()>;
 }
 
@@ -327,7 +350,7 @@ pub struct PocketProvider {
 impl PocketProvider {
     const API_BASE: &'static str = "https://getpocket.com/v3";
     const AUTH_URL: &'static str = "https://getpocket.com/auth/authorize";
-    
+
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -340,14 +363,15 @@ impl ReadLaterProviderTrait for PocketProvider {
     fn provider_type(&self) -> ReadLaterProvider {
         ReadLaterProvider::Pocket
     }
-    
+
     async fn start_oauth(&self, redirect_uri: &str) -> Result<OAuthState> {
         // Get consumer key from environment
         let consumer_key = std::env::var("POCKET_CONSUMER_KEY")
             .map_err(|_| ReadLaterError::OAuth("POCKET_CONSUMER_KEY not set".into()))?;
-        
+
         // Request token from Pocket
-        let resp = self.client
+        let resp = self
+            .client
             .post(format!("{}/oauth/request", Self::API_BASE))
             .header("X-Accept", "application/json")
             .json(&serde_json::json!({
@@ -357,17 +381,24 @@ impl ReadLaterProviderTrait for PocketProvider {
             .send()
             .await
             .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-        
+
         if !resp.status().is_success() {
-            return Err(ReadLaterError::OAuth(format!("Failed to get request token: {}", resp.status())));
+            return Err(ReadLaterError::OAuth(format!(
+                "Failed to get request token: {}",
+                resp.status()
+            )));
         }
-        
+
         #[derive(Deserialize)]
-        struct TokenResponse { code: String }
-        
-        let token_resp: TokenResponse = resp.json().await
+        struct TokenResponse {
+            code: String,
+        }
+
+        let token_resp: TokenResponse = resp
+            .json()
+            .await
             .map_err(|e| ReadLaterError::OAuth(e.to_string()))?;
-        
+
         Ok(OAuthState {
             provider: ReadLaterProvider::Pocket,
             request_token: Some(token_resp.code),
@@ -375,16 +406,23 @@ impl ReadLaterProviderTrait for PocketProvider {
             created_at: Utc::now(),
         })
     }
-    
-    async fn complete_oauth(&self, _callback: &OAuthCallback, state: &OAuthState) -> Result<ProviderConfig> {
-        let request_token = state.request_token.as_ref()
+
+    async fn complete_oauth(
+        &self,
+        _callback: &OAuthCallback,
+        state: &OAuthState,
+    ) -> Result<ProviderConfig> {
+        let request_token = state
+            .request_token
+            .as_ref()
             .ok_or_else(|| ReadLaterError::OAuth("Missing request token".into()))?;
-        
+
         // This would need the consumer_key from the original config
         let consumer_key = std::env::var("POCKET_CONSUMER_KEY")
             .map_err(|_| ReadLaterError::OAuth("POCKET_CONSUMER_KEY not set".into()))?;
-        
-        let resp = self.client
+
+        let resp = self
+            .client
             .post(format!("{}/oauth/authorize", Self::API_BASE))
             .header("X-Accept", "application/json")
             .json(&serde_json::json!({
@@ -394,44 +432,62 @@ impl ReadLaterProviderTrait for PocketProvider {
             .send()
             .await
             .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-        
+
         if !resp.status().is_success() {
-            return Err(ReadLaterError::OAuth(format!("OAuth failed: {}", resp.status())));
+            return Err(ReadLaterError::OAuth(format!(
+                "OAuth failed: {}",
+                resp.status()
+            )));
         }
-        
+
         #[derive(Deserialize)]
-        struct AuthResponse { access_token: String, username: String }
-        
-        let auth: AuthResponse = resp.json().await
+        struct AuthResponse {
+            access_token: String,
+            username: String,
+        }
+
+        let auth: AuthResponse = resp
+            .json()
+            .await
             .map_err(|e| ReadLaterError::OAuth(e.to_string()))?;
-        
+
         Ok(ProviderConfig::Pocket {
             consumer_key,
             access_token: Some(auth.access_token),
             username: Some(auth.username),
         })
     }
-    
+
     async fn refresh_auth(&self, config: &ProviderConfig) -> Result<ProviderConfig> {
         // Pocket tokens don't expire
         Ok(config.clone())
     }
-    
+
     fn is_authenticated(&self, config: &ProviderConfig) -> bool {
         match config {
             ProviderConfig::Pocket { access_token, .. } => access_token.is_some(),
             _ => false,
         }
     }
-    
-    async fn fetch_articles(&self, config: &ProviderConfig, since: Option<DateTime<Utc>>) -> Result<Vec<Article>> {
-        let ProviderConfig::Pocket { consumer_key, access_token, .. } = config else {
+
+    async fn fetch_articles(
+        &self,
+        config: &ProviderConfig,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<Article>> {
+        let ProviderConfig::Pocket {
+            consumer_key,
+            access_token,
+            ..
+        } = config
+        else {
             return Err(ReadLaterError::Api("Invalid config for Pocket".into()));
         };
-        
-        let access_token = access_token.as_ref()
+
+        let access_token = access_token
+            .as_ref()
             .ok_or_else(|| ReadLaterError::AuthRequired("Pocket".into()))?;
-        
+
         let mut params = serde_json::json!({
             "consumer_key": consumer_key,
             "access_token": access_token,
@@ -439,32 +495,36 @@ impl ReadLaterProviderTrait for PocketProvider {
             "detailType": "complete",
             "sort": "newest",
         });
-        
+
         if let Some(ts) = since {
             params["since"] = serde_json::json!(ts.timestamp());
         }
-        
-        let resp = self.client
+
+        let resp = self
+            .client
             .post(format!("{}/get", Self::API_BASE))
             .header("X-Accept", "application/json")
             .json(&params)
             .send()
             .await
             .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-        
+
         if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err(ReadLaterError::RateLimited(60));
         }
-        
+
         if !resp.status().is_success() {
-            return Err(ReadLaterError::Api(format!("Pocket API error: {}", resp.status())));
+            return Err(ReadLaterError::Api(format!(
+                "Pocket API error: {}",
+                resp.status()
+            )));
         }
-        
+
         #[derive(Deserialize)]
         struct PocketResponse {
             list: HashMap<String, PocketItem>,
         }
-        
+
         #[derive(Deserialize)]
         struct PocketItem {
             item_id: String,
@@ -482,70 +542,87 @@ impl ReadLaterProviderTrait for PocketProvider {
             authors: Option<HashMap<String, PocketAuthor>>,
             image: Option<PocketImage>,
         }
-        
+
         #[derive(Deserialize)]
-        struct PocketAuthor { name: Option<String> }
-        
+        struct PocketAuthor {
+            name: Option<String>,
+        }
+
         #[derive(Deserialize)]
-        struct PocketImage { src: Option<String> }
-        
-        let data: PocketResponse = resp.json().await
+        struct PocketImage {
+            src: Option<String>,
+        }
+
+        let data: PocketResponse = resp
+            .json()
+            .await
             .map_err(|e| ReadLaterError::Api(e.to_string()))?;
-        
-        let articles = data.list.into_values().map(|item| {
-            let status = match item.status.as_str() {
-                "0" => ReadStatus::Unread,
-                "1" => ReadStatus::Archived,
-                "2" => ReadStatus::Read,
-                _ => ReadStatus::Unread,
-            };
-            
-            let word_count = item.word_count.as_ref()
-                .and_then(|w| w.parse().ok());
-            
-            let reading_time = word_count.map(|w: u32| (w / 200).max(1));
-            
-            let tags: Vec<String> = item.tags
-                .map(|t| t.keys().cloned().collect())
-                .unwrap_or_default();
-            
-            let author = item.authors
-                .and_then(|a| a.values().next().and_then(|x| x.name.clone()));
-            
-            let added_ts = item.time_added.parse::<i64>().unwrap_or(0);
-            let updated_ts = item.time_updated.parse::<i64>().unwrap_or(0);
-            let read_ts = item.time_read.as_ref()
-                .and_then(|t| t.parse::<i64>().ok())
-                .filter(|&t| t > 0);
-            
-            Article {
-                id: uuid::Uuid::new_v4().to_string(),
-                provider: ReadLaterProvider::Pocket,
-                provider_id: item.item_id,
-                url: item.given_url,
-                title: item.resolved_title.or(item.given_title).unwrap_or_default(),
-                excerpt: item.excerpt,
-                author,
-                word_count,
-                reading_time_minutes: reading_time,
-                tags,
-                status,
-                favorite: item.favorite == "1",
-                added_at: DateTime::from_timestamp(added_ts, 0).unwrap_or_else(Utc::now),
-                updated_at: DateTime::from_timestamp(updated_ts, 0).unwrap_or_else(Utc::now),
-                read_at: read_ts.and_then(|t| DateTime::from_timestamp(t, 0)),
-                content: None,
-                image_url: item.image.and_then(|i| i.src),
-                document_id: None,
-                synced_to_device: false,
-                last_sync: None,
-            }
-        }).collect();
-        
+
+        let articles = data
+            .list
+            .into_values()
+            .map(|item| {
+                let status = match item.status.as_str() {
+                    "0" => ReadStatus::Unread,
+                    "1" => ReadStatus::Archived,
+                    "2" => ReadStatus::Read,
+                    _ => ReadStatus::Unread,
+                };
+
+                let word_count = item.word_count.as_ref().and_then(|w| w.parse().ok());
+
+                let reading_time = word_count.map(|w: u32| (w / 200).max(1));
+
+                let tags: Vec<String> = item
+                    .tags
+                    .map(|t| t.keys().cloned().collect())
+                    .unwrap_or_default();
+
+                let author = item
+                    .authors
+                    .and_then(|a| a.values().next().and_then(|x| x.name.clone()));
+
+                let added_ts = item.time_added.parse::<i64>().unwrap_or(0);
+                let updated_ts = item.time_updated.parse::<i64>().unwrap_or(0);
+                let read_ts = item
+                    .time_read
+                    .as_ref()
+                    .and_then(|t| t.parse::<i64>().ok())
+                    .filter(|&t| t > 0);
+
+                Article {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    provider: ReadLaterProvider::Pocket,
+                    provider_id: item.item_id,
+                    url: item.given_url,
+                    title: item.resolved_title.or(item.given_title).unwrap_or_default(),
+                    excerpt: item.excerpt,
+                    author,
+                    word_count,
+                    reading_time_minutes: reading_time,
+                    tags,
+                    status,
+                    favorite: item.favorite == "1",
+                    added_at: DateTime::from_timestamp(added_ts, 0).unwrap_or_else(Utc::now),
+                    updated_at: DateTime::from_timestamp(updated_ts, 0).unwrap_or_else(Utc::now),
+                    read_at: read_ts.and_then(|t| DateTime::from_timestamp(t, 0)),
+                    content: None,
+                    image_url: item.image.and_then(|i| i.src),
+                    document_id: None,
+                    synced_to_device: false,
+                    last_sync: None,
+                }
+            })
+            .collect();
+
         Ok(articles)
     }
-    
-    async fn fetch_article_content(&self, config: &ProviderConfig, article: &Article) -> Result<ArticleContent> {
+
+    async fn fetch_article_content(
+        &self,
+        config: &ProviderConfig,
+        article: &Article,
+    ) -> Result<ArticleContent> {
         // Pocket doesn't provide article content directly via API
         // Use Mercury Parser or similar service
         let html = format!(
@@ -555,30 +632,42 @@ impl ReadLaterProviderTrait for PocketProvider {
             escape_html(article.excerpt.as_deref().unwrap_or("")),
             escape_html(&safe_href(&article.url))
         );
-        
+
         Ok(ArticleContent {
             html,
             images: Vec::new(),
             styles: None,
         })
     }
-    
-    async fn update_read_status(&self, config: &ProviderConfig, provider_id: &str, status: ReadStatus) -> Result<()> {
-        let ProviderConfig::Pocket { consumer_key, access_token, .. } = config else {
+
+    async fn update_read_status(
+        &self,
+        config: &ProviderConfig,
+        provider_id: &str,
+        status: ReadStatus,
+    ) -> Result<()> {
+        let ProviderConfig::Pocket {
+            consumer_key,
+            access_token,
+            ..
+        } = config
+        else {
             return Err(ReadLaterError::Api("Invalid config".into()));
         };
-        
-        let access_token = access_token.as_ref()
+
+        let access_token = access_token
+            .as_ref()
             .ok_or_else(|| ReadLaterError::AuthRequired("Pocket".into()))?;
-        
+
         let action = match status {
             ReadStatus::Archived => "archive",
             ReadStatus::Read => "archive",
             ReadStatus::Unread => "readd",
             ReadStatus::InProgress => return Ok(()),
         };
-        
-        let resp = self.client
+
+        let resp = self
+            .client
             .post(format!("{}/send", Self::API_BASE))
             .header("X-Accept", "application/json")
             .json(&serde_json::json!({
@@ -592,23 +681,38 @@ impl ReadLaterProviderTrait for PocketProvider {
             .send()
             .await
             .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-        
+
         if !resp.status().is_success() {
-            return Err(ReadLaterError::Api(format!("Failed to update status: {}", resp.status())));
+            return Err(ReadLaterError::Api(format!(
+                "Failed to update status: {}",
+                resp.status()
+            )));
         }
-        
+
         Ok(())
     }
-    
-    async fn add_article(&self, config: &ProviderConfig, url: &str, tags: &[String]) -> Result<Article> {
-        let ProviderConfig::Pocket { consumer_key, access_token, .. } = config else {
+
+    async fn add_article(
+        &self,
+        config: &ProviderConfig,
+        url: &str,
+        tags: &[String],
+    ) -> Result<Article> {
+        let ProviderConfig::Pocket {
+            consumer_key,
+            access_token,
+            ..
+        } = config
+        else {
             return Err(ReadLaterError::Api("Invalid config".into()));
         };
-        
-        let access_token = access_token.as_ref()
+
+        let access_token = access_token
+            .as_ref()
             .ok_or_else(|| ReadLaterError::AuthRequired("Pocket".into()))?;
-        
-        let resp = self.client
+
+        let resp = self
+            .client
             .post(format!("{}/add", Self::API_BASE))
             .header("X-Accept", "application/json")
             .json(&serde_json::json!({
@@ -620,16 +724,19 @@ impl ReadLaterProviderTrait for PocketProvider {
             .send()
             .await
             .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-        
+
         if !resp.status().is_success() {
-            return Err(ReadLaterError::Api(format!("Failed to add article: {}", resp.status())));
+            return Err(ReadLaterError::Api(format!(
+                "Failed to add article: {}",
+                resp.status()
+            )));
         }
-        
+
         #[derive(Deserialize)]
         struct AddResponse {
             item: PocketItem,
         }
-        
+
         #[derive(Deserialize)]
         struct PocketItem {
             item_id: String,
@@ -637,10 +744,12 @@ impl ReadLaterProviderTrait for PocketProvider {
             title: Option<String>,
             excerpt: Option<String>,
         }
-        
-        let data: AddResponse = resp.json().await
+
+        let data: AddResponse = resp
+            .json()
+            .await
             .map_err(|e| ReadLaterError::Api(e.to_string()))?;
-        
+
         Ok(Article {
             id: uuid::Uuid::new_v4().to_string(),
             provider: ReadLaterProvider::Pocket,
@@ -664,16 +773,23 @@ impl ReadLaterProviderTrait for PocketProvider {
             last_sync: None,
         })
     }
-    
+
     async fn delete_article(&self, config: &ProviderConfig, provider_id: &str) -> Result<()> {
-        let ProviderConfig::Pocket { consumer_key, access_token, .. } = config else {
+        let ProviderConfig::Pocket {
+            consumer_key,
+            access_token,
+            ..
+        } = config
+        else {
             return Err(ReadLaterError::Api("Invalid config".into()));
         };
-        
-        let access_token = access_token.as_ref()
+
+        let access_token = access_token
+            .as_ref()
             .ok_or_else(|| ReadLaterError::AuthRequired("Pocket".into()))?;
-        
-        let resp = self.client
+
+        let resp = self
+            .client
             .post(format!("{}/send", Self::API_BASE))
             .header("X-Accept", "application/json")
             .json(&serde_json::json!({
@@ -687,15 +803,17 @@ impl ReadLaterProviderTrait for PocketProvider {
             .send()
             .await
             .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-        
+
         if !resp.status().is_success() {
-            return Err(ReadLaterError::Api(format!("Failed to delete: {}", resp.status())));
+            return Err(ReadLaterError::Api(format!(
+                "Failed to delete: {}",
+                resp.status()
+            )));
         }
-        
+
         Ok(())
     }
 }
-
 
 // ============================================================================
 // Instapaper Provider
@@ -709,7 +827,7 @@ pub struct InstapaperProvider {
 
 impl InstapaperProvider {
     const API_BASE: &'static str = "https://www.instapaper.com/api/1";
-    
+
     pub fn new(consumer_key: String, consumer_secret: String) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -717,10 +835,16 @@ impl InstapaperProvider {
             consumer_secret,
         }
     }
-    
+
     /// Build a POST request signed with OAuth 1.0a HMAC-SHA1 (the only method Instapaper accepts).
     /// `body` params are form-encoded and included in the signature base string.
-    fn signed_post(&self, url: &str, oauth_token: &str, token_secret: Option<&str>, body: &[(&str, &str)]) -> reqwest::RequestBuilder {
+    fn signed_post(
+        &self,
+        url: &str,
+        oauth_token: &str,
+        token_secret: Option<&str>,
+        body: &[(&str, &str)],
+    ) -> reqwest::RequestBuilder {
         let timestamp = Utc::now().timestamp().to_string();
         let nonce = uuid::Uuid::new_v4().simple().to_string();
         let oauth: Vec<(&str, &str)> = vec![
@@ -736,11 +860,21 @@ impl InstapaperProvider {
         let signature = oauth1_signature("POST", url, &all, &self.consumer_secret, token_secret);
         let mut header_params = oauth;
         header_params.push(("oauth_signature", &signature));
-        let header = header_params.iter()
-            .map(|(k, v)| format!("{}=\"{}\"", oauth_percent_encode(k), oauth_percent_encode(v)))
+        let header = header_params
+            .iter()
+            .map(|(k, v)| {
+                format!(
+                    "{}=\"{}\"",
+                    oauth_percent_encode(k),
+                    oauth_percent_encode(v)
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
-        self.client.post(url).header("Authorization", format!("OAuth {}", header)).form(body)
+        self.client
+            .post(url)
+            .header("Authorization", format!("OAuth {}", header))
+            .form(body)
     }
 }
 
@@ -750,7 +884,9 @@ fn oauth_percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{:02X}", b)),
         }
     }
@@ -760,23 +896,41 @@ fn oauth_percent_encode(s: &str) -> String {
 /// Signature base string (RFC 5849 section 3.4.1). `base_url` must already be the
 /// normalized base string URI (no query/fragment); `params` are decoded name/value pairs.
 fn oauth1_base_string(method: &str, base_url: &str, params: &[(&str, &str)]) -> String {
-    let mut encoded: Vec<(String, String)> = params.iter()
+    let mut encoded: Vec<(String, String)> = params
+        .iter()
         .map(|(k, v)| (oauth_percent_encode(k), oauth_percent_encode(v)))
         .collect();
     encoded.sort();
-    let normalized = encoded.iter()
+    let normalized = encoded
+        .iter()
         .map(|(k, v)| format!("{}={}", k, v))
         .collect::<Vec<_>>()
         .join("&");
-    format!("{}&{}&{}", method.to_uppercase(), oauth_percent_encode(base_url), oauth_percent_encode(&normalized))
+    format!(
+        "{}&{}&{}",
+        method.to_uppercase(),
+        oauth_percent_encode(base_url),
+        oauth_percent_encode(&normalized)
+    )
 }
 
 /// OAuth 1.0a HMAC-SHA1 signature (RFC 5849 section 3.4.2), base64-encoded.
-fn oauth1_signature(method: &str, base_url: &str, params: &[(&str, &str)], consumer_secret: &str, token_secret: Option<&str>) -> String {
+fn oauth1_signature(
+    method: &str,
+    base_url: &str,
+    params: &[(&str, &str)],
+    consumer_secret: &str,
+    token_secret: Option<&str>,
+) -> String {
     use base64::Engine;
     use hmac::{Hmac, Mac};
-    let key = format!("{}&{}", oauth_percent_encode(consumer_secret), oauth_percent_encode(token_secret.unwrap_or("")));
-    let mut mac = Hmac::<sha1::Sha1>::new_from_slice(key.as_bytes()).expect("HMAC accepts keys of any length");
+    let key = format!(
+        "{}&{}",
+        oauth_percent_encode(consumer_secret),
+        oauth_percent_encode(token_secret.unwrap_or(""))
+    );
+    let mut mac = Hmac::<sha1::Sha1>::new_from_slice(key.as_bytes())
+        .expect("HMAC accepts keys of any length");
     mac.update(oauth1_base_string(method, base_url, params).as_bytes());
     base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
 }
@@ -786,7 +940,7 @@ impl ReadLaterProviderTrait for InstapaperProvider {
     fn provider_type(&self) -> ReadLaterProvider {
         ReadLaterProvider::Instapaper
     }
-    
+
     async fn start_oauth(&self, redirect_uri: &str) -> Result<OAuthState> {
         // Instapaper uses xAuth (username/password OAuth), not redirect flow
         Ok(OAuthState {
@@ -796,44 +950,64 @@ impl ReadLaterProviderTrait for InstapaperProvider {
             created_at: Utc::now(),
         })
     }
-    
-    async fn complete_oauth(&self, callback: &OAuthCallback, _state: &OAuthState) -> Result<ProviderConfig> {
+
+    async fn complete_oauth(
+        &self,
+        callback: &OAuthCallback,
+        _state: &OAuthState,
+    ) -> Result<ProviderConfig> {
         // For Instapaper, callback contains username/password via xAuth
         // This is a simplified implementation
-        Err(ReadLaterError::OAuth("Instapaper requires xAuth with username/password".into()))
+        Err(ReadLaterError::OAuth(
+            "Instapaper requires xAuth with username/password".into(),
+        ))
     }
-    
+
     async fn refresh_auth(&self, config: &ProviderConfig) -> Result<ProviderConfig> {
         // Instapaper tokens don't expire
         Ok(config.clone())
     }
-    
+
     fn is_authenticated(&self, config: &ProviderConfig) -> bool {
         match config {
             ProviderConfig::Instapaper { oauth_token, .. } => oauth_token.is_some(),
             _ => false,
         }
     }
-    
-    async fn fetch_articles(&self, config: &ProviderConfig, _since: Option<DateTime<Utc>>) -> Result<Vec<Article>> {
-        let ProviderConfig::Instapaper { oauth_token, oauth_token_secret, .. } = config else {
+
+    async fn fetch_articles(
+        &self,
+        config: &ProviderConfig,
+        _since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<Article>> {
+        let ProviderConfig::Instapaper {
+            oauth_token,
+            oauth_token_secret,
+            ..
+        } = config
+        else {
             return Err(ReadLaterError::Api("Invalid config".into()));
         };
-        
-        let oauth_token = oauth_token.as_ref()
+
+        let oauth_token = oauth_token
+            .as_ref()
             .ok_or_else(|| ReadLaterError::AuthRequired("Instapaper".into()))?;
         let token_secret = oauth_token_secret.as_deref();
-        
+
         let url = format!("{}/bookmarks/list", Self::API_BASE);
-        let resp = self.signed_post(&url, oauth_token, token_secret, &[("limit", "500")])
+        let resp = self
+            .signed_post(&url, oauth_token, token_secret, &[("limit", "500")])
             .send()
             .await
             .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-        
+
         if !resp.status().is_success() {
-            return Err(ReadLaterError::Api(format!("Instapaper API error: {}", resp.status())));
+            return Err(ReadLaterError::Api(format!(
+                "Instapaper API error: {}",
+                resp.status()
+            )));
         }
-        
+
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum InstapaperItem {
@@ -846,144 +1020,220 @@ impl ReadLaterProviderTrait for InstapaperProvider {
                 progress: f64,
                 starred: String,
             },
-            Meta { #[serde(rename = "type")] item_type: String },
+            Meta {
+                #[serde(rename = "type")]
+                item_type: String,
+            },
         }
-        
-        let items: Vec<InstapaperItem> = resp.json().await
+
+        let items: Vec<InstapaperItem> = resp
+            .json()
+            .await
             .map_err(|e| ReadLaterError::Api(e.to_string()))?;
-        
-        let articles = items.into_iter()
-            .filter_map(|item| {
-                match item {
-                    InstapaperItem::Bookmark { bookmark_id, url, title, description, time, progress, starred } => {
-                        let status = if progress >= 1.0 {
-                            ReadStatus::Read
-                        } else if progress > 0.0 {
-                            ReadStatus::InProgress
+
+        let articles = items
+            .into_iter()
+            .filter_map(|item| match item {
+                InstapaperItem::Bookmark {
+                    bookmark_id,
+                    url,
+                    title,
+                    description,
+                    time,
+                    progress,
+                    starred,
+                } => {
+                    let status = if progress >= 1.0 {
+                        ReadStatus::Read
+                    } else if progress > 0.0 {
+                        ReadStatus::InProgress
+                    } else {
+                        ReadStatus::Unread
+                    };
+
+                    Some(Article {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        provider: ReadLaterProvider::Instapaper,
+                        provider_id: bookmark_id.to_string(),
+                        url,
+                        title,
+                        excerpt: description,
+                        author: None,
+                        word_count: None,
+                        reading_time_minutes: None,
+                        tags: Vec::new(),
+                        status,
+                        favorite: starred == "1",
+                        added_at: DateTime::from_timestamp(time, 0).unwrap_or_else(Utc::now),
+                        updated_at: DateTime::from_timestamp(time, 0).unwrap_or_else(Utc::now),
+                        read_at: if status == ReadStatus::Read {
+                            Some(Utc::now())
                         } else {
-                            ReadStatus::Unread
-                        };
-                        
-                        Some(Article {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            provider: ReadLaterProvider::Instapaper,
-                            provider_id: bookmark_id.to_string(),
-                            url,
-                            title,
-                            excerpt: description,
-                            author: None,
-                            word_count: None,
-                            reading_time_minutes: None,
-                            tags: Vec::new(),
-                            status,
-                            favorite: starred == "1",
-                            added_at: DateTime::from_timestamp(time, 0).unwrap_or_else(Utc::now),
-                            updated_at: DateTime::from_timestamp(time, 0).unwrap_or_else(Utc::now),
-                            read_at: if status == ReadStatus::Read { Some(Utc::now()) } else { None },
-                            content: None,
-                            image_url: None,
-                            document_id: None,
-                            synced_to_device: false,
-                            last_sync: None,
-                        })
-                    }
-                    InstapaperItem::Meta { .. } => None,
+                            None
+                        },
+                        content: None,
+                        image_url: None,
+                        document_id: None,
+                        synced_to_device: false,
+                        last_sync: None,
+                    })
                 }
+                InstapaperItem::Meta { .. } => None,
             })
             .collect();
-        
+
         Ok(articles)
     }
-    
-    async fn fetch_article_content(&self, config: &ProviderConfig, article: &Article) -> Result<ArticleContent> {
-        let ProviderConfig::Instapaper { oauth_token, oauth_token_secret, .. } = config else {
+
+    async fn fetch_article_content(
+        &self,
+        config: &ProviderConfig,
+        article: &Article,
+    ) -> Result<ArticleContent> {
+        let ProviderConfig::Instapaper {
+            oauth_token,
+            oauth_token_secret,
+            ..
+        } = config
+        else {
             return Err(ReadLaterError::Api("Invalid config".into()));
         };
-        
-        let oauth_token = oauth_token.as_ref()
+
+        let oauth_token = oauth_token
+            .as_ref()
             .ok_or_else(|| ReadLaterError::AuthRequired("Instapaper".into()))?;
         let token_secret = oauth_token_secret.as_deref();
-        
+
         let url = format!("{}/bookmarks/get_text", Self::API_BASE);
-        let resp = self.signed_post(&url, oauth_token, token_secret, &[("bookmark_id", article.provider_id.as_str())])
+        let resp = self
+            .signed_post(
+                &url,
+                oauth_token,
+                token_secret,
+                &[("bookmark_id", article.provider_id.as_str())],
+            )
             .send()
             .await
             .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-        
+
         if !resp.status().is_success() {
-            return Err(ReadLaterError::Api(format!("Failed to get content: {}", resp.status())));
+            return Err(ReadLaterError::Api(format!(
+                "Failed to get content: {}",
+                resp.status()
+            )));
         }
-        
-        let html = resp.text().await
+
+        let html = resp
+            .text()
+            .await
             .map_err(|e| ReadLaterError::Api(e.to_string()))?;
-        
+
         Ok(ArticleContent {
             html,
             images: Vec::new(),
             styles: None,
         })
     }
-    
-    async fn update_read_status(&self, config: &ProviderConfig, provider_id: &str, status: ReadStatus) -> Result<()> {
-        let ProviderConfig::Instapaper { oauth_token, oauth_token_secret, .. } = config else {
+
+    async fn update_read_status(
+        &self,
+        config: &ProviderConfig,
+        provider_id: &str,
+        status: ReadStatus,
+    ) -> Result<()> {
+        let ProviderConfig::Instapaper {
+            oauth_token,
+            oauth_token_secret,
+            ..
+        } = config
+        else {
             return Err(ReadLaterError::Api("Invalid config".into()));
         };
-        
-        let oauth_token = oauth_token.as_ref()
+
+        let oauth_token = oauth_token
+            .as_ref()
             .ok_or_else(|| ReadLaterError::AuthRequired("Instapaper".into()))?;
         let token_secret = oauth_token_secret.as_deref();
-        
+
         let endpoint = match status {
             ReadStatus::Archived => "bookmarks/archive",
             ReadStatus::Unread => "bookmarks/unarchive",
             ReadStatus::Read | ReadStatus::InProgress => return Ok(()),
         };
-        
+
         let url = format!("{}/{}", Self::API_BASE, endpoint);
-        let resp = self.signed_post(&url, oauth_token, token_secret, &[("bookmark_id", provider_id)])
+        let resp = self
+            .signed_post(
+                &url,
+                oauth_token,
+                token_secret,
+                &[("bookmark_id", provider_id)],
+            )
             .send()
             .await
             .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-        
+
         if !resp.status().is_success() {
-            return Err(ReadLaterError::Api(format!("Failed to update status: {}", resp.status())));
+            return Err(ReadLaterError::Api(format!(
+                "Failed to update status: {}",
+                resp.status()
+            )));
         }
-        
+
         Ok(())
     }
-    
-    async fn add_article(&self, config: &ProviderConfig, url: &str, _tags: &[String]) -> Result<Article> {
-        let ProviderConfig::Instapaper { oauth_token, oauth_token_secret, .. } = config else {
+
+    async fn add_article(
+        &self,
+        config: &ProviderConfig,
+        url: &str,
+        _tags: &[String],
+    ) -> Result<Article> {
+        let ProviderConfig::Instapaper {
+            oauth_token,
+            oauth_token_secret,
+            ..
+        } = config
+        else {
             return Err(ReadLaterError::Api("Invalid config".into()));
         };
-        
-        let oauth_token = oauth_token.as_ref()
+
+        let oauth_token = oauth_token
+            .as_ref()
             .ok_or_else(|| ReadLaterError::AuthRequired("Instapaper".into()))?;
         let token_secret = oauth_token_secret.as_deref();
-        
+
         let api_url = format!("{}/bookmarks/add", Self::API_BASE);
-        let resp = self.signed_post(&api_url, oauth_token, token_secret, &[("url", url)])
+        let resp = self
+            .signed_post(&api_url, oauth_token, token_secret, &[("url", url)])
             .send()
             .await
             .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-        
+
         if !resp.status().is_success() {
-            return Err(ReadLaterError::Api(format!("Failed to add article: {}", resp.status())));
+            return Err(ReadLaterError::Api(format!(
+                "Failed to add article: {}",
+                resp.status()
+            )));
         }
-        
+
         #[derive(Deserialize)]
         struct Bookmark {
             bookmark_id: i64,
             url: String,
             title: String,
         }
-        
-        let items: Vec<Bookmark> = resp.json().await
+
+        let items: Vec<Bookmark> = resp
+            .json()
+            .await
             .map_err(|e| ReadLaterError::Api(e.to_string()))?;
-        
-        let bookmark = items.into_iter().next()
+
+        let bookmark = items
+            .into_iter()
+            .next()
             .ok_or_else(|| ReadLaterError::Api("No bookmark returned".into()))?;
-        
+
         Ok(Article {
             id: uuid::Uuid::new_v4().to_string(),
             provider: ReadLaterProvider::Instapaper,
@@ -1007,30 +1257,44 @@ impl ReadLaterProviderTrait for InstapaperProvider {
             last_sync: None,
         })
     }
-    
+
     async fn delete_article(&self, config: &ProviderConfig, provider_id: &str) -> Result<()> {
-        let ProviderConfig::Instapaper { oauth_token, oauth_token_secret, .. } = config else {
+        let ProviderConfig::Instapaper {
+            oauth_token,
+            oauth_token_secret,
+            ..
+        } = config
+        else {
             return Err(ReadLaterError::Api("Invalid config".into()));
         };
-        
-        let oauth_token = oauth_token.as_ref()
+
+        let oauth_token = oauth_token
+            .as_ref()
             .ok_or_else(|| ReadLaterError::AuthRequired("Instapaper".into()))?;
         let token_secret = oauth_token_secret.as_deref();
-        
+
         let url = format!("{}/bookmarks/delete", Self::API_BASE);
-        let resp = self.signed_post(&url, oauth_token, token_secret, &[("bookmark_id", provider_id)])
+        let resp = self
+            .signed_post(
+                &url,
+                oauth_token,
+                token_secret,
+                &[("bookmark_id", provider_id)],
+            )
             .send()
             .await
             .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-        
+
         if !resp.status().is_success() {
-            return Err(ReadLaterError::Api(format!("Failed to delete: {}", resp.status())));
+            return Err(ReadLaterError::Api(format!(
+                "Failed to delete: {}",
+                resp.status()
+            )));
         }
-        
+
         Ok(())
     }
 }
-
 
 // ============================================================================
 // Wallabag Provider
@@ -1046,7 +1310,7 @@ impl WallabagProvider {
             client: reqwest::Client::new(),
         }
     }
-    
+
     async fn ensure_token(&self, config: &ProviderConfig) -> Result<ProviderConfig> {
         let ProviderConfig::Wallabag {
             instance_url,
@@ -1055,21 +1319,30 @@ impl WallabagProvider {
             access_token,
             refresh_token,
             token_expires_at,
-        } = config else {
+        } = config
+        else {
             return Err(ReadLaterError::Api("Invalid config".into()));
         };
-        
-        if !wallabag_token_needs_refresh(access_token.as_deref(), *token_expires_at, refresh_token.is_some(), Utc::now()) {
+
+        if !wallabag_token_needs_refresh(
+            access_token.as_deref(),
+            *token_expires_at,
+            refresh_token.is_some(),
+            Utc::now(),
+        ) {
             return Ok(config.clone());
         }
-        
-        let refresh = refresh_token.as_ref()
+
+        let refresh = refresh_token
+            .as_ref()
             .ok_or_else(|| ReadLaterError::AuthRequired("Wallabag".into()))?;
-        
-        let client_secret = client_secret.as_ref()
+
+        let client_secret = client_secret
+            .as_ref()
             .ok_or_else(|| ReadLaterError::AuthRequired("Wallabag client secret".into()))?;
-        
-        let resp = self.client
+
+        let resp = self
+            .client
             .post(format!("{}/oauth/v2/token", instance_url))
             .form(&[
                 ("grant_type", "refresh_token"),
@@ -1080,21 +1353,26 @@ impl WallabagProvider {
             .send()
             .await
             .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-        
+
         if !resp.status().is_success() {
-            return Err(ReadLaterError::OAuth(format!("Token refresh failed: {}", resp.status())));
+            return Err(ReadLaterError::OAuth(format!(
+                "Token refresh failed: {}",
+                resp.status()
+            )));
         }
-        
+
         #[derive(Deserialize)]
         struct TokenResponse {
             access_token: String,
             refresh_token: String,
             expires_in: i64,
         }
-        
-        let token: TokenResponse = resp.json().await
+
+        let token: TokenResponse = resp
+            .json()
+            .await
             .map_err(|e| ReadLaterError::OAuth(e.to_string()))?;
-        
+
         Ok(ProviderConfig::Wallabag {
             instance_url: instance_url.clone(),
             client_id: client_id.clone(),
@@ -1109,7 +1387,12 @@ impl WallabagProvider {
 /// Refresh only when there is no access token, or it has an expiry that is past or within
 /// five minutes. A token with no recorded expiry is refreshed when a refresh token exists (the
 /// refresh records an expiry, so this happens once) and otherwise used as-is.
-fn wallabag_token_needs_refresh(access_token: Option<&str>, expires_at: Option<DateTime<Utc>>, has_refresh_token: bool, now: DateTime<Utc>) -> bool {
+fn wallabag_token_needs_refresh(
+    access_token: Option<&str>,
+    expires_at: Option<DateTime<Utc>>,
+    has_refresh_token: bool,
+    now: DateTime<Utc>,
+) -> bool {
     match (access_token, expires_at) {
         (None, _) => true,
         (Some(_), None) => has_refresh_token,
@@ -1122,7 +1405,7 @@ impl ReadLaterProviderTrait for WallabagProvider {
     fn provider_type(&self) -> ReadLaterProvider {
         ReadLaterProvider::Wallabag
     }
-    
+
     async fn start_oauth(&self, redirect_uri: &str) -> Result<OAuthState> {
         Ok(OAuthState {
             provider: ReadLaterProvider::Wallabag,
@@ -1131,63 +1414,88 @@ impl ReadLaterProviderTrait for WallabagProvider {
             created_at: Utc::now(),
         })
     }
-    
-    async fn complete_oauth(&self, callback: &OAuthCallback, state: &OAuthState) -> Result<ProviderConfig> {
-        let code = callback.code.as_ref()
+
+    async fn complete_oauth(
+        &self,
+        callback: &OAuthCallback,
+        state: &OAuthState,
+    ) -> Result<ProviderConfig> {
+        let code = callback
+            .code
+            .as_ref()
             .ok_or_else(|| ReadLaterError::OAuth("Missing authorization code".into()))?;
-        
+
         // Would need instance_url, client_id, client_secret from somewhere
-        Err(ReadLaterError::OAuth("Wallabag OAuth requires instance configuration".into()))
+        Err(ReadLaterError::OAuth(
+            "Wallabag OAuth requires instance configuration".into(),
+        ))
     }
-    
+
     async fn refresh_auth(&self, config: &ProviderConfig) -> Result<ProviderConfig> {
         self.ensure_token(config).await
     }
-    
+
     fn is_authenticated(&self, config: &ProviderConfig) -> bool {
         match config {
             ProviderConfig::Wallabag { access_token, .. } => access_token.is_some(),
             _ => false,
         }
     }
-    
-    async fn fetch_articles(&self, config: &ProviderConfig, since: Option<DateTime<Utc>>) -> Result<Vec<Article>> {
+
+    async fn fetch_articles(
+        &self,
+        config: &ProviderConfig,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<Article>> {
         let config = self.ensure_token(config).await?;
-        
-        let ProviderConfig::Wallabag { instance_url, access_token, .. } = &config else {
+
+        let ProviderConfig::Wallabag {
+            instance_url,
+            access_token,
+            ..
+        } = &config
+        else {
             return Err(ReadLaterError::Api("Invalid config".into()));
         };
-        
-        let token = access_token.as_ref()
+
+        let token = access_token
+            .as_ref()
             .ok_or_else(|| ReadLaterError::AuthRequired("Wallabag".into()))?;
-        
-        let mut url = format!("{}/api/entries.json?perPage=100&sort=created&order=desc", instance_url);
-        
+
+        let mut url = format!(
+            "{}/api/entries.json?perPage=100&sort=created&order=desc",
+            instance_url
+        );
+
         if let Some(ts) = since {
             url.push_str(&format!("&since={}", ts.timestamp()));
         }
-        
-        let resp = self.client
+
+        let resp = self
+            .client
             .get(&url)
             .header("Authorization", format!("Bearer {}", token))
             .send()
             .await
             .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-        
+
         if !resp.status().is_success() {
-            return Err(ReadLaterError::Api(format!("Wallabag API error: {}", resp.status())));
+            return Err(ReadLaterError::Api(format!(
+                "Wallabag API error: {}",
+                resp.status()
+            )));
         }
-        
+
         #[derive(Deserialize)]
         struct WallabagResponse {
             _embedded: Embedded,
         }
-        
+
         #[derive(Deserialize)]
         struct Embedded {
             items: Vec<WallabagEntry>,
         }
-        
+
         #[derive(Deserialize)]
         struct WallabagEntry {
             id: i64,
@@ -1202,146 +1510,206 @@ impl ReadLaterProviderTrait for WallabagProvider {
             updated_at: String,
             preview_picture: Option<String>,
         }
-        
+
         #[derive(Deserialize)]
         struct WallabagTag {
             label: String,
         }
-        
-        let data: WallabagResponse = resp.json().await
+
+        let data: WallabagResponse = resp
+            .json()
+            .await
             .map_err(|e| ReadLaterError::Api(e.to_string()))?;
-        
-        let articles = data._embedded.items.into_iter().map(|entry| {
-            let status = if entry.is_archived == 1 {
-                ReadStatus::Archived
-            } else {
-                ReadStatus::Unread
-            };
-            
-            let tags: Vec<String> = entry.tags.into_iter().map(|t| t.label).collect();
-            
-            let excerpt = entry.content.as_ref().map(|c| {
-                let stripped: String = c.chars().take(300).collect();
-                stripped
-            });
-            
-            let created = DateTime::parse_from_rfc3339(&entry.created_at)
-                .map(|d| d.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-            
-            let updated = DateTime::parse_from_rfc3339(&entry.updated_at)
-                .map(|d| d.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-            
-            Article {
-                id: uuid::Uuid::new_v4().to_string(),
-                provider: ReadLaterProvider::Wallabag,
-                provider_id: entry.id.to_string(),
-                url: entry.url,
-                title: entry.title,
-                excerpt,
-                author: None,
-                word_count: entry.reading_time.map(|t| t * 200),
-                reading_time_minutes: entry.reading_time,
-                tags,
-                status,
-                favorite: entry.is_starred == 1,
-                added_at: created,
-                updated_at: updated,
-                read_at: if status == ReadStatus::Archived { Some(updated) } else { None },
-                content: entry.content,
-                image_url: entry.preview_picture,
-                document_id: None,
-                synced_to_device: false,
-                last_sync: None,
-            }
-        }).collect();
-        
+
+        let articles = data
+            ._embedded
+            .items
+            .into_iter()
+            .map(|entry| {
+                let status = if entry.is_archived == 1 {
+                    ReadStatus::Archived
+                } else {
+                    ReadStatus::Unread
+                };
+
+                let tags: Vec<String> = entry.tags.into_iter().map(|t| t.label).collect();
+
+                let excerpt = entry.content.as_ref().map(|c| {
+                    let stripped: String = c.chars().take(300).collect();
+                    stripped
+                });
+
+                let created = DateTime::parse_from_rfc3339(&entry.created_at)
+                    .map(|d| d.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+
+                let updated = DateTime::parse_from_rfc3339(&entry.updated_at)
+                    .map(|d| d.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+
+                Article {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    provider: ReadLaterProvider::Wallabag,
+                    provider_id: entry.id.to_string(),
+                    url: entry.url,
+                    title: entry.title,
+                    excerpt,
+                    author: None,
+                    word_count: entry.reading_time.map(|t| t * 200),
+                    reading_time_minutes: entry.reading_time,
+                    tags,
+                    status,
+                    favorite: entry.is_starred == 1,
+                    added_at: created,
+                    updated_at: updated,
+                    read_at: if status == ReadStatus::Archived {
+                        Some(updated)
+                    } else {
+                        None
+                    },
+                    content: entry.content,
+                    image_url: entry.preview_picture,
+                    document_id: None,
+                    synced_to_device: false,
+                    last_sync: None,
+                }
+            })
+            .collect();
+
         Ok(articles)
     }
-    
-    async fn fetch_article_content(&self, config: &ProviderConfig, article: &Article) -> Result<ArticleContent> {
+
+    async fn fetch_article_content(
+        &self,
+        config: &ProviderConfig,
+        article: &Article,
+    ) -> Result<ArticleContent> {
         let config = self.ensure_token(config).await?;
-        
-        let ProviderConfig::Wallabag { instance_url, access_token, .. } = &config else {
+
+        let ProviderConfig::Wallabag {
+            instance_url,
+            access_token,
+            ..
+        } = &config
+        else {
             return Err(ReadLaterError::Api("Invalid config".into()));
         };
-        
-        let token = access_token.as_ref()
+
+        let token = access_token
+            .as_ref()
             .ok_or_else(|| ReadLaterError::AuthRequired("Wallabag".into()))?;
-        
-        let resp = self.client
-            .get(format!("{}/api/entries/{}.json", instance_url, article.provider_id))
+
+        let resp = self
+            .client
+            .get(format!(
+                "{}/api/entries/{}.json",
+                instance_url, article.provider_id
+            ))
             .header("Authorization", format!("Bearer {}", token))
             .send()
             .await
             .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-        
+
         if !resp.status().is_success() {
-            return Err(ReadLaterError::Api(format!("Failed to get content: {}", resp.status())));
+            return Err(ReadLaterError::Api(format!(
+                "Failed to get content: {}",
+                resp.status()
+            )));
         }
-        
+
         #[derive(Deserialize)]
         struct Entry {
             content: Option<String>,
         }
-        
-        let entry: Entry = resp.json().await
+
+        let entry: Entry = resp
+            .json()
+            .await
             .map_err(|e| ReadLaterError::Api(e.to_string()))?;
-        
+
         let html = entry.content.unwrap_or_else(|| {
-            format!("<html><body><h1>{}</h1><p><a href=\"{}\">Read original</a></p></body></html>",
-                escape_html(&article.title), escape_html(&safe_href(&article.url)))
+            format!(
+                "<html><body><h1>{}</h1><p><a href=\"{}\">Read original</a></p></body></html>",
+                escape_html(&article.title),
+                escape_html(&safe_href(&article.url))
+            )
         });
-        
+
         Ok(ArticleContent {
             html,
             images: Vec::new(),
             styles: None,
         })
     }
-    
-    async fn update_read_status(&self, config: &ProviderConfig, provider_id: &str, status: ReadStatus) -> Result<()> {
+
+    async fn update_read_status(
+        &self,
+        config: &ProviderConfig,
+        provider_id: &str,
+        status: ReadStatus,
+    ) -> Result<()> {
         let config = self.ensure_token(config).await?;
-        
-        let ProviderConfig::Wallabag { instance_url, access_token, .. } = &config else {
+
+        let ProviderConfig::Wallabag {
+            instance_url,
+            access_token,
+            ..
+        } = &config
+        else {
             return Err(ReadLaterError::Api("Invalid config".into()));
         };
-        
-        let token = access_token.as_ref()
+
+        let token = access_token
+            .as_ref()
             .ok_or_else(|| ReadLaterError::AuthRequired("Wallabag".into()))?;
-        
+
         let archive = match status {
             ReadStatus::Archived | ReadStatus::Read => 1,
             ReadStatus::Unread | ReadStatus::InProgress => 0,
         };
-        
-        let resp = self.client
+
+        let resp = self
+            .client
             .patch(format!("{}/api/entries/{}.json", instance_url, provider_id))
             .header("Authorization", format!("Bearer {}", token))
             .json(&serde_json::json!({ "archive": archive }))
             .send()
             .await
             .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-        
+
         if !resp.status().is_success() {
-            return Err(ReadLaterError::Api(format!("Failed to update: {}", resp.status())));
+            return Err(ReadLaterError::Api(format!(
+                "Failed to update: {}",
+                resp.status()
+            )));
         }
-        
+
         Ok(())
     }
-    
-    async fn add_article(&self, config: &ProviderConfig, url: &str, tags: &[String]) -> Result<Article> {
+
+    async fn add_article(
+        &self,
+        config: &ProviderConfig,
+        url: &str,
+        tags: &[String],
+    ) -> Result<Article> {
         let config = self.ensure_token(config).await?;
-        
-        let ProviderConfig::Wallabag { instance_url, access_token, .. } = &config else {
+
+        let ProviderConfig::Wallabag {
+            instance_url,
+            access_token,
+            ..
+        } = &config
+        else {
             return Err(ReadLaterError::Api("Invalid config".into()));
         };
-        
-        let token = access_token.as_ref()
+
+        let token = access_token
+            .as_ref()
             .ok_or_else(|| ReadLaterError::AuthRequired("Wallabag".into()))?;
-        
-        let resp = self.client
+
+        let resp = self
+            .client
             .post(format!("{}/api/entries.json", instance_url))
             .header("Authorization", format!("Bearer {}", token))
             .json(&serde_json::json!({
@@ -1351,11 +1719,14 @@ impl ReadLaterProviderTrait for WallabagProvider {
             .send()
             .await
             .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-        
+
         if !resp.status().is_success() {
-            return Err(ReadLaterError::Api(format!("Failed to add: {}", resp.status())));
+            return Err(ReadLaterError::Api(format!(
+                "Failed to add: {}",
+                resp.status()
+            )));
         }
-        
+
         #[derive(Deserialize)]
         struct Entry {
             id: i64,
@@ -1363,10 +1734,12 @@ impl ReadLaterProviderTrait for WallabagProvider {
             title: String,
             reading_time: Option<u32>,
         }
-        
-        let entry: Entry = resp.json().await
+
+        let entry: Entry = resp
+            .json()
+            .await
             .map_err(|e| ReadLaterError::Api(e.to_string()))?;
-        
+
         Ok(Article {
             id: uuid::Uuid::new_v4().to_string(),
             provider: ReadLaterProvider::Wallabag,
@@ -1390,32 +1763,41 @@ impl ReadLaterProviderTrait for WallabagProvider {
             last_sync: None,
         })
     }
-    
+
     async fn delete_article(&self, config: &ProviderConfig, provider_id: &str) -> Result<()> {
         let config = self.ensure_token(config).await?;
-        
-        let ProviderConfig::Wallabag { instance_url, access_token, .. } = &config else {
+
+        let ProviderConfig::Wallabag {
+            instance_url,
+            access_token,
+            ..
+        } = &config
+        else {
             return Err(ReadLaterError::Api("Invalid config".into()));
         };
-        
-        let token = access_token.as_ref()
+
+        let token = access_token
+            .as_ref()
             .ok_or_else(|| ReadLaterError::AuthRequired("Wallabag".into()))?;
-        
-        let resp = self.client
+
+        let resp = self
+            .client
             .delete(format!("{}/api/entries/{}.json", instance_url, provider_id))
             .header("Authorization", format!("Bearer {}", token))
             .send()
             .await
             .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-        
+
         if !resp.status().is_success() {
-            return Err(ReadLaterError::Api(format!("Failed to delete: {}", resp.status())));
+            return Err(ReadLaterError::Api(format!(
+                "Failed to delete: {}",
+                resp.status()
+            )));
         }
-        
+
         Ok(())
     }
 }
-
 
 // ============================================================================
 // Omnivore Provider (GraphQL API)
@@ -1427,13 +1809,13 @@ pub struct OmnivoreProvider {
 
 impl OmnivoreProvider {
     const DEFAULT_API_URL: &'static str = "https://api-prod.omnivore.app/api/graphql";
-    
+
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::new(),
         }
     }
-    
+
     fn api_url(config: &ProviderConfig) -> &str {
         match config {
             ProviderConfig::Omnivore { api_url, .. } => {
@@ -1442,7 +1824,7 @@ impl OmnivoreProvider {
             _ => Self::DEFAULT_API_URL,
         }
     }
-    
+
     /// The hosted Omnivore service shut down in November 2024, so requests to the default
     /// endpoint can only fail. Fail fast with a clear message; self-hosted instances (an
     /// explicit `api_url`) are still attempted on a best-effort basis.
@@ -1460,7 +1842,7 @@ impl ReadLaterProviderTrait for OmnivoreProvider {
     fn provider_type(&self) -> ReadLaterProvider {
         ReadLaterProvider::Omnivore
     }
-    
+
     async fn start_oauth(&self, redirect_uri: &str) -> Result<OAuthState> {
         // Omnivore uses API keys, not OAuth
         Ok(OAuthState {
@@ -1470,39 +1852,50 @@ impl ReadLaterProviderTrait for OmnivoreProvider {
             created_at: Utc::now(),
         })
     }
-    
-    async fn complete_oauth(&self, callback: &OAuthCallback, _state: &OAuthState) -> Result<ProviderConfig> {
+
+    async fn complete_oauth(
+        &self,
+        callback: &OAuthCallback,
+        _state: &OAuthState,
+    ) -> Result<ProviderConfig> {
         // API key is provided directly
-        let api_key = callback.code.clone()
+        let api_key = callback
+            .code
+            .clone()
             .ok_or_else(|| ReadLaterError::OAuth("API key required".into()))?;
-        
+
         Ok(ProviderConfig::Omnivore {
             api_key: Some(api_key),
             api_url: None,
         })
     }
-    
+
     async fn refresh_auth(&self, config: &ProviderConfig) -> Result<ProviderConfig> {
         // API keys don't expire
         Ok(config.clone())
     }
-    
+
     fn is_authenticated(&self, config: &ProviderConfig) -> bool {
         match config {
             ProviderConfig::Omnivore { api_key, .. } => api_key.is_some(),
             _ => false,
         }
     }
-    
-    async fn fetch_articles(&self, config: &ProviderConfig, since: Option<DateTime<Utc>>) -> Result<Vec<Article>> {
+
+    async fn fetch_articles(
+        &self,
+        config: &ProviderConfig,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<Article>> {
         let ProviderConfig::Omnivore { api_key, .. } = config else {
             return Err(ReadLaterError::Api("Invalid config".into()));
         };
         Self::ensure_available(config)?;
-        
-        let api_key = api_key.as_ref()
+
+        let api_key = api_key
+            .as_ref()
             .ok_or_else(|| ReadLaterError::AuthRequired("Omnivore".into()))?;
-        
+
         let query = r#"
             query Search($after: String, $first: Int, $query: String) {
                 search(after: $after, first: $first, query: $query) {
@@ -1538,12 +1931,13 @@ impl ReadLaterProviderTrait for OmnivoreProvider {
                 }
             }
         "#;
-        
+
         let search_query = since
             .map(|ts| format!("saved:{}", ts.format("%Y-%m-%d")))
             .unwrap_or_default();
-        
-        let resp = self.client
+
+        let resp = self
+            .client
             .post(Self::api_url(config))
             .header("Authorization", api_key)
             .header("Content-Type", "application/json")
@@ -1557,34 +1951,42 @@ impl ReadLaterProviderTrait for OmnivoreProvider {
             .send()
             .await
             .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-        
+
         if !resp.status().is_success() {
-            return Err(ReadLaterError::Api(format!("Omnivore API error: {}", resp.status())));
+            return Err(ReadLaterError::Api(format!(
+                "Omnivore API error: {}",
+                resp.status()
+            )));
         }
-        
+
         #[derive(Deserialize)]
         struct GraphQLResponse {
             data: Option<DataWrapper>,
             errors: Option<Vec<serde_json::Value>>,
         }
-        
+
         #[derive(Deserialize)]
         struct DataWrapper {
             search: SearchResult,
         }
-        
+
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum SearchResult {
-            Success { edges: Vec<Edge> },
-            Error { #[serde(rename = "errorCodes")] error_codes: Vec<String> },
+            Success {
+                edges: Vec<Edge>,
+            },
+            Error {
+                #[serde(rename = "errorCodes")]
+                error_codes: Vec<String>,
+            },
         }
-        
+
         #[derive(Deserialize)]
         struct Edge {
             node: OmnivoreArticle,
         }
-        
+
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct OmnivoreArticle {
@@ -1603,95 +2005,110 @@ impl ReadLaterProviderTrait for OmnivoreProvider {
             words_count: Option<u32>,
             image: Option<String>,
         }
-        
+
         #[derive(Deserialize)]
         struct Label {
             name: String,
         }
-        
-        let gql: GraphQLResponse = resp.json().await
+
+        let gql: GraphQLResponse = resp
+            .json()
+            .await
             .map_err(|e| ReadLaterError::Api(e.to_string()))?;
-        
+
         if let Some(errors) = gql.errors {
             return Err(ReadLaterError::Api(format!("GraphQL errors: {:?}", errors)));
         }
-        
-        let data = gql.data.ok_or_else(|| ReadLaterError::Api("No data".into()))?;
-        
+
+        let data = gql
+            .data
+            .ok_or_else(|| ReadLaterError::Api("No data".into()))?;
+
         let edges = match data.search {
             SearchResult::Success { edges } => edges,
             SearchResult::Error { error_codes } => {
-                return Err(ReadLaterError::Api(format!("Search error: {:?}", error_codes)));
+                return Err(ReadLaterError::Api(format!(
+                    "Search error: {:?}",
+                    error_codes
+                )));
             }
         };
-        
-        let articles = edges.into_iter().map(|edge| {
-            let item = edge.node;
-            
-            let status = if item.is_archived {
-                ReadStatus::Archived
-            } else if item.reading_progress_percent >= 100.0 {
-                ReadStatus::Read
-            } else if item.reading_progress_percent > 0.0 {
-                ReadStatus::InProgress
-            } else {
-                ReadStatus::Unread
-            };
-            
-            let tags: Vec<String> = item.labels.into_iter().map(|l| l.name).collect();
-            
-            let saved_at = DateTime::parse_from_rfc3339(&item.saved_at)
-                .map(|d| d.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-            
-            let updated_at = DateTime::parse_from_rfc3339(&item.updated_at)
-                .map(|d| d.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-            
-            let read_at = item.read_at.and_then(|r| {
-                DateTime::parse_from_rfc3339(&r)
+
+        let articles = edges
+            .into_iter()
+            .map(|edge| {
+                let item = edge.node;
+
+                let status = if item.is_archived {
+                    ReadStatus::Archived
+                } else if item.reading_progress_percent >= 100.0 {
+                    ReadStatus::Read
+                } else if item.reading_progress_percent > 0.0 {
+                    ReadStatus::InProgress
+                } else {
+                    ReadStatus::Unread
+                };
+
+                let tags: Vec<String> = item.labels.into_iter().map(|l| l.name).collect();
+
+                let saved_at = DateTime::parse_from_rfc3339(&item.saved_at)
                     .map(|d| d.with_timezone(&Utc))
-                    .ok()
-            });
-            
-            let reading_time = item.words_count.map(|w| (w / 200).max(1));
-            
-            Article {
-                id: uuid::Uuid::new_v4().to_string(),
-                provider: ReadLaterProvider::Omnivore,
-                provider_id: item.id,
-                url: item.url,
-                title: item.title,
-                excerpt: item.description,
-                author: item.author,
-                word_count: item.words_count,
-                reading_time_minutes: reading_time,
-                tags,
-                status,
-                favorite: false,
-                added_at: saved_at,
-                updated_at,
-                read_at,
-                content: None,
-                image_url: item.image,
-                document_id: None,
-                synced_to_device: false,
-                last_sync: None,
-            }
-        }).collect();
-        
+                    .unwrap_or_else(|_| Utc::now());
+
+                let updated_at = DateTime::parse_from_rfc3339(&item.updated_at)
+                    .map(|d| d.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+
+                let read_at = item.read_at.and_then(|r| {
+                    DateTime::parse_from_rfc3339(&r)
+                        .map(|d| d.with_timezone(&Utc))
+                        .ok()
+                });
+
+                let reading_time = item.words_count.map(|w| (w / 200).max(1));
+
+                Article {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    provider: ReadLaterProvider::Omnivore,
+                    provider_id: item.id,
+                    url: item.url,
+                    title: item.title,
+                    excerpt: item.description,
+                    author: item.author,
+                    word_count: item.words_count,
+                    reading_time_minutes: reading_time,
+                    tags,
+                    status,
+                    favorite: false,
+                    added_at: saved_at,
+                    updated_at,
+                    read_at,
+                    content: None,
+                    image_url: item.image,
+                    document_id: None,
+                    synced_to_device: false,
+                    last_sync: None,
+                }
+            })
+            .collect();
+
         Ok(articles)
     }
-    
-    async fn fetch_article_content(&self, config: &ProviderConfig, article: &Article) -> Result<ArticleContent> {
+
+    async fn fetch_article_content(
+        &self,
+        config: &ProviderConfig,
+        article: &Article,
+    ) -> Result<ArticleContent> {
         let ProviderConfig::Omnivore { api_key, .. } = config else {
             return Err(ReadLaterError::Api("Invalid config".into()));
         };
         Self::ensure_available(config)?;
-        
-        let api_key = api_key.as_ref()
+
+        let api_key = api_key
+            .as_ref()
             .ok_or_else(|| ReadLaterError::AuthRequired("Omnivore".into()))?;
-        
+
         let query = r#"
             query GetArticle($username: String!, $slug: String!) {
                 article(username: $username, slug: $slug) {
@@ -1707,11 +2124,12 @@ impl ReadLaterProviderTrait for OmnivoreProvider {
                 }
             }
         "#;
-        
+
         // Extract slug from provider_id or use the article URL
         let slug = &article.provider_id;
-        
-        let resp = self.client
+
+        let resp = self
+            .client
             .post(Self::api_url(config))
             .header("Authorization", api_key)
             .header("Content-Type", "application/json")
@@ -1725,75 +2143,101 @@ impl ReadLaterProviderTrait for OmnivoreProvider {
             .send()
             .await
             .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-        
+
         if !resp.status().is_success() {
-            return Err(ReadLaterError::Api(format!("Failed to get content: {}", resp.status())));
+            return Err(ReadLaterError::Api(format!(
+                "Failed to get content: {}",
+                resp.status()
+            )));
         }
-        
+
         #[derive(Deserialize)]
         struct Response {
             data: Option<DataWrapper>,
         }
-        
+
         #[derive(Deserialize)]
         struct DataWrapper {
             article: ArticleResult,
         }
-        
+
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum ArticleResult {
-            Success { article: ArticleContent2 },
-            Error { #[serde(rename = "errorCodes")] error_codes: Vec<String> },
+            Success {
+                article: ArticleContent2,
+            },
+            Error {
+                #[serde(rename = "errorCodes")]
+                error_codes: Vec<String>,
+            },
         }
-        
+
         #[derive(Deserialize)]
         struct ArticleContent2 {
             content: String,
         }
-        
-        let data: Response = resp.json().await
+
+        let data: Response = resp
+            .json()
+            .await
             .map_err(|e| ReadLaterError::Api(e.to_string()))?;
-        
+
         let content = match data.data {
-            Some(DataWrapper { article: ArticleResult::Success { article } }) => article.content,
-            Some(DataWrapper { article: ArticleResult::Error { error_codes } }) => {
-                return Err(ReadLaterError::Api(format!("Article error: {:?}", error_codes)));
+            Some(DataWrapper {
+                article: ArticleResult::Success { article },
+            }) => article.content,
+            Some(DataWrapper {
+                article: ArticleResult::Error { error_codes },
+            }) => {
+                return Err(ReadLaterError::Api(format!(
+                    "Article error: {:?}",
+                    error_codes
+                )));
             }
             None => {
                 return Err(ReadLaterError::Api("No data returned".into()));
             }
         };
-        
+
         Ok(ArticleContent {
             html: content,
             images: Vec::new(),
             styles: None,
         })
     }
-    
-    async fn update_read_status(&self, config: &ProviderConfig, provider_id: &str, status: ReadStatus) -> Result<()> {
+
+    async fn update_read_status(
+        &self,
+        config: &ProviderConfig,
+        provider_id: &str,
+        status: ReadStatus,
+    ) -> Result<()> {
         let ProviderConfig::Omnivore { api_key, .. } = config else {
             return Err(ReadLaterError::Api("Invalid config".into()));
         };
         Self::ensure_available(config)?;
-        
-        let api_key = api_key.as_ref()
+
+        let api_key = api_key
+            .as_ref()
             .ok_or_else(|| ReadLaterError::AuthRequired("Omnivore".into()))?;
-        
+
         let mutation = match status {
-            ReadStatus::Archived => r#"
+            ReadStatus::Archived => {
+                r#"
                 mutation SetArchive($input: ArchiveLinkInput!) {
                     setLinkArchived(input: $input) {
                         ... on ArchiveLinkSuccess { linkId }
                         ... on ArchiveLinkError { errorCodes }
                     }
                 }
-            "#,
+            "#
+            }
             _ => return Ok(()),
         };
-        
-        let resp = self.client
+
+        let resp = self
+            .client
             .post(Self::api_url(config))
             .header("Authorization", api_key)
             .header("Content-Type", "application/json")
@@ -1809,23 +2253,32 @@ impl ReadLaterProviderTrait for OmnivoreProvider {
             .send()
             .await
             .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-        
+
         if !resp.status().is_success() {
-            return Err(ReadLaterError::Api(format!("Failed to update: {}", resp.status())));
+            return Err(ReadLaterError::Api(format!(
+                "Failed to update: {}",
+                resp.status()
+            )));
         }
-        
+
         Ok(())
     }
-    
-    async fn add_article(&self, config: &ProviderConfig, url: &str, tags: &[String]) -> Result<Article> {
+
+    async fn add_article(
+        &self,
+        config: &ProviderConfig,
+        url: &str,
+        tags: &[String],
+    ) -> Result<Article> {
         let ProviderConfig::Omnivore { api_key, .. } = config else {
             return Err(ReadLaterError::Api("Invalid config".into()));
         };
         Self::ensure_available(config)?;
-        
-        let api_key = api_key.as_ref()
+
+        let api_key = api_key
+            .as_ref()
             .ok_or_else(|| ReadLaterError::AuthRequired("Omnivore".into()))?;
-        
+
         let mutation = r#"
             mutation SaveUrl($input: SaveUrlInput!) {
                 saveUrl(input: $input) {
@@ -1839,9 +2292,9 @@ impl ReadLaterProviderTrait for OmnivoreProvider {
                 }
             }
         "#;
-        
+
         let client_request_id = uuid::Uuid::new_v4().to_string();
-        
+
         let resp = self.client
             .post(Self::api_url(config))
             .header("Authorization", api_key)
@@ -1859,11 +2312,14 @@ impl ReadLaterProviderTrait for OmnivoreProvider {
             .send()
             .await
             .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-        
+
         if !resp.status().is_success() {
-            return Err(ReadLaterError::Api(format!("Failed to add: {}", resp.status())));
+            return Err(ReadLaterError::Api(format!(
+                "Failed to add: {}",
+                resp.status()
+            )));
         }
-        
+
         Ok(Article {
             id: uuid::Uuid::new_v4().to_string(),
             provider: ReadLaterProvider::Omnivore,
@@ -1887,16 +2343,17 @@ impl ReadLaterProviderTrait for OmnivoreProvider {
             last_sync: None,
         })
     }
-    
+
     async fn delete_article(&self, config: &ProviderConfig, provider_id: &str) -> Result<()> {
         let ProviderConfig::Omnivore { api_key, .. } = config else {
             return Err(ReadLaterError::Api("Invalid config".into()));
         };
         Self::ensure_available(config)?;
-        
-        let api_key = api_key.as_ref()
+
+        let api_key = api_key
+            .as_ref()
             .ok_or_else(|| ReadLaterError::AuthRequired("Omnivore".into()))?;
-        
+
         let mutation = r#"
             mutation SetBookmarkArticle($input: SetBookmarkArticleInput!) {
                 setBookmarkArticle(input: $input) {
@@ -1905,8 +2362,9 @@ impl ReadLaterProviderTrait for OmnivoreProvider {
                 }
             }
         "#;
-        
-        let resp = self.client
+
+        let resp = self
+            .client
             .post(Self::api_url(config))
             .header("Authorization", api_key)
             .header("Content-Type", "application/json")
@@ -1922,15 +2380,17 @@ impl ReadLaterProviderTrait for OmnivoreProvider {
             .send()
             .await
             .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-        
+
         if !resp.status().is_success() {
-            return Err(ReadLaterError::Api(format!("Failed to delete: {}", resp.status())));
+            return Err(ReadLaterError::Api(format!(
+                "Failed to delete: {}",
+                resp.status()
+            )));
         }
-        
+
         Ok(())
     }
 }
-
 
 // ============================================================================
 // EPUB/PDF Converter
@@ -1956,7 +2416,11 @@ fn escape_html(s: &str) -> String {
 /// The result still needs `escape_html` for the attribute context.
 fn safe_href(url: &str) -> String {
     let lower = url.trim_start().to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") { url.trim_start().to_string() } else { "#".to_string() }
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        url.trim_start().to_string()
+    } else {
+        "#".to_string()
+    }
 }
 
 pub struct ArticleConverter {
@@ -1967,20 +2431,26 @@ impl ArticleConverter {
     pub fn new(output_dir: PathBuf) -> Self {
         Self { output_dir }
     }
-    
-    pub async fn convert(&self, article: &Article, content: &ArticleContent, format: ArticleFormat) -> Result<PathBuf> {
+
+    pub async fn convert(
+        &self,
+        article: &Article,
+        content: &ArticleContent,
+        format: ArticleFormat,
+    ) -> Result<PathBuf> {
         match format {
             ArticleFormat::Html => self.save_html(article, content).await,
             ArticleFormat::Epub => self.convert_to_epub(article, content).await,
             ArticleFormat::Pdf => self.convert_to_pdf(article, content).await,
         }
     }
-    
+
     async fn save_html(&self, article: &Article, content: &ArticleContent) -> Result<PathBuf> {
         let filename = self.sanitize_filename(&article.title);
         let path = self.output_dir.join(format!("{}.html", filename));
-        
-        let html = format!(r#"<!DOCTYPE html>
+
+        let html = format!(
+            r#"<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
@@ -2005,40 +2475,53 @@ impl ArticleConverter {
             escape_html(&article.title),
             content.styles.as_deref().unwrap_or(""),
             escape_html(&article.title),
-            article.author.as_deref().map(|a| format!("By {} • ", escape_html(a))).unwrap_or_default(),
+            article
+                .author
+                .as_deref()
+                .map(|a| format!("By {} • ", escape_html(a)))
+                .unwrap_or_default(),
             escape_html(&safe_href(&article.url)),
             content.html
         );
-        
+
         tokio::fs::write(&path, html).await?;
         Ok(path)
     }
-    
-    async fn convert_to_epub(&self, article: &Article, content: &ArticleContent) -> Result<PathBuf> {
+
+    async fn convert_to_epub(
+        &self,
+        article: &Article,
+        content: &ArticleContent,
+    ) -> Result<PathBuf> {
         let filename = self.sanitize_filename(&article.title);
         let path = self.output_dir.join(format!("{}.epub", filename));
-        
+
         // Create a minimal EPUB structure
         let temp_dir = tempfile::tempdir()?;
         let temp_path = temp_dir.path();
-        
+
         // mimetype file
         tokio::fs::write(temp_path.join("mimetype"), "application/epub+zip").await?;
-        
+
         // META-INF/container.xml
         tokio::fs::create_dir_all(temp_path.join("META-INF")).await?;
-        tokio::fs::write(temp_path.join("META-INF/container.xml"), r#"<?xml version="1.0"?>
+        tokio::fs::write(
+            temp_path.join("META-INF/container.xml"),
+            r#"<?xml version="1.0"?>
 <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
   <rootfiles>
     <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
   </rootfiles>
-</container>"#).await?;
-        
+</container>"#,
+        )
+        .await?;
+
         // OEBPS directory
         tokio::fs::create_dir_all(temp_path.join("OEBPS")).await?;
-        
+
         // content.opf
-        let opf = format!(r#"<?xml version="1.0" encoding="UTF-8"?>
+        let opf = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
     <dc:identifier id="uid">{}</dc:identifier>
@@ -2061,9 +2544,10 @@ impl ArticleConverter {
             Utc::now().format("%Y-%m-%dT%H:%M:%SZ")
         );
         tokio::fs::write(temp_path.join("OEBPS/content.opf"), opf).await?;
-        
+
         // nav.xhtml
-        let nav = format!(r#"<?xml version="1.0" encoding="UTF-8"?>
+        let nav = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
 <head><title>Navigation</title></head>
@@ -2072,41 +2556,48 @@ impl ArticleConverter {
   <ol><li><a href="content.xhtml">{}</a></li></ol>
 </nav>
 </body>
-</html>"#, escape_html(&article.title));
+</html>"#,
+            escape_html(&article.title)
+        );
         tokio::fs::write(temp_path.join("OEBPS/nav.xhtml"), nav).await?;
-        
+
         // content.xhtml
         let content_xhtml = Self::epub_content_xhtml(article, content);
         tokio::fs::write(temp_path.join("OEBPS/content.xhtml"), content_xhtml).await?;
-        
+
         // Create ZIP (EPUB is just a ZIP)
         use std::process::Command;
-        
+
         let output = Command::new("zip")
             .args(["-X0", path.to_str().unwrap(), "mimetype"])
             .current_dir(temp_path)
             .output()
             .map_err(|e| ReadLaterError::Conversion(format!("zip mimetype: {}", e)))?;
-        
+
         if !output.status.success() {
-            return Err(ReadLaterError::Conversion("Failed to create EPUB mimetype".into()));
+            return Err(ReadLaterError::Conversion(
+                "Failed to create EPUB mimetype".into(),
+            ));
         }
-        
+
         let output = Command::new("zip")
             .args(["-Xr9D", path.to_str().unwrap(), "META-INF", "OEBPS"])
             .current_dir(temp_path)
             .output()
             .map_err(|e| ReadLaterError::Conversion(format!("zip content: {}", e)))?;
-        
+
         if !output.status.success() {
-            return Err(ReadLaterError::Conversion("Failed to create EPUB content".into()));
+            return Err(ReadLaterError::Conversion(
+                "Failed to create EPUB content".into(),
+            ));
         }
-        
+
         Ok(path)
     }
-    
+
     fn epub_content_xhtml(article: &Article, content: &ArticleContent) -> String {
-        format!(r#"<?xml version="1.0" encoding="UTF-8"?>
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml">
 <head>
@@ -2132,44 +2623,48 @@ img {{ max-width: 100%; }}
             content.html
         )
     }
-    
+
     async fn convert_to_pdf(&self, article: &Article, content: &ArticleContent) -> Result<PathBuf> {
         let filename = self.sanitize_filename(&article.title);
         let pdf_path = self.output_dir.join(format!("{}.pdf", filename));
-        
+
         // Save HTML first
         let html_path = self.save_html(article, content).await?;
-        
+
         // Use wkhtmltopdf or weasyprint if available
         use std::process::Command;
-        
+
         // Try weasyprint first
         let result = Command::new("weasyprint")
             .args([html_path.to_str().unwrap(), pdf_path.to_str().unwrap()])
             .output();
-        
+
         if let Ok(output) = result {
             if output.status.success() {
                 return Ok(pdf_path);
             }
         }
-        
+
         // Try wkhtmltopdf
         let result = Command::new("wkhtmltopdf")
-            .args(["--quiet", html_path.to_str().unwrap(), pdf_path.to_str().unwrap()])
+            .args([
+                "--quiet",
+                html_path.to_str().unwrap(),
+                pdf_path.to_str().unwrap(),
+            ])
             .output();
-        
+
         if let Ok(output) = result {
             if output.status.success() {
                 return Ok(pdf_path);
             }
         }
-        
+
         Err(ReadLaterError::Conversion(
-            "No PDF converter available (install weasyprint or wkhtmltopdf)".into()
+            "No PDF converter available (install weasyprint or wkhtmltopdf)".into(),
         ))
     }
-    
+
     fn sanitize_filename(&self, name: &str) -> String {
         name.chars()
             .map(|c| match c {
@@ -2197,13 +2692,12 @@ pub struct ReadLaterManager {
 
 impl ReadLaterManager {
     pub fn new(db_path: &Path, storage_path: &Path) -> Result<Self> {
-        let db = Connection::open(db_path)
-            .map_err(|e| ReadLaterError::Database(e.to_string()))?;
-        
+        let db = Connection::open(db_path).map_err(|e| ReadLaterError::Database(e.to_string()))?;
+
         Self::init_schema(&db)?;
-        
+
         let converter = ArticleConverter::new(storage_path.join("articles"));
-        
+
         let mut mgr = Self {
             db,
             accounts: Arc::new(RwLock::new(HashMap::new())),
@@ -2212,15 +2706,16 @@ impl ReadLaterManager {
             storage_path: storage_path.to_path_buf(),
             sync_tx: None,
         };
-        
+
         mgr.load_accounts()?;
         mgr.load_articles()?;
-        
+
         Ok(mgr)
     }
-    
+
     fn init_schema(db: &Connection) -> Result<()> {
-        db.execute_batch(r#"
+        db.execute_batch(
+            r#"
             CREATE TABLE IF NOT EXISTS readlater_accounts (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -2267,155 +2762,215 @@ impl ReadLaterManager {
             CREATE INDEX IF NOT EXISTS idx_articles_provider ON readlater_articles(provider);
             CREATE INDEX IF NOT EXISTS idx_articles_status ON readlater_articles(status);
             CREATE INDEX IF NOT EXISTS idx_articles_synced ON readlater_articles(synced_to_device);
-        "#).map_err(|e| ReadLaterError::Database(e.to_string()))?;
-        
+        "#,
+        )
+        .map_err(|e| ReadLaterError::Database(e.to_string()))?;
+
         Ok(())
     }
-    
+
     fn load_accounts(&mut self) -> Result<()> {
         let mut stmt = self.db.prepare(
             "SELECT id, name, provider, enabled, config, sync_settings, last_sync, created_at FROM readlater_accounts"
         ).map_err(|e| ReadLaterError::Database(e.to_string()))?;
-        
-        let rows = stmt.query_map([], |row| {
-            let id: String = row.get(0)?;
-            let name: String = row.get(1)?;
-            let provider_str: String = row.get(2)?;
-            let enabled: bool = row.get::<_, i32>(3)? != 0;
-            let config_json: String = row.get(4)?;
-            let sync_json: String = row.get(5)?;
-            let last_sync: Option<String> = row.get(6)?;
-            let created_at: String = row.get(7)?;
-            
-            Ok((id, name, provider_str, enabled, config_json, sync_json, last_sync, created_at))
-        }).map_err(|e| ReadLaterError::Database(e.to_string()))?;
-        
+
+        let rows = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let name: String = row.get(1)?;
+                let provider_str: String = row.get(2)?;
+                let enabled: bool = row.get::<_, i32>(3)? != 0;
+                let config_json: String = row.get(4)?;
+                let sync_json: String = row.get(5)?;
+                let last_sync: Option<String> = row.get(6)?;
+                let created_at: String = row.get(7)?;
+
+                Ok((
+                    id,
+                    name,
+                    provider_str,
+                    enabled,
+                    config_json,
+                    sync_json,
+                    last_sync,
+                    created_at,
+                ))
+            })
+            .map_err(|e| ReadLaterError::Database(e.to_string()))?;
+
         let mut accounts = self.accounts.write();
-        
+
         for row in rows {
-            let (id, name, provider_str, enabled, config_json, sync_json, last_sync, created_at) = 
+            let (id, name, provider_str, enabled, config_json, sync_json, last_sync, created_at) =
                 row.map_err(|e| ReadLaterError::Database(e.to_string()))?;
-            
-            let provider: ReadLaterProvider = serde_json::from_str(&format!("\"{}\"", provider_str))
-                .map_err(|e| ReadLaterError::Database(e.to_string()))?;
-            
+
+            let provider: ReadLaterProvider =
+                serde_json::from_str(&format!("\"{}\"", provider_str))
+                    .map_err(|e| ReadLaterError::Database(e.to_string()))?;
+
             let config: ProviderConfig = serde_json::from_str(&config_json)
                 .map_err(|e| ReadLaterError::Database(e.to_string()))?;
-            
+
             let sync_settings: SyncSettings = serde_json::from_str(&sync_json)
                 .map_err(|e| ReadLaterError::Database(e.to_string()))?;
-            
+
             let last_sync_dt = last_sync.and_then(|s| {
-                DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc))
+                DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|d| d.with_timezone(&Utc))
             });
-            
+
             let created_dt = DateTime::parse_from_rfc3339(&created_at)
                 .map(|d| d.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
-            
-            accounts.insert(id.clone(), ProviderAccount {
-                id,
-                name,
-                provider,
-                enabled,
-                config,
-                sync_settings,
-                last_sync: last_sync_dt,
-                created_at: created_dt,
-            });
+
+            accounts.insert(
+                id.clone(),
+                ProviderAccount {
+                    id,
+                    name,
+                    provider,
+                    enabled,
+                    config,
+                    sync_settings,
+                    last_sync: last_sync_dt,
+                    created_at: created_dt,
+                },
+            );
         }
-        
+
         Ok(())
     }
-    
+
     fn load_articles(&mut self) -> Result<()> {
         let mut stmt = self.db.prepare(
             "SELECT id, provider, provider_id, url, title, excerpt, author, word_count, reading_time_minutes,              tags, status, favorite, added_at, updated_at, read_at, image_url, document_id, synced_to_device, last_sync              FROM readlater_articles"
         ).map_err(|e| ReadLaterError::Database(e.to_string()))?;
-        
-        let rows = stmt.query_map([], |row| {
-            let id: String = row.get(0)?;
-            let provider_str: String = row.get(1)?;
-            let provider_id: String = row.get(2)?;
-            let url: String = row.get(3)?;
-            let title: String = row.get(4)?;
-            let excerpt: Option<String> = row.get(5)?;
-            let author: Option<String> = row.get(6)?;
-            let word_count: Option<u32> = row.get(7)?;
-            let reading_time: Option<u32> = row.get(8)?;
-            let tags_json: Option<String> = row.get(9)?;
-            let status_str: String = row.get(10)?;
-            let favorite: bool = row.get::<_, i32>(11)? != 0;
-            let added_at: String = row.get(12)?;
-            let updated_at: String = row.get(13)?;
-            let read_at: Option<String> = row.get(14)?;
-            let image_url: Option<String> = row.get(15)?;
-            let document_id: Option<String> = row.get(16)?;
-            let synced: bool = row.get::<_, i32>(17)? != 0;
-            let last_sync: Option<String> = row.get(18)?;
-            
-            Ok((id, provider_str, provider_id, url, title, excerpt, author, word_count, 
-                reading_time, tags_json, status_str, favorite, added_at, updated_at, 
-                read_at, image_url, document_id, synced, last_sync))
-        }).map_err(|e| ReadLaterError::Database(e.to_string()))?;
-        
+
+        let rows = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let provider_str: String = row.get(1)?;
+                let provider_id: String = row.get(2)?;
+                let url: String = row.get(3)?;
+                let title: String = row.get(4)?;
+                let excerpt: Option<String> = row.get(5)?;
+                let author: Option<String> = row.get(6)?;
+                let word_count: Option<u32> = row.get(7)?;
+                let reading_time: Option<u32> = row.get(8)?;
+                let tags_json: Option<String> = row.get(9)?;
+                let status_str: String = row.get(10)?;
+                let favorite: bool = row.get::<_, i32>(11)? != 0;
+                let added_at: String = row.get(12)?;
+                let updated_at: String = row.get(13)?;
+                let read_at: Option<String> = row.get(14)?;
+                let image_url: Option<String> = row.get(15)?;
+                let document_id: Option<String> = row.get(16)?;
+                let synced: bool = row.get::<_, i32>(17)? != 0;
+                let last_sync: Option<String> = row.get(18)?;
+
+                Ok((
+                    id,
+                    provider_str,
+                    provider_id,
+                    url,
+                    title,
+                    excerpt,
+                    author,
+                    word_count,
+                    reading_time,
+                    tags_json,
+                    status_str,
+                    favorite,
+                    added_at,
+                    updated_at,
+                    read_at,
+                    image_url,
+                    document_id,
+                    synced,
+                    last_sync,
+                ))
+            })
+            .map_err(|e| ReadLaterError::Database(e.to_string()))?;
+
         let mut articles = self.articles.write();
-        
+
         for row in rows {
-            let (id, provider_str, provider_id, url, title, excerpt, author, word_count,
-                reading_time, tags_json, status_str, favorite, added_at, updated_at,
-                read_at, image_url, document_id, synced, last_sync) = 
-                row.map_err(|e| ReadLaterError::Database(e.to_string()))?;
-            
-            let provider: ReadLaterProvider = serde_json::from_str(&format!("\"{}\"", provider_str))
-                .map_err(|e| ReadLaterError::Database(e.to_string()))?;
-            
-            let status: ReadStatus = serde_json::from_str(&format!("\"{}\"", status_str))
-                .map_err(|e| ReadLaterError::Database(e.to_string()))?;
-            
-            let tags: Vec<String> = tags_json
-                .map(|j| serde_json::from_str(&j).unwrap_or_default())
-                .unwrap_or_default();
-            
-            let parse_dt = |s: &str| {
-                DateTime::parse_from_rfc3339(s)
-                    .map(|d| d.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now())
-            };
-            
-            articles.insert(id.clone(), Article {
+            let (
                 id,
-                provider,
+                provider_str,
                 provider_id,
                 url,
                 title,
                 excerpt,
                 author,
                 word_count,
-                reading_time_minutes: reading_time,
-                tags,
-                status,
+                reading_time,
+                tags_json,
+                status_str,
                 favorite,
-                added_at: parse_dt(&added_at),
-                updated_at: parse_dt(&updated_at),
-                read_at: read_at.map(|s| parse_dt(&s)),
-                content: None,
+                added_at,
+                updated_at,
+                read_at,
                 image_url,
                 document_id,
-                synced_to_device: synced,
-                last_sync: last_sync.map(|s| parse_dt(&s)),
-            });
+                synced,
+                last_sync,
+            ) = row.map_err(|e| ReadLaterError::Database(e.to_string()))?;
+
+            let provider: ReadLaterProvider =
+                serde_json::from_str(&format!("\"{}\"", provider_str))
+                    .map_err(|e| ReadLaterError::Database(e.to_string()))?;
+
+            let status: ReadStatus = serde_json::from_str(&format!("\"{}\"", status_str))
+                .map_err(|e| ReadLaterError::Database(e.to_string()))?;
+
+            let tags: Vec<String> = tags_json
+                .map(|j| serde_json::from_str(&j).unwrap_or_default())
+                .unwrap_or_default();
+
+            let parse_dt = |s: &str| {
+                DateTime::parse_from_rfc3339(s)
+                    .map(|d| d.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now())
+            };
+
+            articles.insert(
+                id.clone(),
+                Article {
+                    id,
+                    provider,
+                    provider_id,
+                    url,
+                    title,
+                    excerpt,
+                    author,
+                    word_count,
+                    reading_time_minutes: reading_time,
+                    tags,
+                    status,
+                    favorite,
+                    added_at: parse_dt(&added_at),
+                    updated_at: parse_dt(&updated_at),
+                    read_at: read_at.map(|s| parse_dt(&s)),
+                    content: None,
+                    image_url,
+                    document_id,
+                    synced_to_device: synced,
+                    last_sync: last_sync.map(|s| parse_dt(&s)),
+                },
+            );
         }
-        
+
         Ok(())
     }
-    
+
     // Account management
-    
+
     pub fn add_account(&mut self, account: ProviderAccount) -> Result<()> {
         let config_json = serde_json::to_string(&account.config)?;
         let sync_json = serde_json::to_string(&account.sync_settings)?;
-        
+
         self.db.execute(
             "INSERT INTO readlater_accounts (id, name, provider, enabled, config, sync_settings, last_sync, created_at)              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
@@ -2429,15 +2984,15 @@ impl ReadLaterManager {
                 account.created_at.to_rfc3339(),
             ],
         ).map_err(|e| ReadLaterError::Database(e.to_string()))?;
-        
+
         self.accounts.write().insert(account.id.clone(), account);
         Ok(())
     }
-    
+
     pub fn update_account(&mut self, account: ProviderAccount) -> Result<()> {
         let config_json = serde_json::to_string(&account.config)?;
         let sync_json = serde_json::to_string(&account.sync_settings)?;
-        
+
         self.db.execute(
             "UPDATE readlater_accounts SET name=?2, enabled=?3, config=?4, sync_settings=?5, last_sync=?6 WHERE id=?1",
             params![
@@ -2449,32 +3004,33 @@ impl ReadLaterManager {
                 account.last_sync.map(|d| d.to_rfc3339()),
             ],
         ).map_err(|e| ReadLaterError::Database(e.to_string()))?;
-        
+
         self.accounts.write().insert(account.id.clone(), account);
         Ok(())
     }
-    
+
     pub fn delete_account(&mut self, id: &str) -> Result<()> {
-        self.db.execute("DELETE FROM readlater_accounts WHERE id=?1", params![id])
+        self.db
+            .execute("DELETE FROM readlater_accounts WHERE id=?1", params![id])
             .map_err(|e| ReadLaterError::Database(e.to_string()))?;
         self.accounts.write().remove(id);
         Ok(())
     }
-    
+
     pub fn get_account(&self, id: &str) -> Option<ProviderAccount> {
         self.accounts.read().get(id).cloned()
     }
-    
+
     pub fn list_accounts(&self) -> Vec<ProviderAccount> {
         self.accounts.read().values().cloned().collect()
     }
-    
+
     // Article management
-    
+
     pub fn save_article(&mut self, article: &Article) -> Result<()> {
         self.upsert_article(article).map(|_| ())
     }
-    
+
     /// Insert or update an article keyed by its natural key `(provider, provider_id)`
     /// (the table's UNIQUE constraint). If a row already exists under a different id — e.g.
     /// a provider re-fetch that minted a fresh uuid — the existing id is kept, as is the
@@ -2483,24 +3039,32 @@ impl ReadLaterManager {
     /// Returns the article as stored.
     fn upsert_article(&mut self, article: &Article) -> Result<Article> {
         let mut article = article.clone();
-        let existing_id: Option<String> = self.db.query_row(
-            "SELECT id FROM readlater_articles WHERE provider=?1 AND provider_id=?2",
-            params![article.provider.to_string(), article.provider_id],
-            |row| row.get(0),
-        ).map(Some).or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            e => Err(ReadLaterError::Database(e.to_string())),
-        })?;
+        let existing_id: Option<String> = self
+            .db
+            .query_row(
+                "SELECT id FROM readlater_articles WHERE provider=?1 AND provider_id=?2",
+                params![article.provider.to_string(), article.provider_id],
+                |row| row.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(ReadLaterError::Database(e.to_string())),
+            })?;
         if let Some(existing_id) = existing_id.filter(|id| *id != article.id) {
             if let Some(prev) = self.articles.read().get(&existing_id) {
-                if article.document_id.is_none() { article.document_id = prev.document_id.clone(); }
+                if article.document_id.is_none() {
+                    article.document_id = prev.document_id.clone();
+                }
                 article.synced_to_device |= prev.synced_to_device;
-                if article.last_sync.is_none() { article.last_sync = prev.last_sync; }
+                if article.last_sync.is_none() {
+                    article.last_sync = prev.last_sync;
+                }
             }
             article.id = existing_id;
         }
         let tags_json = serde_json::to_string(&article.tags)?;
-        
+
         self.db.execute(
             "INSERT OR REPLACE INTO readlater_articles              (id, provider, provider_id, url, title, excerpt, author, word_count, reading_time_minutes,               tags, status, favorite, added_at, updated_at, read_at, image_url, document_id, synced_to_device, last_sync)              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
@@ -2525,38 +3089,56 @@ impl ReadLaterManager {
                 article.last_sync.map(|d| d.to_rfc3339()),
             ],
         ).map_err(|e| ReadLaterError::Database(e.to_string()))?;
-        
-        self.articles.write().insert(article.id.clone(), article.clone());
+
+        self.articles
+            .write()
+            .insert(article.id.clone(), article.clone());
         Ok(article)
     }
-    
+
     pub fn get_article(&self, id: &str) -> Option<Article> {
         self.articles.read().get(id).cloned()
     }
-    
+
     pub fn query_articles(&self, query: &ArticleQuery) -> Vec<Article> {
         let articles = self.articles.read();
-        let mut results: Vec<Article> = articles.values()
+        let mut results: Vec<Article> = articles
+            .values()
             .filter(|a| {
                 if let Some(provider) = query.provider {
-                    if a.provider != provider { return false; }
+                    if a.provider != provider {
+                        return false;
+                    }
                 }
                 if let Some(status) = query.status {
-                    if a.status != status { return false; }
+                    if a.status != status {
+                        return false;
+                    }
                 }
                 if let Some(favorite) = query.favorite {
-                    if a.favorite != favorite { return false; }
+                    if a.favorite != favorite {
+                        return false;
+                    }
                 }
                 if let Some(synced) = query.synced {
-                    if a.synced_to_device != synced { return false; }
+                    if a.synced_to_device != synced {
+                        return false;
+                    }
                 }
                 if let Some(ref tags) = query.tags {
-                    if !tags.iter().any(|t| a.tags.contains(t)) { return false; }
+                    if !tags.iter().any(|t| a.tags.contains(t)) {
+                        return false;
+                    }
                 }
                 if let Some(ref search) = query.search {
                     let s = search.to_lowercase();
-                    if !a.title.to_lowercase().contains(&s) && 
-                       !a.excerpt.as_ref().map(|e| e.to_lowercase().contains(&s)).unwrap_or(false) {
+                    if !a.title.to_lowercase().contains(&s)
+                        && !a
+                            .excerpt
+                            .as_ref()
+                            .map(|e| e.to_lowercase().contains(&s))
+                            .unwrap_or(false)
+                    {
                         return false;
                     }
                 }
@@ -2564,7 +3146,7 @@ impl ReadLaterManager {
             })
             .cloned()
             .collect();
-        
+
         // Sort
         match query.sort_by.unwrap_or_default() {
             ArticleSortBy::AddedAt => results.sort_by(|a, b| b.added_at.cmp(&a.added_at)),
@@ -2574,30 +3156,31 @@ impl ReadLaterManager {
                 results.sort_by(|a, b| b.reading_time_minutes.cmp(&a.reading_time_minutes));
             }
         }
-        
+
         if matches!(query.sort_order.unwrap_or_default(), SortOrder::Asc) {
             results.reverse();
         }
-        
+
         // Pagination
         let offset = query.offset.unwrap_or(0);
         let limit = query.limit.unwrap_or(50);
-        
+
         results.into_iter().skip(offset).take(limit).collect()
     }
-    
+
     pub fn delete_article(&mut self, id: &str) -> Result<()> {
-        self.db.execute("DELETE FROM readlater_articles WHERE id=?1", params![id])
+        self.db
+            .execute("DELETE FROM readlater_articles WHERE id=?1", params![id])
             .map_err(|e| ReadLaterError::Database(e.to_string()))?;
         self.articles.write().remove(id);
         Ok(())
     }
-    
+
     // OAuth state management
-    
+
     pub fn save_oauth_state(&self, state: &OAuthState) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
-        
+
         self.db.execute(
             "INSERT INTO readlater_oauth_states (id, provider, request_token, redirect_uri, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -2608,15 +3191,15 @@ impl ReadLaterManager {
                 state.created_at.to_rfc3339(),
             ],
         ).map_err(|e| ReadLaterError::Database(e.to_string()))?;
-        
+
         Ok(id)
     }
-    
+
     pub fn get_oauth_state(&self, id: &str) -> Result<Option<OAuthState>> {
         let mut stmt = self.db.prepare(
             "SELECT provider, request_token, redirect_uri, created_at FROM readlater_oauth_states WHERE id=?1"
         ).map_err(|e| ReadLaterError::Database(e.to_string()))?;
-        
+
         let result = stmt.query_row(params![id], |row| {
             let provider_str: String = row.get(0)?;
             let request_token: Option<String> = row.get(1)?;
@@ -2624,15 +3207,16 @@ impl ReadLaterManager {
             let created_at: String = row.get(3)?;
             Ok((provider_str, request_token, redirect_uri, created_at))
         });
-        
+
         match result {
             Ok((provider_str, request_token, redirect_uri, created_at)) => {
-                let provider: ReadLaterProvider = serde_json::from_str(&format!("\"{}\"", provider_str))
-                    .map_err(|e| ReadLaterError::Database(e.to_string()))?;
+                let provider: ReadLaterProvider =
+                    serde_json::from_str(&format!("\"{}\"", provider_str))
+                        .map_err(|e| ReadLaterError::Database(e.to_string()))?;
                 let created = DateTime::parse_from_rfc3339(&created_at)
                     .map(|d| d.with_timezone(&Utc))
                     .unwrap_or_else(|_| Utc::now());
-                
+
                 Ok(Some(OAuthState {
                     provider,
                     request_token,
@@ -2644,15 +3228,19 @@ impl ReadLaterManager {
             Err(e) => Err(ReadLaterError::Database(e.to_string())),
         }
     }
-    
+
     pub fn delete_oauth_state(&self, id: &str) -> Result<()> {
-        self.db.execute("DELETE FROM readlater_oauth_states WHERE id=?1", params![id])
+        self.db
+            .execute(
+                "DELETE FROM readlater_oauth_states WHERE id=?1",
+                params![id],
+            )
             .map_err(|e| ReadLaterError::Database(e.to_string()))?;
         Ok(())
     }
-    
+
     // Sync operations
-    
+
     pub async fn sync_account(&mut self, account_id: &str) -> Result<SyncResult> {
         let start = std::time::Instant::now();
         let mut result = SyncResult {
@@ -2665,12 +3253,13 @@ impl ReadLaterManager {
             duration_ms: 0,
             completed_at: Utc::now(),
         };
-        
-        let account = self.get_account(account_id)
+
+        let account = self
+            .get_account(account_id)
             .ok_or_else(|| ReadLaterError::ProviderNotFound(account_id.into()))?;
-        
+
         result.provider = account.provider;
-        
+
         // Create provider instance
         let provider: Box<dyn ReadLaterProviderTrait> = match account.provider {
             ReadLaterProvider::Pocket => Box::new(PocketProvider::new()),
@@ -2682,7 +3271,7 @@ impl ReadLaterManager {
             ReadLaterProvider::Wallabag => Box::new(WallabagProvider::new()),
             ReadLaterProvider::Omnivore => Box::new(OmnivoreProvider::new()),
         };
-        
+
         // Refresh credentials once per sync (a no-op unless expired/near expiry) so the
         // individual API calls below don't each trigger their own refresh.
         // A failed refresh aborts the sync without touching `last_sync`, so the failure stays
@@ -2697,7 +3286,7 @@ impl ReadLaterManager {
                 return Ok(result);
             }
         }
-        
+
         // Fetch articles
         let since = account.last_sync;
         let mut fetched = false;
@@ -2705,7 +3294,7 @@ impl ReadLaterManager {
             Ok(articles) => {
                 fetched = true;
                 result.articles_fetched = articles.len() as u32;
-                
+
                 for article in select_articles_for_sync(articles, &account.sync_settings) {
                     // Save article (keeps the existing id if we've seen it before)
                     let article = match self.upsert_article(&article) {
@@ -2715,19 +3304,32 @@ impl ReadLaterManager {
                             continue;
                         }
                     };
-                    
+
                     result.articles_synced += 1;
-                    
+
                     // Convert to device format
                     if account.sync_settings.convert_format != ArticleFormat::Html {
-                        match provider.fetch_article_content(&account.config, &article).await {
+                        match provider
+                            .fetch_article_content(&account.config, &article)
+                            .await
+                        {
                             Ok(content) => {
-                                match self.converter.convert(&article, &content, account.sync_settings.convert_format).await {
+                                match self
+                                    .converter
+                                    .convert(
+                                        &article,
+                                        &content,
+                                        account.sync_settings.convert_format,
+                                    )
+                                    .await
+                                {
                                     Ok(_path) => {
                                         result.articles_converted += 1;
                                     }
                                     Err(e) => {
-                                        result.errors.push(format!("Convert {}: {}", article.id, e));
+                                        result
+                                            .errors
+                                            .push(format!("Convert {}: {}", article.id, e));
                                     }
                                 }
                             }
@@ -2742,21 +3344,26 @@ impl ReadLaterManager {
                 result.errors.push(format!("Fetch: {}", e));
             }
         }
-        
+
         // Sync read status back
         if account.sync_settings.sync_read_status {
-            let articles_to_sync: Vec<Article> = self.articles.read()
+            let articles_to_sync: Vec<Article> = self
+                .articles
+                .read()
                 .values()
                 .filter(|a| {
-                    a.provider == account.provider &&
-                    a.synced_to_device &&
-                    (a.status == ReadStatus::Read || a.status == ReadStatus::Archived)
+                    a.provider == account.provider
+                        && a.synced_to_device
+                        && (a.status == ReadStatus::Read || a.status == ReadStatus::Archived)
                 })
                 .cloned()
                 .collect();
-            
+
             for article in articles_to_sync {
-                match provider.update_read_status(&account.config, &article.provider_id, article.status).await {
+                match provider
+                    .update_read_status(&account.config, &article.provider_id, article.status)
+                    .await
+                {
                     Ok(()) => {
                         result.read_status_synced += 1;
                     }
@@ -2766,28 +3373,32 @@ impl ReadLaterManager {
                 }
             }
         }
-        
+
         // Persist refreshed credentials; advance `last_sync` only after a successful fetch so a
         // failed fetch doesn't make the next incremental sync skip this window.
         let mut updated_account = account;
-        if fetched { updated_account.last_sync = Some(Utc::now()); }
+        if fetched {
+            updated_account.last_sync = Some(Utc::now());
+        }
         let _ = self.update_account(updated_account);
-        
+
         result.duration_ms = start.elapsed().as_millis() as u64;
         result.completed_at = Utc::now();
-        
+
         Ok(result)
     }
-    
+
     pub async fn sync_all(&mut self) -> Vec<SyncResult> {
-        let account_ids: Vec<String> = self.accounts.read()
+        let account_ids: Vec<String> = self
+            .accounts
+            .read()
             .values()
             .filter(|a| a.enabled)
             .map(|a| a.id.clone())
             .collect();
-        
+
         let mut results = Vec::new();
-        
+
         for id in account_ids {
             match self.sync_account(&id).await {
                 Ok(result) => results.push(result),
@@ -2805,23 +3416,23 @@ impl ReadLaterManager {
                 }
             }
         }
-        
+
         results
     }
-    
+
     // Scheduler
-    
+
     pub fn start_scheduler(&mut self) -> mpsc::Sender<SyncCommand> {
         let (tx, mut rx) = mpsc::channel::<SyncCommand>(32);
         self.sync_tx = Some(tx.clone());
-        
+
         let accounts = Arc::clone(&self.accounts);
         let articles = Arc::clone(&self.articles);
         let storage_path = self.storage_path.clone();
-        
+
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
-            
+
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
@@ -2831,7 +3442,7 @@ impl ReadLaterManager {
                             accounts.values()
                                 .filter(|a| {
                                     if !a.enabled || !a.sync_settings.auto_sync { return false; }
-                                    
+
                                     let interval = Duration::minutes(a.sync_settings.sync_interval_minutes as i64);
                                     match a.last_sync {
                                         Some(last) => Utc::now() - last > interval,
@@ -2841,13 +3452,13 @@ impl ReadLaterManager {
                                 .cloned()
                                 .collect()
                         };
-                        
+
                         for account in accounts_to_sync {
                             tracing::info!("Scheduled sync for {} ({})", account.name, account.provider);
                             // Would trigger sync here - need to refactor to share manager
                         }
                     }
-                    
+
                     Some(cmd) = rx.recv() => {
                         match cmd {
                             SyncCommand::Stop => break,
@@ -2859,10 +3470,10 @@ impl ReadLaterManager {
                 }
             }
         });
-        
+
         tx
     }
-    
+
     pub fn stop_scheduler(&mut self) {
         if let Some(tx) = self.sync_tx.take() {
             let _ = tx.try_send(SyncCommand::Stop);
@@ -2876,31 +3487,54 @@ impl ReadLaterManager {
 /// Tag filters: an article must carry none of the exclude tags and, when any include
 /// filters exist, at least one include tag.
 fn select_articles_for_sync(articles: Vec<Article>, settings: &SyncSettings) -> Vec<Article> {
-    let mut selected: Vec<Article> = articles.into_iter().filter(|article| {
-        let has_tag = |tag: &str| article.tags.iter().any(|t| t.eq_ignore_ascii_case(tag));
-        if settings.tag_filters.iter().any(|f| !f.include && has_tag(&f.tag)) { return false; }
-        let mut includes = settings.tag_filters.iter().filter(|f| f.include).peekable();
-        if includes.peek().is_some() && !includes.any(|f| has_tag(&f.tag)) { return false; }
-        if settings.include_favorites_only && !article.favorite { return false; }
-        if !settings.include_archived && article.status == ReadStatus::Archived { return false; }
-        true
-    }).collect();
+    let mut selected: Vec<Article> = articles
+        .into_iter()
+        .filter(|article| {
+            let has_tag = |tag: &str| article.tags.iter().any(|t| t.eq_ignore_ascii_case(tag));
+            if settings
+                .tag_filters
+                .iter()
+                .any(|f| !f.include && has_tag(&f.tag))
+            {
+                return false;
+            }
+            let mut includes = settings.tag_filters.iter().filter(|f| f.include).peekable();
+            if includes.peek().is_some() && !includes.any(|f| has_tag(&f.tag)) {
+                return false;
+            }
+            if settings.include_favorites_only && !article.favorite {
+                return false;
+            }
+            if !settings.include_archived && article.status == ReadStatus::Archived {
+                return false;
+            }
+            true
+        })
+        .collect();
     selected.sort_by(|a, b| b.added_at.cmp(&a.added_at));
-    if settings.max_articles > 0 { selected.truncate(settings.max_articles as usize); }
+    if settings.max_articles > 0 {
+        selected.truncate(settings.max_articles as usize);
+    }
     selected
 }
 
 // Default implementations
 impl Default for PocketProvider {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Default for WallabagProvider {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Default for OmnivoreProvider {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -2910,10 +3544,26 @@ mod tests {
     fn article(id: &str, provider_id: &str, added_secs: i64) -> Article {
         let t = DateTime::from_timestamp(added_secs, 0).unwrap();
         Article {
-            id: id.into(), provider: ReadLaterProvider::Pocket, provider_id: provider_id.into(), url: "https://example.com/a".into(),
-            title: "T".into(), excerpt: None, author: None, word_count: None, reading_time_minutes: None, tags: Vec::new(),
-            status: ReadStatus::Unread, favorite: false, added_at: t, updated_at: t, read_at: None, content: None,
-            image_url: None, document_id: None, synced_to_device: false, last_sync: None,
+            id: id.into(),
+            provider: ReadLaterProvider::Pocket,
+            provider_id: provider_id.into(),
+            url: "https://example.com/a".into(),
+            title: "T".into(),
+            excerpt: None,
+            author: None,
+            word_count: None,
+            reading_time_minutes: None,
+            tags: Vec::new(),
+            status: ReadStatus::Unread,
+            favorite: false,
+            added_at: t,
+            updated_at: t,
+            read_at: None,
+            content: None,
+            image_url: None,
+            document_id: None,
+            synced_to_device: false,
+            last_sync: None,
         }
     }
 
@@ -2928,53 +3578,112 @@ mod tests {
     fn oauth_base_string_matches_rfc5849_3_4_1_1() {
         // RFC 5849 section 3.4.1.1 example (decoded query, body and oauth params).
         let params = [
-            ("b5", "=%3D"), ("a3", "a"), ("c@", ""), ("a2", "r b"),
-            ("oauth_consumer_key", "9djdj82h48djs9d2"), ("oauth_token", "kkk9d7dh3k39sjv7"),
-            ("oauth_signature_method", "HMAC-SHA1"), ("oauth_timestamp", "137131201"), ("oauth_nonce", "7d8f3e4a"),
-            ("c2", ""), ("a3", "2 q"),
+            ("b5", "=%3D"),
+            ("a3", "a"),
+            ("c@", ""),
+            ("a2", "r b"),
+            ("oauth_consumer_key", "9djdj82h48djs9d2"),
+            ("oauth_token", "kkk9d7dh3k39sjv7"),
+            ("oauth_signature_method", "HMAC-SHA1"),
+            ("oauth_timestamp", "137131201"),
+            ("oauth_nonce", "7d8f3e4a"),
+            ("c2", ""),
+            ("a3", "2 q"),
         ];
-        assert_eq!(oauth1_base_string("POST", "http://example.com/request", &params),
-            "POST&http%3A%2F%2Fexample.com%2Frequest&a2%3Dr%2520b%26a3%3D2%2520q%26a3%3Da%26b5%3D%253D%25253D%26c%2540%3D%26c2%3D%26oauth_consumer_key%3D9djdj82h48djs9d2%26oauth_nonce%3D7d8f3e4a%26oauth_signature_method%3DHMAC-SHA1%26oauth_timestamp%3D137131201%26oauth_token%3Dkkk9d7dh3k39sjv7");
+        assert_eq!(
+            oauth1_base_string("POST", "http://example.com/request", &params),
+            "POST&http%3A%2F%2Fexample.com%2Frequest&a2%3Dr%2520b%26a3%3D2%2520q%26a3%3Da%26b5%3D%253D%25253D%26c%2540%3D%26c2%3D%26oauth_consumer_key%3D9djdj82h48djs9d2%26oauth_nonce%3D7d8f3e4a%26oauth_signature_method%3DHMAC-SHA1%26oauth_timestamp%3D137131201%26oauth_token%3Dkkk9d7dh3k39sjv7"
+        );
     }
 
     #[test]
     fn oauth_hmac_sha1_signature_matches_known_vector() {
         // OAuth Core 1.0 Appendix A.5 (the photos.example.net example, reused by RFC 5849).
         let params = [
-            ("file", "vacation.jpg"), ("size", "original"),
-            ("oauth_consumer_key", "dpf43f3p2l4k3l03"), ("oauth_token", "nnch734d00sl2jdk"),
-            ("oauth_signature_method", "HMAC-SHA1"), ("oauth_timestamp", "1191242096"),
-            ("oauth_nonce", "kllo9940pd9333jh"), ("oauth_version", "1.0"),
+            ("file", "vacation.jpg"),
+            ("size", "original"),
+            ("oauth_consumer_key", "dpf43f3p2l4k3l03"),
+            ("oauth_token", "nnch734d00sl2jdk"),
+            ("oauth_signature_method", "HMAC-SHA1"),
+            ("oauth_timestamp", "1191242096"),
+            ("oauth_nonce", "kllo9940pd9333jh"),
+            ("oauth_version", "1.0"),
         ];
-        assert_eq!(oauth1_signature("GET", "http://photos.example.net/photos", &params, "kd94hf93k423kf44", Some("pfkkdhi9sl3r4s00")),
-            "tR3+Ty81lMeYAr/Fid0kMTYa/WM=");
+        assert_eq!(
+            oauth1_signature(
+                "GET",
+                "http://photos.example.net/photos",
+                &params,
+                "kd94hf93k423kf44",
+                Some("pfkkdhi9sl3r4s00")
+            ),
+            "tR3+Ty81lMeYAr/Fid0kMTYa/WM="
+        );
         // RFC 5849 section 1.2 authenticated request example.
         let params = [
-            ("file", "vacation.jpg"), ("size", "original"),
-            ("oauth_consumer_key", "dpf43f3p2l4k3l03"), ("oauth_token", "nnch734d00sl2jdk"),
-            ("oauth_signature_method", "HMAC-SHA1"), ("oauth_timestamp", "137131202"), ("oauth_nonce", "chapoH"),
+            ("file", "vacation.jpg"),
+            ("size", "original"),
+            ("oauth_consumer_key", "dpf43f3p2l4k3l03"),
+            ("oauth_token", "nnch734d00sl2jdk"),
+            ("oauth_signature_method", "HMAC-SHA1"),
+            ("oauth_timestamp", "137131202"),
+            ("oauth_nonce", "chapoH"),
         ];
-        assert_eq!(oauth1_signature("GET", "http://photos.example.net/photos", &params, "kd94hf93k423kf44", Some("pfkkdhi9sl3r4s00")),
-            "MdpQcU8iPSUjWoN/UDMsK2sui9I=");
+        assert_eq!(
+            oauth1_signature(
+                "GET",
+                "http://photos.example.net/photos",
+                &params,
+                "kd94hf93k423kf44",
+                Some("pfkkdhi9sl3r4s00")
+            ),
+            "MdpQcU8iPSUjWoN/UDMsK2sui9I="
+        );
     }
 
     #[test]
     fn wallabag_refreshes_only_when_needed() {
         let now = Utc::now();
         assert!(wallabag_token_needs_refresh(None, None, true, now));
-        assert!(wallabag_token_needs_refresh(None, Some(now + Duration::hours(1)), true, now));
+        assert!(wallabag_token_needs_refresh(
+            None,
+            Some(now + Duration::hours(1)),
+            true,
+            now
+        ));
         // Unknown expiry: refresh once if we can (the refresh records an expiry), else use as-is.
         assert!(wallabag_token_needs_refresh(Some("t"), None, true, now));
         assert!(!wallabag_token_needs_refresh(Some("t"), None, false, now));
-        assert!(!wallabag_token_needs_refresh(Some("t"), Some(now + Duration::hours(1)), true, now));
-        assert!(wallabag_token_needs_refresh(Some("t"), Some(now + Duration::minutes(2)), true, now));
-        assert!(wallabag_token_needs_refresh(Some("t"), Some(now - Duration::minutes(1)), true, now));
+        assert!(!wallabag_token_needs_refresh(
+            Some("t"),
+            Some(now + Duration::hours(1)),
+            true,
+            now
+        ));
+        assert!(wallabag_token_needs_refresh(
+            Some("t"),
+            Some(now + Duration::minutes(2)),
+            true,
+            now
+        ));
+        assert!(wallabag_token_needs_refresh(
+            Some("t"),
+            Some(now - Duration::minutes(1)),
+            true,
+            now
+        ));
     }
 
     #[test]
     fn escape_html_and_safe_href() {
-        assert_eq!(escape_html(r#"<a href="x">'&'</a>"#), "&lt;a href=&quot;x&quot;&gt;&#39;&amp;&#39;&lt;/a&gt;");
-        assert_eq!(safe_href("https://ex.com/?a=1&b=2"), "https://ex.com/?a=1&b=2");
+        assert_eq!(
+            escape_html(r#"<a href="x">'&'</a>"#),
+            "&lt;a href=&quot;x&quot;&gt;&#39;&amp;&#39;&lt;/a&gt;"
+        );
+        assert_eq!(
+            safe_href("https://ex.com/?a=1&b=2"),
+            "https://ex.com/?a=1&b=2"
+        );
         assert_eq!(safe_href("javascript:alert(1)"), "#");
         assert_eq!(safe_href(" JavaScript:alert(1)"), "#");
     }
@@ -2991,11 +3700,20 @@ mod tests {
     async fn html_export_escapes_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let conv = ArticleConverter::new(dir.path().to_path_buf());
-        let content = ArticleContent { html: "<p>body</p>".into(), images: Vec::new(), styles: None };
-        let path = conv.convert(&hostile_article(), &content, ArticleFormat::Html).await.unwrap();
+        let content = ArticleContent {
+            html: "<p>body</p>".into(),
+            images: Vec::new(),
+            styles: None,
+        };
+        let path = conv
+            .convert(&hostile_article(), &content, ArticleFormat::Html)
+            .await
+            .unwrap();
         let html = std::fs::read_to_string(path).unwrap();
         assert!(!html.contains("<script>"));
-        assert!(html.contains("<title>&lt;/title&gt;&lt;script&gt;alert(1)&lt;/script&gt;</title>"));
+        assert!(
+            html.contains("<title>&lt;/title&gt;&lt;script&gt;alert(1)&lt;/script&gt;</title>")
+        );
         assert!(html.contains("By A &amp; B &lt;x&gt;"));
         assert!(html.contains(r#"href="https://ex.com/?q=&quot;&gt;&lt;script&gt;""#));
         assert!(html.contains("<p>body</p>"));
@@ -3003,7 +3721,11 @@ mod tests {
 
     #[test]
     fn epub_xhtml_escapes_metadata() {
-        let content = ArticleContent { html: "<p>body</p>".into(), images: Vec::new(), styles: None };
+        let content = ArticleContent {
+            html: "<p>body</p>".into(),
+            images: Vec::new(),
+            styles: None,
+        };
         let xhtml = ArticleConverter::epub_content_xhtml(&hostile_article(), &content);
         assert!(!xhtml.contains("<script>"));
         assert!(xhtml.contains(r#"href="https://ex.com/?q=&quot;&gt;&lt;script&gt;""#));
@@ -3030,7 +3752,10 @@ mod tests {
         assert!(a.synced_to_device);
         assert_eq!(a.document_id.as_deref(), Some("doc"));
         assert!(mgr.get_article("id-2").is_none());
-        let rows: i64 = mgr.db.query_row("SELECT COUNT(*) FROM readlater_articles", [], |r| r.get(0)).unwrap();
+        let rows: i64 = mgr
+            .db
+            .query_row("SELECT COUNT(*) FROM readlater_articles", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(rows, 1);
 
         // Reloading from disk yields the same single article.
@@ -3042,12 +3767,26 @@ mod tests {
 
     #[test]
     fn select_articles_applies_max_articles_newest_first() {
-        let articles: Vec<Article> = (0..10).map(|i| article(&format!("id{i}"), &format!("p{i}"), i * 100)).collect();
-        let mut settings = SyncSettings { max_articles: 3, ..SyncSettings::default() };
+        let articles: Vec<Article> = (0..10)
+            .map(|i| article(&format!("id{i}"), &format!("p{i}"), i * 100))
+            .collect();
+        let mut settings = SyncSettings {
+            max_articles: 3,
+            ..SyncSettings::default()
+        };
         let picked = select_articles_for_sync(articles.clone(), &settings);
-        assert_eq!(picked.iter().map(|a| a.provider_id.as_str()).collect::<Vec<_>>(), ["p9", "p8", "p7"]);
+        assert_eq!(
+            picked
+                .iter()
+                .map(|a| a.provider_id.as_str())
+                .collect::<Vec<_>>(),
+            ["p9", "p8", "p7"]
+        );
         settings.max_articles = 0;
-        assert_eq!(select_articles_for_sync(articles.clone(), &settings).len(), 10);
+        assert_eq!(
+            select_articles_for_sync(articles.clone(), &settings).len(),
+            10
+        );
         // Filters apply before the cap.
         settings.max_articles = 2;
         settings.include_favorites_only = true;
@@ -3056,16 +3795,46 @@ mod tests {
         favs[2].favorite = true;
         favs[3].favorite = true;
         let picked = select_articles_for_sync(favs, &settings);
-        assert_eq!(picked.iter().map(|a| a.provider_id.as_str()).collect::<Vec<_>>(), ["p3", "p2"]);
+        assert_eq!(
+            picked
+                .iter()
+                .map(|a| a.provider_id.as_str())
+                .collect::<Vec<_>>(),
+            ["p3", "p2"]
+        );
     }
 
     #[test]
     fn select_articles_tag_filters_require_include_and_honor_exclude() {
-        let tagged = |p: &str, tags: &[&str]| { let mut a = article(p, p, 0); a.tags = tags.iter().map(|t| t.to_string()).collect(); a };
-        let articles = vec![tagged("none", &[]), tagged("inc", &["Rust"]), tagged("both", &["rust", "skip"]), tagged("exc", &["skip"]), tagged("other", &["go"])];
-        let filter = |tag: &str, include: bool| TagFilter { tag: tag.into(), include };
-        let ids = |settings: &SyncSettings| { let mut v: Vec<String> = select_articles_for_sync(articles.clone(), settings).into_iter().map(|a| a.provider_id).collect(); v.sort(); v };
-        let mut settings = SyncSettings { max_articles: 0, tag_filters: vec![filter("rust", true), filter("skip", false)], ..SyncSettings::default() };
+        let tagged = |p: &str, tags: &[&str]| {
+            let mut a = article(p, p, 0);
+            a.tags = tags.iter().map(|t| t.to_string()).collect();
+            a
+        };
+        let articles = vec![
+            tagged("none", &[]),
+            tagged("inc", &["Rust"]),
+            tagged("both", &["rust", "skip"]),
+            tagged("exc", &["skip"]),
+            tagged("other", &["go"]),
+        ];
+        let filter = |tag: &str, include: bool| TagFilter {
+            tag: tag.into(),
+            include,
+        };
+        let ids = |settings: &SyncSettings| {
+            let mut v: Vec<String> = select_articles_for_sync(articles.clone(), settings)
+                .into_iter()
+                .map(|a| a.provider_id)
+                .collect();
+            v.sort();
+            v
+        };
+        let mut settings = SyncSettings {
+            max_articles: 0,
+            tag_filters: vec![filter("rust", true), filter("skip", false)],
+            ..SyncSettings::default()
+        };
         assert_eq!(ids(&settings), ["inc"]);
         settings.tag_filters = vec![filter("skip", false)];
         assert_eq!(ids(&settings), ["inc", "none", "other"]);
@@ -3073,8 +3842,22 @@ mod tests {
         assert_eq!(ids(&settings), ["both", "inc", "other"]);
     }
 
-    fn test_account(id: &str, provider: ReadLaterProvider, config: ProviderConfig, last_sync: Option<DateTime<Utc>>) -> ProviderAccount {
-        ProviderAccount { id: id.into(), name: id.into(), provider, enabled: true, config, sync_settings: SyncSettings::default(), last_sync, created_at: Utc::now() }
+    fn test_account(
+        id: &str,
+        provider: ReadLaterProvider,
+        config: ProviderConfig,
+        last_sync: Option<DateTime<Utc>>,
+    ) -> ProviderAccount {
+        ProviderAccount {
+            id: id.into(),
+            name: id.into(),
+            provider,
+            enabled: true,
+            config,
+            sync_settings: SyncSettings::default(),
+            last_sync,
+            created_at: Utc::now(),
+        }
     }
 
     #[tokio::test]
@@ -3083,27 +3866,59 @@ mod tests {
         let mut mgr = ReadLaterManager::new(&dir.path().join("rl.db"), dir.path()).unwrap();
         let last = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         // Wallabag with no tokens: refresh fails, so the sync aborts before fetching.
-        let wb = ProviderConfig::Wallabag { instance_url: "http://127.0.0.1:9".into(), client_id: "c".into(), client_secret: None, access_token: None, refresh_token: None, token_expires_at: None };
-        mgr.add_account(test_account("wb", ReadLaterProvider::Wallabag, wb, Some(last))).unwrap();
+        let wb = ProviderConfig::Wallabag {
+            instance_url: "http://127.0.0.1:9".into(),
+            client_id: "c".into(),
+            client_secret: None,
+            access_token: None,
+            refresh_token: None,
+            token_expires_at: None,
+        };
+        mgr.add_account(test_account(
+            "wb",
+            ReadLaterProvider::Wallabag,
+            wb,
+            Some(last),
+        ))
+        .unwrap();
         let r = mgr.sync_account("wb").await.unwrap();
         assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
         assert!(r.errors[0].starts_with("Auth refresh"));
         assert_eq!(mgr.get_account("wb").unwrap().last_sync, Some(last));
         // Hosted Omnivore: refresh is a no-op but the fetch fails.
-        let om = ProviderConfig::Omnivore { api_key: Some("k".into()), api_url: None };
-        mgr.add_account(test_account("om", ReadLaterProvider::Omnivore, om, Some(last))).unwrap();
+        let om = ProviderConfig::Omnivore {
+            api_key: Some("k".into()),
+            api_url: None,
+        };
+        mgr.add_account(test_account(
+            "om",
+            ReadLaterProvider::Omnivore,
+            om,
+            Some(last),
+        ))
+        .unwrap();
         let r = mgr.sync_account("om").await.unwrap();
-        assert!(r.errors.iter().any(|e| e.starts_with("Fetch")), "{:?}", r.errors);
+        assert!(
+            r.errors.iter().any(|e| e.starts_with("Fetch")),
+            "{:?}",
+            r.errors
+        );
         assert_eq!(mgr.get_account("om").unwrap().last_sync, Some(last));
     }
 
     #[tokio::test]
     async fn omnivore_hosted_service_reports_discontinued() {
         let provider = OmnivoreProvider::new();
-        let config = ProviderConfig::Omnivore { api_key: Some("k".into()), api_url: None };
+        let config = ProviderConfig::Omnivore {
+            api_key: Some("k".into()),
+            api_url: None,
+        };
         let err = provider.fetch_articles(&config, None).await.unwrap_err();
         assert!(err.to_string().contains("discontinued"), "{err}");
-        let err = provider.add_article(&config, "https://ex.com", &[]).await.unwrap_err();
+        let err = provider
+            .add_article(&config, "https://ex.com", &[])
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("discontinued"), "{err}");
     }
 }

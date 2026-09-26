@@ -9,17 +9,19 @@
 //! - Scheduled fetch
 //! - OPML import/export
 
-use crate::error::{Result, ServerError};
-use crate::storage::Storage;
-use chrono::{DateTime, Utc};
-use parking_lot::{Mutex, RwLock};
-use rusqlite::{params, Connection, OptionalExtension};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use chrono::{DateTime, Utc};
+use parking_lot::{Mutex, RwLock};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use uuid::Uuid;
+
+use crate::error::{Result, ServerError};
+use crate::storage::Storage;
 
 // ============================================================================
 // Types
@@ -219,15 +221,15 @@ impl FeedManager {
     pub fn new(db_path: &Path, storage: Storage, epub_dir: &Path) -> Result<Self> {
         let conn = Connection::open(db_path)?;
         Self::init_db(&conn)?;
-        
+
         std::fs::create_dir_all(epub_dir).map_err(|e| ServerError::Storage(e))?;
-        
+
         let http_client = reqwest::Client::builder()
             .user_agent("remarkable-server/0.1 (RSS Reader)")
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| ServerError::Internal(e.to_string()))?;
-        
+
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
             storage,
@@ -236,9 +238,10 @@ impl FeedManager {
             scheduler_tx: None,
         })
     }
-    
+
     fn init_db(conn: &Connection) -> Result<()> {
-        conn.execute_batch(r#"
+        conn.execute_batch(
+            r#"
             CREATE TABLE IF NOT EXISTS subscriptions (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -288,26 +291,29 @@ impl FeedManager {
                 delete_after_sync INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (subscription_id) REFERENCES subscriptions(id) ON DELETE CASCADE
             );
-        "#)?;
+        "#,
+        )?;
         Ok(())
     }
-    
+
     // ========================================================================
     // Subscriptions CRUD
     // ========================================================================
-    
+
     /// List all subscriptions
     pub fn list_subscriptions(&self) -> Result<Vec<Subscription>> {
         let db = self.db.lock();
-        let mut stmt = db.prepare(r#"
+        let mut stmt = db.prepare(
+            r#"
             SELECT s.id, s.name, s.url, s.feed_type, s.folder, s.enabled,
                    s.fetch_interval_mins, s.last_fetch, s.last_error,
                    s.created_at, s.updated_at,
                    (SELECT COUNT(*) FROM articles WHERE subscription_id = s.id) as article_count
             FROM subscriptions s
             ORDER BY s.name
-        "#)?;
-        
+        "#,
+        )?;
+
         let rows = stmt.query_map([], |row| {
             Ok(Subscription {
                 id: row.get(0)?,
@@ -317,29 +323,40 @@ impl FeedManager {
                 folder: row.get(4)?,
                 enabled: row.get::<_, i32>(5)? != 0,
                 fetch_interval_mins: row.get(6)?,
-                last_fetch: row.get::<_, Option<String>>(7)?.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc))),
+                last_fetch: row.get::<_, Option<String>>(7)?.and_then(|s| {
+                    DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|d| d.with_timezone(&Utc))
+                }),
                 last_error: row.get(8)?,
-                created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(9)?).unwrap().with_timezone(&Utc),
-                updated_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(10)?).unwrap().with_timezone(&Utc),
+                created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(9)?)
+                    .unwrap()
+                    .with_timezone(&Utc),
+                updated_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(10)?)
+                    .unwrap()
+                    .with_timezone(&Utc),
                 article_count: row.get(11)?,
             })
         })?;
-        
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
-    
+
     /// Get a subscription by ID
     pub fn get_subscription(&self, id: &str) -> Result<Subscription> {
         let db = self.db.lock();
-        let mut stmt = db.prepare(r#"
+        let mut stmt = db.prepare(
+            r#"
             SELECT s.id, s.name, s.url, s.feed_type, s.folder, s.enabled,
                    s.fetch_interval_mins, s.last_fetch, s.last_error,
                    s.created_at, s.updated_at,
                    (SELECT COUNT(*) FROM articles WHERE subscription_id = s.id) as article_count
             FROM subscriptions s
             WHERE s.id = ?
-        "#)?;
-        
+        "#,
+        )?;
+
         stmt.query_row([id], |row| {
             Ok(Subscription {
                 id: row.get(0)?,
@@ -349,27 +366,39 @@ impl FeedManager {
                 folder: row.get(4)?,
                 enabled: row.get::<_, i32>(5)? != 0,
                 fetch_interval_mins: row.get(6)?,
-                last_fetch: row.get::<_, Option<String>>(7)?.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc))),
+                last_fetch: row.get::<_, Option<String>>(7)?.and_then(|s| {
+                    DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|d| d.with_timezone(&Utc))
+                }),
                 last_error: row.get(8)?,
-                created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(9)?).unwrap().with_timezone(&Utc),
-                updated_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(10)?).unwrap().with_timezone(&Utc),
+                created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(9)?)
+                    .unwrap()
+                    .with_timezone(&Utc),
+                updated_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(10)?)
+                    .unwrap()
+                    .with_timezone(&Utc),
                 article_count: row.get(11)?,
             })
-        }).map_err(|_| ServerError::NotFound(format!("Subscription {}", id)))
+        })
+        .map_err(|_| ServerError::NotFound(format!("Subscription {}", id)))
     }
-    
+
     /// Create a new subscription
-    pub async fn create_subscription(&self, req: CreateSubscriptionRequest) -> Result<Subscription> {
+    pub async fn create_subscription(
+        &self,
+        req: CreateSubscriptionRequest,
+    ) -> Result<Subscription> {
         // Auto-detect feed type and title if not provided
         let (feed_type, detected_title) = self.detect_feed(&req.url).await?;
         let feed_type = req.feed_type.unwrap_or(feed_type);
         let name = req.name.unwrap_or(detected_title);
-        
+
         let now = Utc::now();
         let id = Uuid::new_v4().to_string();
         let folder = req.folder.unwrap_or_default();
         let fetch_interval = req.fetch_interval_mins.unwrap_or(60);
-        
+
         {
             let db = self.db.lock();
             db.execute(
@@ -378,10 +407,10 @@ impl FeedManager {
                 params![id, name, req.url, feed_type.to_string(), folder, fetch_interval, now.to_rfc3339(), now.to_rfc3339()]
             )?;
         }
-        
+
         self.get_subscription(&id)
     }
-    
+
     /// Delete a subscription
     pub fn delete_subscription(&self, id: &str) -> Result<()> {
         let db = self.db.lock();
@@ -391,17 +420,33 @@ impl FeedManager {
         }
         Ok(())
     }
-    
+
     /// Update subscription settings
-    pub fn update_subscription(&self, id: &str, updates: serde_json::Value) -> Result<Subscription> {
+    pub fn update_subscription(
+        &self,
+        id: &str,
+        updates: serde_json::Value,
+    ) -> Result<Subscription> {
         let current = self.get_subscription(id)?;
         let now = Utc::now();
-        
-        let name = updates.get("name").and_then(|v| v.as_str()).unwrap_or(&current.name);
-        let folder = updates.get("folder").and_then(|v| v.as_str()).unwrap_or(&current.folder);
-        let enabled = updates.get("enabled").and_then(|v| v.as_bool()).unwrap_or(current.enabled);
-        let interval = updates.get("fetchIntervalMins").and_then(|v| v.as_u64()).unwrap_or(current.fetch_interval_mins as u64) as u32;
-        
+
+        let name = updates
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&current.name);
+        let folder = updates
+            .get("folder")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&current.folder);
+        let enabled = updates
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(current.enabled);
+        let interval = updates
+            .get("fetchIntervalMins")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(current.fetch_interval_mins as u64) as u32;
+
         {
             let db = self.db.lock();
             db.execute(
@@ -409,28 +454,35 @@ impl FeedManager {
                 params![name, folder, enabled as i32, interval, now.to_rfc3339(), id]
             )?;
         }
-        
+
         self.get_subscription(id)
     }
-    
+
     // ========================================================================
     // Feed Detection & Parsing
     // ========================================================================
-    
+
     /// Detect feed type from URL
     async fn detect_feed(&self, url: &str) -> Result<(FeedType, String)> {
-        let response = self.http_client.get(url).send().await
+        let response = self
+            .http_client
+            .get(url)
+            .send()
+            .await
             .map_err(|e| ServerError::Internal(format!("Failed to fetch feed: {}", e)))?;
-        
-        let content_type = response.headers()
+
+        let content_type = response
+            .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_owned();
-        
-        let body = response.text().await
+
+        let body = response
+            .text()
+            .await
             .map_err(|e| ServerError::Internal(format!("Failed to read feed: {}", e)))?;
-        
+
         // Try parsing as RSS/Atom
         match feed_rs::parser::parse(body.as_bytes()) {
             Ok(feed) => {
@@ -439,7 +491,10 @@ impl FeedManager {
                 } else {
                     FeedType::Rss
                 };
-                let title = feed.title.map(|t| t.content).unwrap_or_else(|| "Untitled Feed".to_string());
+                let title = feed
+                    .title
+                    .map(|t| t.content)
+                    .unwrap_or_else(|| "Untitled Feed".to_string());
                 Ok((feed_type, title))
             }
             Err(_) => {
@@ -451,7 +506,7 @@ impl FeedManager {
             }
         }
     }
-    
+
     /// Find feed link in HTML page
     fn find_feed_link(&self, html: &str) -> Option<String> {
         // Simple regex-free extraction
@@ -467,42 +522,58 @@ impl FeedManager {
         }
         None
     }
-    
+
     /// Fetch and parse a feed
     async fn fetch_feed(&self, subscription: &Subscription) -> Result<Vec<Article>> {
-        let response = self.http_client.get(&subscription.url).send().await
+        let response = self
+            .http_client
+            .get(&subscription.url)
+            .send()
+            .await
             .map_err(|e| ServerError::Internal(format!("Failed to fetch feed: {}", e)))?;
-        
-        let body = response.bytes().await
+
+        let body = response
+            .bytes()
+            .await
             .map_err(|e| ServerError::Internal(format!("Failed to read feed: {}", e)))?;
-        
+
         let feed = feed_rs::parser::parse(&body[..])
             .map_err(|e| ServerError::Internal(format!("Failed to parse feed: {}", e)))?;
-        
+
         let now = Utc::now();
         let mut articles = Vec::new();
-        
+
         for entry in feed.entries {
             let id = Uuid::new_v4().to_string();
-            let url = entry.links.first().map(|l| l.href.clone()).unwrap_or_default();
-            
+            let url = entry
+                .links
+                .first()
+                .map(|l| l.href.clone())
+                .unwrap_or_default();
+
             // Skip if we already have this article
             if self.article_exists_by_url(&subscription.id, &url)? {
                 continue;
             }
-            
-            let content_html = entry.content
+
+            let content_html = entry
+                .content
                 .and_then(|c| c.body)
                 .or_else(|| entry.summary.as_ref().map(|s| s.content.clone()));
-            
+
             let content_text = content_html.as_ref().map(|h| strip_html(h));
-            let word_count = content_text.as_ref().map(|t| t.split_whitespace().count() as u32);
+            let word_count = content_text
+                .as_ref()
+                .map(|t| t.split_whitespace().count() as u32);
             let reading_time = word_count.map(|w| (w / 200).max(1));
-            
+
             articles.push(Article {
                 id,
                 subscription_id: subscription.id.clone(),
-                title: entry.title.map(|t| t.content).unwrap_or_else(|| "Untitled".to_string()),
+                title: entry
+                    .title
+                    .map(|t| t.content)
+                    .unwrap_or_else(|| "Untitled".to_string()),
                 url,
                 author: entry.authors.first().map(|a| a.name.clone()),
                 summary: entry.summary.map(|s| s.content),
@@ -517,39 +588,46 @@ impl FeedManager {
                 reading_time_mins: reading_time,
             });
         }
-        
+
         Ok(articles)
     }
-    
+
     fn article_exists_by_url(&self, subscription_id: &str, url: &str) -> Result<bool> {
         let db = self.db.lock();
         let count: i32 = db.query_row(
             "SELECT COUNT(*) FROM articles WHERE subscription_id = ? AND url = ?",
             params![subscription_id, url],
-            |row| row.get(0)
+            |row| row.get(0),
         )?;
         Ok(count > 0)
     }
-    
+
     // ========================================================================
     // Article Extraction (Readability)
     // ========================================================================
-    
+
     /// Extract article content using readability
     pub async fn extract_article(&self, url: &str) -> Result<ExtractedArticle> {
-        let response = self.http_client.get(url).send().await
+        let response = self
+            .http_client
+            .get(url)
+            .send()
+            .await
             .map_err(|e| ServerError::Internal(format!("Failed to fetch article: {}", e)))?;
-        
-        let html = response.text().await
+
+        let html = response
+            .text()
+            .await
             .map_err(|e| ServerError::Internal(format!("Failed to read article: {}", e)))?;
-        
+
         // Use readability to extract main content
-        let extracted = readability::extractor::extract(&mut html.as_bytes(), &url.parse().unwrap())
-            .map_err(|e| ServerError::Internal(format!("Failed to extract article: {}", e)))?;
-        
+        let extracted =
+            readability::extractor::extract(&mut html.as_bytes(), &url.parse().unwrap())
+                .map_err(|e| ServerError::Internal(format!("Failed to extract article: {}", e)))?;
+
         let text = strip_html(&extracted.content);
         let word_count = text.split_whitespace().count() as u32;
-        
+
         Ok(ExtractedArticle {
             title: extracted.title,
             content_html: extracted.content,
@@ -558,26 +636,30 @@ impl FeedManager {
             reading_time_mins: (word_count / 200).max(1),
         })
     }
-    
+
     // ========================================================================
     // EPUB Generation
     // ========================================================================
-    
+
     /// Convert an article to EPUB
     pub fn article_to_epub(&self, article: &Article) -> Result<PathBuf> {
         let safe_title = sanitize_filename(&article.title);
-        let epub_path = self.epub_dir.join(format!("{}_{}.epub", safe_title, &article.id[..8]));
-        
-        let mut builder = epub_builder::EpubBuilder::new(epub_builder::ZipLibrary::new().unwrap()).unwrap();
-        
+        let epub_path = self
+            .epub_dir
+            .join(format!("{}_{}.epub", safe_title, &article.id[..8]));
+
+        let mut builder =
+            epub_builder::EpubBuilder::new(epub_builder::ZipLibrary::new().unwrap()).unwrap();
+
         builder.metadata("title", &article.title).unwrap();
         if let Some(ref author) = article.author {
             builder.metadata("author", author).unwrap();
         }
         builder.metadata("generator", "remarkable-server").unwrap();
-        
+
         // Build XHTML content
-        let content = format!(r#"<?xml version="1.0" encoding="UTF-8"?>
+        let content = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml">
 <head>
@@ -599,25 +681,43 @@ impl FeedManager {
 </html>"#,
             html_escape(&article.title),
             html_escape(&article.title),
-            article.author.as_ref().map(|a| format!("By {} • ", html_escape(a))).unwrap_or_default(),
-            article.published_at.map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default(),
-            article.content_html.as_deref().unwrap_or("<p>No content available.</p>")
+            article
+                .author
+                .as_ref()
+                .map(|a| format!("By {} • ", html_escape(a)))
+                .unwrap_or_default(),
+            article
+                .published_at
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .unwrap_or_default(),
+            article
+                .content_html
+                .as_deref()
+                .unwrap_or("<p>No content available.</p>")
         );
-        
-        builder.add_content(
-            epub_builder::EpubContent::new("content.xhtml", content.as_bytes())
-                .title(&article.title)
-        ).unwrap();
-        
+
+        builder
+            .add_content(
+                epub_builder::EpubContent::new("content.xhtml", content.as_bytes())
+                    .title(&article.title),
+            )
+            .unwrap();
+
         let mut file = std::fs::File::create(&epub_path)?;
-        builder.generate(&mut file).map_err(|e| ServerError::Internal(format!("EPUB generation failed: {:?}", e)))?;
-        
+        builder
+            .generate(&mut file)
+            .map_err(|e| ServerError::Internal(format!("EPUB generation failed: {:?}", e)))?;
+
         Ok(epub_path)
     }
-    
+
     /// Sync unsynced articles (of `subscription_id`, or all when `None`) as EPUBs
     /// into the device folder `folder` (see [`crate::documents::ensure_folder`]).
-    pub fn sync_articles_to_folder(&self, subscription_id: Option<&str>, folder: &str) -> Result<u32> {
+    pub fn sync_articles_to_folder(
+        &self,
+        subscription_id: Option<&str>,
+        folder: &str,
+    ) -> Result<u32> {
         let articles = self.list_articles(ArticleQuery {
             subscription_id: subscription_id.map(String::from),
             unsynced: Some(true),
@@ -627,7 +727,7 @@ impl FeedManager {
             return Ok(0);
         }
         let parent = crate::documents::ensure_folder(&self.storage, folder)?;
-        
+
         let mut synced = 0;
         for article in articles {
             // Generate EPUB if not exists
@@ -638,74 +738,96 @@ impl FeedManager {
                 self.update_article_epub(&article.id, &path)?;
                 path
             };
-            
+
             // Add to the sync tree as a real document so the device pulls it.
             let epub_data = std::fs::read(&epub_path)?;
-            let (doc_id, _) = crate::documents::create_document_in(&self.storage, &article.title, "epub", &epub_data, &parent)?;
-            tracing::info!("Feed article {:?} ({}) synced as document {}", article.title, folder, doc_id);
-            
+            let (doc_id, _) = crate::documents::create_document_in(
+                &self.storage,
+                &article.title,
+                "epub",
+                &epub_data,
+                &parent,
+            )?;
+            tracing::info!(
+                "Feed article {:?} ({}) synced as document {}",
+                article.title,
+                folder,
+                doc_id
+            );
+
             // Mark as synced
             self.mark_article_synced(&article.id)?;
             synced += 1;
         }
-        
+
         Ok(synced)
     }
-    
+
     fn update_article_epub(&self, article_id: &str, path: &Path) -> Result<()> {
         let db = self.db.lock();
         db.execute(
             "UPDATE articles SET epub_path = ? WHERE id = ?",
-            params![path.to_string_lossy(), article_id]
+            params![path.to_string_lossy(), article_id],
         )?;
         Ok(())
     }
-    
+
     fn mark_article_synced(&self, article_id: &str) -> Result<()> {
         let db = self.db.lock();
         db.execute("UPDATE articles SET synced = 1 WHERE id = ?", [article_id])?;
         Ok(())
     }
-    
+
     // ========================================================================
     // Articles CRUD
     // ========================================================================
-    
+
     /// List articles with optional filtering
     pub fn list_articles(&self, query: ArticleQuery) -> Result<Vec<Article>> {
         let db = self.db.lock();
-        
-        let mut sql = String::from(r#"
+
+        let mut sql = String::from(
+            r#"
             SELECT id, subscription_id, title, url, author, summary, content_html, content_text,
                    published_at, fetched_at, read, synced, epub_path, word_count
             FROM articles WHERE 1=1
-        "#);
-        
+        "#,
+        );
+
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        
+
         if let Some(ref sub_id) = query.subscription_id {
             sql.push_str(" AND subscription_id = ?");
             params_vec.push(Box::new(sub_id.clone()));
         }
         if let Some(unread) = query.unread {
-            sql.push_str(if unread { " AND read = 0" } else { " AND read = 1" });
+            sql.push_str(if unread {
+                " AND read = 0"
+            } else {
+                " AND read = 1"
+            });
         }
         if let Some(unsynced) = query.unsynced {
-            sql.push_str(if unsynced { " AND synced = 0" } else { " AND synced = 1" });
+            sql.push_str(if unsynced {
+                " AND synced = 0"
+            } else {
+                " AND synced = 1"
+            });
         }
-        
+
         sql.push_str(" ORDER BY published_at DESC, fetched_at DESC");
-        
+
         if let Some(limit) = query.limit {
             sql.push_str(&format!(" LIMIT {}", limit));
         }
         if let Some(offset) = query.offset {
             sql.push_str(&format!(" OFFSET {}", offset));
         }
-        
+
         let mut stmt = db.prepare(&sql)?;
-        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
-        
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+
         let rows = stmt.query_map(params_refs.as_slice(), |row| {
             let word_count: Option<u32> = row.get(13)?;
             Ok(Article {
@@ -717,8 +839,14 @@ impl FeedManager {
                 summary: row.get(5)?,
                 content_html: row.get(6)?,
                 content_text: row.get(7)?,
-                published_at: row.get::<_, Option<String>>(8)?.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc))),
-                fetched_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(9)?).unwrap().with_timezone(&Utc),
+                published_at: row.get::<_, Option<String>>(8)?.and_then(|s| {
+                    DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|d| d.with_timezone(&Utc))
+                }),
+                fetched_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(9)?)
+                    .unwrap()
+                    .with_timezone(&Utc),
                 read: row.get::<_, i32>(10)? != 0,
                 synced: row.get::<_, i32>(11)? != 0,
                 epub_path: row.get(12)?,
@@ -726,19 +854,22 @@ impl FeedManager {
                 reading_time_mins: word_count.map(|w| (w / 200).max(1)),
             })
         })?;
-        
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
-    
+
     /// Get a single article
     pub fn get_article(&self, id: &str) -> Result<Article> {
         let db = self.db.lock();
-        let mut stmt = db.prepare(r#"
+        let mut stmt = db.prepare(
+            r#"
             SELECT id, subscription_id, title, url, author, summary, content_html, content_text,
                    published_at, fetched_at, read, synced, epub_path, word_count
             FROM articles WHERE id = ?
-        "#)?;
-        
+        "#,
+        )?;
+
         stmt.query_row([id], |row| {
             let word_count: Option<u32> = row.get(13)?;
             Ok(Article {
@@ -750,29 +881,39 @@ impl FeedManager {
                 summary: row.get(5)?,
                 content_html: row.get(6)?,
                 content_text: row.get(7)?,
-                published_at: row.get::<_, Option<String>>(8)?.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc))),
-                fetched_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(9)?).unwrap().with_timezone(&Utc),
+                published_at: row.get::<_, Option<String>>(8)?.and_then(|s| {
+                    DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|d| d.with_timezone(&Utc))
+                }),
+                fetched_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(9)?)
+                    .unwrap()
+                    .with_timezone(&Utc),
                 read: row.get::<_, i32>(10)? != 0,
                 synced: row.get::<_, i32>(11)? != 0,
                 epub_path: row.get(12)?,
                 word_count,
                 reading_time_mins: word_count.map(|w| (w / 200).max(1)),
             })
-        }).map_err(|_| ServerError::NotFound(format!("Article {}", id)))
+        })
+        .map_err(|_| ServerError::NotFound(format!("Article {}", id)))
     }
-    
+
     /// Mark article as read
     pub fn mark_read(&self, id: &str, read: bool) -> Result<()> {
         let db = self.db.lock();
-        db.execute("UPDATE articles SET read = ? WHERE id = ?", params![read as i32, id])?;
+        db.execute(
+            "UPDATE articles SET read = ? WHERE id = ?",
+            params![read as i32, id],
+        )?;
         Ok(())
     }
-    
+
     /// Save articles to database
     fn save_articles(&self, articles: &[Article]) -> Result<u32> {
         let db = self.db.lock();
         let mut saved = 0;
-        
+
         for article in articles {
             let result = db.execute(
                 r#"INSERT OR IGNORE INTO articles 
@@ -794,32 +935,39 @@ impl FeedManager {
                     article.synced as i32,
                     article.epub_path,
                     article.word_count
-                ]
+                ],
             )?;
-            if result > 0 { saved += 1; }
+            if result > 0 {
+                saved += 1;
+            }
         }
-        
+
         Ok(saved)
     }
-    
+
     // ========================================================================
     // Refresh & Scheduling
     // ========================================================================
-    
+
     /// Refresh subscriptions
     pub async fn refresh(&self, req: RefreshRequest) -> Result<RefreshResponse> {
         let subscriptions = if let Some(ref ids) = req.subscription_ids {
-            ids.iter().filter_map(|id| self.get_subscription(id).ok()).collect()
+            ids.iter()
+                .filter_map(|id| self.get_subscription(id).ok())
+                .collect()
         } else {
-            self.list_subscriptions()?.into_iter().filter(|s| s.enabled).collect::<Vec<_>>()
+            self.list_subscriptions()?
+                .into_iter()
+                .filter(|s| s.enabled)
+                .collect::<Vec<_>>()
         };
-        
+
         let mut response = RefreshResponse {
             refreshed: 0,
             new_articles: 0,
             errors: Vec::new(),
         };
-        
+
         for sub in subscriptions {
             // Skip if not due yet (unless forced)
             if !req.force_all.unwrap_or(false) {
@@ -830,7 +978,7 @@ impl FeedManager {
                     }
                 }
             }
-            
+
             match self.fetch_feed(&sub).await {
                 Ok(articles) => {
                     let new_count = self.save_articles(&articles)?;
@@ -847,27 +995,28 @@ impl FeedManager {
                 }
             }
         }
-        
+
         Ok(response)
     }
-    
+
     fn update_last_fetch(&self, subscription_id: &str, error: Option<&str>) -> Result<()> {
         let db = self.db.lock();
         let now = Utc::now().to_rfc3339();
         db.execute(
             "UPDATE subscriptions SET last_fetch = ?, last_error = ?, updated_at = ? WHERE id = ?",
-            params![now, error, now, subscription_id]
+            params![now, error, now, subscription_id],
         )?;
         Ok(())
     }
-    
+
     /// Start background scheduler
     pub fn start_scheduler(self: Arc<Self>, interval_secs: u64) -> mpsc::Sender<SchedulerCommand> {
         let (tx, mut rx) = mpsc::channel::<SchedulerCommand>(32);
         let manager = self.clone();
-        
+
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
@@ -889,19 +1038,19 @@ impl FeedManager {
                 }
             }
         });
-        
+
         tx
     }
-    
+
     // ========================================================================
     // OPML Import/Export
     // ========================================================================
-    
+
     /// Import subscriptions from OPML
     pub async fn import_opml(&self, opml_content: &str) -> Result<Vec<Subscription>> {
         let doc = parse_opml(opml_content)?;
         let mut imported = Vec::new();
-        
+
         for outline in flatten_outlines(&doc.outlines) {
             if let Some(url) = outline.xml_url {
                 let req = CreateSubscriptionRequest {
@@ -921,32 +1070,36 @@ impl FeedManager {
                 }
             }
         }
-        
+
         Ok(imported)
     }
-    
+
     /// Export subscriptions to OPML
     pub fn export_opml(&self) -> Result<String> {
         let subscriptions = self.list_subscriptions()?;
         let now = Utc::now();
-        
-        let mut opml = String::from(r#"<?xml version="1.0" encoding="UTF-8"?>
+
+        let mut opml = String::from(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <opml version="2.0">
 <head>
     <title>remarkable-server feeds</title>
-    <dateCreated>"#);
+    <dateCreated>"#,
+        );
         opml.push_str(&now.to_rfc2822());
-        opml.push_str(r#"</dateCreated>
+        opml.push_str(
+            r#"</dateCreated>
 </head>
 <body>
-"#);
-        
+"#,
+        );
+
         // Group by folder
         let mut by_folder: HashMap<String, Vec<&Subscription>> = HashMap::new();
         for sub in &subscriptions {
             by_folder.entry(sub.folder.clone()).or_default().push(sub);
         }
-        
+
         for (folder, subs) in by_folder {
             if folder.is_empty() {
                 for sub in subs {
@@ -959,8 +1112,11 @@ impl FeedManager {
                     ));
                 }
             } else {
-                opml.push_str(&format!(r#"    <outline text="{}">
-"#, html_escape(&folder)));
+                opml.push_str(&format!(
+                    r#"    <outline text="{}">
+"#,
+                    html_escape(&folder)
+                ));
                 for sub in subs {
                     opml.push_str(&format!(
                         r#"        <outline text="{}" type="{}" xmlUrl="{}" />
@@ -970,39 +1126,51 @@ impl FeedManager {
                         html_escape(&sub.url)
                     ));
                 }
-                opml.push_str("    </outline>
-");
+                opml.push_str(
+                    "    </outline>
+",
+                );
             }
         }
-        
-        opml.push_str("</body>
-</opml>");
+
+        opml.push_str(
+            "</body>
+</opml>",
+        );
         Ok(opml)
     }
-    
+
     // ========================================================================
     // Statistics
     // ========================================================================
-    
+
     /// Get feed statistics
     pub fn stats(&self) -> Result<FeedStats> {
         let db = self.db.lock();
-        
-        let subscription_count: u32 = db.query_row("SELECT COUNT(*) FROM subscriptions", [], |r| r.get(0))?;
+
+        let subscription_count: u32 =
+            db.query_row("SELECT COUNT(*) FROM subscriptions", [], |r| r.get(0))?;
         let article_count: u32 = db.query_row("SELECT COUNT(*) FROM articles", [], |r| r.get(0))?;
-        let unread_count: u32 = db.query_row("SELECT COUNT(*) FROM articles WHERE read = 0", [], |r| r.get(0))?;
-        let unsynced_count: u32 = db.query_row("SELECT COUNT(*) FROM articles WHERE synced = 0", [], |r| r.get(0))?;
-        
+        let unread_count: u32 =
+            db.query_row("SELECT COUNT(*) FROM articles WHERE read = 0", [], |r| {
+                r.get(0)
+            })?;
+        let unsynced_count: u32 =
+            db.query_row("SELECT COUNT(*) FROM articles WHERE synced = 0", [], |r| {
+                r.get(0)
+            })?;
+
         // Calculate total EPUB size
         let total_epub_bytes = std::fs::read_dir(&self.epub_dir)
             .map(|entries| {
-                entries.filter_map(|e| e.ok())
+                entries
+                    .filter_map(|e| e.ok())
                     .filter_map(|e| e.metadata().ok())
                     .map(|m| m.len())
                     .sum()
             })
             .unwrap_or(0);
-        
+
         Ok(FeedStats {
             subscription_count,
             article_count,
@@ -1053,58 +1221,75 @@ impl FeedManager {
         )?;
         Ok(())
     }
-    
+
     /// Fetch newsletters from IMAP
     pub async fn fetch_newsletters(&self, subscription_id: &str) -> Result<Vec<Article>> {
         let config = self.get_imap_config(subscription_id)?;
         let mut articles = Vec::new();
-        
+
         // Connect to IMAP: implicit TLS when `tls` is set, otherwise STARTTLS (never plaintext).
-        let mode = if config.tls { imap::ConnectionMode::Tls } else { imap::ConnectionMode::StartTls };
+        let mode = if config.tls {
+            imap::ConnectionMode::Tls
+        } else {
+            imap::ConnectionMode::StartTls
+        };
         let client = imap::ClientBuilder::new(config.host.as_str(), config.port)
             .mode(mode)
             .connect()
             .map_err(|e| ServerError::Internal(format!("IMAP connect error: {}", e)))?;
 
-        let mut session = client.login(&config.username, &config.password)
+        let mut session = client
+            .login(&config.username, &config.password)
             .map_err(|(e, _)| ServerError::Internal(format!("IMAP login error: {}", e)))?;
-        
-        session.select(&config.mailbox)
+
+        session
+            .select(&config.mailbox)
             .map_err(|e| ServerError::Internal(format!("IMAP select error: {}", e)))?;
-        
+
         // Fetch unread messages
-        let uids = session.uid_search("UNSEEN")
+        let uids = session
+            .uid_search("UNSEEN")
             .map_err(|e| ServerError::Internal(format!("IMAP search error: {}", e)))?;
-        
+
         let now = Utc::now();
-        
+
         for uid in uids {
-            let messages = session.uid_fetch(uid.to_string(), "(RFC822 ENVELOPE)")
+            let messages = session
+                .uid_fetch(uid.to_string(), "(RFC822 ENVELOPE)")
                 .map_err(|e| ServerError::Internal(format!("IMAP fetch error: {}", e)))?;
-            
+
             for message in messages.iter() {
                 if let Some(body) = message.body() {
                     let parsed = mailparse::parse_mail(body)
                         .map_err(|e| ServerError::Internal(format!("Mail parse error: {}", e)))?;
-                    
-                    let subject = parsed.headers.iter()
+
+                    let subject = parsed
+                        .headers
+                        .iter()
                         .find(|h| h.get_key_ref() == "Subject")
                         .map(|h| h.get_value())
                         .unwrap_or_else(|| "No Subject".to_string());
-                    
-                    let from = parsed.headers.iter()
+
+                    let from = parsed
+                        .headers
+                        .iter()
                         .find(|h| h.get_key_ref() == "From")
                         .map(|h| h.get_value());
-                    
+
                     let content_html = extract_html_body(&parsed);
                     let content_text = content_html.as_ref().map(|h| strip_html(h));
-                    let word_count = content_text.as_ref().map(|t| t.split_whitespace().count() as u32);
-                    
+                    let word_count = content_text
+                        .as_ref()
+                        .map(|t| t.split_whitespace().count() as u32);
+
                     articles.push(Article {
                         id: Uuid::new_v4().to_string(),
                         subscription_id: subscription_id.to_string(),
                         title: subject,
-                        url: format!("imap://{}:{}/{}/{}", config.host, config.port, config.mailbox, uid),
+                        url: format!(
+                            "imap://{}:{}/{}/{}",
+                            config.host, config.port, config.mailbox, uid
+                        ),
                         author: from,
                         summary: None,
                         content_html,
@@ -1118,24 +1303,26 @@ impl FeedManager {
                         reading_time_mins: word_count.map(|w| (w / 200).max(1)),
                     });
                 }
-                
+
                 // Mark as read and optionally delete
                 if config.delete_after_sync {
-                    session.uid_store(uid.to_string(), "+FLAGS (\\Deleted)").ok();
+                    session
+                        .uid_store(uid.to_string(), "+FLAGS (\\Deleted)")
+                        .ok();
                 } else {
                     session.uid_store(uid.to_string(), "+FLAGS (\\Seen)").ok();
                 }
             }
         }
-        
+
         if config.delete_after_sync {
             session.expunge().ok();
         }
-        
+
         session.logout().ok();
         Ok(articles)
     }
-    
+
     fn get_imap_config(&self, subscription_id: &str) -> Result<ImapConfig> {
         let db = self.db.lock();
         db.query_row(
@@ -1170,7 +1357,7 @@ fn strip_html(html: &str) -> String {
     let mut result = String::with_capacity(html.len());
     let mut in_tag = false;
     let mut in_script = false;
-    
+
     for c in html.chars() {
         if c == '<' {
             in_tag = true;
@@ -1187,7 +1374,7 @@ fn strip_html(html: &str) -> String {
             result.push(c);
         }
     }
-    
+
     // Decode common entities
     result
         .replace("&nbsp;", " ")
@@ -1207,7 +1394,13 @@ fn html_escape(s: &str) -> String {
 
 fn sanitize_filename(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .take(50)
         .collect()
 }
@@ -1216,7 +1409,7 @@ fn parse_opml(content: &str) -> Result<OpmlDocument> {
     // Simple XML parsing for OPML
     let title = extract_xml_value(content, "title").unwrap_or_else(|| "Imported".to_string());
     let outlines = parse_outlines(content);
-    
+
     Ok(OpmlDocument {
         title,
         date_created: None,
@@ -1227,7 +1420,7 @@ fn parse_opml(content: &str) -> Result<OpmlDocument> {
 fn extract_xml_value(content: &str, tag: &str) -> Option<String> {
     let start_tag = format!("<{}>", tag);
     let end_tag = format!("</{}>", tag);
-    
+
     if let Some(start) = content.find(&start_tag) {
         let rest = &content[start + start_tag.len()..];
         if let Some(end) = rest.find(&end_tag) {
@@ -1239,14 +1432,14 @@ fn extract_xml_value(content: &str, tag: &str) -> Option<String> {
 
 fn parse_outlines(content: &str) -> Vec<OpmlOutline> {
     let mut outlines = Vec::new();
-    
+
     for line in content.lines() {
         if line.contains("<outline") {
             let text = extract_attr(line, "text").unwrap_or_default();
             let xml_url = extract_attr(line, "xmlUrl");
             let html_url = extract_attr(line, "htmlUrl");
             let feed_type = extract_attr(line, "type");
-            
+
             outlines.push(OpmlOutline {
                 text,
                 xml_url,
@@ -1256,7 +1449,7 @@ fn parse_outlines(content: &str) -> Vec<OpmlOutline> {
             });
         }
     }
-    
+
     outlines
 }
 
@@ -1265,7 +1458,12 @@ fn extract_attr(line: &str, attr: &str) -> Option<String> {
     if let Some(start) = line.find(&needle) {
         let rest = &line[start + needle.len()..];
         if let Some(end) = rest.find('"') {
-            return Some(rest[..end].replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">"));
+            return Some(
+                rest[..end]
+                    .replace("&amp;", "&")
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">"),
+            );
         }
     }
     None
@@ -1285,18 +1483,21 @@ fn extract_html_body(mail: &mailparse::ParsedMail) -> Option<String> {
     if mail.ctype.mimetype == "text/html" {
         return mail.get_body().ok();
     }
-    
+
     for subpart in &mail.subparts {
         if let Some(html) = extract_html_body(subpart) {
             return Some(html);
         }
     }
-    
+
     // Fall back to text/plain
     if mail.ctype.mimetype == "text/plain" {
-        return mail.get_body().ok().map(|t| format!("<pre>{}</pre>", html_escape(&t)));
+        return mail
+            .get_body()
+            .ok()
+            .map(|t| format!("<pre>{}</pre>", html_escape(&t)));
     }
-    
+
     None
 }
 
@@ -1304,7 +1505,9 @@ fn extract_html_body(mail: &mailparse::ParsedMail) -> Option<String> {
 // Axum API Handlers
 // ============================================================================
 
-use axum::{extract::{Path as UrlPath, Query, State}, http::StatusCode, Json};
+use axum::Json;
+use axum::extract::{Path as UrlPath, Query, State};
+use axum::http::StatusCode;
 
 #[derive(Clone)]
 pub struct FeedState {
@@ -1316,9 +1519,7 @@ pub struct FeedState {
 }
 
 /// GET /feeds/v1/subscriptions - List all subscriptions
-pub async fn list_subscriptions(
-    State(state): State<FeedState>,
-) -> Result<Json<Vec<Subscription>>> {
+pub async fn list_subscriptions(State(state): State<FeedState>) -> Result<Json<Vec<Subscription>>> {
     let subscriptions = state.manager.list_subscriptions()?;
     Ok(Json(subscriptions))
 }
@@ -1413,7 +1614,9 @@ pub async fn extract_article(
     State(state): State<FeedState>,
     Json(req): Json<serde_json::Value>,
 ) -> Result<Json<ExtractedArticle>> {
-    let url = req.get("url").and_then(|v| v.as_str())
+    let url = req
+        .get("url")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| ServerError::MissingHeader("url".into()))?;
     let extracted = state.manager.extract_article(url).await?;
     Ok(Json(extracted))
@@ -1431,19 +1634,21 @@ pub async fn import_opml(
 /// GET /feeds/v1/export/opml - Export OPML
 pub async fn export_opml(
     State(state): State<FeedState>,
-) -> Result<(StatusCode, [(axum::http::header::HeaderName, &'static str); 1], String)> {
+) -> Result<(
+    StatusCode,
+    [(axum::http::header::HeaderName, &'static str); 1],
+    String,
+)> {
     let opml = state.manager.export_opml()?;
     Ok((
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/xml")],
-        opml
+        opml,
     ))
 }
 
 /// GET /feeds/v1/stats - Get statistics
-pub async fn get_stats(
-    State(state): State<FeedState>,
-) -> Result<Json<FeedStats>> {
+pub async fn get_stats(State(state): State<FeedState>) -> Result<Json<FeedStats>> {
     let stats = state.manager.stats()?;
     Ok(Json(stats))
 }
@@ -1456,13 +1661,21 @@ pub async fn sync_to_device(
     let sub = state.manager.get_subscription(&id)?;
     let before = state.manager.storage.get_root().generation;
     // Only this subscription's articles, so each lands in its own configured folder.
-    let result = state.manager.sync_articles_to_folder(Some(&sub.id), &sub.folder);
+    let result = state
+        .manager
+        .sync_articles_to_folder(Some(&sub.id), &sub.folder);
     // Articles (and the folder) are committed one by one and marked synced, so a later
     // failure must not swallow the push for what already landed: retries skip those.
     let generation = state.manager.storage.get_root().generation;
     if generation != before {
         // Tell connected devices to pull the new root, as document uploads do.
-        let _ = state.notification_tx.send(crate::notifications::WsMessage::sync_complete(generation, "local-server", "local-user"));
+        let _ = state
+            .notification_tx
+            .send(crate::notifications::WsMessage::sync_complete(
+                generation,
+                "local-server",
+                "local-user",
+            ));
     }
     Ok(Json(serde_json::json!({ "synced": result? })))
 }
@@ -1471,8 +1684,8 @@ pub async fn sync_to_device(
 // Router
 // ============================================================================
 
-use axum::routing::{delete, get, patch, post};
 use axum::Router;
+use axum::routing::{delete, get, patch, post};
 
 pub fn feeds_router(state: FeedState) -> Router {
     Router::new()
@@ -1500,41 +1713,91 @@ mod folder_sync_tests {
 
     fn article(id: &str, sub: &str) -> Article {
         // article_to_epub slices the first 8 chars of the id (real ids are uuids).
-        Article { id: format!("{id}-000000000"), subscription_id: sub.into(), title: format!("Title {id}"), url: format!("https://example.com/{id}"),
-            author: None, summary: None, content_html: Some("<p>hi</p>".into()), content_text: None, published_at: None,
-            fetched_at: Utc::now(), read: false, synced: false, epub_path: None, word_count: None, reading_time_mins: None }
+        Article {
+            id: format!("{id}-000000000"),
+            subscription_id: sub.into(),
+            title: format!("Title {id}"),
+            url: format!("https://example.com/{id}"),
+            author: None,
+            summary: None,
+            content_html: Some("<p>hi</p>".into()),
+            content_text: None,
+            published_at: None,
+            fetched_at: Utc::now(),
+            read: false,
+            synced: false,
+            epub_path: None,
+            word_count: None,
+            reading_time_mins: None,
+        }
     }
 
     /// (visibleName, type, parent) of every node in the current root.
     fn tree(storage: &Storage) -> Vec<(String, String, String, String)> {
-        let lines = |b: Vec<u8>| String::from_utf8_lossy(&b).lines().skip(1).map(|l| l.split(':').map(String::from).collect::<Vec<_>>()).collect::<Vec<_>>();
-        lines(storage.get(&storage.get_root().hash).unwrap()).into_iter().map(|node| {
-            let meta = lines(storage.get(&node[0]).unwrap()).into_iter().find(|f| f[2] == format!("{}.metadata", node[2])).unwrap();
-            let m: serde_json::Value = serde_json::from_slice(&storage.get(&meta[0]).unwrap()).unwrap();
-            (node[2].clone(), m["visibleName"].as_str().unwrap().into(), m["type"].as_str().unwrap().into(), m["parent"].as_str().unwrap().into())
-        }).collect()
+        let lines = |b: Vec<u8>| {
+            String::from_utf8_lossy(&b)
+                .lines()
+                .skip(1)
+                .map(|l| l.split(':').map(String::from).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        };
+        lines(storage.get(&storage.get_root().hash).unwrap())
+            .into_iter()
+            .map(|node| {
+                let meta = lines(storage.get(&node[0]).unwrap())
+                    .into_iter()
+                    .find(|f| f[2] == format!("{}.metadata", node[2]))
+                    .unwrap();
+                let m: serde_json::Value =
+                    serde_json::from_slice(&storage.get(&meta[0]).unwrap()).unwrap();
+                (
+                    node[2].clone(),
+                    m["visibleName"].as_str().unwrap().into(),
+                    m["type"].as_str().unwrap().into(),
+                    m["parent"].as_str().unwrap().into(),
+                )
+            })
+            .collect()
     }
 
     #[test]
     fn sync_places_articles_in_configured_folder() {
         let tmp = tempfile::TempDir::new().unwrap();
         let storage = Storage::new(tmp.path().join("storage")).unwrap();
-        let manager = FeedManager::new(&tmp.path().join("feeds.db"), storage.clone(), &tmp.path().join("epub")).unwrap();
+        let manager = FeedManager::new(
+            &tmp.path().join("feeds.db"),
+            storage.clone(),
+            &tmp.path().join("epub"),
+        )
+        .unwrap();
         for sub in ["news", "other"] {
             manager.db.lock().execute("INSERT INTO subscriptions (id, name, url, feed_type, created_at, updated_at) VALUES (?1, ?1, ?1, 'rss', '', '')", [sub]).unwrap();
         }
-        manager.save_articles(&[article("a1", "news"), article("b1", "other")]).unwrap();
+        manager
+            .save_articles(&[article("a1", "news"), article("b1", "other")])
+            .unwrap();
 
-        assert_eq!(manager.sync_articles_to_folder(Some("news"), "News").unwrap(), 1, "only this subscription's articles");
+        assert_eq!(
+            manager
+                .sync_articles_to_folder(Some("news"), "News")
+                .unwrap(),
+            1,
+            "only this subscription's articles"
+        );
         let t = tree(&storage);
-        let folder = t.iter().find(|n| n.2 == "CollectionType").expect("folder created");
+        let folder = t
+            .iter()
+            .find(|n| n.2 == "CollectionType")
+            .expect("folder created");
         assert_eq!((folder.1.as_str(), folder.3.as_str()), ("News", ""));
         let doc = t.iter().find(|n| n.1 == "Title a1").unwrap();
         assert_eq!(doc.3, folder.0, "document parent is the folder id");
 
         // Next sync reuses the folder; an empty folder setting keeps the top level.
         manager.save_articles(&[article("a2", "news")]).unwrap();
-        manager.sync_articles_to_folder(Some("news"), "News").unwrap();
+        manager
+            .sync_articles_to_folder(Some("news"), "News")
+            .unwrap();
         manager.sync_articles_to_folder(Some("other"), "").unwrap();
         let t = tree(&storage);
         assert_eq!(t.iter().filter(|n| n.2 == "CollectionType").count(), 1);
@@ -1546,16 +1809,31 @@ mod folder_sync_tests {
     async fn sync_to_device_notifies_devices_only_when_something_synced() {
         let tmp = tempfile::TempDir::new().unwrap();
         let storage = Storage::new(tmp.path().join("storage")).unwrap();
-        let manager = Arc::new(FeedManager::new(&tmp.path().join("feeds.db"), storage.clone(), &tmp.path().join("epub")).unwrap());
+        let manager = Arc::new(
+            FeedManager::new(
+                &tmp.path().join("feeds.db"),
+                storage.clone(),
+                &tmp.path().join("epub"),
+            )
+            .unwrap(),
+        );
         manager.db.lock().execute("INSERT INTO subscriptions (id, name, url, feed_type, created_at, updated_at) VALUES ('news', 'news', 'news', 'rss', ?1, ?1)", [Utc::now().to_rfc3339()]).unwrap();
         manager.save_articles(&[article("a1", "news")]).unwrap();
         let (notification_tx, mut rx) = tokio::sync::broadcast::channel(4);
-        let state = FeedState { manager, scheduler: None, notification_tx };
+        let state = FeedState {
+            manager,
+            scheduler: None,
+            notification_tx,
+        };
 
-        sync_to_device(State(state.clone()), UrlPath("news".into())).await.unwrap();
+        sync_to_device(State(state.clone()), UrlPath("news".into()))
+            .await
+            .unwrap();
         let msg = rx.try_recv().expect("SyncComplete after new EPUBs");
         assert_eq!(msg.message.attributes.event, "SyncComplete");
-        sync_to_device(State(state), UrlPath("news".into())).await.unwrap();
+        sync_to_device(State(state), UrlPath("news".into()))
+            .await
+            .unwrap();
         assert!(rx.try_recv().is_err(), "nothing new, no push");
     }
 
@@ -1563,18 +1841,38 @@ mod folder_sync_tests {
     async fn sync_to_device_notifies_committed_articles_even_when_a_later_one_fails() {
         let tmp = tempfile::TempDir::new().unwrap();
         let storage = Storage::new(tmp.path().join("storage")).unwrap();
-        let manager = Arc::new(FeedManager::new(&tmp.path().join("feeds.db"), storage.clone(), &tmp.path().join("epub")).unwrap());
+        let manager = Arc::new(
+            FeedManager::new(
+                &tmp.path().join("feeds.db"),
+                storage.clone(),
+                &tmp.path().join("epub"),
+            )
+            .unwrap(),
+        );
         manager.db.lock().execute("INSERT INTO subscriptions (id, name, url, feed_type, created_at, updated_at, folder) VALUES ('news', 'news', 'news', 'rss', ?1, ?1, 'News')", [Utc::now().to_rfc3339()]).unwrap();
         // Newest first: a1 syncs, then a2's EPUB can't be read.
-        let mut ok = article("a1", "news"); ok.published_at = Some(Utc::now());
-        let mut bad = article("a2", "news"); bad.published_at = Some(Utc::now() - chrono::Duration::days(1));
+        let mut ok = article("a1", "news");
+        ok.published_at = Some(Utc::now());
+        let mut bad = article("a2", "news");
+        bad.published_at = Some(Utc::now() - chrono::Duration::days(1));
         bad.epub_path = Some(tmp.path().join("missing.epub").to_string_lossy().into());
         manager.save_articles(&[ok, bad]).unwrap();
         let (notification_tx, mut rx) = tokio::sync::broadcast::channel(4);
-        let state = FeedState { manager, scheduler: None, notification_tx };
+        let state = FeedState {
+            manager,
+            scheduler: None,
+            notification_tx,
+        };
 
-        assert!(sync_to_device(State(state.clone()), UrlPath("news".into())).await.is_err(), "the failure is still reported");
-        let msg = rx.try_recv().expect("SyncComplete for the article that did land");
+        assert!(
+            sync_to_device(State(state.clone()), UrlPath("news".into()))
+                .await
+                .is_err(),
+            "the failure is still reported"
+        );
+        let msg = rx
+            .try_recv()
+            .expect("SyncComplete for the article that did land");
         assert_eq!(msg.message.attributes.event, "SyncComplete");
         assert!(tree(&storage).iter().any(|n| n.1 == "Title a1"));
         assert!(rx.try_recv().is_err());

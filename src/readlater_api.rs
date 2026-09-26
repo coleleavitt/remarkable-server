@@ -1,20 +1,26 @@
 //! Read-it-later API endpoints
 
-use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
-    routing::{delete, get, post, put},
-    Json, Router,
-};
+use std::sync::Arc;
+
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::{delete, get, post, put};
+use axum::{Json, Router};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 use crate::error::{Result, ServerError};
 use crate::readlater::{
-    ArticleQuery, OAuthCallback, ProviderAccount, ProviderConfig, ReadLaterError,
-    ReadLaterManager, ReadLaterProvider, ReadStatus, SyncSettings,
+    ArticleQuery,
+    OAuthCallback,
+    ProviderAccount,
+    ProviderConfig,
+    ReadLaterError,
+    ReadLaterManager,
+    ReadLaterProvider,
+    ReadStatus,
+    SyncSettings,
 };
 
 // ============================================================================
@@ -28,7 +34,9 @@ pub struct ReadLaterState {
 
 impl ReadLaterState {
     pub fn new(manager: ReadLaterManager) -> Self {
-        Self { manager: Arc::new(Mutex::new(manager)) }
+        Self {
+            manager: Arc::new(Mutex::new(manager)),
+        }
     }
 }
 
@@ -39,12 +47,18 @@ impl ReadLaterState {
 impl From<ReadLaterError> for ServerError {
     fn from(e: ReadLaterError) -> Self {
         match e {
-            ReadLaterError::ProviderNotFound(id) | ReadLaterError::ArticleNotFound(id) => ServerError::NotFound(id),
+            ReadLaterError::ProviderNotFound(id) | ReadLaterError::ArticleNotFound(id) => {
+                ServerError::NotFound(id)
+            }
             ReadLaterError::AuthRequired(_) => ServerError::Unauthorized,
-            ReadLaterError::OAuth(msg) | ReadLaterError::Api(msg) | ReadLaterError::Conversion(msg) => ServerError::Internal(msg),
+            ReadLaterError::OAuth(msg)
+            | ReadLaterError::Api(msg)
+            | ReadLaterError::Conversion(msg) => ServerError::Internal(msg),
             ReadLaterError::Database(msg) => ServerError::Database(msg),
             ReadLaterError::Network(msg) => ServerError::Internal(format!("Network: {}", msg)),
-            ReadLaterError::RateLimited(secs) => ServerError::Internal(format!("Rate limited, retry after {} seconds", secs)),
+            ReadLaterError::RateLimited(secs) => {
+                ServerError::Internal(format!("Rate limited, retry after {} seconds", secs))
+            }
             ReadLaterError::Io(e) => ServerError::Storage(e),
             ReadLaterError::Json(e) => ServerError::Json(e),
         }
@@ -134,9 +148,12 @@ pub struct ArticleListResponse {
 // Account Endpoints
 // ============================================================================
 
-pub async fn list_accounts(State(state): State<ReadLaterState>) -> Result<Json<AccountListResponse>> {
+pub async fn list_accounts(
+    State(state): State<ReadLaterState>,
+) -> Result<Json<AccountListResponse>> {
     let manager = state.manager.lock();
-    let accounts: Vec<AccountResponse> = manager.list_accounts()
+    let accounts: Vec<AccountResponse> = manager
+        .list_accounts()
         .into_iter()
         .map(|a| AccountResponse {
             id: a.id,
@@ -153,7 +170,7 @@ pub async fn list_accounts(State(state): State<ReadLaterState>) -> Result<Json<A
             last_sync: a.last_sync.map(|d| d.to_rfc3339()),
         })
         .collect();
-    
+
     Ok(Json(AccountListResponse { accounts }))
 }
 
@@ -171,10 +188,10 @@ pub async fn add_account(
         last_sync: None,
         created_at: chrono::Utc::now(),
     };
-    
+
     let id = account.id.clone();
     state.manager.lock().add_account(account)?;
-    
+
     Ok((StatusCode::CREATED, Json(serde_json::json!({"id": id}))))
 }
 
@@ -183,9 +200,10 @@ pub async fn get_account(
     Path(id): Path<String>,
 ) -> Result<Json<AccountResponse>> {
     let manager = state.manager.lock();
-    let account = manager.get_account(&id)
+    let account = manager
+        .get_account(&id)
         .ok_or_else(|| ServerError::NotFound(id))?;
-    
+
     Ok(Json(AccountResponse {
         id: account.id,
         name: account.name,
@@ -208,9 +226,10 @@ pub async fn update_account(
     Json(req): Json<UpdateAccountRequest>,
 ) -> Result<StatusCode> {
     let mut manager = state.manager.lock();
-    let mut account = manager.get_account(&id)
+    let mut account = manager
+        .get_account(&id)
         .ok_or_else(|| ServerError::NotFound(id))?;
-    
+
     if let Some(name) = req.name {
         account.name = name;
     }
@@ -220,9 +239,9 @@ pub async fn update_account(
     if let Some(settings) = req.sync_settings {
         account.sync_settings = settings;
     }
-    
+
     manager.update_account(account)?;
-    
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -242,8 +261,14 @@ pub async fn start_oauth(
     State(state): State<ReadLaterState>,
     Json(req): Json<StartOAuthRequest>,
 ) -> Result<Json<OAuthResponse>> {
-    use crate::readlater::{PocketProvider, InstapaperProvider, WallabagProvider, OmnivoreProvider, ReadLaterProviderTrait};
-    
+    use crate::readlater::{
+        InstapaperProvider,
+        OmnivoreProvider,
+        PocketProvider,
+        ReadLaterProviderTrait,
+        WallabagProvider,
+    };
+
     let provider: Box<dyn ReadLaterProviderTrait> = match req.provider {
         ReadLaterProvider::Pocket => Box::new(PocketProvider::new()),
         ReadLaterProvider::Instapaper => {
@@ -254,10 +279,10 @@ pub async fn start_oauth(
         ReadLaterProvider::Wallabag => Box::new(WallabagProvider::new()),
         ReadLaterProvider::Omnivore => Box::new(OmnivoreProvider::new()),
     };
-    
+
     let oauth_state = provider.start_oauth(&req.redirect_uri).await?;
     let state_id = state.manager.lock().save_oauth_state(&oauth_state)?;
-    
+
     let auth_url = match req.provider {
         ReadLaterProvider::Pocket => {
             format!(
@@ -267,19 +292,28 @@ pub async fn start_oauth(
             )
         }
         ReadLaterProvider::Wallabag => {
-            if let Some(ProviderConfig::Wallabag { instance_url, client_id, .. }) = req.config {
+            if let Some(ProviderConfig::Wallabag {
+                instance_url,
+                client_id,
+                ..
+            }) = req.config
+            {
                 format!(
                     "{}/oauth/v2/auth?client_id={}&redirect_uri={}&response_type=code",
-                    instance_url, client_id, urlencoding::encode(&req.redirect_uri)
+                    instance_url,
+                    client_id,
+                    urlencoding::encode(&req.redirect_uri)
                 )
             } else {
-                return Err(ServerError::Internal("Wallabag requires instance_url and client_id".into()));
+                return Err(ServerError::Internal(
+                    "Wallabag requires instance_url and client_id".into(),
+                ));
             }
         }
         ReadLaterProvider::Instapaper => "xauth://instapaper".to_string(),
         ReadLaterProvider::Omnivore => "apikey://omnivore".to_string(),
     };
-    
+
     Ok(Json(OAuthResponse { state_id, auth_url }))
 }
 
@@ -287,14 +321,21 @@ pub async fn complete_oauth(
     State(state): State<ReadLaterState>,
     Json(req): Json<CompleteOAuthRequest>,
 ) -> Result<impl IntoResponse> {
-    use crate::readlater::{PocketProvider, InstapaperProvider, WallabagProvider, OmnivoreProvider, ReadLaterProviderTrait};
-    
+    use crate::readlater::{
+        InstapaperProvider,
+        OmnivoreProvider,
+        PocketProvider,
+        ReadLaterProviderTrait,
+        WallabagProvider,
+    };
+
     let oauth_state = {
         let manager = state.manager.lock();
-        manager.get_oauth_state(&req.state_id)?
+        manager
+            .get_oauth_state(&req.state_id)?
             .ok_or_else(|| ServerError::Internal("Invalid OAuth state".into()))?
     };
-    
+
     let provider: Box<dyn ReadLaterProviderTrait> = match oauth_state.provider {
         ReadLaterProvider::Pocket => Box::new(PocketProvider::new()),
         ReadLaterProvider::Instapaper => {
@@ -305,9 +346,9 @@ pub async fn complete_oauth(
         ReadLaterProvider::Wallabag => Box::new(WallabagProvider::new()),
         ReadLaterProvider::Omnivore => Box::new(OmnivoreProvider::new()),
     };
-    
+
     let config = provider.complete_oauth(&req.callback, &oauth_state).await?;
-    
+
     let account = ProviderAccount {
         id: uuid::Uuid::new_v4().to_string(),
         name: req.account_name,
@@ -318,12 +359,12 @@ pub async fn complete_oauth(
         last_sync: None,
         created_at: chrono::Utc::now(),
     };
-    
+
     let id = account.id.clone();
     let mut manager = state.manager.lock();
     manager.add_account(account)?;
     manager.delete_oauth_state(&req.state_id)?;
-    
+
     Ok((StatusCode::CREATED, Json(serde_json::json!({"id": id}))))
 }
 
@@ -346,7 +387,8 @@ pub async fn get_article(
     Path(id): Path<String>,
 ) -> Result<Json<crate::readlater::Article>> {
     let manager = state.manager.lock();
-    let article = manager.get_article(&id)
+    let article = manager
+        .get_article(&id)
         .ok_or_else(|| ServerError::NotFound(id))?;
     Ok(Json(article))
 }
@@ -357,9 +399,10 @@ pub async fn update_article(
     Json(req): Json<UpdateArticleRequest>,
 ) -> Result<Json<crate::readlater::Article>> {
     let mut manager = state.manager.lock();
-    let mut article = manager.get_article(&id)
+    let mut article = manager
+        .get_article(&id)
         .ok_or_else(|| ServerError::NotFound(id))?;
-    
+
     if let Some(status) = req.status {
         article.status = status;
         if status == ReadStatus::Read {
@@ -381,10 +424,10 @@ pub async fn update_article(
             article.last_sync = Some(chrono::Utc::now());
         }
     }
-    
+
     article.updated_at = chrono::Utc::now();
     manager.save_article(&article)?;
-    
+
     Ok(Json(article))
 }
 
@@ -407,9 +450,11 @@ pub async fn sync_account(
     // Get account details first, then release lock
     let account = {
         let manager = state.manager.lock();
-        manager.get_account(&id).ok_or_else(|| ServerError::NotFound(id.clone()))?
+        manager
+            .get_account(&id)
+            .ok_or_else(|| ServerError::NotFound(id.clone()))?
     };
-    
+
     // Perform sync outside of lock - for now just return status
     // Full async sync would need a different architecture
     Ok(Json(serde_json::json!({
@@ -419,15 +464,17 @@ pub async fn sync_account(
     })))
 }
 
-pub async fn sync_all(
-    State(state): State<ReadLaterState>,
-) -> Result<Json<SyncAllResponse>> {
+pub async fn sync_all(State(state): State<ReadLaterState>) -> Result<Json<SyncAllResponse>> {
     // Get enabled account count, then release lock
     let account_count = {
         let manager = state.manager.lock();
-        manager.list_accounts().into_iter().filter(|a| a.enabled).count()
+        manager
+            .list_accounts()
+            .into_iter()
+            .filter(|a| a.enabled)
+            .count()
     };
-    
+
     // For now just return queued status
     // Full async sync would need a different architecture (background task)
     Ok(Json(SyncAllResponse {

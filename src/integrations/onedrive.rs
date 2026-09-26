@@ -2,13 +2,20 @@
 //!
 //! Full read/write access via Microsoft Graph API.
 
-use crate::integrations::{
-    oauth::{refresh_token, OAuthConfig, OAuthToken},
-    CloudFile, CloudFolder, CloudProvider, IntegrationError, ProviderType, Result, StorageQuota,
-};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+
+use crate::integrations::oauth::{OAuthConfig, OAuthToken, refresh_token};
+use crate::integrations::{
+    CloudFile,
+    CloudFolder,
+    CloudProvider,
+    IntegrationError,
+    ProviderType,
+    Result,
+    StorageQuota,
+};
 
 const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 
@@ -272,7 +279,7 @@ impl CloudProvider for OneDrive {
             .map_err(|e| IntegrationError::Network(e.to_string()))?;
 
         let list: ListChildrenResponse = self.handle_response(response).await?;
-        
+
         let mut files: Vec<CloudFile> = list.value.into_iter().map(|i| i.to_cloud_file()).collect();
 
         // Handle pagination
@@ -308,7 +315,7 @@ impl CloudProvider for OneDrive {
             .map_err(|e| IntegrationError::Network(e.to_string()))?;
 
         let list: ListChildrenResponse = self.handle_response(response).await?;
-        
+
         let mut folders: Vec<CloudFolder> = list
             .value
             .into_iter()
@@ -538,7 +545,7 @@ impl CloudProvider for OneDrive {
             .map_err(|e| IntegrationError::Network(e.to_string()))?;
 
         let delta: DeltaResponse = self.handle_response(response).await?;
-        
+
         let files: Vec<CloudFile> = delta.value.into_iter().map(|i| i.to_cloud_file()).collect();
 
         // Return the delta link for next sync
@@ -582,7 +589,10 @@ impl OneDrive {
                 GRAPH_BASE, id, name
             )
         } else {
-            format!("{}/me/drive/root:/{}:/createUploadSession", GRAPH_BASE, name)
+            format!(
+                "{}/me/drive/root:/{}:/createUploadSession",
+                GRAPH_BASE, name
+            )
         };
 
         #[derive(Serialize)]
@@ -655,8 +665,8 @@ impl OneDrive {
             }
         }
 
-        last_response
-            .map(|i| i.to_cloud_file())
-            .ok_or_else(|| IntegrationError::Api("Upload completed but no response received".into()))
+        last_response.map(|i| i.to_cloud_file()).ok_or_else(|| {
+            IntegrationError::Api("Upload completed but no response received".into())
+        })
     }
 }
