@@ -6,6 +6,7 @@ use thiserror::Error;
 pub enum ServerError {
     #[error("Not found: {0}")] NotFound(String),
     #[error("Missing header: {0}")] MissingHeader(String),
+    #[error("Invalid header: {0}")] InvalidHeader(String),
     #[error("Checksum mismatch: expected {expected}, actual {actual}")] ChecksumMismatch { expected: String, actual: String },
     #[error("Invalid hash: {0}")] InvalidHash(String),
     #[error("Generation mismatch: current {current}")] GenerationMismatch { current: u64 },
@@ -33,6 +34,7 @@ impl IntoResponse for ServerError {
         let (status, err, det) = match &self {
             Self::NotFound(m) => (StatusCode::NOT_FOUND, "not_found", Some(m.clone())),
             Self::MissingHeader(h) => (StatusCode::BAD_REQUEST, "missing_header", Some(h.clone())),
+            Self::InvalidHeader(h) => (StatusCode::BAD_REQUEST, "invalid_header", Some(h.clone())),
             Self::ChecksumMismatch { expected, actual } => (StatusCode::BAD_REQUEST, "checksum_mismatch", Some(format!("expected={}, actual={}", expected, actual))),
             Self::InvalidHash(h) => (StatusCode::BAD_REQUEST, "invalid_hash", Some(h.clone())),
             Self::GenerationMismatch { current } => (StatusCode::PRECONDITION_FAILED, "generation_mismatch", Some(format!("current={current}"))),

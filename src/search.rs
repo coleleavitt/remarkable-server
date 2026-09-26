@@ -194,10 +194,19 @@ impl SearchIndex {
     
     /// Index a PDF by extracting text with pdftotext
     pub fn index_pdf(&self, hash: &str, filename: &str, pdf_data: &[u8]) -> Result<()> {
+        let content = Self::extract_pdf_text(hash, filename, pdf_data);
+        self.index_document(hash, filename, content.as_deref())
+    }
+    
+    /// Extract a PDF's text with pdftotext (None if it fails or isn't installed).
+    fn extract_pdf_text(hash: &str, filename: &str, pdf_data: &[u8]) -> Option<String> {
         // Write PDF to temp file
         let temp_dir = std::env::temp_dir();
         let temp_pdf = temp_dir.join(format!("{}.pdf", hash));
-        std::fs::write(&temp_pdf, pdf_data)?;
+        if let Err(e) = std::fs::write(&temp_pdf, pdf_data) {
+            warn!("Failed to stage PDF {} for text extraction: {}", filename, e);
+            return None;
+        }
         
         // Extract text with pdftotext
         let output = Command::new("pdftotext")
@@ -209,7 +218,7 @@ impl SearchIndex {
         // Clean up temp file
         let _ = std::fs::remove_file(&temp_pdf);
         
-        let content = match output {
+        match output {
             Ok(out) if out.status.success() => {
                 let text = String::from_utf8_lossy(&out.stdout).to_string();
                 // Truncate to reasonable size for indexing
@@ -227,9 +236,7 @@ impl SearchIndex {
                 warn!("pdftotext not available: {}", e);
                 None
             }
-        };
-        
-        self.index_document(hash, filename, content.as_deref())
+        }
     }
     
     /// Remove document from index
@@ -308,7 +315,8 @@ impl SearchIndex {
             hash: row.get(0)?,
             filename: row.get(1)?,
             doc_type: Self::parse_doc_type(&row.get::<_, String>(2)?),
-            snippet: row.get(3)?,
+            // NULL for name-only rows (no extracted text); still a match on the filename.
+            snippet: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
             rank: row.get(4)?,
         })
     }
@@ -366,46 +374,44 @@ impl SearchIndex {
         })
     }
     
-    /// Rebuild entire index from storage
+    /// Rebuild entire index from storage. Rows are replaced wholesale in one transaction,
+    /// so blobs no longer in storage (deleted documents) drop out of search, and a failed
+    /// rebuild leaves the previous index intact.
     pub fn rebuild_from_storage(&self, storage: &Storage) -> Result<usize> {
         info!("Rebuilding search index from storage...");
         
-        let hashes = storage.list_hashes()?;
-        let mut indexed = 0;
-        
-        for hash in &hashes {
-            if let Some(filename) = storage.filename_for_hash(hash) {
-                let doc_type = DocumentType::from_filename(&filename);
-                
-                match doc_type {
-                    DocumentType::Pdf => {
-                        if let Ok(data) = storage.get(hash) {
-                            if let Err(e) = self.index_pdf(hash, &filename, &data) {
-                                warn!("Failed to index PDF {}: {}", filename, e);
-                            } else {
-                                indexed += 1;
-                            }
-                        }
-                    }
-                    DocumentType::Document | DocumentType::Folder => {
-                        // Index just the filename for non-PDF documents
-                        if let Err(e) = self.index_document(hash, &filename, None) {
-                            warn!("Failed to index {}: {}", filename, e);
-                        } else {
-                            indexed += 1;
-                        }
-                    }
-                    _ => {
-                        // Index filename for other types too
-                        let _ = self.index_document(hash, &filename, None);
-                        indexed += 1;
-                    }
-                }
-            }
+        // Extract text first (pdftotext is slow) so the DB lock is only held for the swap.
+        let mut rows = Vec::new();
+        for hash in storage.list_hashes()? {
+            let Some(filename) = storage.filename_for_hash(&hash) else { continue };
+            let content = match DocumentType::from_filename(&filename) {
+                DocumentType::Pdf => match storage.get(&hash) {
+                    Ok(data) => Self::extract_pdf_text(&hash, &filename, &data),
+                    Err(_) => continue,
+                },
+                _ => None,
+            };
+            rows.push((hash, filename, content));
         }
         
-        info!("Indexed {} documents", indexed);
-        Ok(indexed)
+        let mut conn = self.inner.conn.lock();
+        let tx = conn.transaction().map_err(|e| ServerError::Database(e.to_string()))?;
+        tx.execute("DELETE FROM documents", []).map_err(|e| ServerError::Database(e.to_string()))?;
+        let now = chrono::Utc::now().timestamp();
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO documents (hash, filename, doc_type, content, indexed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            ).map_err(|e| ServerError::Database(e.to_string()))?;
+            for (hash, filename, content) in &rows {
+                stmt.execute(params![hash, filename, DocumentType::from_filename(filename).as_str(), content, now])
+                    .map_err(|e| ServerError::Database(e.to_string()))?;
+            }
+        }
+        tx.commit().map_err(|e| ServerError::Database(e.to_string()))?;
+        
+        info!("Indexed {} documents", rows.len());
+        Ok(rows.len())
     }
     
     /// Incremental index: index new/changed documents since last sync
@@ -518,6 +524,28 @@ mod tests {
         
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].doc_type, DocumentType::Pdf);
+    }
+
+    #[test]
+    fn test_rebuild_prunes_deleted_blobs() {
+        let tmp = TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path().join("store")).unwrap();
+        let index = SearchIndex::new(tmp.path()).unwrap();
+        let (keep, gone) = ("a".repeat(64), "b".repeat(64));
+        storage.put_with_hash(b"{}", &keep, "keepme.metadata").unwrap();
+        storage.put_with_hash(b"{}", &gone, "goneaway.metadata").unwrap();
+        // A stale row for a blob storage never had (e.g. left by an older rebuild).
+        index.index_document(&"c".repeat(64), "phantom.metadata", None).unwrap();
+        let q = |q: &str| index.search(&SearchQuery { q: q.into(), limit: 10, offset: 0, doc_type: None }).unwrap().len();
+
+        assert_eq!(index.rebuild_from_storage(&storage).unwrap(), 2);
+        assert_eq!((q("keepme"), q("goneaway"), q("phantom")), (1, 1, 0));
+
+        storage.delete(&gone).unwrap();
+        assert_eq!(index.rebuild_from_storage(&storage).unwrap(), 1);
+        assert_eq!((q("keepme"), q("goneaway")), (1, 0));
+        assert!(!index.is_indexed(&gone));
+        assert_eq!(index.stats().unwrap().total_documents, 1);
     }
 
     #[test]

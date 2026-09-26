@@ -11,7 +11,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::{api::AppState, error::{Result, ServerError}, notifications::WsMessage, storage::Storage};
+use crate::{api::AppState, error::{Result, ServerError}, notifications::WsMessage, storage::{is_valid_hash, Storage}};
 
 const SCHEMA: &str = "3";
 const FILE_TYPE: &str = "0";
@@ -22,16 +22,35 @@ const ROOT_RETRIES: usize = 5;
 struct Entry { hash: String, kind: String, name: String, subfiles: u64, size: u64 }
 
 impl Entry {
+    /// Strict: exactly `hash:type:name:subfiles:size` with a valid hash and non-empty fields.
     fn parse(line: &str) -> Option<Self> {
         let mut f = line.split(':');
-        Some(Self {
-            hash: f.next()?.to_owned(),
-            kind: f.next()?.to_owned(),
-            name: f.next()?.to_owned(),
+        let e = Self {
+            hash: f.next().filter(|h| is_valid_hash(h))?.to_owned(),
+            kind: f.next().filter(|k| !k.is_empty())?.to_owned(),
+            name: f.next().filter(|n| !n.is_empty())?.to_owned(),
             subfiles: f.next()?.parse().ok()?,
             size: f.next()?.parse().ok()?,
-        })
+        };
+        if f.next().is_some() { return None; }
+        Some(e)
     }
+}
+
+/// Parse the current root index for rewriting. Refuses anything not fully understood
+/// (other schema, e.g. 4 with its `0:.:count:size` summary line whose hashing we haven't
+/// verified; or any unparseable line): rewriting a root with lines dropped would delete
+/// those documents from the tablet on its next sync.
+fn parse_root(data: &[u8]) -> std::result::Result<Vec<Entry>, String> {
+    let text = std::str::from_utf8(data).map_err(|_| "root index is not UTF-8".to_string())?;
+    let mut lines = text.lines();
+    match lines.next() {
+        Some(SCHEMA) => {}
+        other => return Err(format!("unsupported root index schema {other:?} (only {SCHEMA:?})")),
+    }
+    lines.filter(|l| !l.trim().is_empty())
+        .map(|l| Entry::parse(l).ok_or_else(|| format!("unparseable root index line {l:?}")))
+        .collect()
 }
 
 fn index_hash(entries: &mut [Entry]) -> Result<String> {
@@ -98,7 +117,10 @@ pub fn create_document(storage: &Storage, name: &str, ext: &str, data: &[u8]) ->
         let mut entries: Vec<Entry> = if root.hash.is_empty() {
             Vec::new()
         } else {
-            String::from_utf8_lossy(&storage.get(&root.hash)?).lines().skip(1).filter_map(Entry::parse).collect()
+            parse_root(&storage.get(&root.hash)?).map_err(|why| {
+                tracing::error!(root = %root.hash, generation = root.generation, %why, "refusing to add document: root index not understood");
+                ServerError::Internal(format!("refusing to modify root index: {why}"))
+            })?
         };
         entries.push(doc_entry());
         let root_hash = index_hash(&mut entries)?;
@@ -150,4 +172,63 @@ pub async fn upload_v2(State(state): State<AppState>, headers: HeaderMap, body: 
     let meta: UploadMeta = serde_json::from_slice(&meta)?;
     let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).ok_or_else(|| ServerError::MissingHeader("content-type".into()))?;
     finish(&state, &user_id, &meta.file_name, file_type(ct)?, &body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn storage_with_root(index: &str) -> (Storage, String, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        let root_hash = hex::encode(Sha256::digest(index.as_bytes()));
+        storage.put_with_hash(index.as_bytes(), &root_hash, "root.docSchema").unwrap();
+        storage.set_root(root_hash.clone()).unwrap();
+        (storage, root_hash, tmp)
+    }
+
+    fn entry_line(c: char, name: &str) -> String { format!("{}:{DOC_TYPE}:{name}:3:100", c.to_string().repeat(64)) }
+
+    #[test]
+    fn refuses_root_with_unparseable_line() {
+        let bad = [
+            format!("3\n{}\nnot-an-entry\n", entry_line('a', "doc-a")),
+            format!("4\n0:.:1:100\n{}\n", entry_line('a', "doc-a")),
+            format!("3\n{}:extra\n", entry_line('a', "doc-a")),
+            format!("3\n{}\n", entry_line('a', "doc-a").replacen('a', "A", 1)),
+        ];
+        for index in bad {
+            let (storage, root_hash, _tmp) = storage_with_root(&index);
+            let before = storage.get_root();
+            assert!(create_document(&storage, "Book", "pdf", b"%PDF-1.4").is_err(), "{index:?}");
+            let after = storage.get_root();
+            assert_eq!((after.hash.as_str(), after.generation), (root_hash.as_str(), before.generation), "root must be unchanged");
+            assert_eq!(storage.get(&root_hash).unwrap(), index.as_bytes());
+        }
+    }
+
+    #[test]
+    fn adds_document_and_keeps_existing_entries() {
+        let (a, b) = (entry_line('a', "doc-a"), entry_line('b', "doc-b"));
+        let (storage, _, _tmp) = storage_with_root(&format!("3\n{a}\n{b}\n"));
+        let gen = storage.get_root().generation;
+        let (id, new_gen) = create_document(&storage, "Book", "pdf", b"%PDF-1.4").unwrap();
+        assert_eq!(new_gen, gen + 1);
+        let entries = parse_root(&storage.get(&storage.get_root().hash).unwrap()).unwrap();
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names.len(), 3);
+        assert!(names.contains(&"doc-a") && names.contains(&"doc-b") && names.contains(&id.as_str()));
+        let text = String::from_utf8(storage.get(&storage.get_root().hash).unwrap()).unwrap();
+        assert!(text.contains(&a) && text.contains(&b));
+    }
+
+    #[test]
+    fn creates_root_when_none_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        let (id, _) = create_document(&storage, "Book", "epub", b"PK").unwrap();
+        let entries = parse_root(&storage.get(&storage.get_root().hash).unwrap()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, id);
+    }
 }
