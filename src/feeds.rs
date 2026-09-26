@@ -2038,6 +2038,16 @@ mod readability_tests {
 
         let a = extract_readable("", "https://example.com/blank").unwrap();
         assert_eq!((a.title.as_str(), a.content_html.as_str()), ("", ""));
+
+        // No article, only navigation: like the old extractor (which fell back to the whole
+        // document), answer with what is there instead of failing, links made absolute.
+        let a = extract_readable(
+            include_str!("../tests/fixtures/articles/link_farm.html"),
+            "https://example.com/sitemap",
+        )
+        .unwrap();
+        assert_eq!(a.title, "Site map");
+        assert!(a.content_html.contains(r#"href="https://example.com/b""#));
     }
 
     /// gjson (dom_smoothie's JSON-LD parser) builds a non-UTF-8 `String` from `\u000` followed by
