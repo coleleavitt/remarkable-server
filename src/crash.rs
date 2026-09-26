@@ -16,7 +16,8 @@
 //!   (default [`DEFAULT_MAX_TOTAL_BYTES`]) and `CRASH_MAX_REPORTS` (default
 //!   [`DEFAULT_MAX_REPORTS`]) by deleting the *oldest* reports. New reports are never
 //!   rejected, so the device still gets its 200 and stops retrying, while the newest
-//!   crashes (the interesting ones) are kept.
+//!   crashes (the interesting ones) are kept. Reports still being written (by this
+//!   or a concurrent request) carry an [`INCOMPLETE_MARKER`] file and are skipped.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -35,6 +36,11 @@ pub const MAX_PART_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_PARTS: usize = 16;
 pub const DEFAULT_MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 pub const DEFAULT_MAX_REPORTS: usize = 200;
+/// Present in a report dir while its upload is in progress; eviction skips such dirs.
+pub const INCOMPLETE_MARKER: &str = ".incomplete";
+/// A marker older than this is left over from a crashed/killed upload, and the report
+/// becomes evictable again (a live upload is bounded by `MAX_BODY`, so takes far less).
+const STALE_INCOMPLETE: std::time::Duration = std::time::Duration::from_secs(3600);
 
 #[derive(Debug, Clone)]
 struct Limits {
@@ -72,10 +78,13 @@ async fn store(limits: &Limits, params: HashMap<String, String>, mut mp: Multipa
     if tokio::fs::create_dir_all(&base).await.is_err() {
         return StatusCode::OK; // never make the device retry forever on our storage error
     }
+    let marker = base.join(INCOMPLETE_MARKER);
+    let _ = tokio::fs::write(&marker, b"").await;
     if let Ok(meta) = serde_json::to_vec(&params) {
         let _ = tokio::fs::write(base.join("meta.json"), meta).await;
     }
-    let mut used: HashSet<String> = HashSet::from(["meta.json".to_string()]);
+    let mut used: HashSet<String> =
+        HashSet::from(["meta.json".to_string(), INCOMPLETE_MARKER.to_string()]);
     let mut parts = 0usize;
     let mut truncated = 0usize;
     let mut dropped = 0usize;
@@ -108,6 +117,7 @@ async fn store(limits: &Limits, params: HashMap<String, String>, mut mp: Multipa
         parts += 1;
         truncated += cut as usize;
     }
+    let _ = tokio::fs::remove_file(&marker).await;
     tracing::info!(
         "crash report stored id={id} parts={parts} truncated={truncated} dropped={dropped} format={:?}",
         params.get("format")
@@ -117,7 +127,10 @@ async fn store(limits: &Limits, params: HashMap<String, String>, mut mp: Multipa
         limits.max_total_bytes,
         limits.max_reports,
     );
-    let _ = tokio::task::spawn_blocking(move || enforce_quota(&dir, max_bytes, max_reports)).await;
+    let _ = tokio::task::spawn_blocking(move || {
+        enforce_quota(&dir, max_bytes, max_reports, Some(&base))
+    })
+    .await;
     StatusCode::OK
 }
 
@@ -168,9 +181,18 @@ fn dir_size(path: &Path) -> u64 {
         .sum()
 }
 
+/// Whether `report` is still being uploaded: it has a fresh [`INCOMPLETE_MARKER`].
+fn in_progress(report: &Path) -> bool {
+    std::fs::metadata(report.join(INCOMPLETE_MARKER))
+        .and_then(|m| m.modified())
+        .is_ok_and(|t| t.elapsed().map_or(true, |age| age < STALE_INCOMPLETE))
+}
+
 /// Delete the oldest report dirs (by mtime, then name) until the crash dir holds at
-/// most `max_reports` reports and `max_bytes` bytes. Only subdirectories are touched.
-fn enforce_quota(dir: &Path, max_bytes: u64, max_reports: usize) {
+/// most `max_reports` reports and `max_bytes` bytes. Only subdirectories are touched;
+/// `keep` (the report just written) and in-progress reports are never evicted, and
+/// a report that fails to delete still counts toward the totals.
+fn enforce_quota(dir: &Path, max_bytes: u64, max_reports: usize, keep: Option<&Path>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
@@ -193,11 +215,17 @@ fn enforce_quota(dir: &Path, max_bytes: u64, max_reports: usize) {
         if count <= max_reports && total <= max_bytes {
             break;
         }
-        if std::fs::remove_dir_all(&path).is_ok() {
-            tracing::info!("crash quota: evicted {}", path.display());
+        if keep == Some(path.as_path()) || in_progress(&path) {
+            continue;
         }
-        count -= 1;
-        total = total.saturating_sub(size);
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                tracing::info!("crash quota: evicted {}", path.display());
+                count -= 1;
+                total = total.saturating_sub(size);
+            }
+            Err(e) => tracing::warn!("crash quota: cannot evict {}: {e}", path.display()),
+        }
     }
 }
 
@@ -355,9 +383,75 @@ mod tests {
             .unwrap()
             .set_modified(now - std::time::Duration::from_secs(1))
             .unwrap();
-        enforce_quota(tmp.path(), 150, 100);
+        enforce_quota(tmp.path(), 150, 100, None);
         assert!(!tmp.path().join("old2").exists(), "oldest evicted by size");
         assert!(tmp.path().join("old3").exists());
         assert_eq!(report_dirs(tmp.path()).len(), 2);
+    }
+    /// Report dir `name` with a 100-byte file and an mtime `age_secs` in the past.
+    fn old_report(root: &Path, name: &str, age_secs: u64) -> PathBuf {
+        let d = root.join(name);
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("f"), vec![0u8; 100]).unwrap();
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+        std::fs::File::open(&d).unwrap().set_modified(t).unwrap();
+        d
+    }
+
+    #[test]
+    fn quota_skips_current_and_in_progress_reports() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let busy = old_report(tmp.path(), "busy", 300);
+        std::fs::write(busy.join(INCOMPLETE_MARKER), b"").unwrap();
+        let old = old_report(tmp.path(), "old", 200);
+        let cur = old_report(tmp.path(), "cur", 100);
+        enforce_quota(tmp.path(), u64::MAX, 0, Some(&cur));
+        assert!(busy.exists(), "in-progress report kept");
+        assert!(!old.exists(), "finished report evicted");
+        assert!(cur.exists(), "report of this request kept");
+
+        // A marker left behind by a dead upload goes stale and stops protecting it.
+        let stale = std::time::SystemTime::now() - STALE_INCOMPLETE * 2;
+        std::fs::File::options()
+            .write(true)
+            .open(busy.join(INCOMPLETE_MARKER))
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
+        enforce_quota(tmp.path(), u64::MAX, 0, Some(&cur));
+        assert!(!busy.exists());
+    }
+
+    #[tokio::test]
+    async fn upload_removes_incomplete_marker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mp = multipart(&[("x", Some(INCOMPLETE_MARKER), b"data".to_vec())]).await;
+        assert_eq!(
+            store(&limits(tmp.path()), HashMap::new(), mp).await,
+            StatusCode::OK
+        );
+        let d = &report_dirs(tmp.path())[0];
+        assert!(!d.join(INCOMPLETE_MARKER).exists());
+        assert_eq!(files(d), [".incomplete-1", "meta.json"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_eviction_is_not_counted() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stuck = old_report(tmp.path(), "stuck", 300);
+        let old = old_report(tmp.path(), "old", 200);
+        let new = old_report(tmp.path(), "new", 100);
+        // Read-only dir: its file can't be unlinked, so remove_dir_all fails.
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o555)).unwrap();
+        enforce_quota(tmp.path(), u64::MAX, 2, None);
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if !stuck.join("f").exists() {
+            return; // running as root: permissions don't bite, nothing to check
+        }
+        // The failed delete doesn't count, so the next-oldest goes to get down to 2.
+        assert!(!old.exists(), "next-oldest evicted instead");
+        assert!(new.exists());
     }
 }

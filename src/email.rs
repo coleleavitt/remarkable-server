@@ -23,7 +23,15 @@ use parking_lot::RwLock;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead,
+    AsyncBufReadExt,
+    AsyncRead,
+    AsyncReadExt,
+    AsyncWrite,
+    AsyncWriteExt,
+    BufReader,
+};
 use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
 
@@ -36,9 +44,12 @@ const SUPPORTED_EXTENSIONS: &[&str] = &["pdf", "epub"];
 
 /// Maximum message size, advertised in EHLO (`SIZE`) and enforced during DATA.
 const MAX_MESSAGE_BYTES: usize = 50 * 1024 * 1024;
-/// Longest single line read at once; longer lines are consumed in pieces, so one
-/// newline-less stream can't grow the line buffer without bound.
+/// Longest DATA piece read at once; longer lines are consumed in pieces (appended
+/// verbatim), so one newline-less stream can't grow the line buffer without bound.
 const MAX_LINE_BYTES: u64 = 1024 * 1024;
+/// Longest accepted command line (incl. CRLF). RFC 5321 §4.5.3.1.4 sets 512; allow
+/// some slack for lenient clients. Longer lines are discarded whole with `500`.
+const MAX_COMMAND_LINE_BYTES: u64 = 4096;
 
 /// SMTP server configuration
 #[derive(Debug, Clone)]
@@ -212,15 +223,22 @@ impl EmailServer {
 
     /// Handle a single SMTP connection
     async fn handle_connection(&self, stream: TcpStream, peer: SocketAddr) -> Result<()> {
-        let (reader, mut writer) = stream.into_split();
-        let mut reader = BufReader::new(reader);
-        let mut line: Vec<u8> = Vec::new();
+        let (reader, writer) = stream.into_split();
+        self.session(reader, writer, peer).await
+    }
+
+    /// Run one SMTP session over any byte stream (a TCP connection in production).
+    async fn session<R, W>(&self, reader: R, mut writer: W, peer: SocketAddr) -> Result<()>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let mut reader = SmtpReader::new(BufReader::new(reader));
 
         // Session state
         let session_id = Uuid::new_v4().to_string();
         let mut mail_from: Option<String> = None;
         let mut rcpt_to: Vec<String> = Vec::new();
-        let mut in_data = false;
         let mut data_buf = DataBuf::new(MAX_MESSAGE_BYTES);
 
         // Send greeting
@@ -231,53 +249,18 @@ impl EmailServer {
         writer.write_all(greeting.as_bytes()).await?;
 
         loop {
-            line.clear();
-            let bytes_read = (&mut reader)
-                .take(MAX_LINE_BYTES)
-                .read_until(b'\n', &mut line)
-                .await?;
-            if bytes_read == 0 {
-                break; // Connection closed
-            }
-
-            if in_data {
-                // Check for end of data
-                if line.trim_ascii() == b"." {
-                    in_data = false;
-
-                    if data_buf.overflowed() {
-                        tracing::warn!(
-                            "SMTP [{session_id}] message over {MAX_MESSAGE_BYTES} bytes discarded"
-                        );
-                        writer
-                            .write_all(b"552 Message size exceeds fixed maximum message size\r\n")
-                            .await?;
-                    } else if let Some(from) = &mail_from {
-                        // Process the email
-                        match self.process_email(from, &rcpt_to, data_buf.bytes()).await {
-                            Ok(count) => {
-                                let msg =
-                                    format!("250 OK: {} attachment(s) queued for sync\r\n", count);
-                                writer.write_all(msg.as_bytes()).await?;
-                            }
-                            Err(e) => {
-                                tracing::error!("Email processing failed: {}", e);
-                                writer.write_all(b"451 Email processing failed\r\n").await?;
-                            }
-                        }
-                    }
-
-                    // Reset for next message
-                    mail_from = None;
-                    rcpt_to.clear();
-                    data_buf.clear();
-                } else {
-                    data_buf.push_line(&line);
+            match reader.read_command().await? {
+                CommandRead::Eof => break, // Connection closed
+                CommandRead::TooLong => {
+                    tracing::warn!("SMTP [{session_id}] command line too long, discarded");
+                    writer.write_all(b"500 Line too long\r\n").await?;
+                    continue;
                 }
-                continue;
+                CommandRead::Line => {}
             }
 
-            let text = String::from_utf8_lossy(&line);
+            // Owned so the reader can be borrowed again (DATA) while this is alive.
+            let text = String::from_utf8_lossy(reader.line()).into_owned();
             let line_trimmed = text.trim();
             tracing::trace!("SMTP [{session_id}] <- {}", line_trimmed);
 
@@ -318,10 +301,40 @@ impl EmailServer {
                             .write_all(b"503 MAIL FROM and RCPT TO required first\r\n")
                             .await?;
                     } else {
-                        in_data = true;
                         writer
                             .write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n")
                             .await?;
+                        data_buf.clear();
+                        if !reader.read_data(&mut data_buf).await? {
+                            break; // Connection closed mid-DATA
+                        }
+                        if data_buf.overflowed() {
+                            tracing::warn!(
+                                "SMTP [{session_id}] message over {MAX_MESSAGE_BYTES} bytes discarded"
+                            );
+                            writer
+                                .write_all(
+                                    b"552 Message size exceeds fixed maximum message size\r\n",
+                                )
+                                .await?;
+                        } else if let Some(from) = &mail_from {
+                            match self.process_email(from, &rcpt_to, data_buf.bytes()).await {
+                                Ok(count) => {
+                                    let msg = format!(
+                                        "250 OK: {count} attachment(s) queued for sync\r\n"
+                                    );
+                                    writer.write_all(msg.as_bytes()).await?;
+                                }
+                                Err(e) => {
+                                    tracing::error!("Email processing failed: {}", e);
+                                    writer.write_all(b"451 Email processing failed\r\n").await?;
+                                }
+                            }
+                        }
+                        // Reset for next message
+                        mail_from = None;
+                        rcpt_to.clear();
+                        data_buf.clear();
                     }
                 }
                 SmtpCommand::Quit => {
@@ -782,6 +795,100 @@ fn parse_command(line: &str) -> SmtpCommand<'_> {
     }
 }
 
+/// Outcome of [`SmtpReader::read_command`]; the line itself is in [`SmtpReader::line`].
+#[derive(Debug, PartialEq, Eq)]
+enum CommandRead {
+    /// A complete command line (or a final unterminated one before EOF).
+    Line,
+    /// The line exceeded the command cap; all of it, up to and including its newline,
+    /// was discarded so no part of it can be parsed as a command.
+    TooLong,
+    Eof,
+}
+
+/// Line framing for an SMTP session with bounded reads.
+///
+/// Reads are capped per call, so a line longer than the cap arrives in pieces. The
+/// reader tracks whether each piece completed a line (ended in `\n`), so a piece of an
+/// over-long line is never mistaken for the start of a new command or for the
+/// end-of-data `.` line.
+struct SmtpReader<R> {
+    inner: R,
+    buf: Vec<u8>,
+    command_cap: u64,
+    data_cap: u64,
+}
+
+impl<R: AsyncBufRead + Unpin> SmtpReader<R> {
+    fn new(inner: R) -> Self {
+        Self::with_caps(inner, MAX_COMMAND_LINE_BYTES, MAX_LINE_BYTES)
+    }
+
+    fn with_caps(inner: R, command_cap: u64, data_cap: u64) -> Self {
+        Self {
+            inner,
+            buf: Vec::new(),
+            command_cap,
+            data_cap,
+        }
+    }
+
+    /// The line from the last [`CommandRead::Line`].
+    fn line(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// Read up to `cap` bytes, stopping after the first `\n`. Returns bytes read.
+    async fn read_piece(&mut self, cap: u64) -> std::io::Result<usize> {
+        self.buf.clear();
+        (&mut self.inner)
+            .take(cap)
+            .read_until(b'\n', &mut self.buf)
+            .await
+    }
+
+    fn piece_ends_line(&self) -> bool {
+        self.buf.last() == Some(&b'\n')
+    }
+
+    async fn read_command(&mut self) -> std::io::Result<CommandRead> {
+        let n = self.read_piece(self.command_cap).await?;
+        if n == 0 {
+            return Ok(CommandRead::Eof);
+        }
+        if self.piece_ends_line() || (n as u64) < self.command_cap {
+            return Ok(CommandRead::Line);
+        }
+        // Over-long: swallow the rest of this line so none of it runs as a command.
+        loop {
+            let n = self.read_piece(self.command_cap).await?;
+            if n == 0 || self.piece_ends_line() {
+                break;
+            }
+        }
+        self.buf.clear();
+        Ok(CommandRead::TooLong)
+    }
+
+    /// Read DATA into `data` until the end-of-data line. Returns `false` on EOF first.
+    /// The `.` terminator is only recognised as a whole line that starts at a real line
+    /// start; pieces of longer lines are appended verbatim.
+    async fn read_data(&mut self, data: &mut DataBuf) -> std::io::Result<bool> {
+        let mut at_line_start = true;
+        loop {
+            if self.read_piece(self.data_cap).await? == 0 {
+                return Ok(false);
+            }
+            let complete = self.piece_ends_line();
+            if at_line_start && matches!(self.buf.as_slice(), b".\r\n" | b".\n") {
+                return Ok(true);
+            }
+            data.push(&self.buf, at_line_start);
+            at_line_start = complete;
+        }
+    }
+}
+
 /// DATA accumulator: undoes dot-stuffing and stops buffering once the message would
 /// exceed `max` bytes (the rest is read and discarded; the caller then replies 552).
 #[derive(Debug)]
@@ -800,14 +907,16 @@ impl DataBuf {
         }
     }
 
-    fn push_line(&mut self, line: &[u8]) {
+    /// Append one piece of DATA. `at_line_start` says whether `piece` begins a new
+    /// line; only then is a leading dot a stuffed dot (RFC 5321 §4.5.2) and removed.
+    /// Continuation pieces of an over-long line are appended verbatim.
+    fn push(&mut self, piece: &[u8], at_line_start: bool) {
         if self.overflow {
             return;
         }
-        let content = if line.starts_with(b"..") {
-            &line[1..]
-        } else {
-            line
+        let content = match piece {
+            [b'.', rest @ ..] if at_line_start => rest,
+            _ => piece,
         };
         if self.buf.len() + content.len() > self.max {
             self.overflow = true;
@@ -964,8 +1073,8 @@ mod tests {
     #[test]
     fn data_buf_unstuffs_dots() {
         let mut d = DataBuf::new(1000);
-        d.push_line(b"Subject: x\r\n");
-        d.push_line(b"..leading dot\r\n");
+        d.push(b"Subject: x\r\n", true);
+        d.push(b"..leading dot\r\n", true);
         assert_eq!(d.bytes(), b"Subject: x\r\n.leading dot\r\n");
         assert!(!d.overflowed());
     }
@@ -973,19 +1082,162 @@ mod tests {
     #[test]
     fn data_buf_enforces_size_limit() {
         let mut d = DataBuf::new(10);
-        d.push_line(b"12345\r\n"); // 7
-        d.push_line(b"abc"); // 10: exactly at the limit is fine
+        d.push(b"12345\r\n", true); // 7
+        d.push(b"abc", true); // 10: exactly at the limit is fine
         assert!(!d.overflowed());
-        d.push_line(b"x"); // 11 > 10
+        d.push(b"x", true); // 11 > 10
         assert!(d.overflowed());
         assert!(d.bytes().is_empty(), "buffer released on overflow");
         assert_eq!(d.buf.capacity(), 0);
-        d.push_line(&[b'y'; 100]); // further lines discarded
+        d.push(&[b'y'; 100], true); // further lines discarded
         assert!(d.bytes().is_empty());
         d.clear(); // next message (after 552 / RSET) starts fresh
         assert!(!d.overflowed());
-        d.push_line(b"ok");
+        d.push(b"ok", true);
         assert_eq!(d.bytes(), b"ok");
+    }
+
+    #[test]
+    fn data_buf_unstuffs_only_at_line_start() {
+        let mut d = DataBuf::new(1000);
+        d.push(b".x\r\n", true);
+        d.push(b"abc", true);
+        d.push(b"..continued\r\n", false); // piece of a long line: verbatim
+        assert_eq!(d.bytes(), b"x\r\nabc..continued\r\n");
+    }
+
+    fn reader(input: &[u8], command_cap: u64, data_cap: u64) -> SmtpReader<&[u8]> {
+        SmtpReader::with_caps(input, command_cap, data_cap)
+    }
+
+    #[tokio::test]
+    async fn over_long_command_is_discarded_whole() {
+        // With an 8-byte cap, "NOOP AAA" is the first piece and "QUIT\r\n" the rest of
+        // the same line; it must not be parsed as a command.
+        let mut r = reader(b"NOOP AAAQUIT\r\nNOOP\r\n", 8, 64);
+        assert_eq!(r.read_command().await.unwrap(), CommandRead::TooLong);
+        assert_eq!(r.read_command().await.unwrap(), CommandRead::Line);
+        assert_eq!(r.line(), b"NOOP\r\n");
+        assert_eq!(r.read_command().await.unwrap(), CommandRead::Eof);
+
+        // Remainder spanning several pieces is swallowed too.
+        let long = [&[b'N'; 30][..], b"QUIT\r\nRSET\r\n"].concat();
+        let mut r = reader(&long, 8, 64);
+        assert_eq!(r.read_command().await.unwrap(), CommandRead::TooLong);
+        assert_eq!(r.read_command().await.unwrap(), CommandRead::Line);
+        assert_eq!(r.line(), b"RSET\r\n");
+
+        // Exactly at the cap (newline included) is still a line.
+        let mut r = reader(b"ABCDEF\r\n", 8, 64);
+        assert_eq!(r.read_command().await.unwrap(), CommandRead::Line);
+        assert_eq!(r.line(), b"ABCDEF\r\n");
+    }
+
+    #[tokio::test]
+    async fn data_piece_boundary_does_not_end_data() {
+        // The 8-byte cap splits the first line right before ".\r\n".
+        let mut r = reader(b"xxxxxxxx.\r\nmore\r\n.\r\nNOOP\r\n", 64, 8);
+        let mut d = DataBuf::new(1000);
+        assert!(r.read_data(&mut d).await.unwrap());
+        assert_eq!(d.bytes(), b"xxxxxxxx.\r\nmore\r\n");
+        assert_eq!(r.read_command().await.unwrap(), CommandRead::Line);
+        assert_eq!(r.line(), b"NOOP\r\n");
+    }
+
+    #[tokio::test]
+    async fn data_unstuffs_dots_only_at_real_line_starts() {
+        // "..z" lands at a piece boundary mid-line: kept verbatim. "..w" starts a line.
+        let mut r = reader(b"yyyyyyyy..z\r\n..w\r\n.\r\n", 64, 8);
+        let mut d = DataBuf::new(1000);
+        assert!(r.read_data(&mut d).await.unwrap());
+        assert_eq!(d.bytes(), b"yyyyyyyy..z\r\n.w\r\n");
+    }
+
+    #[tokio::test]
+    async fn data_long_lines_count_toward_size_limit() {
+        let mut input = vec![b'a'; 100];
+        input.extend_from_slice(b"\r\n.\r\n");
+        let mut r = reader(&input, 64, 8);
+        let mut d = DataBuf::new(50);
+        assert!(r.read_data(&mut d).await.unwrap(), "terminator still found");
+        assert!(d.overflowed());
+    }
+
+    #[tokio::test]
+    async fn data_eof_before_terminator() {
+        let mut r = reader(b"partial\r\n", 64, 8);
+        let mut d = DataBuf::new(1000);
+        assert!(!r.read_data(&mut d).await.unwrap());
+    }
+
+    fn test_server(tmp: &Path) -> EmailServer {
+        let storage = Storage::new(tmp.join("storage")).unwrap();
+        let devices = DeviceManager::new(tmp.join("devices.db"), "us", "test").unwrap();
+        let code = devices.create_pairing_code("user").unwrap();
+        devices.exchange_code(&code, "dev", "remarkable").unwrap();
+        EmailServer::new(
+            EmailConfig::default(),
+            storage,
+            devices,
+            &tmp.join("email.db"),
+        )
+        .unwrap()
+    }
+
+    /// Feed `input` to a session and return everything it wrote back.
+    async fn run_session(server: &EmailServer, input: Vec<u8>) -> String {
+        let (mut client, conn) = tokio::io::duplex(1 << 20);
+        let (r, w) = tokio::io::split(conn);
+        let peer: SocketAddr = "127.0.0.1:2525".parse().unwrap();
+        let client_side = async move {
+            client.write_all(&input).await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut out = Vec::new();
+            client.read_to_end(&mut out).await.unwrap();
+            out
+        };
+        let (res, out) = tokio::join!(server.session(r, w, peer), client_side);
+        res.unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[tokio::test]
+    async fn session_rejects_over_long_command_without_running_embedded_command() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = test_server(tmp.path());
+        // First read piece is exactly the command cap; "QUIT" follows on the same line.
+        let pad = MAX_COMMAND_LINE_BYTES as usize - "NOOP ".len();
+        let mut input = format!("NOOP {}", "A".repeat(pad)).into_bytes();
+        input.extend_from_slice(b"QUIT\r\nNOOP\r\nQUIT\r\n");
+        let out = run_session(&server, input).await;
+        let lines: Vec<&str> = out.split("\r\n").filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            &lines[1..],
+            ["500 Line too long", "250 OK", "221 Bye"],
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_over_size_message_gets_552() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = test_server(tmp.path());
+        let mut input =
+            b"EHLO c\r\nMAIL FROM:<a@b.c>\r\nRCPT TO:<send@dev.remarkable.local>\r\nDATA\r\n"
+                .to_vec();
+        // One newline-less line well past the data piece cap, then over the size cap.
+        let line = vec![b'z'; MAX_LINE_BYTES as usize * 3];
+        while input.len() <= MAX_MESSAGE_BYTES + line.len() {
+            input.extend_from_slice(&line);
+        }
+        input.extend_from_slice(b"\r\n.\r\nNOOP\r\nQUIT\r\n");
+        let out = run_session(&server, input).await;
+        assert!(
+            out.ends_with(
+                "552 Message size exceeds fixed maximum message size\r\n250 OK\r\n221 Bye\r\n"
+            ),
+            "{out}"
+        );
     }
 
     #[test]
