@@ -10,12 +10,16 @@
 //!    the fetch already reflects them; a change not sent yet also survives the fetch;
 //! 3. fetch the articles changed since the account's `last_sync`;
 //! 4. apply the account's filters and `max_articles`, record the articles (one transaction, off
-//!    the async threads), and skip the ones already on the device (`synced_to_device`);
-//! 5. render each new article (EPUB or PDF) and add it to the sync tree with
-//!    [`documents::create_document_in`], inside `folder_id` (resolved or created by
-//!    [`documents::ensure_folder`]; none = top level). Both refuse a root index they don't
-//!    fully understand, so the tablet's library is never rewritten lossily. The article is
-//!    marked delivered right after its document is committed, on the same blocking thread;
+//!    the async threads; articles are unique per account and provider id), and skip the ones
+//!    already on the device (`synced_to_device`, or found in the tree under the document an
+//!    earlier sync recorded before its commit);
+//! 5. render each new article (EPUB or PDF) and add them to the sync tree in batches of up to
+//!    [`BATCH_ARTICLES`], each in one root commit ([`documents::stage_documents`]), inside
+//!    `folder_id` (resolved or created by [`documents::ensure_folder`]; none = top level). These
+//!    refuse a root index they don't fully understand, so the tablet's library is never
+//!    rewritten lossily; such a root is found before any content is fetched. Each article is
+//!    recorded with its document's id before the commit and marked delivered right after it,
+//!    on the same blocking thread;
 //! 6. if the root changed, tell connected devices to pull it (SyncComplete);
 //! 7. advance `last_sync` to when the fetch started, unless something is to be retried over the
 //!    same window: the fetch or recording failed, the tree refused a document, no PDF converter
@@ -46,11 +50,10 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use tokio::sync::broadcast;
 
-use crate::documents;
+use crate::documents::{self, NewDocument};
 use crate::notifications::WsMessage;
 use crate::readlater::{
     Article,
-    ArticleContent,
     ArticleConverter,
     ArticleFormat,
     HttpTimeouts,
@@ -60,7 +63,7 @@ use crate::readlater::{
     ReadLaterManager,
     ReadLaterProvider,
     ReadLaterProviderTrait,
-    Recorded,
+    RenderedArticle,
     SyncResult,
     provider_with_timeouts,
     select_articles_for_sync,
@@ -86,6 +89,14 @@ pub const MAX_ITEM_FAILURES: u32 = 3;
 /// Provider requests in a row that may fail to get through before a sync stops, taking the
 /// provider for unreachable.
 const MAX_UNREACHABLE: u32 = 2;
+/// Most articles added to the device in one root commit. A sync delivering many (the first
+/// import of an account) then moves the root a few times rather than once per article, so a
+/// tablet syncing meanwhile has its root update refused (and retried) a few times at most, and
+/// a commit the tree refuses holds back at most this many.
+const BATCH_ARTICLES: usize = 20;
+/// Rendered bytes after which a batch is committed early, so a batch of large PDFs isn't held
+/// in memory all at once.
+const BATCH_BYTES: usize = 64 << 20;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
@@ -723,102 +734,18 @@ impl Run<'_> {
             Ok(Err(e)) => return self.fail(format!("Save articles: {e}")),
             Err(e) => return self.fail(format!("Save articles: {e}")),
         };
-        let mut pending = Vec::new();
-        for r in recorded {
-            match r {
-                Recorded::Stored(article) if article.synced_to_device => {
-                    self.result.articles_already_synced += 1;
-                }
-                Recorded::Stored(article) => pending.push(article),
-                Recorded::OtherAccount { provider_id, owner } => self.result.errors.push(format!(
-                    "Skip {provider_id}: already recorded for account {owner} (articles are \
-                     unique per provider id)"
-                )),
-            }
-        }
+        let (on_device, pending): (Vec<Article>, Vec<Article>) =
+            recorded.into_iter().partition(|a| a.synced_to_device);
+        self.result.articles_already_synced += count(on_device.len());
         let format = self.account.sync_settings.convert_format;
         if pending.is_empty() || format == ArticleFormat::Html {
             return;
         }
 
-        let folder = self
-            .account
-            .sync_settings
-            .folder_id
-            .clone()
-            .unwrap_or_default();
         let generation_before = self.syncer.storage.get_root().generation;
-        let mut parent = None;
-        for article in pending {
-            if !self.still_allowed() {
-                break;
-            }
-            let content = self
-                .provider
-                .fetch_article_content(&self.account.config, &article)
-                .await;
-            self.absorb_refreshed();
-            let item = Item::Article(article.provider_id.clone());
-            let content = match content {
-                Ok(content) => {
-                    self.unreachable = 0;
-                    content
-                }
-                Err(e) => {
-                    let message = format!("Content {}: {e}", article.id);
-                    if matches!(e, ReadLaterError::Network(_)) {
-                        // Not the article's fault: retried over the same window.
-                        self.result.errors.push(message);
-                        self.retry = true;
-                        if self.unreachable() {
-                            break;
-                        }
-                    } else {
-                        self.unreachable = 0;
-                        self.item_rejected(item, message);
-                    }
-                    continue;
-                }
-            };
-            let delivery = Delivery {
-                storage: self.syncer.storage.clone(),
-                manager: Arc::clone(&self.syncer.manager),
-                folder: folder.clone(),
-                parent: parent.clone(),
-                article,
-                content,
-                format,
-                pdf: self.syncer.pdf.clone(),
-            };
-            let outcome = match tokio::task::spawn_blocking(move || delivery.run()).await {
-                Ok(outcome) => outcome,
-                Err(e) => {
-                    self.fail(format!("Deliver: {e}"));
-                    break;
-                }
-            };
-            self.result.articles_converted += u32::from(outcome.converted);
-            self.result.articles_synced += u32::from(outcome.document_id.is_some());
-            if outcome.parent.is_some() {
-                parent = outcome.parent;
-            }
-            match outcome.failure {
-                None => self.syncer.item_done(&self.account.id, item),
-                Some(failure) if failure.stage == Stage::Render => {
-                    self.item_rejected(item, failure.message);
-                }
-                // No converter works here, so none of the rest would render either (they are
-                // delivered once one does); the tree refused the change (e.g. a root index we
-                // won't rewrite), and the rest would be refused the same way; or a delivery
-                // couldn't be recorded, and the next one wouldn't be either (it would be added
-                // again).
-                Some(failure) => {
-                    self.fail(failure.message);
-                    break;
-                }
-            }
+        if let Some(pending) = self.not_on_device(pending).await {
+            self.deliver(pending, format).await;
         }
-
         let root = self.syncer.storage.get_root();
         if root.generation != generation_before {
             // Tell connected devices to pull the new root, as document uploads do.
@@ -829,6 +756,208 @@ impl Run<'_> {
             ));
         }
     }
+
+    /// The articles of `pending` not on the device yet. Before a batch is committed its
+    /// articles are recorded with the ids of the documents they are being added as, so one an
+    /// earlier sync added without recording it (the process died between the two, or the
+    /// database write failed) is recognised here, its document being in the tree, and marked
+    /// delivered rather than added again. `None` (reported; the sync fails) if the tree is one
+    /// the server won't add documents to, found before any content is fetched, or if what was
+    /// found can't be recorded.
+    async fn not_on_device(&mut self, pending: Vec<Article>) -> Option<Vec<Article>> {
+        let storage = self.syncer.storage.clone();
+        let listed = tokio::task::spawn_blocking(move || documents::root_node_ids(&storage)).await;
+        let listed = match listed {
+            Ok(Ok(listed)) => listed,
+            Ok(Err(e)) => {
+                self.fail(format!("Add articles to the device: {e}"));
+                return None;
+            }
+            Err(e) => {
+                self.fail(format!("Read the sync tree: {e}"));
+                return None;
+            }
+        };
+        let (found, rest): (Vec<Article>, Vec<Article>) = pending.into_iter().partition(|a| {
+            a.document_id
+                .as_ref()
+                .is_some_and(|document| listed.contains(document))
+        });
+        if found.is_empty() {
+            return Some(rest);
+        }
+        let deliveries: Vec<(String, String)> = found
+            .iter()
+            .filter_map(|a| Some((a.id.clone(), a.document_id.clone()?)))
+            .collect();
+        let marked = self.syncer.manager.lock().mark_delivered_all(&deliveries);
+        if let Err(e) = marked {
+            self.fail(format!(
+                "Record {} articles found on the device as delivered: {e}",
+                found.len()
+            ));
+            return None;
+        }
+        for (article, document) in &deliveries {
+            tracing::info!(
+                %article,
+                %document,
+                "read-later article found on the device (added by an earlier sync that didn't \
+                 record it); recorded as delivered"
+            );
+        }
+        for article in &found {
+            self.syncer
+                .item_done(&self.account.id, Item::Article(article.provider_id.clone()));
+        }
+        self.result.articles_already_synced += count(found.len());
+        Some(rest)
+    }
+
+    /// Render `pending` as `format` and put them on the device in batches, each in one root
+    /// commit of at most [`BATCH_ARTICLES`] documents (and about [`BATCH_BYTES`]), inside the
+    /// account's folder. The account is checked before each article and each commit: once it
+    /// may no longer be synced, what is rendered and not committed is dropped (delivered by a
+    /// later sync). When the sync stops otherwise (the provider unreachable, no working
+    /// converter), what is rendered is still committed; when a commit fails, nothing more is.
+    async fn deliver(&mut self, pending: Vec<Article>, format: ArticleFormat) {
+        let folder = self
+            .account
+            .sync_settings
+            .folder_id
+            .clone()
+            .unwrap_or_default();
+        let mut parent = None;
+        let mut batch = Batch::default();
+        for article in pending {
+            if !self.still_allowed() {
+                return;
+            }
+            match self.render(article, format).await {
+                Rendering::Done(article, document) => {
+                    batch.push(article, document);
+                    if batch.is_full() {
+                        let full = std::mem::take(&mut batch);
+                        if !self.commit(full, &folder, &mut parent).await {
+                            return;
+                        }
+                    }
+                }
+                Rendering::Skipped => {}
+                Rendering::Stop => break,
+            }
+        }
+        if !batch.is_empty() && self.still_allowed() {
+            self.commit(batch, &folder, &mut parent).await;
+        }
+    }
+
+    /// Fetch `article`'s content and render it as `format` (on a blocking thread).
+    async fn render(&mut self, article: Article, format: ArticleFormat) -> Rendering {
+        let content = self
+            .provider
+            .fetch_article_content(&self.account.config, &article)
+            .await;
+        self.absorb_refreshed();
+        let item = Item::Article(article.provider_id.clone());
+        let content = match content {
+            Ok(content) => {
+                self.unreachable = 0;
+                content
+            }
+            Err(e) => {
+                let message = format!("Content {}: {e}", article.id);
+                if matches!(e, ReadLaterError::Network(_)) {
+                    // Not the article's fault: retried over the same window.
+                    self.result.errors.push(message);
+                    self.retry = true;
+                    if self.unreachable() {
+                        return Rendering::Stop;
+                    }
+                } else {
+                    self.unreachable = 0;
+                    self.item_rejected(item, message);
+                }
+                return Rendering::Skipped;
+            }
+        };
+        let pdf = self.syncer.pdf.clone();
+        let rendered = tokio::task::spawn_blocking(move || {
+            let rendered = ArticleConverter::render_with(&article, &content, format, &pdf);
+            (article, rendered)
+        })
+        .await;
+        match rendered {
+            Ok((article, Ok(document))) => {
+                self.result.articles_converted += 1;
+                Rendering::Done(article, document)
+            }
+            // No converter works here, so none of the rest would render either; they are
+            // delivered once one does.
+            Ok((article, Err(e @ ReadLaterError::ConverterUnavailable(_)))) => {
+                self.fail(format!("Convert {}: {e}", article.id));
+                Rendering::Stop
+            }
+            Ok((article, Err(e))) => {
+                self.item_rejected(item, format!("Convert {}: {e}", article.id));
+                Rendering::Skipped
+            }
+            Err(e) => {
+                self.fail(format!("Convert: {e}"));
+                Rendering::Stop
+            }
+        }
+    }
+
+    /// Put `batch` on the device in one root commit and mark its articles delivered, on a
+    /// blocking thread; returns whether it went through. If not, the sync fails (reported): the
+    /// tree refused the change (e.g. a root index we won't rewrite), and the rest would be
+    /// refused the same way; or the batch couldn't be recorded, and the next wouldn't be either.
+    async fn commit(&mut self, batch: Batch, folder: &str, parent: &mut Option<String>) -> bool {
+        let commit = BatchCommit {
+            storage: self.syncer.storage.clone(),
+            manager: Arc::clone(&self.syncer.manager),
+            folder: folder.to_owned(),
+            parent: parent.clone(),
+            documents: batch.documents,
+        };
+        let outcome = match tokio::task::spawn_blocking(move || commit.run()).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                self.fail(format!("Deliver: {e}"));
+                return false;
+            }
+        };
+        if outcome.parent.is_some() {
+            *parent = outcome.parent;
+        }
+        self.result.articles_synced += count(outcome.added.len());
+        for provider_id in outcome.added {
+            self.syncer
+                .item_done(&self.account.id, Item::Article(provider_id));
+        }
+        match outcome.failure {
+            None => true,
+            Some(message) => {
+                self.fail(message);
+                false
+            }
+        }
+    }
+}
+
+/// `n` as a count in a [`SyncResult`].
+fn count(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// What became of one article's rendering.
+enum Rendering {
+    Done(Article, RenderedArticle),
+    /// Not delivered this sync (reported); go on with the next article.
+    Skipped,
+    /// The sync stops (reported).
+    Stop,
 }
 
 /// Whether the scheduler syncs `account` at all: enabled, `auto_sync`, and its provider still
@@ -874,109 +1003,123 @@ fn retry_after(interval: Duration, failures: u32) -> Duration {
     )
 }
 
-/// The step of a [`Delivery`] that failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Stage {
-    /// The article couldn't be rendered (a converter that works failed on it).
-    Render,
-    /// No converter works on this host, whatever the article.
-    Converter,
-    /// Resolving the folder or committing the document to the sync tree.
-    Tree,
-    Record,
-}
-
-struct Failure {
-    stage: Stage,
-    message: String,
-}
-
+/// Rendered articles waiting to be added to the device in one root commit.
 #[derive(Default)]
-struct Delivered {
-    converted: bool,
+struct Batch {
+    documents: Vec<(Article, RenderedArticle)>,
+    bytes: usize,
+}
+
+impl Batch {
+    fn push(&mut self, article: Article, document: RenderedArticle) {
+        self.bytes = self.bytes.saturating_add(document.bytes.len());
+        self.documents.push((article, document));
+    }
+
+    /// Whether the batch is to be committed now: it holds [`BATCH_ARTICLES`] documents, or
+    /// [`BATCH_BYTES`] of them.
+    fn is_full(&self) -> bool {
+        self.documents.len() >= BATCH_ARTICLES || self.bytes >= BATCH_BYTES
+    }
+
+    fn is_empty(&self) -> bool {
+        self.documents.is_empty()
+    }
+}
+
+/// What a [`BatchCommit`] did.
+#[derive(Default)]
+struct Committed {
     /// The folder's collection id, once resolved (reused for the rest of the sync).
     parent: Option<String>,
-    document_id: Option<String>,
-    failure: Option<Failure>,
+    /// Provider ids of the articles whose documents were committed.
+    added: Vec<String>,
+    failure: Option<String>,
 }
 
-impl Delivered {
-    fn failed(mut self, stage: Stage, message: String) -> Self {
-        self.failure = Some(Failure { stage, message });
+impl Committed {
+    fn failed(mut self, message: String) -> Self {
+        self.failure = Some(message);
         self
     }
 }
 
-/// One article's trip onto the device; blocking, so it runs on a blocking thread.
-struct Delivery {
+/// A batch's trip onto the device; blocking, so it runs on a blocking thread.
+struct BatchCommit {
     storage: Storage,
     manager: Arc<Mutex<ReadLaterManager>>,
     folder: String,
     parent: Option<String>,
-    article: Article,
-    content: ArticleContent,
-    format: ArticleFormat,
-    pdf: PdfPrograms,
+    documents: Vec<(Article, RenderedArticle)>,
 }
 
-impl Delivery {
-    /// Render the article, resolve the folder (once per sync), commit the document, and mark
-    /// the article delivered. Nothing awaits between the commit and the mark, and a blocking
-    /// task runs to completion even if the sync that started it is dropped, so a committed
-    /// document is recorded unless the process dies or the database write fails (reported).
-    fn run(self) -> Delivered {
-        let mut out = Delivered::default();
-        let id = &self.article.id;
-        let rendered = match ArticleConverter::render_with(
-            &self.article,
-            &self.content,
-            self.format,
-            &self.pdf,
-        ) {
-            Ok(rendered) => rendered,
-            Err(e @ ReadLaterError::ConverterUnavailable(_)) => {
-                return out.failed(Stage::Converter, format!("Convert {id}: {e}"));
-            }
-            Err(e) => return out.failed(Stage::Render, format!("Convert {id}: {e}")),
-        };
-        out.converted = true;
+impl BatchCommit {
+    /// Resolve the folder (once per sync), store the documents' blobs, record the document each
+    /// article is being added as, add them all to the tree in one root commit, and mark the
+    /// articles delivered. Every step refuses a root index it doesn't fully understand, leaving
+    /// it untouched. Nothing awaits between the commit and the mark, and a blocking task runs
+    /// to completion even if the sync that started it is dropped; if the mark still doesn't
+    /// happen (the process dies, the database write fails), the next sync finds the recorded
+    /// documents in the tree and marks their articles instead of adding them again.
+    fn run(self) -> Committed {
+        let mut out = Committed::default();
+        let n = self.documents.len();
         let parent = match self.parent {
             Some(parent) => parent,
             None => match documents::ensure_folder(&self.storage, &self.folder) {
                 Ok(parent) => parent,
-                Err(e) => {
-                    return out.failed(Stage::Tree, format!("Folder {:?}: {e}", self.folder));
-                }
+                Err(e) => return out.failed(format!("Folder {:?}: {e}", self.folder)),
             },
         };
         out.parent = Some(parent.clone());
-        let created = documents::create_document_in(
-            &self.storage,
-            document_name(&self.article),
-            rendered.ext,
-            &rendered.bytes,
-            &parent,
-        );
-        let (document_id, generation) = match created {
-            Ok(created) => created,
-            Err(e) => return out.failed(Stage::Tree, format!("Add {id} to the device: {e}")),
+        let new: Vec<NewDocument<'_>> = self
+            .documents
+            .iter()
+            .map(|(article, document)| NewDocument {
+                name: document_name(article),
+                ext: document.ext,
+                data: &document.bytes,
+            })
+            .collect();
+        let staged = match documents::stage_documents(&self.storage, &new, &parent) {
+            Ok(staged) => staged,
+            Err(e) => return out.failed(format!("Add {n} articles to the device: {e}")),
         };
-        tracing::info!(
-            article = %id,
-            document = %document_id,
-            generation,
-            title = %self.article.title,
-            "read-later article added to the device"
-        );
-        out.document_id = Some(document_id.clone());
-        let marked = self.manager.lock().mark_delivered(id, &document_id);
-        if let Err(e) = marked {
-            tracing::error!(
-                article = %id,
-                document = %document_id,
-                "document committed but not recorded as delivered; a later sync may add it again: {e}"
+        let deliveries: Vec<(String, String)> = self
+            .documents
+            .iter()
+            .map(|(article, _)| article.id.clone())
+            .zip(staged.ids())
+            .collect();
+        if let Err(e) = self.manager.lock().plan_deliveries(&deliveries) {
+            return out.failed(format!("Record the documents of {n} articles: {e}"));
+        }
+        let generation = match staged.commit(&self.storage) {
+            Ok(generation) => generation,
+            Err(e) => return out.failed(format!("Add {n} articles to the device: {e}")),
+        };
+        for ((article, _), (_, document)) in self.documents.iter().zip(&deliveries) {
+            tracing::info!(
+                article = %article.id,
+                %document,
+                generation,
+                title = %article.title,
+                "read-later article added to the device"
             );
-            return out.failed(Stage::Record, format!("Record {id} as delivered: {e}"));
+        }
+        out.added = self
+            .documents
+            .iter()
+            .map(|(article, _)| article.provider_id.clone())
+            .collect();
+        if let Err(e) = self.manager.lock().mark_delivered_all(&deliveries) {
+            tracing::error!(
+                articles = n,
+                generation,
+                "documents committed but not recorded as delivered; the next sync finds them in \
+                 the tree: {e}"
+            );
+            return out.failed(format!("Record {n} articles as delivered: {e}"));
         }
         out
     }
@@ -1038,6 +1181,10 @@ mod tests {
         /// When set, a list request signals `listing`, then waits for a permit.
         gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
         listing: tokio::sync::Notify,
+        /// When set, a content request signals `fetching`, then waits for (and uses up) a
+        /// permit.
+        content_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+        fetching: tokio::sync::Notify,
     }
 
     impl MockWallabag {
@@ -1095,6 +1242,11 @@ mod tests {
         m.content_calls.fetch_add(1, Ordering::SeqCst);
         if m.hang_content.load(Ordering::SeqCst) {
             std::future::pending::<()>().await;
+        }
+        let gate = m.content_gate.lock().clone();
+        if let Some(gate) = gate {
+            m.fetching.notify_one();
+            gate.acquire().await.unwrap().forget();
         }
         if m.fail_content.lock().contains(&id) {
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1246,11 +1398,25 @@ mod tests {
             self.state.manager.lock().add_account(account).unwrap();
         }
 
-        /// The recorded article with this Wallabag entry id.
+        /// The recorded article with this Wallabag entry id (only one account has it).
         fn article(&self, entry_id: i64) -> Article {
+            let mut found: Vec<Article> = self
+                .articles()
+                .into_iter()
+                .filter(|a| a.provider_id == entry_id.to_string())
+                .collect();
+            assert_eq!(found.len(), 1, "{found:?}");
+            found.remove(0)
+        }
+
+        /// `account`'s recorded article with this Wallabag entry id.
+        fn article_of(&self, account: &str, entry_id: i64) -> Article {
             self.articles()
                 .into_iter()
-                .find(|a| a.provider_id == entry_id.to_string())
+                .find(|a| {
+                    a.provider_id == entry_id.to_string()
+                        && a.account_id.as_deref() == Some(account)
+                })
                 .unwrap()
         }
 
@@ -1534,8 +1700,8 @@ mod tests {
         assert_eq!(f.pushes().len(), 1);
     }
 
-    /// A root index the server doesn't fully understand is never rewritten: the first refused
-    /// document stops the delivery, nothing is marked delivered and no push is sent.
+    /// A root index the server doesn't fully understand is never rewritten: it is found before
+    /// any content is fetched, nothing is marked delivered and no push is sent.
     #[tokio::test]
     async fn refused_root_is_left_untouched() {
         let mut f = Fixture::new(vec![entry(1), entry(2)]).await;
@@ -1557,9 +1723,10 @@ mod tests {
         );
         assert_eq!(
             f.mock.content_calls.load(Ordering::SeqCst),
-            1,
-            "stopped after the first refusal"
+            0,
+            "stopped before fetching any content"
         );
+        assert_eq!(f.account_failures("wb"), Some(1), "an account-wide failure");
         let after = f.storage.get_root();
         assert_eq!((after.hash, after.generation), (hash, root.generation));
         assert!(f.articles().iter().all(|a| !a.synced_to_device));
@@ -1879,20 +2046,264 @@ mod tests {
         assert_eq!(SchedulerConfig::from_vars(None, Some("x")).tick, secs(60));
     }
 
-    #[test]
-    fn document_name_falls_back_to_the_url() {
-        let mut article: Article = serde_json::from_value(json!({
-            "id": "a", "provider": "wallabag", "provider_id": "1", "url": "https://ex.com/1",
+    /// An article `id` with Wallabag entry id `provider_id`, titled "  Title  ".
+    fn test_article(id: &str, provider_id: &str) -> Article {
+        serde_json::from_value(json!({
+            "id": id, "provider": "wallabag", "provider_id": provider_id,
+            "url": format!("https://ex.com/{provider_id}"),
             "title": "  Title  ", "excerpt": null, "author": null, "word_count": null,
             "reading_time_minutes": null, "tags": [], "status": "unread", "favorite": false,
             "added_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z",
             "read_at": null, "content": null, "image_url": null, "document_id": null,
             "synced_to_device": false, "last_sync": null
         }))
-        .unwrap();
+        .unwrap()
+    }
+
+    #[test]
+    fn document_name_falls_back_to_the_url() {
+        let mut article = test_article("a", "1");
         assert_eq!(document_name(&article), "Title");
         article.title = " ".into();
         assert_eq!(document_name(&article), "https://ex.com/1");
+    }
+
+    #[test]
+    fn a_batch_is_full_at_its_article_or_byte_limit() {
+        let rendered = |size: usize| RenderedArticle {
+            ext: "epub",
+            bytes: vec![0; size],
+        };
+        let mut batch = Batch::default();
+        for _ in 1..BATCH_ARTICLES {
+            batch.push(test_article("a", "1"), rendered(1));
+            assert!(!batch.is_full());
+        }
+        batch.push(test_article("a", "1"), rendered(1));
+        assert!(batch.is_full());
+
+        let mut large = Batch::default();
+        large.push(test_article("a", "1"), rendered(1));
+        large.bytes = BATCH_BYTES - 1;
+        assert!(!large.is_full());
+        large.push(test_article("a", "1"), rendered(1));
+        assert!(large.is_full());
+    }
+
+    /// A batch the tree refuses commits nothing and marks nothing: the root index (one the
+    /// server doesn't fully understand) is left byte for byte, no blob is written, and the
+    /// article is neither delivered nor given a document.
+    #[test]
+    fn a_refused_batch_commits_and_marks_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(dir.path().join("storage")).unwrap();
+        let manager = Arc::new(Mutex::new(
+            ReadLaterManager::new(&dir.path().join("rl.db")).unwrap(),
+        ));
+        let article = test_article("a", "1");
+        manager.lock().save_article(&article).unwrap();
+        let (index, hash) = (b"3\nnot a valid entry\n", "a".repeat(64));
+        storage
+            .put_with_hash(index, &hash, "root.docSchema")
+            .unwrap();
+        let root = storage.set_root(hash.clone()).unwrap();
+        let blobs = storage.list_hashes().unwrap().len();
+
+        let out = BatchCommit {
+            storage: storage.clone(),
+            manager: Arc::clone(&manager),
+            folder: String::new(),
+            parent: None,
+            documents: vec![(
+                article,
+                RenderedArticle {
+                    ext: "epub",
+                    bytes: b"PK".to_vec(),
+                },
+            )],
+        }
+        .run();
+        let failure = out.failure.expect("refused");
+        assert!(
+            failure.contains("refusing to modify root index"),
+            "{failure}"
+        );
+        assert!(out.added.is_empty());
+        let after = storage.get_root();
+        assert_eq!(
+            (after.hash, after.generation),
+            (hash.clone(), root.generation)
+        );
+        assert_eq!(storage.get(&hash).unwrap(), index);
+        assert_eq!(storage.list_hashes().unwrap().len(), blobs);
+        let a = manager.lock().get_article("a").unwrap();
+        assert_eq!((a.synced_to_device, a.document_id), (false, None));
+    }
+
+    /// Articles are added in batches, each in one root commit: a sync delivering 3 moves the
+    /// root once, and a first import of 21 moves it twice (20, then 1). Devices get one push
+    /// either way.
+    #[tokio::test]
+    async fn articles_are_added_one_commit_per_batch() {
+        for (entries, commits) in [(3, 1), (BATCH_ARTICLES as i64 + 1, 2)] {
+            let mut f = Fixture::new((1..=entries).map(entry).collect()).await;
+            f.add_account("wb", |s| s.max_articles = 0);
+            let before = f.storage.get_root().generation;
+
+            let r = f.syncer().sync_account("wb").await.unwrap();
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+            let n = u32::try_from(entries).unwrap();
+            assert_eq!(
+                (r.articles_fetched, r.articles_converted, r.articles_synced),
+                (n, n, n)
+            );
+            let after = f.storage.get_root().generation;
+            assert_eq!(after, before + commits, "{entries} articles");
+            assert_eq!(f.document_names().len(), entries as usize);
+            assert!(f.articles().iter().all(|a| a.synced_to_device));
+            assert_eq!(f.pushes().len(), 1);
+        }
+    }
+
+    /// A sync that committed a batch but didn't record it (the process died in between, or
+    /// the database write failed) leaves each article with the document it was being added
+    /// as. The next sync finds that document in the tree and marks the article delivered
+    /// instead of adding it again (its content isn't even fetched); an article whose document
+    /// never landed is delivered as usual.
+    #[tokio::test]
+    async fn a_committed_but_unrecorded_batch_is_not_added_again() {
+        let mut f = Fixture::new(vec![entry(1), entry(2)]).await;
+        f.add_account("wb", |_| {});
+        f.mock.fail_content.lock().extend([1, 2]);
+        assert_eq!(
+            f.syncer().sync_account("wb").await.unwrap().articles_synced,
+            0
+        );
+        let (a1, a2) = (f.article(1), f.article(2));
+        let one = [NewDocument {
+            name: "Article 1",
+            ext: "epub",
+            data: b"PK",
+        }];
+        let staged = documents::stage_documents(&f.storage, &one, "").unwrap();
+        let landed = staged.ids().remove(0);
+        f.state
+            .manager
+            .lock()
+            .plan_deliveries(&[
+                (a1.id.clone(), landed.clone()),
+                (a2.id.clone(), "never-committed".into()),
+            ])
+            .unwrap();
+        staged.commit(&f.storage).unwrap();
+        f.pushes();
+        let content_calls = f.mock.content_calls.load(Ordering::SeqCst);
+
+        f.mock.fail_content.lock().clear();
+        let r = f.syncer().sync_account("wb").await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!((r.articles_synced, r.articles_already_synced), (1, 1));
+        assert_eq!(
+            f.mock.content_calls.load(Ordering::SeqCst),
+            content_calls + 1
+        );
+        assert_eq!(f.document_names(), ["Article 1", "Article 2"]);
+        let a1 = f.article(1);
+        assert_eq!(
+            (a1.synced_to_device, a1.document_id.as_deref()),
+            (true, Some(landed.as_str()))
+        );
+        let a2 = f.article(2);
+        let document = a2.document_id.expect("delivered as a new document");
+        assert!(a2.synced_to_device);
+        assert!(tree(&f.storage).iter().any(|n| n.id == document));
+        assert_eq!(f.pushes().len(), 1);
+
+        let r = f.syncer().sync_account("wb").await.unwrap();
+        assert_eq!((r.articles_synced, r.articles_already_synced), (0, 2));
+    }
+
+    /// The database refusing to record a committed batch as delivered (a trigger stands in for,
+    /// say, a full disk) fails the sync, but each article was recorded with its document before
+    /// the commit, so the next sync finds them in the tree and adds nothing again.
+    #[tokio::test]
+    async fn a_batch_the_database_fails_to_record_is_not_added_again() {
+        let mut f = Fixture::new(vec![entry(1), entry(2)]).await;
+        f.add_account("wb", |_| {});
+        let db = rusqlite::Connection::open(&f.db).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER no_marks BEFORE UPDATE OF synced_to_device ON readlater_articles
+             WHEN NEW.synced_to_device = 1 BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+        )
+        .unwrap();
+
+        let r = f.syncer().sync_account("wb").await.unwrap();
+        assert_eq!(r.articles_synced, 2, "on the device");
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.starts_with("Record 2 articles as delivered")),
+            "{:?}",
+            r.errors
+        );
+        assert_eq!(f.account_failures("wb"), Some(1));
+        assert_eq!(f.account("wb").last_sync, None);
+        assert!(
+            f.articles()
+                .iter()
+                .all(|a| !a.synced_to_device && a.document_id.is_some())
+        );
+        assert_eq!(f.document_names().len(), 2);
+        assert_eq!(f.pushes().len(), 1);
+
+        db.execute_batch("DROP TRIGGER no_marks").unwrap();
+        let r = f.syncer().sync_account("wb").await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!((r.articles_synced, r.articles_already_synced), (0, 2));
+        assert_eq!(f.document_names(), ["Article 1", "Article 2"]);
+        assert!(f.articles().iter().all(|a| a.synced_to_device));
+        assert!(f.account("wb").last_sync.is_some());
+        assert!(f.pushes().is_empty());
+    }
+
+    /// An account disabled while a scheduled sync renders its articles stops the sync before
+    /// the commit: what was rendered is dropped (delivered by a later sync), not added.
+    #[tokio::test]
+    async fn disabling_the_account_before_the_commit_adds_nothing() {
+        let mut f = Fixture::new(vec![entry(1), entry(2)]).await;
+        f.add_account("wb", |_| {});
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *f.mock.content_gate.lock() = Some(Arc::clone(&gate));
+        let syncer = Arc::clone(&f.state.syncer);
+        let pass = tokio::spawn(async move { syncer.run_due(Utc::now()).await });
+        f.mock.fetching.notified().await; // the first article's content
+        gate.add_permits(1);
+        f.mock.fetching.notified().await; // the second's: the first is rendered
+
+        let mut account = f.account("wb");
+        account.enabled = false;
+        f.state.manager.lock().update_account(account).unwrap();
+        gate.add_permits(1);
+
+        let results = pass.await.unwrap();
+        assert_eq!(results.len(), 1);
+        let r = &results[0];
+        assert_eq!((r.articles_converted, r.articles_synced), (2, 0));
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.starts_with("Stopped: the account was disabled")),
+            "{:?}",
+            r.errors
+        );
+        assert!(tree(&f.storage).is_empty());
+        assert!(
+            f.articles()
+                .iter()
+                .all(|a| !a.synced_to_device && a.document_id.is_none())
+        );
+        assert_eq!(f.account("wb").last_sync, None);
+        assert!(f.pushes().is_empty());
     }
     /// An article the provider keeps refusing is reported on every sync but doesn't back the
     /// account off, and holds `last_sync` back only until it has failed MAX_ITEM_FAILURES syncs
@@ -2019,7 +2430,8 @@ mod tests {
 
     /// A status changed here (`PUT /articles/{id}`) goes to the provider of the account that
     /// recorded the article, once. Another account of the same provider (a second Wallabag
-    /// numbering its entries alike) never sends it, nor takes the article over.
+    /// numbering its entries alike) never sends it, nor takes the article over: it records and
+    /// delivers its own entry with that id.
     #[tokio::test]
     async fn status_changes_are_sent_once_by_their_own_account() {
         let f = Fixture::new(vec![entry(1), entry(2)]).await;
@@ -2031,7 +2443,7 @@ mod tests {
         let app = readlater_router(f.state.clone());
         let set_status = |status: &str| {
             let body = json!({ "status": status }).to_string();
-            let request = Request::put(format!("/articles/{}", f.article(1).id))
+            let request = Request::put(format!("/articles/{}", f.article_of("wb", 1).id))
                 .header("content-type", "application/json")
                 .body(Body::from(body))
                 .unwrap();
@@ -2041,35 +2453,39 @@ mod tests {
             set_status("archived").await.unwrap().status(),
             StatusCode::OK
         );
-        assert!(f.article(1).read_status_pending);
+        assert!(f.article_of("wb", 1).read_status_pending);
 
         let mut other_entry = entry(1);
         other_entry["title"] = json!("Another instance's 1");
         let (other, other_base) = spawn_mock(vec![other_entry, entry(3)]).await;
         f.add_account_at("wb2", &other_base, |_| {});
         let r = f.syncer().sync_account("wb2").await.unwrap();
-        assert_eq!((r.read_status_synced, r.articles_synced), (0, 1));
-        assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
-        assert!(
-            r.errors[0].starts_with("Skip 1: already recorded for account wb"),
-            "{:?}",
-            r.errors
-        );
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!((r.read_status_synced, r.articles_synced), (0, 2));
         assert_eq!(f.account_failures("wb2"), Some(0));
         assert!(f.account("wb2").last_sync.is_some());
         assert_eq!(other.patch_calls.load(Ordering::SeqCst), 0);
         assert_eq!(f.mock.patch_calls.load(Ordering::SeqCst), 0);
-        let a = f.article(1);
+        let a = f.article_of("wb", 1);
         assert_eq!(
-            (a.title.as_str(), a.account_id.as_deref()),
-            ("Article 1", Some("wb"))
+            (
+                a.title.as_str(),
+                a.account_id.as_deref(),
+                a.read_status_pending
+            ),
+            ("Article 1", Some("wb"), true)
+        );
+        let theirs = f.article_of("wb2", 1);
+        assert_eq!(
+            (theirs.title.as_str(), theirs.synced_to_device),
+            ("Another instance's 1", true)
         );
 
         let r = f.syncer().sync_account("wb").await.unwrap();
         assert!(r.errors.is_empty(), "{:?}", r.errors);
         assert_eq!(r.read_status_synced, 1);
         assert_eq!(*f.mock.patches.lock(), [(1, 1)]);
-        let a = f.article(1);
+        let a = f.article_of("wb", 1);
         assert_eq!(
             (a.status, a.read_status_pending),
             (ReadStatus::Archived, false)
@@ -2080,11 +2496,20 @@ mod tests {
             set_status("archived").await.unwrap().status(),
             StatusCode::OK
         );
-        assert!(!f.article(1).read_status_pending);
+        assert!(!f.article_of("wb", 1).read_status_pending);
         let r = f.syncer().sync_account("wb").await.unwrap();
         assert_eq!(r.read_status_synced, 0);
         assert_eq!(f.mock.patch_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(f.document_names().len(), 3);
+        assert_eq!(
+            f.document_names(),
+            [
+                "Another instance's 1",
+                "Article 1",
+                "Article 2",
+                "Article 3"
+            ]
+        );
+        assert_eq!(f.articles().len(), 4);
     }
 
     /// A status change the provider refuses stays pending and wins over the provider's status

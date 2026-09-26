@@ -59,7 +59,10 @@ These are done and, in several cases, ahead of rmfakecloud:
   strict document path, push SyncComplete only when the root changed, and never
   add an article twice. Provider requests time out, PDF converters are confined
   and killed after a deadline, and status changes go back once, to the account
-  that recorded the article (#33).
+  that recorded the article. Articles go on the tablet in batches of up to 20
+  per root commit (a first import no longer bumps the generation once per
+  article), are keyed by account (two Wallabag instances can both hold an id;
+  old databases are re-keyed once), and `readlater.db` is owner-only (#33).
 - ✅ **Security hardening (Sept 2026 review)** — OAuth device-code sign-ins need
   owner approval (#18); deleting or re-pairing a device revokes its tokens, and
   users only see and delete their own devices (#17); pairing codes are
@@ -134,13 +137,6 @@ The community's top *concrete* pains. Small, bounded, high-value.
   memory.
 - ⬜ **Remote calendar providers** — only local ICS files sync; CalDAV, Google
   and Office 365 calendars answer "not implemented".
-- ⬜ **Read-later: one root update per sync** — each delivered article is its
-  own root commit, so a first import of `max_articles` documents bumps the
-  generation that many times (a tablet syncing meanwhile retries its root PUT).
-- ⬜ **Read-later: articles unique per provider id** — the table's
-  `UNIQUE(provider, provider_id)` means two accounts of one provider listing the
-  same id (e.g. two Wallabag instances) can't both have it; the second one's is
-  skipped and reported. Key articles by account instead (table rebuild).
 - 🧪 **`/mqtt` topic** — MQTT-over-WebSocket push publishes on whatever concrete
   topics the client subscribes to; not yet verified against a real tablet.
 
