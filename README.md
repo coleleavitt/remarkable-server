@@ -245,7 +245,7 @@ Enter the code on the tablet under Settings → General → Account → Connect.
 
 Without shell access, the owner can get a code from `POST /devices/v1` with `x-admin-token`
 (see Admin endpoints). The code pairs `local-user` (like `--pair`) unless `?user=<id>` names another
-account (1-128 chars of `A-Za-z0-9._@|-`; anything else is 400). Device and user tokens cannot mint pairing codes: a second paired device
+account (1-254 printable ASCII chars without spaces, `/` or `\\`, e.g. an email; send `+` as `%2B`; anything else is 400). Device and user tokens cannot mint pairing codes: a second paired device
 could otherwise approve the first one's passcode reset.
 
 ### Admin endpoints
@@ -273,6 +273,8 @@ Admin endpoints are disabled unless `ADMIN_TOKEN` is set; requests must send it 
 Handwriting conversion (`POST /convert/v1/handwriting`) runs the local `tesseract` binary: fine for neat print, poor for cursive/maths.
 
 Authenticated feature APIs (Bearer token): `/search/v1/*`, `/versions/v1/*`, `/feeds/v1/*` (RSS/Atom to EPUB), `/integrations/v2/{calendars,readlater,cloud}/*`, `/email/v1/*` (when inbound email is on).
+
+Cloud sync (`POST /integrations/v2/{cloud,storage}/sync`) only reads/writes under `<storage>/integrations/`: `local_path` must be relative to that directory (default `.` = the directory itself), absolute paths, `..` and symlinks leading outside it are rejected with 400, and missing subdirectories are created. Provider requests time out (10 s connect, 10 min total).
 
 See [remarkable-research](https://github.com/coleleavitt/remarkable-research) for device configuration tools.
 
@@ -314,5 +316,22 @@ store and root as sync v3; `EntrySession` commits a new root under an optimistic
 grants), `POST /oauth/revoke`, and `POST /token/json/4/device/exchange` (migrate a legacy
 device access data). The access access data is the same user access data the sync/gentree auth already
 accepts, so no other change is needed; the id access data is an HS512 auth data carrying the
-`https://auth.remarkable.com/{tectonic,subscription,mdm,created_at}` claims. Single-user
-local server: a minted device-code auto-approves to the local account (no web UI).
+`https://auth.remarkable.com/{tectonic,subscription,mdm,created_at}` claims.
+
+Device codes are **not** auto-approved (RFC 8628): `/oauth/token` answers
+`authorization_pending` until the owner approves the `user_code` the client shows, and
+`expired_token` after `expires_in` (600 s). Pending codes are held in memory, expired ones are
+evicted, and at most 256 are kept (unapproved codes are dropped first). To approve (the first
+two need `ADMIN_TOKEN` set; the third does not):
+
+- open the advertised `verification_uri` (`https://<host>/oauth/verify?user_code=1234-5678`)
+  and submit the code with the admin token, or
+- `curl -X POST https://<host>/admin/oauth/approve -H "x-admin-token: $ADMIN_TOKEN"
+  -H 'content-type: application/json' -d '{"user_code":"1234-5678"}'`, or
+- the same request with `Authorization: Bearer <device credential>` of an already-paired
+  device instead of the admin token (short-lived access credentials and credentials of
+  deleted devices are refused).
+
+The server also logs `OAuth device code requested` with the `user_code` at WARN. Legacy
+pairing (`--pair` + `/token/json/2/device/new`) and `/token/json/4/device/exchange` are
+unchanged and need no approval.
