@@ -663,15 +663,26 @@ impl DeviceManager {
     /// re-checked: a session outliving its 3h user token is the tablet's normal behaviour).
     /// Fails closed on a DB error; the client just reconnects.
     pub fn session_still_valid(&self, s: &SessionIdentity) -> bool {
-        s.device_id == ADMIN_DEVICE_ID
-            || Self::check_registration(
-                &self.inner.conn.lock(),
-                &s.device_id,
-                &s.user_id,
-                s.epoch,
-                "session",
-            )
-            .is_ok()
+        if s.device_id == ADMIN_DEVICE_ID {
+            return true;
+        }
+        match Self::check_registration(
+            &self.inner.conn.lock(),
+            &s.device_id,
+            &s.user_id,
+            s.epoch,
+            "session",
+        ) {
+            Ok(()) => true,
+            // Only a definite "not registered / revoked" ends the session. A transient DB error
+            // (busy, I/O) must not drop the tablet's connection; the next tick re-checks, and real
+            // revocations also arrive through the broadcast event.
+            Err(ServerError::InvalidToken) => false,
+            Err(e) => {
+                tracing::warn!(device_id = %s.device_id, error = %e, "session re-check failed; keeping session open");
+                true
+            }
+        }
     }
     /// Resolves once the session's device is revoked: on its `DeviceRevoked` event, or when a
     /// periodic re-check (every `SESSION_RECHECK`, and after a lagged event stream) finds the
@@ -1338,6 +1349,26 @@ mod revocation_tests {
         let other_dt = other;
         assert!(dm.revoke_device_token(&other_dt).unwrap());
         assert!(dm.validate_token(&bearer(&other_ut)).is_err());
+    }
+
+    #[test]
+    fn transient_db_error_does_not_end_a_session() {
+        let (dm, tmp) = setup();
+        let dt = pair(&dm, "local-user", "RM110-1");
+        let id = dm.session_identity(&bearer(&dt)).unwrap();
+        assert!(dm.session_still_valid(&id));
+        // Break the devices table from outside: the re-check errors, but the session stays up.
+        let other = Connection::open(tmp.path().join("devices.db")).unwrap();
+        other
+            .execute_batch("ALTER TABLE devices RENAME TO devices_gone")
+            .unwrap();
+        assert!(dm.session_still_valid(&id));
+        other
+            .execute_batch("ALTER TABLE devices_gone RENAME TO devices")
+            .unwrap();
+        // A real revocation still ends it.
+        assert!(dm.delete_device("RM110-1", None).unwrap());
+        assert!(!dm.session_still_valid(&id));
     }
 
     #[test]
