@@ -132,7 +132,6 @@ pub(crate) async fn create_dirs_within(root: &Path, rel: &Path) -> Result<Option
 /// symlink and `rename` replaces the directory entry rather than writing through it, so a
 /// symlink swapped in after our checks can't redirect the content. Also makes writes atomic.
 async fn write_replace(dir: &Path, target: &Path, content: &[u8]) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
     let tmp = dir.join(format!(".rms-sync-{}.tmp", uuid::Uuid::new_v4()));
     let res = async {
         let mut f = fs::OpenOptions::new()
@@ -140,8 +139,7 @@ async fn write_replace(dir: &Path, target: &Path, content: &[u8]) -> Result<()> 
             .create_new(true)
             .open(&tmp)
             .await?;
-        f.write_all(content).await?;
-        f.sync_all().await?;
+        write_durably(&mut f, content).await?;
         fs::rename(&tmp, target).await
     }
     .await;
@@ -149,6 +147,18 @@ async fn write_replace(dir: &Path, target: &Path, content: &[u8]) -> Result<()> 
         let _ = fs::remove_file(&tmp).await;
     }
     Ok(res?)
+}
+
+/// Write all of `content` to `f` and fsync it. tokio's `File` returns from a write before the
+/// data is written: the write runs in a background task, and its failure is reported only by
+/// the next write or `flush`. `sync_all` waits for that task but drops its error, so without
+/// the `flush` a short write (disk full, file size limit) would be renamed into place as a
+/// complete file.
+async fn write_durably(f: &mut fs::File, content: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    f.write_all(content).await?;
+    f.flush().await?;
+    f.sync_all().await
 }
 
 /// Classify a failed local write of the remote file at `cloud_path`: errors that come back the
@@ -2058,6 +2068,20 @@ mod tests {
         }
         let e = local_write_error("/x", IntegrationError::Network("reset".into()));
         assert!(matches!(e, IntegrationError::Network(_)));
+    }
+
+    /// A write that fails in tokio's background task fails `write_durably`, so `write_replace`
+    /// never renames a short file into place as a finished download. Every write to a file
+    /// opened read-only fails (EBADF), while on Linux its fsync still succeeds: that is the
+    /// case where `sync_all` on its own dropped the error.
+    #[tokio::test]
+    async fn failed_writes_are_not_reported_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, "").unwrap();
+        let mut f = fs::File::from_std(std::fs::File::open(&path).unwrap());
+        write_durably(&mut f, b"abcdef").await.unwrap_err();
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
     }
 
     #[test]
