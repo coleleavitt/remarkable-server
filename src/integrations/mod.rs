@@ -81,17 +81,29 @@ pub enum IntegrationError {
     /// changes since it can't be listed, so the only way to catch up is a full listing.
     #[error("Delta cursor expired, full resync required: {0}")]
     ResyncRequired(String),
+
+    /// A remote file can't be written locally however often it is retried: something on
+    /// disk is in the way (a local directory where the file goes, e.g. after a remote folder
+    /// was replaced by a file of the same name) or the local filesystem rejects the name.
+    #[error("Local path unusable: {0}")]
+    LocalPathUnusable(String),
 }
 
 impl IntegrationError {
     /// Retrying can never succeed: the remote name is rejected by path validation (traversal,
-    /// symlink escape), the item no longer exists, or its content can't be downloaded. Everything else (network, I/O, rate limit,
-    /// auth, API errors) may be transient. Delta sync advances its cursor past permanent
-    /// failures but holds it for transient ones so the change is fetched again next time.
+    /// symlink escape, too long), the item no longer exists, its content can't be downloaded,
+    /// or the local path can't take it ([`LocalPathUnusable`](Self::LocalPathUnusable)).
+    /// Everything else (network, rate limit, auth, API errors, and other I/O errors such as a
+    /// full disk or a permission problem, which can be fixed on the server) may be transient.
+    /// Delta sync advances its cursor past permanent failures but holds it for transient ones
+    /// so the change is fetched again next time.
     pub fn is_permanent(&self) -> bool {
         matches!(
             self,
-            Self::InvalidPath(_) | Self::NotFound(_) | Self::NotDownloadable(_)
+            Self::InvalidPath(_)
+                | Self::NotFound(_)
+                | Self::NotDownloadable(_)
+                | Self::LocalPathUnusable(_)
         )
     }
 }

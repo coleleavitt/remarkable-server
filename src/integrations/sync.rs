@@ -17,9 +17,17 @@ use crate::integrations::conflict::{
 };
 use crate::integrations::{CloudFile, CloudProvider, IntegrationError, Result, SyncFolderConfig};
 
+/// Longest path segment, in bytes, that a local path may have: `NAME_MAX` on the usual Linux
+/// filesystems (ext4, XFS, Btrfs). Dropbox and OneDrive allow names of 255 *characters*, so
+/// a name with multi-byte characters can be valid remotely but impossible to create here.
+pub(crate) const MAX_NAME_BYTES: usize = 255;
+
 /// Split a *relative* sync path into components, rejecting anything that could escape
 /// the sync root: absolute paths, `..`/`.`/empty segments, backslashes, NUL, drive prefixes.
 /// Remote file names are attacker-controlled, so every local path is built from this.
+/// Segments longer than [`MAX_NAME_BYTES`] are rejected too: they could never be written
+/// locally, and rejecting them up front makes that a permanent failure rather than a write
+/// error on every sync.
 pub(crate) fn safe_components(path: &str) -> Result<Vec<&str>> {
     let bad = |why: &str| {
         Err(IntegrationError::InvalidPath(format!(
@@ -49,6 +57,9 @@ pub(crate) fn safe_components(path: &str) -> Result<Vec<&str>> {
     for part in &parts {
         if part.is_empty() || *part == "." || *part == ".." {
             return bad("empty, '.' or '..' segment");
+        }
+        if part.len() > MAX_NAME_BYTES {
+            return bad("segment longer than 255 bytes");
         }
         let mut comps = Path::new(part).components();
         if !matches!(
@@ -138,6 +149,23 @@ async fn write_replace(dir: &Path, target: &Path, content: &[u8]) -> Result<()> 
         let _ = fs::remove_file(&tmp).await;
     }
     Ok(res?)
+}
+
+/// Classify a failed local write of the remote file at `cloud_path`: errors that come back the
+/// same on every retry (something that isn't a directory where one is needed or the other way
+/// round, a name the filesystem rejects) become the permanent
+/// [`LocalPathUnusable`](IntegrationError::LocalPathUnusable), so they don't hold a delta
+/// cursor forever. Other errors (disk full, permission denied) are left as they are.
+fn local_write_error(cloud_path: &str, e: IntegrationError) -> IntegrationError {
+    use std::io::ErrorKind::{InvalidFilename, IsADirectory, NotADirectory};
+    match e {
+        IntegrationError::Io(io)
+            if matches!(io.kind(), IsADirectory | NotADirectory | InvalidFilename) =>
+        {
+            IntegrationError::LocalPathUnusable(format!("{:?}: {}", cloud_path, io))
+        }
+        e => e,
+    }
 }
 
 /// Sync direction
@@ -690,6 +718,18 @@ impl<P: CloudProvider> CloudSync<P> {
                     e
                 );
             })?;
+        // A local directory where the file goes (the remote folder was replaced by a file;
+        // remote deletions aren't applied locally, so the directory stays) would fail the write
+        // every time. Catch it before fetching the body rather than after.
+        if fs::symlink_metadata(&local_path)
+            .await
+            .is_ok_and(|m| m.is_dir())
+        {
+            return Err(IntegrationError::LocalPathUnusable(format!(
+                "{:?}: a local directory is in the way",
+                cloud_file.path
+            )));
+        }
         let content = self.provider.download_file(&cloud_file.id).await?;
 
         // Symlinks already inside the sync root must not redirect the write (or any mkdir) elsewhere.
@@ -712,8 +752,10 @@ impl<P: CloudProvider> CloudSync<P> {
             (Some(d), Some(n)) => (d, n),
             _ => return Err(escape()),
         };
+        let unusable = |e| local_write_error(&cloud_file.path, e);
         let dir = create_dirs_within(&self.config.local_path, rel_dir)
-            .await?
+            .await
+            .map_err(unusable)?
             .ok_or_else(escape)?;
         let target = dir.join(name);
         if fs::symlink_metadata(&target)
@@ -723,7 +765,9 @@ impl<P: CloudProvider> CloudSync<P> {
         {
             return Err(escape());
         }
-        write_replace(&dir, &target, &content).await?;
+        write_replace(&dir, &target, &content)
+            .await
+            .map_err(unusable)?;
 
         // Update state
         self.state
@@ -904,8 +948,9 @@ impl<P: CloudProvider> CloudSync<P> {
     /// stored once nothing remote is left to retry: if the listing failed or a download failed
     /// for a reason that may go away, the old cursor is kept, so the next delta runs the resync
     /// again instead of silently skipping those files (a fresh cursor never lists changes made
-    /// before it). Permanent failures (deleted, not downloadable, unsafe path) don't hold it,
-    /// and neither do failed uploads, which no cursor covers.
+    /// before it). Permanent failures (deleted, not downloadable, unsafe or over-long name, a
+    /// local directory in the way) don't hold it, and neither do failed uploads, which no
+    /// cursor covers.
     ///
     /// Like the delta it stands in for, a resync never uploads files that exist only locally
     /// (see [`LocalOnly::Keep`]).
@@ -1523,11 +1568,170 @@ mod tests {
         assert_eq!(sync.state().cursor.as_deref(), Some("c2"));
     }
 
+    /// A remote folder replaced by a file of the same name leaves the local directory in place
+    /// (remote deletions aren't applied). Writing the file there fails every time, so it is a
+    /// permanent failure: caught before any download, and neither a resync nor a delta holds
+    /// its cursor for it.
+    #[tokio::test]
+    async fn remote_file_over_local_directory_does_not_hold_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("Dir")).unwrap();
+        std::fs::write(dir.path().join("Dir/kept.txt"), "mine").unwrap();
+        let provider = MockProvider {
+            files: vec![cf("was-a-folder", "/Dir"), cf("ok", "/ok.txt")],
+            next_cursor: Some("fresh".into()),
+            stale_cursor: Some("stale".into()),
+            ..Default::default()
+        };
+        let state = SyncState {
+            cursor: Some("stale".into()),
+            ..Default::default()
+        };
+        // CloudWins so the delta below tries to replace the (newer) local directory.
+        let config = SyncConfig {
+            conflict_strategy: ConflictStrategy::CloudWins,
+            ..cfg(dir.path(), SyncDirection::Download)
+        };
+        let mut sync = CloudSync::with_state(provider, config, state);
+
+        // Resync (stale cursor): the file is skipped as unusable, the rest syncs, and the fresh
+        // cursor is stored instead of repeating the full listing on every delta.
+        let r = sync.delta_sync().await.unwrap();
+        assert_eq!((r.downloaded, r.errors.len()), (1, 1), "{:?}", r.errors);
+        assert!(
+            r.errors[0].contains("Local path unusable"),
+            "{:?}",
+            r.errors
+        );
+        assert_eq!(sync.state().cursor.as_deref(), Some("fresh"));
+
+        // Delta: the same change fails permanently again, and the cursor still advances.
+        sync.provider.next_cursor = Some("c3".into());
+        let r = sync.delta_sync().await.unwrap();
+        assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+        assert!(
+            r.errors[0].contains("Local path unusable"),
+            "{:?}",
+            r.errors
+        );
+        assert_eq!(sync.state().cursor.as_deref(), Some("c3"));
+
+        // The body was never fetched, and the local directory is untouched.
+        assert!(
+            !sync
+                .provider
+                .downloads
+                .lock()
+                .unwrap()
+                .contains(&"was-a-folder".to_string())
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("Dir/kept.txt")).unwrap(),
+            b"mine"
+        );
+    }
+
+    /// Dropbox and OneDrive allow 255 characters per name, which can be more than the 255 bytes
+    /// a local name may have. Such a file (or folder) is rejected up front like an unsafe name:
+    /// never downloaded, and the cursor from a first sync is stored and then advanced.
+    #[tokio::test]
+    async fn names_too_long_for_the_local_filesystem_do_not_hold_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = format!("{}.pdf", "\u{6587}".repeat(90)); // 94 characters, 274 bytes
+        assert!(long.chars().count() <= 255 && long.len() > MAX_NAME_BYTES);
+        let provider = MockProvider {
+            files: vec![
+                cf("long-file", &format!("/{}", long)),
+                cf("in-long-folder", &format!("/{}/x.pdf", long)),
+                cf("ok", "/ok.txt"),
+            ],
+            next_cursor: Some("c1".into()),
+            ..Default::default()
+        };
+        let mut sync = CloudSync::new(provider, cfg(dir.path(), SyncDirection::Download));
+
+        // No cursor yet: the full sync runs and its fresh cursor is kept.
+        let r = sync.delta_sync().await.unwrap();
+        assert_eq!((r.downloaded, r.errors.len()), (1, 2), "{:?}", r.errors);
+        assert_eq!(sync.state().cursor.as_deref(), Some("c1"));
+
+        sync.provider.next_cursor = Some("c2".into());
+        let r = sync.delta_sync().await.unwrap();
+        assert_eq!(r.errors.len(), 2, "{:?}", r.errors);
+        assert_eq!(sync.state().cursor.as_deref(), Some("c2"));
+        assert!(
+            sync.provider
+                .downloads
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|id| id == "ok")
+        );
+    }
+
+    #[test]
+    fn overlong_segments_rejected() {
+        let max = "a".repeat(MAX_NAME_BYTES);
+        let over = "a".repeat(MAX_NAME_BYTES + 1);
+        // Measured in bytes, not characters: 86 three-byte characters are 258 bytes.
+        let wide = "\u{6587}".repeat(86);
+        assert!(is_safe_name(&max));
+        assert!(safe_components(&format!("{max}/{max}")).is_ok());
+        for bad in [&over, &wide] {
+            assert!(!is_safe_name(bad), "accepted {} bytes", bad.len());
+            assert!(safe_components(&format!("ok/{bad}/x")).is_err());
+            assert!(local_path_for(Path::new("/srv/sync"), &format!("/{bad}")).is_err());
+        }
+    }
+
+    /// Local write failures that come back on every retry are classified permanent; the
+    /// others (fixable on the server) stay transient. Checked against real filesystem errors.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_write_errors_classified() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/x"), "x").unwrap();
+
+        // A file renamed over a (non-empty) directory: IsADirectory.
+        let e = write_replace(dir.path(), &dir.path().join("sub"), b"new")
+            .await
+            .unwrap_err();
+        let e = local_write_error("/sub", e);
+        assert!(matches!(e, IntegrationError::LocalPathUnusable(_)), "{e:?}");
+        assert!(e.is_permanent());
+        assert_eq!(std::fs::read(dir.path().join("sub/x")).unwrap(), b"x");
+
+        // A name the filesystem refuses (ENAMETOOLONG): InvalidFilename.
+        let long = dir.path().join("a".repeat(MAX_NAME_BYTES + 1));
+        let e = write_replace(dir.path(), &long, b"new").await.unwrap_err();
+        let e = local_write_error("/aaa", e);
+        assert!(e.is_permanent(), "{e:?}");
+
+        // No temp files are left behind by the failed writes.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::StorageFull,
+            std::io::ErrorKind::Other,
+        ] {
+            let e = local_write_error("/x", IntegrationError::Io(kind.into()));
+            assert!(
+                matches!(e, IntegrationError::Io(_)) && !e.is_permanent(),
+                "{e:?}"
+            );
+        }
+        let e = local_write_error("/x", IntegrationError::Network("reset".into()));
+        assert!(matches!(e, IntegrationError::Network(_)));
+    }
+
     #[test]
     fn error_permanence() {
         assert!(IntegrationError::InvalidPath("x".into()).is_permanent());
         assert!(IntegrationError::NotFound("x".into()).is_permanent());
         assert!(IntegrationError::NotDownloadable("x".into()).is_permanent());
+        assert!(IntegrationError::LocalPathUnusable("x".into()).is_permanent());
         for e in [
             IntegrationError::Network("x".into()),
             IntegrationError::Io(std::io::Error::other("x")),
