@@ -53,6 +53,16 @@ These are done and, in several cases, ahead of rmfakecloud:
   Wallabag password) are stored in `readlater.db` apart from the config, survive
   restarts, refreshed tokens are saved at once, never returned by the API;
   Wallabag refreshes on 401, Instapaper xAuth login; Omnivore removed (#27).
+- ✅ **Read-later sync runs** — a scheduler (per-account interval, backoff on
+  account-wide failures, one sync per account at a time) and the `/sync`
+  endpoints put new articles on the tablet as EPUB/PDF documents through the
+  strict document path, push SyncComplete only when the root changed, and never
+  add an article twice. Provider requests time out, PDF converters are confined
+  and killed after a deadline, and status changes go back once, to the account
+  that recorded the article. Articles go on the tablet in batches of up to 20
+  per root commit (a first import no longer bumps the generation once per
+  article), are keyed by account (two Wallabag instances can both hold an id;
+  old databases are re-keyed once), and `readlater.db` is owner-only (#33).
 - ✅ **Security hardening (Sept 2026 review)** — OAuth device-code sign-ins need
   owner approval (#18); deleting or re-pairing a device revokes its tokens, and
   users only see and delete their own devices (#17); pairing codes are
@@ -117,9 +127,6 @@ The community's top *concrete* pains. Small, bounded, high-value.
 
 ### Known follow-ups (from the #23–#29 reviews)
 
-- ⬜ **Read-later sync never runs** — `/integrations/v2/readlater/sync` and
-  `/accounts/{id}/sync` only answer `queued` / zero counts, and the manager's
-  scheduler is never started; wire them to an actual sync.
 - ⬜ **Dropbox / OneDrive listings** — full listings are non-recursive, and
   their delta (change feed) ignores the configured sync folder (Drive got both
   fixes in #26).

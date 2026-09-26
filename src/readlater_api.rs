@@ -4,13 +4,15 @@ use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
 
 use crate::error::{Result, ServerError};
+use crate::notifications::WsMessage;
 use crate::readlater::{
     ArticleQuery,
     OAuthCallback,
@@ -21,9 +23,12 @@ use crate::readlater::{
     ReadLaterManager,
     ReadLaterProvider,
     ReadStatus,
+    SyncResult,
     SyncSettings,
     provider_for,
 };
+use crate::readlater_sync::{ReadLaterSyncer, SchedulerConfig, SyncAllReport, SyncError};
+use crate::storage::Storage;
 
 // ============================================================================
 // State
@@ -32,13 +37,43 @@ use crate::readlater::{
 #[derive(Clone)]
 pub struct ReadLaterState {
     pub manager: Arc<Mutex<ReadLaterManager>>,
+    /// Runs syncs into `storage` (the device's sync tree); shared with the scheduler.
+    pub syncer: Arc<ReadLaterSyncer>,
+    /// The scheduler's task, once [`with_scheduler`](Self::with_scheduler) started it.
+    pub scheduler: Option<Arc<tokio::task::JoinHandle<()>>>,
 }
 
 impl ReadLaterState {
-    pub fn new(manager: ReadLaterManager) -> Self {
+    /// Articles are delivered into `storage`, and devices are told to pull through
+    /// `notification_tx` (`AppState::notification_tx`). No scheduler runs yet.
+    pub fn new(
+        manager: ReadLaterManager,
+        storage: Storage,
+        notification_tx: broadcast::Sender<WsMessage>,
+    ) -> Self {
+        let manager = Arc::new(Mutex::new(manager));
+        let syncer = Arc::new(ReadLaterSyncer::new(
+            Arc::clone(&manager),
+            storage,
+            notification_tx,
+        ));
         Self {
-            manager: Arc::new(Mutex::new(manager)),
+            manager,
+            syncer,
+            scheduler: None,
         }
+    }
+
+    /// Start scheduled syncs as `config` says: not when it turns them off, nor outside a Tokio
+    /// runtime (as in plain unit tests).
+    pub fn with_scheduler(mut self, config: SchedulerConfig) -> Self {
+        if !config.enabled {
+            tracing::info!("read-later scheduler off (READLATER_AUTO_SYNC)");
+        } else if tokio::runtime::Handle::try_current().is_ok() {
+            let task = Arc::clone(&self.syncer).spawn_scheduler(config.tick);
+            self.scheduler = Some(Arc::new(task));
+        }
+        self
     }
 }
 
@@ -55,7 +90,8 @@ impl From<ReadLaterError> for ServerError {
             ReadLaterError::AuthRequired(_) => ServerError::Unauthorized,
             ReadLaterError::OAuth(msg)
             | ReadLaterError::Api(msg)
-            | ReadLaterError::Conversion(msg) => ServerError::Internal(msg),
+            | ReadLaterError::Conversion(msg)
+            | ReadLaterError::ConverterUnavailable(msg) => ServerError::Internal(msg),
             ReadLaterError::Database(msg) => ServerError::Database(msg),
             ReadLaterError::Network(msg) => ServerError::Internal(format!("Network: {}", msg)),
             ReadLaterError::RateLimited(secs) => {
@@ -147,9 +183,27 @@ impl From<ProviderAccount> for AccountResponse {
 
 #[derive(Debug, Serialize)]
 pub struct SyncAllResponse {
+    /// Articles the providers returned.
     pub total_fetched: u32,
+    /// Articles put on the device as new documents.
     pub total_synced: u32,
     pub total_errors: usize,
+    /// One entry per account synced.
+    pub results: Vec<SyncResult>,
+    /// Accounts skipped because a sync of them was already running.
+    pub already_running: Vec<String>,
+}
+
+impl From<SyncAllReport> for SyncAllResponse {
+    fn from(report: SyncAllReport) -> Self {
+        Self {
+            total_fetched: report.results.iter().map(|r| r.articles_fetched).sum(),
+            total_synced: report.results.iter().map(|r| r.articles_synced).sum(),
+            total_errors: report.results.iter().map(|r| r.errors.len()).sum(),
+            results: report.results,
+            already_running: report.already_running,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -365,6 +419,10 @@ pub async fn update_article(
         .ok_or_else(|| ServerError::NotFound(id))?;
 
     if let Some(status) = req.status {
+        if status != article.status {
+            // Sent to the provider by the account's next sync (with `sync_read_status`).
+            article.read_status_pending = true;
+        }
         article.status = status;
         if status == ReadStatus::Read {
             article.read_at = Some(chrono::Utc::now());
@@ -404,45 +462,42 @@ pub async fn delete_article_handler(
 // Sync Endpoints
 // ============================================================================
 
+/// `POST /accounts/{id}/sync`: sync the account now and answer with its [`SyncResult`] (per-step
+/// errors are listed there); 404 for an unknown account, 409 while it is already syncing.
+///
+/// The sync runs in its own task, so a client that disconnects doesn't cut it short.
 pub async fn sync_account(
     State(state): State<ReadLaterState>,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>> {
-    // Get account details first, then release lock
-    let account = {
-        let manager = state.manager.lock();
-        manager
-            .get_account(&id)
-            .ok_or_else(|| ServerError::NotFound(id.clone()))?
-    };
-
-    // Perform sync outside of lock - for now just return status
-    // Full async sync would need a different architecture
-    Ok(Json(serde_json::json!({
-        "status": "queued",
-        "account_id": account.id,
-        "provider": account.provider.to_string(),
-    })))
+) -> Result<Response> {
+    let syncer = Arc::clone(&state.syncer);
+    let synced = tokio::spawn(async move { syncer.sync_account(&id).await })
+        .await
+        .map_err(|e| ServerError::Internal(format!("read-later sync task failed: {e}")))?;
+    match synced {
+        Ok(result) => Ok(Json(result).into_response()),
+        Err(SyncError::AccountNotFound(id)) => Err(ServerError::NotFound(id)),
+        Err(e @ SyncError::AlreadyRunning(_)) => Ok(already_running(&e)),
+    }
 }
 
+/// `POST /sync`: sync every enabled account, one after another, and answer with the totals and
+/// each account's result. Accounts already syncing are listed in `already_running`.
 pub async fn sync_all(State(state): State<ReadLaterState>) -> Result<Json<SyncAllResponse>> {
-    // Get enabled account count, then release lock
-    let _account_count = {
-        let manager = state.manager.lock();
-        manager
-            .list_accounts()
-            .into_iter()
-            .filter(|a| a.enabled)
-            .count()
-    };
+    let syncer = Arc::clone(&state.syncer);
+    let report = tokio::spawn(async move { syncer.sync_all().await })
+        .await
+        .map_err(|e| ServerError::Internal(format!("read-later sync task failed: {e}")))?;
+    Ok(Json(report.into()))
+}
 
-    // For now just return queued status
-    // Full async sync would need a different architecture (background task)
-    Ok(Json(SyncAllResponse {
-        total_fetched: 0,
-        total_synced: 0,
-        total_errors: 0,
-    }))
+/// 409 in the same `{error, details}` shape as [`ServerError`] responses.
+fn already_running(e: &SyncError) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({"error": "already_running", "details": e.to_string()})),
+    )
+        .into_response()
 }
 
 // ============================================================================
@@ -475,11 +530,16 @@ pub fn readlater_router(state: ReadLaterState) -> Router {
 mod tests {
     use super::*;
 
+    fn test_state(dir: &std::path::Path) -> ReadLaterState {
+        let mgr = ReadLaterManager::new(&dir.join("rl.db")).unwrap();
+        let storage = Storage::new(dir.join("storage")).unwrap();
+        ReadLaterState::new(mgr, storage, broadcast::channel(4).0)
+    }
+
     #[tokio::test]
     async fn account_responses_never_include_credentials() {
         let dir = tempfile::tempdir().unwrap();
-        let mgr = ReadLaterManager::new(&dir.path().join("rl.db"), dir.path()).unwrap();
-        let state = ReadLaterState::new(mgr);
+        let state = test_state(dir.path());
         let req: AddAccountRequest = serde_json::from_value(serde_json::json!({
             "name": "wb",
             "provider": "wallabag",
@@ -517,8 +577,7 @@ mod tests {
     #[tokio::test]
     async fn omnivore_is_rejected_as_discontinued() {
         let dir = tempfile::tempdir().unwrap();
-        let mgr = ReadLaterManager::new(&dir.path().join("rl.db"), dir.path()).unwrap();
-        let state = ReadLaterState::new(mgr);
+        let state = test_state(dir.path());
         let req: AddAccountRequest = serde_json::from_value(serde_json::json!({
             "name": "om",
             "provider": "omnivore",

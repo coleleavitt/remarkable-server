@@ -2,8 +2,8 @@
 //! Supports Pocket, Instapaper and Wallabag. Omnivore (shut down November 2024) is kept only
 //! as a discontinued marker so existing database rows still load.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
@@ -11,7 +11,6 @@ use parking_lot::RwLock;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::mpsc;
 
 // ============================================================================
 // Error Types
@@ -33,6 +32,10 @@ pub enum ReadLaterError {
     RateLimited(u64),
     #[error("Conversion error: {0}")]
     Conversion(String),
+    /// No converter works on this host (none installed, too old, or broken): the host's
+    /// problem, not the article's.
+    #[error("Converter unavailable: {0}")]
+    ConverterUnavailable(String),
     #[error("Database error: {0}")]
     Database(String),
     #[error("Network error: {0}")]
@@ -55,7 +58,7 @@ pub type Result<T> = std::result::Result<T, ReadLaterError>;
 // Provider Types
 // ============================================================================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReadLaterProvider {
     Pocket,
@@ -120,9 +123,21 @@ pub struct Article {
     pub read_at: Option<DateTime<Utc>>,
     pub content: Option<String>,
     pub image_url: Option<String>,
+    /// The article's document in the sync tree once `synced_to_device`. Before that, the
+    /// document a sync is adding it as (set just before the tree commit), so a later sync can
+    /// tell whether that commit landed.
     pub document_id: Option<String>,
     pub synced_to_device: bool,
     pub last_sync: Option<DateTime<Utc>>,
+    /// The account whose sync recorded the article; `None` for rows from before accounts were
+    /// recorded, until a sync of that provider takes them over. Articles are unique per
+    /// account and provider id.
+    #[serde(default)]
+    pub account_id: Option<String>,
+    /// `status` was changed here (`PUT /articles/{id}`) and is still to be sent to the
+    /// provider by the account's next sync (with `sync_read_status`).
+    #[serde(default)]
+    pub read_status_pending: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -357,26 +372,26 @@ pub struct OAuthCallback {
 // Sync Types
 // ============================================================================
 
+/// Outcome of one account's sync (see [`crate::readlater_sync`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncResult {
+    #[serde(default)]
+    pub account_id: String,
     pub provider: ReadLaterProvider,
+    /// Articles the provider returned (changed since the account's last sync).
     pub articles_fetched: u32,
+    /// Articles put on the device in this sync, each as a new document.
     pub articles_synced: u32,
+    /// Articles rendered to the account's format in this sync.
     pub articles_converted: u32,
+    /// Selected articles skipped because they are already on the device.
+    #[serde(default)]
+    pub articles_already_synced: u32,
+    /// Status changes made here (`PUT /articles/{id}`) sent to the provider in this sync.
     pub read_status_synced: u32,
     pub errors: Vec<String>,
     pub duration_ms: u64,
     pub completed_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone)]
-pub enum SyncCommand {
-    SyncAll,
-    SyncProvider(String),
-    SyncArticle(String),
-    ConvertArticle(String, ArticleFormat),
-    SyncReadStatus(String),
-    Stop,
 }
 
 // ============================================================================
@@ -465,17 +480,64 @@ pub trait ReadLaterProviderTrait: Send + Sync {
     }
 }
 
-/// Construct the provider implementation for `kind`. Instapaper's consumer key/secret come
-/// from `INSTAPAPER_CONSUMER_KEY` / `INSTAPAPER_CONSUMER_SECRET`.
+/// Time limits for requests to a provider's API. Without them a server that accepts the
+/// connection and never answers would stall a sync, and with it the scheduler, for good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpTimeouts {
+    /// Establishing the connection (TCP and TLS).
+    pub connect: std::time::Duration,
+    /// The whole request, from connecting until the response body has been read.
+    pub request: std::time::Duration,
+}
+
+impl Default for HttpTimeouts {
+    /// 10 s to connect and 30 s per request, as feed fetches get.
+    fn default() -> Self {
+        Self {
+            connect: std::time::Duration::from_secs(10),
+            request: std::time::Duration::from_secs(30),
+        }
+    }
+}
+
+impl HttpTimeouts {
+    /// An HTTP client that gives up after these limits. Building one fails only if the TLS
+    /// backend can't be set up (when `reqwest::Client::new()` would panic).
+    pub fn client(self) -> Result<reqwest::Client> {
+        reqwest::Client::builder()
+            .connect_timeout(self.connect)
+            .timeout(self.request)
+            .build()
+            .map_err(|e| ReadLaterError::Network(format!("HTTP client: {e}")))
+    }
+}
+
+/// A client with the default [`HttpTimeouts`] for the providers' `new()` constructors; like
+/// `reqwest::Client::new()`, it panics only if no TLS backend can be set up.
+fn default_client() -> reqwest::Client {
+    HttpTimeouts::default().client().unwrap_or_default()
+}
+
+/// Construct the provider implementation for `kind`, with the default [`HttpTimeouts`].
 pub fn provider_for(kind: ReadLaterProvider) -> Result<Box<dyn ReadLaterProviderTrait>> {
+    provider_with_timeouts(kind, HttpTimeouts::default())
+}
+
+/// Construct the provider implementation for `kind`, its requests limited by `timeouts`.
+/// Instapaper's consumer key/secret come from `INSTAPAPER_CONSUMER_KEY` /
+/// `INSTAPAPER_CONSUMER_SECRET`.
+pub fn provider_with_timeouts(
+    kind: ReadLaterProvider,
+    timeouts: HttpTimeouts,
+) -> Result<Box<dyn ReadLaterProviderTrait>> {
     Ok(match kind {
-        ReadLaterProvider::Pocket => Box::new(PocketProvider::new()),
+        ReadLaterProvider::Pocket => Box::new(PocketProvider::with_client(timeouts.client()?)),
         ReadLaterProvider::Instapaper => {
             let key = std::env::var("INSTAPAPER_CONSUMER_KEY").unwrap_or_default();
             let secret = std::env::var("INSTAPAPER_CONSUMER_SECRET").unwrap_or_default();
-            Box::new(InstapaperProvider::new(key, secret))
+            Box::new(InstapaperProvider::new(key, secret).with_client(timeouts.client()?))
         }
-        ReadLaterProvider::Wallabag => Box::new(WallabagProvider::new()),
+        ReadLaterProvider::Wallabag => Box::new(WallabagProvider::with_client(timeouts.client()?)),
         ReadLaterProvider::Omnivore => {
             return Err(ReadLaterError::Discontinued(OMNIVORE_DISCONTINUED.into()));
         }
@@ -494,9 +556,12 @@ impl PocketProvider {
     const API_BASE: &'static str = "https://getpocket.com/v3";
 
     pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::new(),
-        }
+        Self::with_client(default_client())
+    }
+
+    /// Use `client` (e.g. one with other [`HttpTimeouts`]) for API requests.
+    pub fn with_client(client: reqwest::Client) -> Self {
+        Self { client }
     }
 }
 
@@ -753,6 +818,8 @@ impl ReadLaterProviderTrait for PocketProvider {
                     document_id: None,
                     synced_to_device: false,
                     last_sync: None,
+                    account_id: None,
+                    read_status_pending: false,
                 }
             })
             .collect();
@@ -913,6 +980,8 @@ impl ReadLaterProviderTrait for PocketProvider {
             document_id: None,
             synced_to_device: false,
             last_sync: None,
+            account_id: None,
+            read_status_pending: false,
         })
     }
 
@@ -973,11 +1042,17 @@ impl InstapaperProvider {
 
     pub fn new(consumer_key: String, consumer_secret: String) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: default_client(),
             consumer_key,
             consumer_secret,
             api_base: Self::API_BASE.to_string(),
         }
+    }
+
+    /// Use `client` (e.g. one with other [`HttpTimeouts`]) for API requests.
+    pub fn with_client(mut self, client: reqwest::Client) -> Self {
+        self.client = client;
+        self
     }
 
     /// Point the provider at a different API root (used by tests against a local server).
@@ -1305,6 +1380,8 @@ impl ReadLaterProviderTrait for InstapaperProvider {
                         document_id: None,
                         synced_to_device: false,
                         last_sync: None,
+                        account_id: None,
+                        read_status_pending: false,
                     })
                 }
                 InstapaperItem::Meta { .. } => None,
@@ -1484,6 +1561,8 @@ impl ReadLaterProviderTrait for InstapaperProvider {
             document_id: None,
             synced_to_device: false,
             last_sync: None,
+            account_id: None,
+            read_status_pending: false,
         })
     }
 
@@ -1549,8 +1628,13 @@ struct WallabagToken {
 
 impl WallabagProvider {
     pub fn new() -> Self {
+        Self::with_client(default_client())
+    }
+
+    /// Use `client` (e.g. one with other [`HttpTimeouts`]) for API and token requests.
+    pub fn with_client(client: reqwest::Client) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client,
             refreshed: parking_lot::Mutex::new(None),
         }
     }
@@ -1909,6 +1993,8 @@ impl ReadLaterProviderTrait for WallabagProvider {
                     document_id: None,
                     synced_to_device: false,
                     last_sync: None,
+                    account_id: None,
+                    read_status_pending: false,
                 }
             })
             .collect();
@@ -2046,6 +2132,8 @@ impl ReadLaterProviderTrait for WallabagProvider {
             document_id: None,
             synced_to_device: false,
             last_sync: None,
+            account_id: None,
+            read_status_pending: false,
         })
     }
 
@@ -2102,33 +2190,48 @@ fn safe_href(url: &str) -> String {
     }
 }
 
-pub struct ArticleConverter {
-    output_dir: PathBuf,
+/// An article rendered for the device.
+#[derive(Debug, Clone)]
+pub struct RenderedArticle {
+    /// File extension, which is also the reMarkable `fileType`: `epub`, `pdf` or `html`.
+    pub ext: &'static str,
+    pub bytes: Vec<u8>,
 }
 
-impl ArticleConverter {
-    pub fn new(output_dir: PathBuf) -> Self {
-        Self { output_dir }
-    }
+/// Renders articles into the format an account delivers. Blocking: the EPUB is built in memory
+/// and the PDF by running `weasyprint` or `wkhtmltopdf`, so async callers run it on a blocking
+/// thread.
+pub struct ArticleConverter;
 
-    pub async fn convert(
-        &self,
+impl ArticleConverter {
+    /// Render `article` as `format`, printing PDFs with the converters on `PATH`.
+    pub fn render(
         article: &Article,
         content: &ArticleContent,
         format: ArticleFormat,
-    ) -> Result<PathBuf> {
-        match format {
-            ArticleFormat::Html => self.save_html(article, content).await,
-            ArticleFormat::Epub => self.convert_to_epub(article, content).await,
-            ArticleFormat::Pdf => self.convert_to_pdf(article, content).await,
-        }
+    ) -> Result<RenderedArticle> {
+        Self::render_with(article, content, format, &PdfPrograms::default())
     }
 
-    async fn save_html(&self, article: &Article, content: &ArticleContent) -> Result<PathBuf> {
-        let filename = self.sanitize_filename(&article.title);
-        let path = self.output_dir.join(format!("{}.html", filename));
+    /// [`render`](Self::render), printing PDFs with `programs`. A PDF no converter printed is
+    /// [`ReadLaterError::ConverterUnavailable`] if none works here at all, else
+    /// [`ReadLaterError::Conversion`] (the article is at fault).
+    pub(crate) fn render_with(
+        article: &Article,
+        content: &ArticleContent,
+        format: ArticleFormat,
+        programs: &PdfPrograms,
+    ) -> Result<RenderedArticle> {
+        let (ext, bytes) = match format {
+            ArticleFormat::Html => ("html", Self::html_document(article, content).into_bytes()),
+            ArticleFormat::Epub => ("epub", Self::epub(article, content)?),
+            ArticleFormat::Pdf => ("pdf", Self::pdf(article, content, programs)?),
+        };
+        Ok(RenderedArticle { ext, bytes })
+    }
 
-        let html = format!(
+    fn html_document(article: &Article, content: &ArticleContent) -> String {
+        format!(
             r#"<!DOCTYPE html>
 <html>
 <head>
@@ -2161,117 +2264,39 @@ impl ArticleConverter {
                 .unwrap_or_default(),
             escape_html(&safe_href(&article.url)),
             content.html
-        );
-
-        tokio::fs::write(&path, html).await?;
-        Ok(path)
+        )
     }
 
-    async fn convert_to_epub(
-        &self,
-        article: &Article,
-        content: &ArticleContent,
-    ) -> Result<PathBuf> {
-        let filename = self.sanitize_filename(&article.title);
-        let path = self.output_dir.join(format!("{}.epub", filename));
-
-        // Create a minimal EPUB structure
-        let temp_dir = tempfile::tempdir()?;
-        let temp_path = temp_dir.path();
-
-        // mimetype file
-        tokio::fs::write(temp_path.join("mimetype"), "application/epub+zip").await?;
-
-        // META-INF/container.xml
-        tokio::fs::create_dir_all(temp_path.join("META-INF")).await?;
-        tokio::fs::write(
-            temp_path.join("META-INF/container.xml"),
-            r#"<?xml version="1.0"?>
-<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
-  <rootfiles>
-    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
-  </rootfiles>
-</container>"#,
-        )
-        .await?;
-
-        // OEBPS directory
-        tokio::fs::create_dir_all(temp_path.join("OEBPS")).await?;
-
-        // content.opf
-        let opf = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
-  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-    <dc:identifier id="uid">{}</dc:identifier>
-    <dc:title>{}</dc:title>
-    <dc:creator>{}</dc:creator>
-    <dc:language>en</dc:language>
-    <meta property="dcterms:modified">{}</meta>
-  </metadata>
-  <manifest>
-    <item id="content" href="content.xhtml" media-type="application/xhtml+xml"/>
-    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
-  </manifest>
-  <spine>
-    <itemref idref="content"/>
-  </spine>
-</package>"#,
-            escape_html(&article.id),
-            escape_html(&article.title),
-            escape_html(article.author.as_deref().unwrap_or("Unknown")),
-            Utc::now().format("%Y-%m-%dT%H:%M:%SZ")
-        );
-        tokio::fs::write(temp_path.join("OEBPS/content.opf"), opf).await?;
-
-        // nav.xhtml
-        let nav = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
-<head><title>Navigation</title></head>
-<body>
-<nav epub:type="toc">
-  <ol><li><a href="content.xhtml">{}</a></li></ol>
-</nav>
-</body>
-</html>"#,
-            escape_html(&article.title)
-        );
-        tokio::fs::write(temp_path.join("OEBPS/nav.xhtml"), nav).await?;
-
-        // content.xhtml
-        let content_xhtml = Self::epub_content_xhtml(article, content);
-        tokio::fs::write(temp_path.join("OEBPS/content.xhtml"), content_xhtml).await?;
-
-        // Create ZIP (EPUB is just a ZIP)
-        use std::process::Command;
-
-        let output = Command::new("zip")
-            .args(["-X0", path.to_str().unwrap(), "mimetype"])
-            .current_dir(temp_path)
-            .output()
-            .map_err(|e| ReadLaterError::Conversion(format!("zip mimetype: {}", e)))?;
-
-        if !output.status.success() {
-            return Err(ReadLaterError::Conversion(
-                "Failed to create EPUB mimetype".into(),
-            ));
+    /// Build the EPUB in memory (the same library the feed EPUBs use), so no `zip` binary or
+    /// scratch files are needed.
+    fn epub(article: &Article, content: &ArticleContent) -> Result<Vec<u8>> {
+        fn epub_err(e: impl std::fmt::Display) -> ReadLaterError {
+            ReadLaterError::Conversion(format!("EPUB: {e}"))
         }
-
-        let output = Command::new("zip")
-            .args(["-Xr9D", path.to_str().unwrap(), "META-INF", "OEBPS"])
-            .current_dir(temp_path)
-            .output()
-            .map_err(|e| ReadLaterError::Conversion(format!("zip content: {}", e)))?;
-
-        if !output.status.success() {
-            return Err(ReadLaterError::Conversion(
-                "Failed to create EPUB content".into(),
-            ));
+        let mut builder =
+            epub_builder::EpubBuilder::new(epub_builder::ZipLibrary::new().map_err(epub_err)?)
+                .map_err(epub_err)?;
+        builder
+            .metadata("title", article.title.as_str())
+            .map_err(epub_err)?;
+        if let Some(author) = &article.author {
+            builder
+                .metadata("author", author.as_str())
+                .map_err(epub_err)?;
         }
-
-        Ok(path)
+        builder
+            .metadata("generator", "remarkable-server")
+            .map_err(epub_err)?;
+        let xhtml = Self::epub_content_xhtml(article, content);
+        builder
+            .add_content(
+                epub_builder::EpubContent::new("content.xhtml", xhtml.as_bytes())
+                    .title(article.title.as_str()),
+            )
+            .map_err(epub_err)?;
+        let mut out = Vec::new();
+        builder.generate(&mut out).map_err(epub_err)?;
+        Ok(out)
     }
 
     fn epub_content_xhtml(article: &Article, content: &ArticleContent) -> String {
@@ -2303,56 +2328,207 @@ img {{ max-width: 100%; }}
         )
     }
 
-    async fn convert_to_pdf(&self, article: &Article, content: &ArticleContent) -> Result<PathBuf> {
-        let filename = self.sanitize_filename(&article.title);
-        let pdf_path = self.output_dir.join(format!("{}.pdf", filename));
-
-        // Save HTML first
-        let html_path = self.save_html(article, content).await?;
-
-        // Use wkhtmltopdf or weasyprint if available
-        use std::process::Command;
-
-        // Try weasyprint first
-        let result = Command::new("weasyprint")
-            .args([html_path.to_str().unwrap(), pdf_path.to_str().unwrap()])
-            .output();
-
-        if let Ok(output) = result {
-            if output.status.success() {
-                return Ok(pdf_path);
-            }
-        }
-
-        // Try wkhtmltopdf
-        let result = Command::new("wkhtmltopdf")
-            .args([
-                "--quiet",
-                html_path.to_str().unwrap(),
-                pdf_path.to_str().unwrap(),
-            ])
-            .output();
-
-        if let Ok(output) = result {
-            if output.status.success() {
-                return Ok(pdf_path);
-            }
-        }
-
-        Err(ReadLaterError::Conversion(
-            "No PDF converter available (install weasyprint or wkhtmltopdf)".into(),
-        ))
+    /// Print the HTML rendering with `weasyprint`, else `wkhtmltopdf` (see [`pdf_printers`]),
+    /// in a scratch directory.
+    fn pdf(article: &Article, content: &ArticleContent, programs: &PdfPrograms) -> Result<Vec<u8>> {
+        let dir = tempfile::tempdir().map_err(no_scratch_space)?;
+        print_pdf(
+            &pdf_printers(programs, dir.path()),
+            dir.path(),
+            &Self::html_document(article, content),
+            PDF_PRINT_TIMEOUT,
+        )
     }
+}
 
-    fn sanitize_filename(&self, name: &str) -> String {
-        name.chars()
-            .map(|c| match c {
-                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-                c if c.is_control() => '_',
-                c => c,
-            })
-            .take(200)
-            .collect()
+/// Longest one PDF printer may run on one page before it is killed, so a converter stuck on a
+/// page can't stall the sync (and the scheduler) for good.
+const PDF_PRINT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A page any working PDF printer prints: a printer that fails on an article but prints this is
+/// failing on the article, not on this host.
+const TEST_PAGE: &str = concat!(
+    "<!DOCTYPE html>\n",
+    "<html><head><meta charset=\"utf-8\"><title>Test page</title></head>",
+    "<body><p>Test page</p></body></html>\n",
+);
+
+/// Without scratch space no converter can run, whatever the article.
+fn no_scratch_space(e: std::io::Error) -> ReadLaterError {
+    ReadLaterError::ConverterUnavailable(format!("scratch directory: {e}"))
+}
+
+/// The PDF converter programs [`ArticleConverter`] runs: `weasyprint` and `wkhtmltopdf`, found
+/// on `PATH`, by default.
+#[derive(Debug, Clone)]
+pub(crate) struct PdfPrograms {
+    pub(crate) weasyprint: std::ffi::OsString,
+    pub(crate) wkhtmltopdf: std::ffi::OsString,
+}
+
+impl Default for PdfPrograms {
+    fn default() -> Self {
+        Self {
+            weasyprint: "weasyprint".into(),
+            wkhtmltopdf: "wkhtmltopdf".into(),
+        }
+    }
+}
+
+/// A PDF converter command line: `program`, `options`, then the input HTML and output PDF.
+#[derive(Debug, Clone)]
+struct PdfPrinter {
+    program: std::ffi::OsString,
+    options: Vec<std::ffi::OsString>,
+}
+
+/// The printers tried, in order, for HTML inside the scratch directory `dir`. The HTML comes
+/// from the provider, i.e. from any web page, so each is confined as far as its options allow:
+/// WeasyPrint may fetch only `http`, `https` and `data:` URLs, never `file:` ones, so no file
+/// from this machine (a TLS key, a database) can be pulled into the PDF, e.g. as an
+/// attachment; this needs WeasyPrint 67 or later (the first with `--allowed-protocols`), and an
+/// older one just fails. wkhtmltopdf runs without JavaScript and may read no local file outside
+/// `dir`. Both may still load http(s) resources such as images, as any renderer of the page
+/// would.
+fn pdf_printers(programs: &PdfPrograms, dir: &Path) -> Vec<PdfPrinter> {
+    let options = |options: &[&std::ffi::OsStr]| options.iter().map(|&o| o.to_owned()).collect();
+    let os = std::ffi::OsStr::new;
+    vec![
+        PdfPrinter {
+            program: programs.weasyprint.clone(),
+            options: options(&[os("--allowed-protocols"), os("http,https,data")]),
+        },
+        PdfPrinter {
+            program: programs.wkhtmltopdf.clone(),
+            options: options(&[
+                os("--quiet"),
+                os("--disable-javascript"),
+                os("--disable-local-file-access"),
+                os("--allow"),
+                dir.as_os_str(),
+            ]),
+        },
+    ]
+}
+
+/// Print `html` in the scratch directory `dir` with the first of `printers` that manages (exits
+/// successfully having written a PDF), each killed after `limit`. If none does, the ones that
+/// ran are tried on [`TEST_PAGE`]: if one prints it, the article is at fault
+/// ([`ReadLaterError::Conversion`]); if none does (none installed, too old for its options, or
+/// broken), no converter works here ([`ReadLaterError::ConverterUnavailable`]), whatever the
+/// article.
+fn print_pdf(
+    printers: &[PdfPrinter],
+    dir: &Path,
+    html: &str,
+    limit: std::time::Duration,
+) -> Result<Vec<u8>> {
+    let (input, output) = (dir.join("article.html"), dir.join("article.pdf"));
+    std::fs::write(&input, html).map_err(no_scratch_space)?;
+    let mut failures = Vec::new();
+    let mut ran = Vec::new();
+    for printer in printers {
+        let name = printer.program.to_string_lossy();
+        let (failure, started) = match print_with(printer, &input, &output, limit) {
+            Ok(Printed::Pdf(pdf)) => return Ok(pdf),
+            Ok(Printed::Failed) => (format!("{name} failed"), true),
+            Ok(Printed::NoPdf) => (format!("{name} wrote no PDF"), true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                (format!("{name} not installed"), false)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => (format!("{name}: {e}"), true),
+            // It couldn't be started (e.g. not executable).
+            Err(e) => (format!("{name}: {e}"), false),
+        };
+        failures.push(failure);
+        if started {
+            ran.push(printer);
+        }
+    }
+    let failures = failures.join(", ");
+
+    let (input, output) = (dir.join("test.html"), dir.join("test.pdf"));
+    std::fs::write(&input, TEST_PAGE).map_err(no_scratch_space)?;
+    for printer in ran {
+        if matches!(
+            print_with(printer, &input, &output, limit),
+            Ok(Printed::Pdf(_))
+        ) {
+            return Err(ReadLaterError::Conversion(format!(
+                "no PDF printed ({failures}), though {} prints a test page",
+                printer.program.to_string_lossy()
+            )));
+        }
+    }
+    Err(ReadLaterError::ConverterUnavailable(format!(
+        "no PDF printed ({failures}), nor a test page; install WeasyPrint 67 or later, or \
+         wkhtmltopdf"
+    )))
+}
+
+/// What one PDF printer did with a page.
+enum Printed {
+    Pdf(Vec<u8>),
+    /// It exited unsuccessfully.
+    Failed,
+    /// It exited successfully without writing a PDF.
+    NoPdf,
+}
+
+/// Print `input` to `output` with `printer` (see [`run_with_deadline`]). Whatever an earlier
+/// printer left at `output` is removed first, so it is never taken for this one's.
+fn print_with(
+    printer: &PdfPrinter,
+    input: &Path,
+    output: &Path,
+    limit: std::time::Duration,
+) -> std::io::Result<Printed> {
+    match std::fs::remove_file(output) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    if !run_with_deadline(printer, input, output, limit)? {
+        return Ok(Printed::Failed);
+    }
+    Ok(match std::fs::read(output) {
+        Ok(pdf) if pdf.starts_with(b"%PDF-") => Printed::Pdf(pdf),
+        _ => Printed::NoPdf,
+    })
+}
+
+/// Run `printer` on `input`, writing `output`, without stdin, stdout or stderr until it exits,
+/// killing it once `limit` has passed. Returns whether it exited successfully.
+fn run_with_deadline(
+    printer: &PdfPrinter,
+    input: &Path,
+    output: &Path,
+    limit: std::time::Duration,
+) -> std::io::Result<bool> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(&printer.program)
+        .args(&printer.options)
+        .arg(input)
+        .arg(output)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status.success());
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            // It may have exited just now; either way, reap it.
+            let _ = child.kill();
+            child.wait()?;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("killed after {} s", limit.as_secs_f32()),
+            ));
+        }
+        std::thread::sleep((deadline - now).min(std::time::Duration::from_millis(50)));
     }
 }
 
@@ -2360,30 +2536,114 @@ img {{ max-width: 100%; }}
 // Read Later Manager
 // ============================================================================
 
+/// `CREATE TABLE IF NOT EXISTS` for the articles table, named `name`. An article is unique per
+/// account and provider id: two accounts of one provider may each hold the same provider id.
+fn articles_table(name: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {name} (
+            id TEXT PRIMARY KEY,
+            provider TEXT NOT NULL,
+            provider_id TEXT NOT NULL,
+            account_id TEXT,
+            url TEXT NOT NULL,
+            title TEXT NOT NULL,
+            excerpt TEXT,
+            author TEXT,
+            word_count INTEGER,
+            reading_time_minutes INTEGER,
+            tags TEXT,
+            status TEXT NOT NULL,
+            favorite INTEGER DEFAULT 0,
+            added_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            read_at TEXT,
+            image_url TEXT,
+            document_id TEXT,
+            synced_to_device INTEGER DEFAULT 0,
+            last_sync TEXT,
+            read_status_pending INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(account_id, provider, provider_id)
+        );"
+    )
+}
+
+/// Every column of the articles table (as [`articles_table`] creates it).
+const ARTICLE_COLUMNS: &str = "id, provider, provider_id, account_id, url, title, excerpt, \
+     author, word_count, reading_time_minutes, tags, status, favorite, added_at, updated_at, \
+     read_at, image_url, document_id, synced_to_device, last_sync, read_status_pending";
+
+const ARTICLE_INDEXES: &str = "
+    CREATE INDEX IF NOT EXISTS idx_articles_provider ON readlater_articles(provider);
+    CREATE INDEX IF NOT EXISTS idx_articles_status ON readlater_articles(status);
+    CREATE INDEX IF NOT EXISTS idx_articles_synced ON readlater_articles(synced_to_device);";
+
+/// The columns of each UNIQUE constraint or index of `table`, in key order.
+fn unique_keys(db: &Connection, table: &str) -> Result<Vec<Vec<String>>> {
+    let db_err = |e: rusqlite::Error| ReadLaterError::Database(e.to_string());
+    let indexes: Vec<String> = db
+        .prepare("SELECT name FROM pragma_index_list(?1) WHERE \"unique\" = 1")
+        .map_err(db_err)?
+        .query_map([table], |r| r.get(0))
+        .map_err(db_err)?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(db_err)?;
+    let mut columns = db
+        .prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")
+        .map_err(db_err)?;
+    indexes
+        .iter()
+        .map(|index| {
+            columns
+                .query_map([index], |r| r.get(0))
+                .map_err(db_err)?
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .map_err(db_err)
+        })
+        .collect()
+}
+
+/// Make the database file readable and writable by its owner only: it holds provider tokens
+/// and passwords. SQLite creates its journal files with the same mode. A failure is logged
+/// rather than fatal, since this runs while the server starts.
+#[cfg(unix)]
+fn restrict_to_owner(db_path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    // Nothing to protect for an in-memory database.
+    if !db_path.is_file() {
+        return;
+    }
+    if let Err(e) = std::fs::set_permissions(db_path, std::fs::Permissions::from_mode(0o600)) {
+        tracing::warn!(
+            "read-later database {}: cannot restrict its permissions: {}",
+            db_path.display(),
+            e
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_db_path: &Path) {}
+
+/// Read-later accounts and articles, persisted in `readlater.db`. Syncing them to the device is
+/// [`crate::readlater_sync::ReadLaterSyncer`]'s job.
 pub struct ReadLaterManager {
     db: Connection,
     accounts: Arc<RwLock<HashMap<String, ProviderAccount>>>,
     articles: Arc<RwLock<HashMap<String, Article>>>,
-    converter: ArticleConverter,
-    storage_path: PathBuf,
-    sync_tx: Option<mpsc::Sender<SyncCommand>>,
 }
 
 impl ReadLaterManager {
-    pub fn new(db_path: &Path, storage_path: &Path) -> Result<Self> {
+    pub fn new(db_path: &Path) -> Result<Self> {
         let db = Connection::open(db_path).map_err(|e| ReadLaterError::Database(e.to_string()))?;
+        // Before anything is written: the database holds provider tokens and passwords.
+        restrict_to_owner(db_path);
 
         Self::init_schema(&db)?;
-
-        let converter = ArticleConverter::new(storage_path.join("articles"));
 
         let mut mgr = Self {
             db,
             accounts: Arc::new(RwLock::new(HashMap::new())),
             articles: Arc::new(RwLock::new(HashMap::new())),
-            converter,
-            storage_path: storage_path.to_path_buf(),
-            sync_tx: None,
         };
 
         mgr.load_accounts()?;
@@ -2393,7 +2653,7 @@ impl ReadLaterManager {
     }
 
     fn init_schema(db: &Connection) -> Result<()> {
-        db.execute_batch(
+        db.execute_batch(&format!(
             r#"
             CREATE TABLE IF NOT EXISTS readlater_accounts (
                 id TEXT PRIMARY KEY,
@@ -2405,31 +2665,9 @@ impl ReadLaterManager {
                 last_sync TEXT,
                 created_at TEXT NOT NULL
             );
-            
-            CREATE TABLE IF NOT EXISTS readlater_articles (
-                id TEXT PRIMARY KEY,
-                provider TEXT NOT NULL,
-                provider_id TEXT NOT NULL,
-                account_id TEXT,
-                url TEXT NOT NULL,
-                title TEXT NOT NULL,
-                excerpt TEXT,
-                author TEXT,
-                word_count INTEGER,
-                reading_time_minutes INTEGER,
-                tags TEXT,
-                status TEXT NOT NULL,
-                favorite INTEGER DEFAULT 0,
-                added_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                read_at TEXT,
-                image_url TEXT,
-                document_id TEXT,
-                synced_to_device INTEGER DEFAULT 0,
-                last_sync TEXT,
-                UNIQUE(provider, provider_id)
-            );
-            
+
+            {articles}
+
             CREATE TABLE IF NOT EXISTS readlater_oauth_states (
                 id TEXT PRIMARY KEY,
                 provider TEXT NOT NULL,
@@ -2437,18 +2675,64 @@ impl ReadLaterManager {
                 redirect_uri TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
-            
-            CREATE INDEX IF NOT EXISTS idx_articles_provider ON readlater_articles(provider);
-            CREATE INDEX IF NOT EXISTS idx_articles_status ON readlater_articles(status);
-            CREATE INDEX IF NOT EXISTS idx_articles_synced ON readlater_articles(synced_to_device);
+
+            {ARTICLE_INDEXES}
         "#,
-        )
+            articles = articles_table("readlater_articles"),
+        ))
         .map_err(|e| ReadLaterError::Database(e.to_string()))?;
 
         // Provider credentials (JSON `ProviderSecrets`), split from `config` so they survive
         // restarts without ever being part of the client-facing config JSON.
         Self::ensure_column(db, "readlater_accounts", "secrets", "TEXT")?;
+        // Which account recorded an article (so status changes go back to the right one), and
+        // whether a status change made here is still to be sent to the provider.
+        Self::ensure_column(db, "readlater_articles", "account_id", "TEXT")?;
+        Self::ensure_column(
+            db,
+            "readlater_articles",
+            "read_status_pending",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        Self::key_articles_by_account(db)?;
 
+        Ok(())
+    }
+
+    /// Rebuild `readlater_articles` keyed by `(account_id, provider, provider_id)` if it is still
+    /// keyed by `(provider, provider_id)`, as databases created before accounts were recorded
+    /// are: two accounts of one provider (say two Wallabag instances) number their entries
+    /// alike, and each must be able to hold its own. SQLite can't change a table's constraints
+    /// in place, so the table is copied into a new one, which then takes its place, all in one
+    /// transaction: a failure (or a crash) leaves the old table as it was, and the next start
+    /// tries again. Every row is kept as it is, rows of no account (`account_id` NULL) included.
+    /// Once rebuilt the old key is gone, so this does nothing on later starts.
+    fn key_articles_by_account(db: &Connection) -> Result<()> {
+        let db_err = |e: rusqlite::Error| ReadLaterError::Database(e.to_string());
+        let old_key = ["provider", "provider_id"];
+        if !unique_keys(db, "readlater_articles")?
+            .iter()
+            .any(|key| key == &old_key)
+        {
+            return Ok(());
+        }
+        let tx = db.unchecked_transaction().map_err(db_err)?;
+        tx.execute_batch(&format!(
+            "DROP TABLE IF EXISTS readlater_articles_rekeyed;
+             {new}
+             INSERT INTO readlater_articles_rekeyed ({ARTICLE_COLUMNS})
+                 SELECT {ARTICLE_COLUMNS} FROM readlater_articles;
+             DROP TABLE readlater_articles;
+             ALTER TABLE readlater_articles_rekeyed RENAME TO readlater_articles;
+             {ARTICLE_INDEXES}",
+            new = articles_table("readlater_articles_rekeyed"),
+        ))
+        .map_err(db_err)?;
+        let rows: i64 = tx
+            .query_row("SELECT COUNT(*) FROM readlater_articles", [], |r| r.get(0))
+            .map_err(db_err)?;
+        tx.commit().map_err(db_err)?;
+        tracing::info!(rows, "read-later articles re-keyed by account");
         Ok(())
     }
 
@@ -2564,7 +2848,7 @@ impl ReadLaterManager {
 
     fn load_articles(&mut self) -> Result<()> {
         let mut stmt = self.db.prepare(
-            "SELECT id, provider, provider_id, url, title, excerpt, author, word_count, reading_time_minutes,              tags, status, favorite, added_at, updated_at, read_at, image_url, document_id, synced_to_device, last_sync              FROM readlater_articles"
+            "SELECT id, provider, provider_id, url, title, excerpt, author, word_count, reading_time_minutes,              tags, status, favorite, added_at, updated_at, read_at, image_url, document_id, synced_to_device, last_sync,              account_id, read_status_pending FROM readlater_articles"
         ).map_err(|e| ReadLaterError::Database(e.to_string()))?;
 
         let rows = stmt
@@ -2588,6 +2872,8 @@ impl ReadLaterManager {
                 let document_id: Option<String> = row.get(16)?;
                 let synced: bool = row.get::<_, i32>(17)? != 0;
                 let last_sync: Option<String> = row.get(18)?;
+                let account_id: Option<String> = row.get(19)?;
+                let read_status_pending: bool = row.get::<_, i32>(20)? != 0;
 
                 Ok((
                     id,
@@ -2609,6 +2895,8 @@ impl ReadLaterManager {
                     document_id,
                     synced,
                     last_sync,
+                    account_id,
+                    read_status_pending,
                 ))
             })
             .map_err(|e| ReadLaterError::Database(e.to_string()))?;
@@ -2636,6 +2924,8 @@ impl ReadLaterManager {
                 document_id,
                 synced,
                 last_sync,
+                account_id,
+                read_status_pending,
             ) = row.map_err(|e| ReadLaterError::Database(e.to_string()))?;
 
             let provider: ReadLaterProvider =
@@ -2678,6 +2968,8 @@ impl ReadLaterManager {
                     document_id,
                     synced_to_device: synced,
                     last_sync: last_sync.map(|s| parse_dt(&s)),
+                    account_id,
+                    read_status_pending,
                 },
             );
         }
@@ -2762,20 +3054,23 @@ impl ReadLaterManager {
         Ok(())
     }
 
-    /// Pick up a token refresh the provider did inside its last call: adopt the new config
-    /// for the rest of the sync and persist it right away, so rotated tokens aren't lost.
-    fn absorb_refreshed_config(
-        &mut self,
-        provider: &dyn ReadLaterProviderTrait,
-        account: &mut ProviderAccount,
-        errors: &mut Vec<String>,
-    ) {
-        if let Some(config) = provider.take_refreshed_config() {
-            account.config = config;
-            if let Err(e) = self.update_account_config(&account.id, &account.config) {
-                errors.push(format!("Persist refreshed credentials: {}", e));
-            }
+    /// Record the start of the last fully synced window, touching only `last_sync` so
+    /// concurrent edits to name/settings are not overwritten.
+    pub fn set_last_sync(&mut self, id: &str, at: DateTime<Utc>) -> Result<()> {
+        let changed = self
+            .db
+            .execute(
+                "UPDATE readlater_accounts SET last_sync=?2 WHERE id=?1",
+                params![id, at.to_rfc3339()],
+            )
+            .map_err(|e| ReadLaterError::Database(e.to_string()))?;
+        if changed == 0 {
+            return Err(ReadLaterError::ProviderNotFound(id.into()));
         }
+        if let Some(account) = self.accounts.write().get_mut(id) {
+            account.last_sync = Some(at);
+        }
+        Ok(())
     }
 
     pub fn delete_account(&mut self, id: &str) -> Result<()> {
@@ -2800,19 +3095,24 @@ impl ReadLaterManager {
         self.upsert_article(article).map(|_| ())
     }
 
-    /// Insert or update an article keyed by its natural key `(provider, provider_id)`
-    /// (the table's UNIQUE constraint). If a row already exists under a different id — e.g.
-    /// a provider re-fetch that minted a fresh uuid — the existing id is kept, as is the
-    /// device-side state (document_id / synced_to_device / last_sync) the provider can't
-    /// know about, so the DB row and the in-memory map stay one entry per article.
-    /// Returns the article as stored.
-    fn upsert_article(&mut self, article: &Article) -> Result<Article> {
+    /// Insert or update an article keyed by its natural key `(account_id, provider,
+    /// provider_id)` (the table's UNIQUE constraint; a `None` account matches `None`). If a row
+    /// already exists under a different id — e.g. a provider re-fetch that minted a fresh uuid —
+    /// the existing id is kept, as is the device-side state (document_id / synced_to_device /
+    /// last_sync) the provider can't know about, so the DB row and the in-memory map stay one
+    /// entry per article. Returns the article as stored.
+    pub(crate) fn upsert_article(&mut self, article: &Article) -> Result<Article> {
         let mut article = article.clone();
         let existing_id: Option<String> = self
             .db
             .query_row(
-                "SELECT id FROM readlater_articles WHERE provider=?1 AND provider_id=?2",
-                params![article.provider.to_string(), article.provider_id],
+                "SELECT id FROM readlater_articles
+                 WHERE account_id IS ?1 AND provider=?2 AND provider_id=?3",
+                params![
+                    article.account_id,
+                    article.provider.to_string(),
+                    article.provider_id
+                ],
                 |row| row.get(0),
             )
             .map(Some)
@@ -2829,35 +3129,13 @@ impl ReadLaterManager {
                 if article.last_sync.is_none() {
                     article.last_sync = prev.last_sync;
                 }
+                if article.account_id.is_none() {
+                    article.account_id = prev.account_id.clone();
+                }
             }
             article.id = existing_id;
         }
-        let tags_json = serde_json::to_string(&article.tags)?;
-
-        self.db.execute(
-            "INSERT OR REPLACE INTO readlater_articles              (id, provider, provider_id, url, title, excerpt, author, word_count, reading_time_minutes,               tags, status, favorite, added_at, updated_at, read_at, image_url, document_id, synced_to_device, last_sync)              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
-            params![
-                article.id,
-                article.provider.to_string(),
-                article.provider_id,
-                article.url,
-                article.title,
-                article.excerpt,
-                article.author,
-                article.word_count,
-                article.reading_time_minutes,
-                tags_json,
-                format!("{:?}", article.status).to_lowercase(),
-                article.favorite as i32,
-                article.added_at.to_rfc3339(),
-                article.updated_at.to_rfc3339(),
-                article.read_at.map(|d| d.to_rfc3339()),
-                article.image_url,
-                article.document_id,
-                article.synced_to_device as i32,
-                article.last_sync.map(|d| d.to_rfc3339()),
-            ],
-        ).map_err(|e| ReadLaterError::Database(e.to_string()))?;
+        write_article(&self.db, &article)?;
 
         self.articles
             .write()
@@ -2867,6 +3145,197 @@ impl ReadLaterManager {
 
     pub fn get_article(&self, id: &str) -> Option<Article> {
         self.articles.read().get(id).cloned()
+    }
+
+    /// Record, before the tree commit that adds them, the documents the articles are being
+    /// added as (`(article id, document id)` pairs), all in one transaction: if the commit lands
+    /// but [`mark_delivered_all`](Self::mark_delivered_all) never runs or fails, the next sync
+    /// finds the document in the tree and marks the article instead of adding it again. Articles
+    /// already delivered, or deleted meanwhile, are left alone.
+    pub(crate) fn plan_deliveries(&mut self, deliveries: &[(String, String)]) -> Result<()> {
+        self.set_delivery_columns(deliveries, false)
+    }
+
+    /// Record that each article is on the device as its document (`(article id, document id)`
+    /// pairs), all in one transaction, so later syncs never add it again. Articles deleted
+    /// meanwhile are skipped.
+    pub(crate) fn mark_delivered_all(&mut self, deliveries: &[(String, String)]) -> Result<()> {
+        self.set_delivery_columns(deliveries, true)
+    }
+
+    /// Set `document_id` (and, when `delivered`, `synced_to_device` and `last_sync`) of each
+    /// article, touching no other column, so edits made meanwhile (a status change) are kept.
+    fn set_delivery_columns(
+        &mut self,
+        deliveries: &[(String, String)],
+        delivered: bool,
+    ) -> Result<()> {
+        let db_err = |e: rusqlite::Error| ReadLaterError::Database(e.to_string());
+        let now = Utc::now();
+        let tx = self.db.unchecked_transaction().map_err(db_err)?;
+        for (article_id, document_id) in deliveries {
+            if delivered {
+                tx.execute(
+                    "UPDATE readlater_articles SET document_id=?2, synced_to_device=1, last_sync=?3
+                     WHERE id=?1",
+                    params![article_id, document_id, now.to_rfc3339()],
+                )
+            } else {
+                tx.execute(
+                    "UPDATE readlater_articles SET document_id=?2
+                     WHERE id=?1 AND synced_to_device=0",
+                    params![article_id, document_id],
+                )
+            }
+            .map_err(db_err)?;
+        }
+        tx.commit().map_err(db_err)?;
+        let mut articles = self.articles.write();
+        for (article_id, document_id) in deliveries {
+            let Some(article) = articles.get_mut(article_id) else {
+                continue;
+            };
+            if delivered {
+                article.synced_to_device = true;
+                article.last_sync = Some(now);
+            } else if article.synced_to_device {
+                continue;
+            }
+            article.document_id = Some(document_id.clone());
+        }
+        Ok(())
+    }
+
+    /// Record the articles `account_id` just fetched from its provider, all in one transaction,
+    /// and return each as it is now recorded (in order; `synced_to_device` tells whether it is
+    /// already on the device). Articles are unique per account and provider id, so another
+    /// account of the same provider (say a second Wallabag, numbering its entries alike) holds
+    /// its own rows and never gets in the way. A provider id listed again later in `articles`
+    /// is ignored: each article is recorded and returned once, so it can't be delivered as two
+    /// documents.
+    ///
+    /// An article the account recorded before keeps its id and device state (`document_id`,
+    /// `synced_to_device`), so it is never delivered twice. If its status was changed here and
+    /// not yet sent (`read_status_pending`), that status is kept over the provider's when
+    /// `keep_pending_status` (the account sends status changes), so the change isn't lost before
+    /// it is pushed; otherwise the provider's status wins and the change is dropped. Otherwise a
+    /// row of the same provider id and URL recorded for no account (from before accounts were
+    /// recorded) or for a deleted one is taken over with its device state, minus any pending
+    /// status change, which was meant for the old account. Such a row of another URL was another
+    /// instance's entry: it is left alone, still recording that its page is on the device (for
+    /// that instance, if added back, to take over), and this article is recorded as a new one,
+    /// still to be delivered.
+    pub(crate) fn record_fetched(
+        &mut self,
+        account_id: &str,
+        keep_pending_status: bool,
+        articles: Vec<Article>,
+    ) -> Result<Vec<Article>> {
+        type Key = (ReadLaterProvider, String);
+        let db_err = |e: rusqlite::Error| ReadLaterError::Database(e.to_string());
+        let accounts = self.accounts.read();
+        let (own, mut orphans) = {
+            let wanted: HashSet<(ReadLaterProvider, &str)> = articles
+                .iter()
+                .map(|a| (a.provider, a.provider_id.as_str()))
+                .collect();
+            let mut own: HashMap<Key, Article> = HashMap::new();
+            let mut orphans: HashMap<Key, Vec<Article>> = HashMap::new();
+            for a in self.articles.read().values() {
+                if !wanted.contains(&(a.provider, a.provider_id.as_str())) {
+                    continue;
+                }
+                let key = (a.provider, a.provider_id.clone());
+                match a.account_id.as_deref() {
+                    Some(owner) if owner == account_id => {
+                        own.insert(key, a.clone());
+                    }
+                    Some(owner) if accounts.contains_key(owner) => {}
+                    _ => orphans.entry(key).or_default().push(a.clone()),
+                }
+            }
+            for rows in orphans.values_mut() {
+                rows.sort_by(|a, b| a.id.cmp(&b.id));
+            }
+            (own, orphans)
+        };
+        let tx = self.db.unchecked_transaction().map_err(db_err)?;
+        let mut recorded = Vec::with_capacity(articles.len());
+        let mut seen: HashSet<Key> = HashSet::new();
+        for mut article in articles {
+            let key = (article.provider, article.provider_id.clone());
+            if !seen.insert(key.clone()) {
+                continue; // listed twice: the first copy is the article
+            }
+            if let Some(prev) = own.get(&key) {
+                article.id = prev.id.clone();
+                keep_device_state(&mut article, prev);
+                if prev.read_status_pending && keep_pending_status {
+                    article.status = prev.status;
+                    article.read_at = prev.read_at;
+                    article.read_status_pending = true;
+                }
+            } else if let Some(rows) = orphans.get_mut(&key) {
+                // Only a row of the same page, each taken over once. One of another page (another
+                // instance's entry with this id) is left alone: it is the record that its page
+                // is on the device, for the account that lists that page to take over.
+                if let Some(at) = rows.iter().position(|r| r.url == article.url) {
+                    let prev = rows.remove(at);
+                    article.id = prev.id.clone();
+                    keep_device_state(&mut article, &prev);
+                }
+            }
+            article.account_id = Some(account_id.to_owned());
+            write_article(&tx, &article)?;
+            recorded.push(article);
+        }
+        tx.commit().map_err(db_err)?;
+        drop(accounts);
+        let mut map = self.articles.write();
+        for article in &recorded {
+            map.insert(article.id.clone(), article.clone());
+        }
+        Ok(recorded)
+    }
+
+    /// Articles recorded for `account_id` whose status was changed here and is still to be
+    /// sent to the provider.
+    pub(crate) fn pending_read_status(&self, account_id: &str) -> Vec<Article> {
+        self.articles
+            .read()
+            .values()
+            .filter(|a| a.read_status_pending && a.account_id.as_deref() == Some(account_id))
+            .cloned()
+            .collect()
+    }
+
+    /// The provider was sent `status` for `article_id`: nothing is pending any more, unless the
+    /// status was changed again meanwhile (that change is still to be sent).
+    pub(crate) fn read_status_sent(&mut self, article_id: &str, status: ReadStatus) -> Result<()> {
+        self.clear_read_status_pending(article_id, Some(status))
+    }
+
+    /// Stop trying to send `article_id`'s status change (the provider keeps refusing it).
+    pub(crate) fn drop_read_status_change(&mut self, article_id: &str) -> Result<()> {
+        self.clear_read_status_pending(article_id, None)
+    }
+
+    /// Clear `read_status_pending`, if `sent` is `None` or still the article's status.
+    fn clear_read_status_pending(
+        &mut self,
+        article_id: &str,
+        sent: Option<ReadStatus>,
+    ) -> Result<()> {
+        let Some(mut article) = self.get_article(article_id) else {
+            return Ok(()); // deleted meanwhile
+        };
+        if !article.read_status_pending || sent.is_some_and(|s| s != article.status) {
+            return Ok(());
+        }
+        article.read_status_pending = false;
+        write_article(&self.db, &article)?;
+        self.articles.write().insert(article.id.clone(), article);
+        Ok(())
     }
 
     pub fn query_articles(&self, query: &ArticleQuery) -> Vec<Article> {
@@ -3007,262 +3476,63 @@ impl ReadLaterManager {
             .map_err(|e| ReadLaterError::Database(e.to_string()))?;
         Ok(())
     }
+}
 
-    // Sync operations
-
-    pub async fn sync_account(&mut self, account_id: &str) -> Result<SyncResult> {
-        let start = std::time::Instant::now();
-        let mut result = SyncResult {
-            provider: ReadLaterProvider::Pocket,
-            articles_fetched: 0,
-            articles_synced: 0,
-            articles_converted: 0,
-            read_status_synced: 0,
-            errors: Vec::new(),
-            duration_ms: 0,
-            completed_at: Utc::now(),
-        };
-
-        let account = self
-            .get_account(account_id)
-            .ok_or_else(|| ReadLaterError::ProviderNotFound(account_id.into()))?;
-
-        result.provider = account.provider;
-
-        // Create provider instance. A discontinued provider (Omnivore) is reported as a sync
-        // error rather than failing `sync_all` for every other account.
-        let provider = match provider_for(account.provider) {
-            Ok(p) => p,
-            Err(e) => {
-                result.errors.push(e.to_string());
-                result.duration_ms = start.elapsed().as_millis() as u64;
-                result.completed_at = Utc::now();
-                return Ok(result);
-            }
-        };
-        let provider = provider.as_ref();
-
-        // Refresh credentials once per sync (a no-op unless expired/near expiry) so the
-        // individual API calls below don't each trigger their own refresh. A refreshed token is
-        // persisted immediately.
-        // A failed refresh aborts the sync without touching `last_sync`, so the failure stays
-        // visible and the next sync retries the same window.
-        let mut account = account;
-        match provider.refresh_auth(&account.config).await {
-            Ok(config) => {
-                account.config = config;
-                if provider.take_refreshed_config().is_some() {
-                    if let Err(e) = self.update_account_config(&account.id, &account.config) {
-                        result
-                            .errors
-                            .push(format!("Persist refreshed credentials: {}", e));
-                    }
-                }
-            }
-            Err(e) => {
-                result.errors.push(format!("Auth refresh: {}", e));
-                result.duration_ms = start.elapsed().as_millis() as u64;
-                result.completed_at = Utc::now();
-                return Ok(result);
-            }
-        }
-
-        // Fetch articles
-        let since = account.last_sync;
-        let mut fetched = false;
-        let fetch_result = provider.fetch_articles(&account.config, since).await;
-        self.absorb_refreshed_config(provider, &mut account, &mut result.errors);
-        match fetch_result {
-            Ok(articles) => {
-                fetched = true;
-                result.articles_fetched = articles.len() as u32;
-
-                for article in select_articles_for_sync(articles, &account.sync_settings) {
-                    // Save article (keeps the existing id if we've seen it before)
-                    let article = match self.upsert_article(&article) {
-                        Ok(stored) => stored,
-                        Err(e) => {
-                            result.errors.push(format!("Save {}: {}", article.id, e));
-                            continue;
-                        }
-                    };
-
-                    result.articles_synced += 1;
-
-                    // Convert to device format
-                    if account.sync_settings.convert_format != ArticleFormat::Html {
-                        let content = provider
-                            .fetch_article_content(&account.config, &article)
-                            .await;
-                        self.absorb_refreshed_config(provider, &mut account, &mut result.errors);
-                        match content {
-                            Ok(content) => {
-                                match self
-                                    .converter
-                                    .convert(
-                                        &article,
-                                        &content,
-                                        account.sync_settings.convert_format,
-                                    )
-                                    .await
-                                {
-                                    Ok(_path) => {
-                                        result.articles_converted += 1;
-                                    }
-                                    Err(e) => {
-                                        result
-                                            .errors
-                                            .push(format!("Convert {}: {}", article.id, e));
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                result.errors.push(format!("Content {}: {}", article.id, e));
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                result.errors.push(format!("Fetch: {}", e));
-            }
-        }
-
-        // Sync read status back
-        if account.sync_settings.sync_read_status {
-            let articles_to_sync: Vec<Article> = self
-                .articles
-                .read()
-                .values()
-                .filter(|a| {
-                    a.provider == account.provider
-                        && a.synced_to_device
-                        && (a.status == ReadStatus::Read || a.status == ReadStatus::Archived)
-                })
-                .cloned()
-                .collect();
-
-            for article in articles_to_sync {
-                let updated = provider
-                    .update_read_status(&account.config, &article.provider_id, article.status)
-                    .await;
-                self.absorb_refreshed_config(provider, &mut account, &mut result.errors);
-                match updated {
-                    Ok(()) => {
-                        result.read_status_synced += 1;
-                    }
-                    Err(e) => {
-                        result.errors.push(format!("Status {}: {}", article.id, e));
-                    }
-                }
-            }
-        }
-
-        // Persist refreshed credentials; advance `last_sync` only after a successful fetch so a
-        // failed fetch doesn't make the next incremental sync skip this window.
-        let mut updated_account = account;
-        if fetched {
-            updated_account.last_sync = Some(Utc::now());
-        }
-        let _ = self.update_account(updated_account);
-
-        result.duration_ms = start.elapsed().as_millis() as u64;
-        result.completed_at = Utc::now();
-
-        Ok(result)
+/// Carry over to a fetched `article` the device-side state of its row `prev`, which the
+/// provider can't know about.
+fn keep_device_state(article: &mut Article, prev: &Article) {
+    if article.document_id.is_none() {
+        article.document_id = prev.document_id.clone();
     }
-
-    pub async fn sync_all(&mut self) -> Vec<SyncResult> {
-        let account_ids: Vec<String> = self
-            .accounts
-            .read()
-            .values()
-            .filter(|a| a.enabled)
-            .map(|a| a.id.clone())
-            .collect();
-
-        let mut results = Vec::new();
-
-        for id in account_ids {
-            match self.sync_account(&id).await {
-                Ok(result) => results.push(result),
-                Err(e) => {
-                    results.push(SyncResult {
-                        provider: ReadLaterProvider::Pocket,
-                        articles_fetched: 0,
-                        articles_synced: 0,
-                        articles_converted: 0,
-                        read_status_synced: 0,
-                        errors: vec![e.to_string()],
-                        duration_ms: 0,
-                        completed_at: Utc::now(),
-                    });
-                }
-            }
-        }
-
-        results
+    article.synced_to_device |= prev.synced_to_device;
+    if article.last_sync.is_none() {
+        article.last_sync = prev.last_sync;
     }
+}
 
-    // Scheduler
+/// Write `article` as its row, replacing any row with its id (or its account and provider id).
+fn write_article(db: &Connection, article: &Article) -> Result<()> {
+    let tags_json = serde_json::to_string(&article.tags)?;
+    db.execute(
+        "INSERT OR REPLACE INTO readlater_articles          (id, provider, provider_id, url, title, excerpt, author, word_count, reading_time_minutes,           tags, status, favorite, added_at, updated_at, read_at, image_url, document_id, synced_to_device,           last_sync, account_id, read_status_pending)          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+        params![
+            article.id,
+            article.provider.to_string(),
+            article.provider_id,
+            article.url,
+            article.title,
+            article.excerpt,
+            article.author,
+            article.word_count,
+            article.reading_time_minutes,
+            tags_json,
+            format!("{:?}", article.status).to_lowercase(),
+            article.favorite as i32,
+            article.added_at.to_rfc3339(),
+            article.updated_at.to_rfc3339(),
+            article.read_at.map(|d| d.to_rfc3339()),
+            article.image_url,
+            article.document_id,
+            article.synced_to_device as i32,
+            article.last_sync.map(|d| d.to_rfc3339()),
+            article.account_id,
+            article.read_status_pending as i32,
+        ],
+    )
+    .map_err(|e| ReadLaterError::Database(e.to_string()))?;
+    Ok(())
+}
 
-    pub fn start_scheduler(&mut self) -> mpsc::Sender<SyncCommand> {
-        let (tx, mut rx) = mpsc::channel::<SyncCommand>(32);
-        self.sync_tx = Some(tx.clone());
-
-        let accounts = Arc::clone(&self.accounts);
-        let _articles = Arc::clone(&self.articles);
-        let _storage_path = self.storage_path.clone();
-
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
-
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        // Check for accounts that need sync
-                        let accounts_to_sync: Vec<ProviderAccount> = {
-                            let accounts = accounts.read();
-                            accounts.values()
-                                .filter(|a| {
-                                    if !a.enabled || !a.sync_settings.auto_sync { return false; }
-
-                                    let interval = Duration::minutes(a.sync_settings.sync_interval_minutes as i64);
-                                    match a.last_sync {
-                                        Some(last) => Utc::now() - last > interval,
-                                        None => true,
-                                    }
-                                })
-                                .cloned()
-                                .collect()
-                        };
-
-                        for account in accounts_to_sync {
-                            tracing::info!("Scheduled sync for {} ({})", account.name, account.provider);
-                            // Would trigger sync here - need to refactor to share manager
-                        }
-                    }
-
-                    Some(cmd) = rx.recv() => {
-                        match cmd {
-                            SyncCommand::Stop => break,
-                            _ => {
-                                // Handle other commands
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        tx
-    }
-
-    pub fn stop_scheduler(&mut self) {
-        if let Some(tx) = self.sync_tx.take() {
-            let _ = tx.try_send(SyncCommand::Stop);
-        }
-    }
+/// `articles` with each provider id once, in order, keeping the first copy. A provider may list
+/// an entry twice (a buggy or hostile server, or pages that overlap as entries are added
+/// meanwhile); it is still one article, to be counted, capped by `max_articles` and put on the
+/// device once.
+pub(crate) fn distinct_articles(articles: Vec<Article>) -> Vec<Article> {
+    let mut seen = HashSet::new();
+    articles
+        .into_iter()
+        .filter(|a| seen.insert((a.provider, a.provider_id.clone())))
+        .collect()
 }
 
 /// Apply the account's sync filters (tags, favorites, archived) and cap the result at
@@ -3270,7 +3540,10 @@ impl ReadLaterManager {
 /// sync: articles it drops are older than everything kept and are not revisited later.
 /// Tag filters: an article must carry none of the exclude tags and, when any include
 /// filters exist, at least one include tag.
-fn select_articles_for_sync(articles: Vec<Article>, settings: &SyncSettings) -> Vec<Article> {
+pub(crate) fn select_articles_for_sync(
+    articles: Vec<Article>,
+    settings: &SyncSettings,
+) -> Vec<Article> {
     let mut selected: Vec<Article> = articles
         .into_iter()
         .filter(|article| {
@@ -3315,8 +3588,59 @@ impl Default for WallabagProvider {
     }
 }
 
+/// Fixtures shared by the read-later test modules.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) fn test_account(
+        id: &str,
+        provider: ReadLaterProvider,
+        config: ProviderConfig,
+        last_sync: Option<DateTime<Utc>>,
+    ) -> ProviderAccount {
+        ProviderAccount {
+            id: id.into(),
+            name: id.into(),
+            provider,
+            enabled: true,
+            config,
+            sync_settings: SyncSettings::default(),
+            last_sync,
+            created_at: Utc::now(),
+        }
+    }
+
+    pub(crate) fn wallabag_config(
+        instance_url: &str,
+        access_token: Option<&str>,
+        refresh_token: Option<&str>,
+        token_expires_at: Option<DateTime<Utc>>,
+    ) -> ProviderConfig {
+        ProviderConfig::Wallabag {
+            instance_url: instance_url.into(),
+            client_id: "cid".into(),
+            client_secret: Some("csecret".into()),
+            access_token: access_token.map(Into::into),
+            refresh_token: refresh_token.map(Into::into),
+            token_expires_at,
+            username: None,
+            password: None,
+        }
+    }
+
+    /// Serve `app` on an ephemeral local port; returns its base URL.
+    pub(crate) async fn spawn_server(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{}", addr)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::*;
     use super::*;
 
     fn article(id: &str, provider_id: &str, added_secs: i64) -> Article {
@@ -3342,6 +3666,8 @@ mod tests {
             document_id: None,
             synced_to_device: false,
             last_sync: None,
+            account_id: None,
+            read_status_pending: false,
         }
     }
 
@@ -3474,20 +3800,17 @@ mod tests {
         a
     }
 
-    #[tokio::test]
-    async fn html_export_escapes_metadata() {
-        let dir = tempfile::tempdir().unwrap();
-        let conv = ArticleConverter::new(dir.path().to_path_buf());
+    #[test]
+    fn html_export_escapes_metadata() {
         let content = ArticleContent {
             html: "<p>body</p>".into(),
             images: Vec::new(),
             styles: None,
         };
-        let path = conv
-            .convert(&hostile_article(), &content, ArticleFormat::Html)
-            .await
-            .unwrap();
-        let html = std::fs::read_to_string(path).unwrap();
+        let rendered =
+            ArticleConverter::render(&hostile_article(), &content, ArticleFormat::Html).unwrap();
+        assert_eq!(rendered.ext, "html");
+        let html = String::from_utf8(rendered.bytes).unwrap();
         assert!(!html.contains("<script>"));
         assert!(
             html.contains("<title>&lt;/title&gt;&lt;script&gt;alert(1)&lt;/script&gt;</title>")
@@ -3510,10 +3833,31 @@ mod tests {
         assert!(xhtml.contains("max-width: 100%;"));
     }
 
+    /// EPUBs are built in memory (no `zip` binary): a ZIP whose first entry is the stored
+    /// `mimetype`, as EPUB readers require, with the article as `OEBPS/content.xhtml`.
+    #[test]
+    fn epub_is_rendered_in_memory() {
+        let content = ArticleContent {
+            html: "<p>body text</p>".into(),
+            images: Vec::new(),
+            styles: None,
+        };
+        let rendered =
+            ArticleConverter::render(&hostile_article(), &content, ArticleFormat::Epub).unwrap();
+        assert_eq!(rendered.ext, "epub");
+        let b = &rendered.bytes;
+        assert_eq!(&b[..4], b"PK\x03\x04");
+        assert_eq!(&b[30..38], b"mimetype");
+        assert_eq!(&b[38..58], b"application/epub+zip");
+        let find = |needle: &[u8]| b.windows(needle.len()).any(|w| w == needle);
+        assert!(find(b"OEBPS/content.xhtml"));
+        assert!(find(b"META-INF/container.xml"));
+    }
+
     #[test]
     fn save_article_upserts_by_provider_id() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = ReadLaterManager::new(&dir.path().join("rl.db"), dir.path()).unwrap();
+        let mut mgr = ReadLaterManager::new(&dir.path().join("rl.db")).unwrap();
         let mut first = article("id-1", "p1", 0);
         first.synced_to_device = true;
         first.document_id = Some("doc".into());
@@ -3538,9 +3882,40 @@ mod tests {
 
         // Reloading from disk yields the same single article.
         drop(mgr);
-        let mgr = ReadLaterManager::new(&dir.path().join("rl.db"), dir.path()).unwrap();
+        let mgr = ReadLaterManager::new(&dir.path().join("rl.db")).unwrap();
         assert_eq!(mgr.articles.read().len(), 1);
         assert_eq!(mgr.get_article("id-1").unwrap().title, "Updated");
+    }
+
+    /// A provider id listed twice is one article, its first copy, in listed order; the same id
+    /// from another provider is another article.
+    #[test]
+    fn distinct_articles_keeps_the_first_copy_of_each() {
+        let mut repeat = article("second", "p1", 5);
+        repeat.title = "second copy".into();
+        let mut other_provider = article("wb", "p1", 0);
+        other_provider.provider = ReadLaterProvider::Wallabag;
+        let listed = vec![
+            article("first", "p1", 0),
+            article("p2", "p2", 0),
+            repeat,
+            other_provider,
+            article("p2-again", "p2", 0),
+        ];
+        let distinct = distinct_articles(listed);
+        let kept: Vec<(&str, ReadLaterProvider, &str)> = distinct
+            .iter()
+            .map(|a| (a.id.as_str(), a.provider, a.title.as_str()))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                ("first", ReadLaterProvider::Pocket, "T"),
+                ("p2", ReadLaterProvider::Pocket, "T"),
+                ("wb", ReadLaterProvider::Wallabag, "T"),
+            ]
+        );
+        assert!(distinct_articles(Vec::new()).is_empty());
     }
 
     #[test]
@@ -3620,104 +3995,11 @@ mod tests {
         assert_eq!(ids(&settings), ["both", "inc", "other"]);
     }
 
-    fn test_account(
-        id: &str,
-        provider: ReadLaterProvider,
-        config: ProviderConfig,
-        last_sync: Option<DateTime<Utc>>,
-    ) -> ProviderAccount {
-        ProviderAccount {
-            id: id.into(),
-            name: id.into(),
-            provider,
-            enabled: true,
-            config,
-            sync_settings: SyncSettings::default(),
-            last_sync,
-            created_at: Utc::now(),
-        }
-    }
-
-    #[tokio::test]
-    async fn failed_refresh_or_fetch_does_not_advance_last_sync() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut mgr = ReadLaterManager::new(&dir.path().join("rl.db"), dir.path()).unwrap();
-        let last = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        // Wallabag with no tokens: refresh fails, so the sync aborts before fetching.
-        let wb = ProviderConfig::Wallabag {
-            instance_url: "http://127.0.0.1:9".into(),
-            client_id: "c".into(),
-            client_secret: None,
-            access_token: None,
-            refresh_token: None,
-            token_expires_at: None,
-            username: None,
-            password: None,
-        };
-        mgr.add_account(test_account(
-            "wb",
-            ReadLaterProvider::Wallabag,
-            wb,
-            Some(last),
-        ))
-        .unwrap();
-        let r = mgr.sync_account("wb").await.unwrap();
-        assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
-        assert!(r.errors[0].starts_with("Auth refresh"));
-        assert_eq!(mgr.get_account("wb").unwrap().last_sync, Some(last));
-        // Valid (unexpired) token but an unreachable server: refresh is a no-op, fetch fails.
-        let unreachable = wallabag_config(
-            "http://127.0.0.1:9",
-            Some("t"),
-            None,
-            Some(Utc::now() + Duration::hours(1)),
-        );
-        mgr.add_account(test_account(
-            "wb2",
-            ReadLaterProvider::Wallabag,
-            unreachable,
-            Some(last),
-        ))
-        .unwrap();
-        let r = mgr.sync_account("wb2").await.unwrap();
-        assert!(
-            r.errors.iter().any(|e| e.starts_with("Fetch")),
-            "{:?}",
-            r.errors
-        );
-        assert_eq!(mgr.get_account("wb2").unwrap().last_sync, Some(last));
-    }
-
-    fn wallabag_config(
-        instance_url: &str,
-        access_token: Option<&str>,
-        refresh_token: Option<&str>,
-        token_expires_at: Option<DateTime<Utc>>,
-    ) -> ProviderConfig {
-        ProviderConfig::Wallabag {
-            instance_url: instance_url.into(),
-            client_id: "cid".into(),
-            client_secret: Some("csecret".into()),
-            access_token: access_token.map(Into::into),
-            refresh_token: refresh_token.map(Into::into),
-            token_expires_at,
-            username: None,
-            password: None,
-        }
-    }
-
-    async fn spawn_server(app: axum::Router) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        format!("http://{}", addr)
-    }
-
     #[test]
     fn credentials_persist_across_restart_but_not_in_config_json() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("rl.db");
-        let mut mgr = ReadLaterManager::new(&db, dir.path()).unwrap();
+        let mut mgr = ReadLaterManager::new(&db).unwrap();
         let mut wb = wallabag_config("https://wb.example", Some("AT"), Some("RT"), None);
         if let ProviderConfig::Wallabag {
             username, password, ..
@@ -3769,7 +4051,7 @@ mod tests {
         mgr.update_account_config("wb", &refreshed).unwrap();
         drop(mgr);
 
-        let mgr = ReadLaterManager::new(&db, dir.path()).unwrap();
+        let mgr = ReadLaterManager::new(&db).unwrap();
         let ProviderConfig::Wallabag {
             client_secret,
             access_token,
@@ -3848,7 +4130,7 @@ mod tests {
             .unwrap();
         }
 
-        let mut mgr = ReadLaterManager::new(&db_path, dir.path()).unwrap();
+        let mut mgr = ReadLaterManager::new(&db_path).unwrap();
         let om = mgr.get_account("om").unwrap();
         assert_eq!(om.provider, ReadLaterProvider::Omnivore);
         assert!(!om.config.is_authenticated());
@@ -3862,13 +4144,6 @@ mod tests {
         };
         assert_eq!(access_token.as_deref(), Some("legacy"));
 
-        // Syncing the discontinued account reports it instead of failing.
-        let r = mgr.sync_account("om").await.unwrap();
-        assert!(
-            r.errors.iter().any(|e| e.contains("Omnivore shut down")),
-            "{:?}",
-            r.errors
-        );
         let err = provider_for(ReadLaterProvider::Omnivore).err().unwrap();
         assert!(matches!(err, ReadLaterError::Discontinued(_)));
         // New Omnivore accounts are rejected; the old one can still be deleted.
@@ -3886,7 +4161,7 @@ mod tests {
         // The migration added the column and is idempotent; the legacy token was kept.
         mgr.update_account(mgr.get_account("pk").unwrap()).unwrap();
         drop(mgr);
-        let mgr = ReadLaterManager::new(&db_path, dir.path()).unwrap();
+        let mgr = ReadLaterManager::new(&db_path).unwrap();
         let secrets: String = mgr
             .db
             .query_row(
@@ -3958,54 +4233,6 @@ mod tests {
             )
             .with_state(Arc::clone(&state));
         (spawn_server(app).await, state)
-    }
-
-    /// A revoked token (unexpired as far as we know) gets a 401: refresh once, retry, persist.
-    #[tokio::test]
-    async fn wallabag_401_refreshes_retries_and_persists_token() {
-        let (base, mock) = mock_wallabag("fresh", "fresh").await;
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("rl.db");
-        let mut mgr = ReadLaterManager::new(&db, dir.path()).unwrap();
-        let mut account = test_account(
-            "wb",
-            ReadLaterProvider::Wallabag,
-            wallabag_config(
-                &base,
-                Some("revoked"),
-                Some("old-refresh"),
-                Some(Utc::now() + Duration::hours(1)),
-            ),
-            None,
-        );
-        account.sync_settings.convert_format = ArticleFormat::Html;
-        mgr.add_account(account).unwrap();
-
-        let r = mgr.sync_account("wb").await.unwrap();
-        assert!(r.errors.is_empty(), "{:?}", r.errors);
-        assert_eq!(r.articles_fetched, 1);
-        {
-            let reqs = mock.token_requests.lock().unwrap();
-            assert_eq!(reqs.len(), 1);
-            assert_eq!(reqs[0]["grant_type"], "refresh_token");
-            assert_eq!(reqs[0]["refresh_token"], "old-refresh");
-            assert_eq!(reqs[0]["client_secret"], "csecret");
-        }
-        drop(mgr);
-
-        let mgr = ReadLaterManager::new(&db, dir.path()).unwrap();
-        let ProviderConfig::Wallabag {
-            access_token,
-            refresh_token,
-            token_expires_at,
-            ..
-        } = mgr.get_account("wb").unwrap().config
-        else {
-            panic!("wrong variant")
-        };
-        assert_eq!(access_token.as_deref(), Some("fresh"));
-        assert_eq!(refresh_token.as_deref(), Some("rotated-refresh"));
-        assert!(token_expires_at.unwrap() > Utc::now());
     }
 
     /// No refresh token: the password grant is used, and a retry that still gets 401 is not
@@ -4168,7 +4395,7 @@ mod tests {
         // The obtained tokens persist with the account.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("rl.db");
-        let mut mgr = ReadLaterManager::new(&db, dir.path()).unwrap();
+        let mut mgr = ReadLaterManager::new(&db).unwrap();
         mgr.add_account(test_account(
             "ip",
             ReadLaterProvider::Instapaper,
@@ -4177,7 +4404,7 @@ mod tests {
         ))
         .unwrap();
         drop(mgr);
-        let mgr = ReadLaterManager::new(&db, dir.path()).unwrap();
+        let mgr = ReadLaterManager::new(&db).unwrap();
         assert!(mgr.get_account("ip").unwrap().config.is_authenticated());
 
         // Missing username / consumer credentials are clear errors, not requests.
@@ -4193,5 +4420,605 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("INSTAPAPER_CONSUMER_KEY"), "{err}");
+    }
+    fn pocket_account(id: &str) -> ProviderAccount {
+        let config = ProviderConfig::Pocket {
+            consumer_key: "ck".into(),
+            access_token: None,
+            username: None,
+        };
+        test_account(id, ReadLaterProvider::Pocket, config, None)
+    }
+
+    /// A delivered article recorded for `owner`, archived here and not yet sent.
+    fn delivered(provider_id: &str, owner: Option<&str>) -> Article {
+        let mut a = article(&format!("id-{provider_id}"), provider_id, 0);
+        a.account_id = owner.map(Into::into);
+        a.synced_to_device = true;
+        a.document_id = Some(format!("doc-{provider_id}"));
+        a.status = ReadStatus::Archived;
+        a.read_status_pending = true;
+        a
+    }
+
+    /// Fetched articles are recorded per account, in one transaction: a row seen before keeps
+    /// its id and device state, and its status change not yet sent wins over the provider's
+    /// (only if the account sends changes). Rows of no account or a deleted one are taken over
+    /// without their pending change; another account's row of the same provider id is left
+    /// alone, next to this account's own; and a provider id listed twice is one row, recorded
+    /// and returned once as its first copy (so it can't be delivered as two documents).
+    #[test]
+    fn record_fetched_keeps_device_state_and_scopes_rows_to_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rl.db");
+        let mut mgr = ReadLaterManager::new(&db).unwrap();
+        mgr.add_account(pocket_account("a")).unwrap();
+        mgr.add_account(pocket_account("b")).unwrap();
+        for (provider_id, owner) in [("p1", Some("a")), ("p2", Some("gone")), ("p3", None)] {
+            mgr.save_article(&delivered(provider_id, owner)).unwrap();
+        }
+        // As a provider fetch returns them: fresh ids, unread, nothing on the device.
+        let fetched = |provider_id: &str| article(&format!("new-{provider_id}"), provider_id, 0);
+
+        let r = mgr.record_fetched("a", true, vec![fetched("p1")]).unwrap();
+        let p1 = &r[0];
+        assert_eq!(
+            (
+                p1.id.as_str(),
+                p1.synced_to_device,
+                p1.document_id.as_deref()
+            ),
+            ("id-p1", true, Some("doc-p1"))
+        );
+        assert_eq!(
+            (p1.status, p1.read_status_pending),
+            (ReadStatus::Archived, true)
+        );
+        let r = mgr.record_fetched("a", false, vec![fetched("p1")]).unwrap();
+        assert_eq!(
+            (r[0].status, r[0].read_status_pending),
+            (ReadStatus::Unread, false)
+        );
+
+        let mut fetched_by_b = ["p1", "p2", "p3", "p4", "p4"].map(fetched).to_vec();
+        fetched_by_b[3].title = "first copy".into();
+        fetched_by_b[4].id = "repeat-p4".into();
+        fetched_by_b[4].title = "second copy".into();
+        let r = mgr.record_fetched("b", true, fetched_by_b).unwrap();
+        assert_eq!(r.len(), 4, "p4 is returned once: {r:?}");
+        // b's own p1, not a's: nothing on the device yet.
+        assert_eq!(
+            (
+                r[0].id.as_str(),
+                r[0].account_id.as_deref(),
+                r[0].synced_to_device
+            ),
+            ("new-p1", Some("b"), false)
+        );
+        for (a, provider_id) in r[1..3].iter().zip(["p2", "p3"]) {
+            assert_eq!(a.id, format!("id-{provider_id}"));
+            assert_eq!(a.account_id.as_deref(), Some("b"));
+            assert!(a.synced_to_device);
+            assert_eq!(
+                (a.status, a.read_status_pending),
+                (ReadStatus::Unread, false)
+            );
+        }
+        assert_eq!(
+            (r[3].id.as_str(), r[3].title.as_str()),
+            ("new-p4", "first copy")
+        );
+        assert!(mgr.pending_read_status("b").is_empty());
+        assert_eq!(mgr.articles.read().len(), 5);
+
+        drop(mgr);
+        let mgr = ReadLaterManager::new(&db).unwrap();
+        let rows: i64 = mgr
+            .db
+            .query_row("SELECT COUNT(*) FROM readlater_articles", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((rows, mgr.articles.read().len()), (5, 5));
+        let a = |id: &str| mgr.get_article(id).unwrap();
+        assert_eq!(a("id-p1").account_id.as_deref(), Some("a"));
+        assert!(a("id-p1").synced_to_device);
+        assert_eq!(a("new-p1").account_id.as_deref(), Some("b"));
+        assert_eq!(a("id-p2").account_id.as_deref(), Some("b"));
+        assert!(!a("id-p2").read_status_pending);
+        assert_eq!(a("new-p4").account_id.as_deref(), Some("b"));
+        assert_eq!(
+            a("new-p4").title,
+            "first copy",
+            "the repeat didn't overwrite it"
+        );
+        assert!(mgr.get_article("repeat-p4").is_none());
+    }
+
+    /// The delivery columns: a planned document id is recorded only for an article not yet
+    /// delivered, marking sets it with `synced_to_device`, both in one transaction and without
+    /// touching other columns, and both skip articles deleted meanwhile. Survives a reopen.
+    #[test]
+    fn deliveries_are_planned_then_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rl.db");
+        let mut mgr = ReadLaterManager::new(&db).unwrap();
+        mgr.save_article(&article("new", "p1", 0)).unwrap();
+        let mut done = delivered("p2", None);
+        done.read_status_pending = false;
+        mgr.save_article(&done).unwrap();
+        let pairs = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(a, d)| (a.to_string(), d.to_string()))
+                .collect()
+        };
+
+        mgr.plan_deliveries(&pairs(&[
+            ("new", "doc-1"),
+            ("id-p2", "doc-x"),
+            ("gone", "doc-y"),
+        ]))
+        .unwrap();
+        let a = mgr.get_article("new").unwrap();
+        assert_eq!(
+            (a.document_id.as_deref(), a.synced_to_device, a.last_sync),
+            (Some("doc-1"), false, None)
+        );
+        assert_eq!(
+            mgr.get_article("id-p2").unwrap().document_id.as_deref(),
+            Some("doc-p2"),
+            "a delivered article keeps its document"
+        );
+
+        let mut edited = mgr.get_article("new").unwrap();
+        edited.status = ReadStatus::Read;
+        mgr.save_article(&edited).unwrap();
+        mgr.mark_delivered_all(&pairs(&[("new", "doc-1"), ("gone", "doc-y")]))
+            .unwrap();
+        drop(mgr);
+        let mgr = ReadLaterManager::new(&db).unwrap();
+        let a = mgr.get_article("new").unwrap();
+        assert_eq!(
+            (a.document_id.as_deref(), a.synced_to_device, a.status),
+            (Some("doc-1"), true, ReadStatus::Read)
+        );
+        assert!(a.last_sync.is_some());
+        assert!(mgr.get_article("gone").is_none());
+        assert_eq!(mgr.articles.read().len(), 2);
+    }
+
+    /// A row of no account or a deleted one is taken over, with its device state, only if it has
+    /// the same URL. One of another URL is another instance's entry with the same id (two
+    /// Wallabags number theirs alike): it is left as it is, still recording that its page is on
+    /// the device, and this account's article is recorded as a new one, still to be delivered.
+    /// The account's own row keeps its state whatever the URL.
+    #[test]
+    fn record_fetched_takes_over_device_state_only_for_the_same_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rl.db");
+        let mut mgr = ReadLaterManager::new(&db).unwrap();
+        mgr.add_account(pocket_account("b")).unwrap();
+        let other_page = "https://old.example/1";
+        let rows = [
+            ("id-p1", "p1", Some("gone"), other_page),
+            ("id-p2", "p2", None, other_page),
+            ("id-p3", "p3", Some("b"), other_page),
+            // Of two deleted accounts' rows of p4, the one of this page is taken over.
+            ("id-p4-else", "p4", Some("gone"), other_page),
+            ("id-p4-same", "p4", Some("gone2"), "https://example.com/a"),
+        ];
+        for (id, provider_id, owner, url) in rows {
+            let mut a = delivered(provider_id, owner);
+            a.id = id.into();
+            a.url = url.into();
+            a.document_id = Some(format!("doc-{id}"));
+            a.last_sync = Some(Utc::now());
+            mgr.save_article(&a).unwrap();
+        }
+        let fetched = ["p1", "p2", "p3", "p4"].map(|p| article(&format!("new-{p}"), p, 0));
+
+        let r = mgr.record_fetched("b", true, fetched.to_vec()).unwrap();
+        let state = |a: &Article| {
+            (
+                a.id.clone(),
+                a.account_id.clone(),
+                a.url.clone(),
+                a.synced_to_device,
+                a.document_id.clone(),
+                a.last_sync.is_some(),
+                (a.status, a.read_status_pending),
+            )
+        };
+        let unread = (ReadStatus::Unread, false);
+        let new_page = |id: &str| {
+            let b = Some("b".to_owned());
+            let url = "https://example.com/a".to_owned();
+            (id.to_owned(), b, url, false, None, false, unread)
+        };
+        let left_alone = |id: &str, owner: Option<&str>| {
+            let doc = Some(format!("doc-{id}"));
+            let pending = (ReadStatus::Archived, true);
+            let owner = owner.map(str::to_owned);
+            (
+                id.to_owned(),
+                owner,
+                other_page.to_owned(),
+                true,
+                doc,
+                true,
+                pending,
+            )
+        };
+        assert_eq!(state(&r[0]), new_page("new-p1"));
+        assert_eq!(state(&r[1]), new_page("new-p2"));
+        let own = &r[2];
+        assert_eq!(
+            (
+                own.id.as_str(),
+                own.synced_to_device,
+                own.document_id.as_deref()
+            ),
+            ("id-p3", true, Some("doc-id-p3"))
+        );
+        let url = "https://example.com/a".to_owned();
+        let doc = Some("doc-id-p4-same".to_owned());
+        let b = Some("b".to_owned());
+        assert_eq!(
+            state(&r[3]),
+            ("id-p4-same".to_owned(), b, url, true, doc, true, unread),
+            "the same page, taken over with its device state but not its pending change"
+        );
+
+        drop(mgr);
+        let mgr = ReadLaterManager::new(&db).unwrap();
+        let get = |id: &str| state(&mgr.get_article(id).unwrap());
+        assert_eq!(get("new-p1"), new_page("new-p1"));
+        assert_eq!(get("id-p1"), left_alone("id-p1", Some("gone")));
+        assert_eq!(get("id-p2"), left_alone("id-p2", None));
+        assert_eq!(get("id-p4-else"), left_alone("id-p4-else", Some("gone")));
+        assert_eq!(get("id-p4-same").1.as_deref(), Some("b"));
+        assert_eq!(mgr.articles.read().len(), 7);
+    }
+
+    /// Status changes to send are per account, and a sent one is cleared unless the status
+    /// was changed again meanwhile.
+    #[test]
+    fn pending_status_changes_are_per_account_and_cleared_once_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rl.db");
+        let mut mgr = ReadLaterManager::new(&db).unwrap();
+        mgr.save_article(&delivered("p1", Some("a"))).unwrap();
+        mgr.save_article(&delivered("p2", Some("b"))).unwrap();
+        let mut sent = delivered("p3", Some("a"));
+        sent.read_status_pending = false;
+        mgr.save_article(&sent).unwrap();
+        let ids = |mgr: &ReadLaterManager, account: &str| -> Vec<String> {
+            mgr.pending_read_status(account)
+                .into_iter()
+                .map(|a| a.id)
+                .collect()
+        };
+        assert_eq!(ids(&mgr, "a"), ["id-p1"]);
+
+        mgr.read_status_sent("id-p1", ReadStatus::Read).unwrap();
+        assert_eq!(ids(&mgr, "a"), ["id-p1"], "changed again since");
+        mgr.read_status_sent("id-p1", ReadStatus::Archived).unwrap();
+        mgr.drop_read_status_change("id-p2").unwrap();
+        mgr.read_status_sent("gone", ReadStatus::Read).unwrap();
+        drop(mgr);
+        let mgr = ReadLaterManager::new(&db).unwrap();
+        assert!(ids(&mgr, "a").is_empty() && ids(&mgr, "b").is_empty());
+    }
+
+    /// The PDF printers are confined: WeasyPrint fetches only http(s) and `data:` URLs, so no
+    /// local file can be pulled into the PDF, and wkhtmltopdf runs no JavaScript and reads no
+    /// local file outside the scratch directory.
+    #[test]
+    fn pdf_printers_are_confined() {
+        let printers = pdf_printers(&PdfPrograms::default(), Path::new("/scratch"));
+        let options = |i: usize| -> Vec<&str> {
+            printers[i]
+                .options
+                .iter()
+                .map(|a| a.to_str().unwrap())
+                .collect()
+        };
+        assert_eq!(printers[0].program, "weasyprint");
+        assert!(
+            options(0)
+                .windows(2)
+                .any(|w| w == ["--allowed-protocols", "http,https,data"])
+        );
+        assert_eq!(printers[1].program, "wkhtmltopdf");
+        let wk = options(1);
+        assert!(wk.contains(&"--disable-javascript"));
+        assert!(wk.contains(&"--disable-local-file-access"));
+        assert!(wk.windows(2).any(|w| w == ["--allow", "/scratch"]));
+    }
+
+    /// A printer running `script` with `sh -c`, which gets the input HTML as `$0` and the
+    /// output PDF as `$1`.
+    #[cfg(unix)]
+    fn sh(script: &str) -> PdfPrinter {
+        PdfPrinter {
+            program: "sh".into(),
+            options: vec!["-c".into(), script.into()],
+        }
+    }
+
+    #[cfg(unix)]
+    const PRINTS: &str = r#"printf '%%PDF-1.4' > "$1""#;
+
+    #[cfg(unix)]
+    fn not_installed() -> PdfPrinter {
+        PdfPrinter {
+            program: "no-such-pdf-printer".into(),
+            options: Vec::new(),
+        }
+    }
+
+    /// A printer that doesn't finish in time is killed and the next one is tried; when none
+    /// prints, the error says what each did.
+    #[cfg(unix)]
+    #[test]
+    fn a_stuck_pdf_printer_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let limit = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let printers = [sh("exec sleep 30"), sh(PRINTS)];
+        let pdf = print_pdf(&printers, dir.path(), "<p>a</p>", limit).unwrap();
+        assert_eq!(pdf, b"%PDF-1.4");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+
+        let err = print_pdf(
+            &[sh("exec sleep 30"), not_installed()],
+            dir.path(),
+            "<p>a</p>",
+            limit,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("sh: killed after"), "{err}");
+        assert!(err.contains("no-such-pdf-printer not installed"), "{err}");
+    }
+
+    /// A PDF no printer printed is the article's fault only if a printer that failed on it
+    /// prints a test page. If none does (none installed, one too old for its options, which
+    /// exits with a usage error, or one that fails on everything), or there is no scratch
+    /// space, no converter works here: an error of the host, not of the article.
+    #[cfg(unix)]
+    #[test]
+    fn pdf_failures_tell_the_article_from_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let limit = std::time::Duration::from_secs(30);
+        let print = |printers: &[PdfPrinter]| print_pdf(printers, dir.path(), "<p>a</p>", limit);
+        let fails_on_articles = sh(&format!(r#"grep -q 'Test page' "$0" && {PRINTS}"#));
+
+        let err = print(&[fails_on_articles, not_installed()]).unwrap_err();
+        assert!(matches!(err, ReadLaterError::Conversion(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("(sh failed, no-such-pdf-printer not installed), though sh prints"),
+            "{err}"
+        );
+
+        for printers in [
+            vec![not_installed(), not_installed()],
+            vec![sh("exit 2"), not_installed()],
+            vec![sh("exit 1")],
+            Vec::new(),
+        ] {
+            let err = print(&printers).unwrap_err();
+            assert!(
+                matches!(err, ReadLaterError::ConverterUnavailable(_)),
+                "{printers:?}: {err:?}"
+            );
+            assert!(err.to_string().contains("WeasyPrint 67 or later"), "{err}");
+        }
+
+        let gone = dir.path().join("gone");
+        let err = print_pdf(&[sh(PRINTS)], &gone, "<p>a</p>", limit).unwrap_err();
+        assert!(
+            matches!(&err, ReadLaterError::ConverterUnavailable(m) if m.starts_with("scratch")),
+            "{err:?}"
+        );
+    }
+
+    /// A printer that exits successfully without writing a PDF (nothing, or not a PDF) hasn't
+    /// printed: the next one is tried. What a printer that failed left behind is never taken
+    /// for a later one's PDF.
+    #[cfg(unix)]
+    #[test]
+    fn a_printer_that_writes_no_pdf_is_passed_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let limit = std::time::Duration::from_secs(30);
+        let print = |printers: &[PdfPrinter]| print_pdf(printers, dir.path(), "<p>a</p>", limit);
+
+        assert_eq!(print(&[sh("exit 0"), sh(PRINTS)]).unwrap(), b"%PDF-1.4");
+        assert_eq!(
+            print(&[sh(r#"echo oops > "$1""#), sh(PRINTS)]).unwrap(),
+            b"%PDF-1.4"
+        );
+
+        let fails_after_writing = sh(&format!("{PRINTS}; exit 1"));
+        let err = print(&[fails_after_writing, sh("exit 0")]).unwrap_err();
+        assert!(
+            matches!(err, ReadLaterError::ConverterUnavailable(_)),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().contains("(sh failed, sh wrote no PDF)"),
+            "{err}"
+        );
+    }
+
+    /// `readlater.db` holds provider tokens and passwords: it is readable by its owner only,
+    /// and one created before (with the umask's mode) is tightened on the next start.
+    #[cfg(unix)]
+    #[test]
+    fn database_is_private_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("readlater.db");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        drop(ReadLaterManager::new(&db).unwrap());
+        assert_eq!(mode(&db), 0o600);
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(ReadLaterManager::new(&db).unwrap());
+        assert_eq!(mode(&db), 0o600);
+    }
+
+    /// An articles table from before articles were keyed by account (`UNIQUE(provider,
+    /// provider_id)`) is rebuilt with the new key once, keeping every row as it was (rows of no
+    /// account included) and the indexes. Afterwards two accounts each hold the same provider
+    /// id, and a row of no account is still taken over by the account that lists it.
+    #[test]
+    fn old_articles_table_is_rekeyed_by_account_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("rl.db");
+        {
+            let db = Connection::open(&db_path).unwrap();
+            db.execute_batch(
+                r#"
+                CREATE TABLE readlater_accounts (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL, provider TEXT NOT NULL,
+                    enabled INTEGER DEFAULT 1, config TEXT NOT NULL, sync_settings TEXT NOT NULL,
+                    last_sync TEXT, created_at TEXT NOT NULL, secrets TEXT
+                );
+                CREATE TABLE readlater_articles (
+                    id TEXT PRIMARY KEY, provider TEXT NOT NULL, provider_id TEXT NOT NULL,
+                    account_id TEXT, url TEXT NOT NULL, title TEXT NOT NULL, excerpt TEXT,
+                    author TEXT, word_count INTEGER, reading_time_minutes INTEGER, tags TEXT,
+                    status TEXT NOT NULL, favorite INTEGER DEFAULT 0, added_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL, read_at TEXT, image_url TEXT, document_id TEXT,
+                    synced_to_device INTEGER DEFAULT 0, last_sync TEXT,
+                    UNIQUE(provider, provider_id)
+                );
+                CREATE INDEX idx_articles_provider ON readlater_articles(provider);
+                CREATE INDEX idx_articles_status ON readlater_articles(status);
+                CREATE INDEX idx_articles_synced ON readlater_articles(synced_to_device);
+                "#,
+            )
+            .unwrap();
+            let at = "2025-01-01T00:00:00+00:00";
+            for (id, provider_id, owner, url, doc) in [
+                ("x1", "1", Some("a"), "https://ex.com/1", "doc-1"),
+                ("x2", "2", None, "https://ex.com/2", "doc-2"),
+            ] {
+                db.execute(
+                    "INSERT INTO readlater_articles (id, provider, provider_id, account_id, url, \
+                     title, tags, status, favorite, added_at, updated_at, document_id, \
+                     synced_to_device, last_sync) VALUES (?1, 'pocket', ?2, ?3, ?4, 'T', \
+                     '[\"t\"]', 'read', 1, ?5, ?5, ?6, 1, ?5)",
+                    params![id, provider_id, owner, url, at, doc],
+                )
+                .unwrap();
+            }
+        }
+        let schema = |db: &Connection| -> String {
+            db.query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'readlater_articles'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let indexes = |db: &Connection| -> Vec<String> {
+            db.prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%' \
+                 AND tbl_name = 'readlater_articles' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+        };
+
+        let mut mgr = ReadLaterManager::new(&db_path).unwrap();
+        let keys = unique_keys(&mgr.db, "readlater_articles").unwrap();
+        assert!(keys.contains(&vec![
+            "account_id".into(),
+            "provider".into(),
+            "provider_id".into()
+        ]));
+        assert!(!keys.contains(&vec!["provider".into(), "provider_id".into()]));
+        assert_eq!(
+            indexes(&mgr.db),
+            [
+                "idx_articles_provider",
+                "idx_articles_status",
+                "idx_articles_synced"
+            ]
+        );
+        let leftovers: i64 = mgr
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'readlater_articles_rekeyed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftovers, 0);
+        for (id, owner, doc) in [("x1", Some("a"), "doc-1"), ("x2", None, "doc-2")] {
+            let a = mgr.get_article(id).unwrap();
+            assert_eq!(
+                (
+                    a.account_id.as_deref(),
+                    a.document_id.as_deref(),
+                    a.synced_to_device,
+                    a.status,
+                    a.favorite,
+                    a.tags.as_slice(),
+                    a.read_status_pending,
+                ),
+                (
+                    owner,
+                    Some(doc),
+                    true,
+                    ReadStatus::Read,
+                    true,
+                    &["t".to_string()][..],
+                    false
+                )
+            );
+            assert!(a.last_sync.is_some());
+        }
+
+        mgr.add_account(pocket_account("a")).unwrap();
+        mgr.add_account(pocket_account("b")).unwrap();
+        let mut theirs = article("fresh-1", "1", 0);
+        theirs.url = "https://elsewhere.example/1".into();
+        let mut orphan = article("fresh-2", "2", 0);
+        orphan.url = "https://ex.com/2".into();
+        let r = mgr.record_fetched("b", true, vec![theirs, orphan]).unwrap();
+        assert_eq!(
+            (r[0].id.as_str(), r[0].synced_to_device),
+            ("fresh-1", false),
+            "b's own entry 1, next to a's"
+        );
+        assert_eq!(
+            (
+                r[1].id.as_str(),
+                r[1].account_id.as_deref(),
+                r[1].synced_to_device
+            ),
+            ("x2", Some("b"), true),
+            "the row of no account, taken over with its device state (same page)"
+        );
+        let a1 = mgr.get_article("x1").unwrap();
+        assert_eq!(
+            (a1.account_id.as_deref(), a1.synced_to_device),
+            (Some("a"), true)
+        );
+
+        let sql = schema(&mgr.db);
+        assert!(
+            sql.contains("UNIQUE(account_id, provider, provider_id)"),
+            "{sql}"
+        );
+        drop(mgr);
+        let mgr = ReadLaterManager::new(&db_path).unwrap();
+        assert_eq!(schema(&mgr.db), sql, "rebuilt once");
+        assert_eq!(mgr.articles.read().len(), 3);
     }
 }
