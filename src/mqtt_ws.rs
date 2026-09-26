@@ -59,7 +59,7 @@ const SUBACK_FAILURE: u8 = 0x80;
 /// Distinct topics one session may subscribe to; filters past it are refused in the
 /// SUBACK. Every notification is published once per topic, so this bounds both the
 /// session's state and what one event costs to fan out.
-const MAX_SUBSCRIPTIONS: usize = 64;
+pub const MAX_SUBSCRIPTIONS: usize = 64;
 
 /// Largest WebSocket message, and frame, the endpoint reads; a bigger one closes the
 /// socket (a single frame at its header), so no more than this is buffered for a
@@ -67,7 +67,7 @@ const MAX_SUBSCRIPTIONS: usize = 64;
 /// a client id, a token and at most a will, and a SUBSCRIBE of [`MAX_SUBSCRIPTIONS`]
 /// ordinary topics is a few KiB. Without this, tungstenite's defaults (64 MiB messages,
 /// 16 MiB frames) let any client, authenticated or not, have that much buffered per socket.
-pub(crate) const MAX_MESSAGE_SIZE: usize = 256 * 1024;
+pub const MAX_MESSAGE_SIZE: usize = 256 * 1024;
 
 /// The [`PATH`] route, to merge into [`crate::create_router`]'s router, when `flag`
 /// (the value of [`ENABLE_ENV`]) is `1`, `true` or `on`; `None` otherwise, including
@@ -408,7 +408,7 @@ fn is_concrete(filter: &str) -> bool {
 }
 
 /// Most bytes of one client-chosen topic that go into a log line.
-const LOGGED_TOPIC_BYTES: usize = 64;
+pub const LOGGED_TOPIC_BYTES: usize = 64;
 
 /// `topic` for a log line: cut to at most [`LOGGED_TOPIC_BYTES`] at a character boundary,
 /// with `…` marking a cut. Log it with `?` (Debug), which escapes control characters, so
@@ -1136,146 +1136,6 @@ mod tests {
             next(&mut out).await,
             build_pingresp(),
             "nothing past the cap was published"
-        );
-    }
-
-    /// A SUBSCRIBE (packet id `id`) of `filters`, each at QoS 0.
-    fn subscribe_all<T: AsRef<str>>(id: u16, filters: impl IntoIterator<Item = T>) -> Message {
-        let mut body = id.to_be_bytes().to_vec();
-        for f in filters {
-            let f = f.as_ref().as_bytes();
-            body.extend_from_slice(&(f.len() as u16).to_be_bytes());
-            body.extend_from_slice(f);
-            body.push(0);
-        }
-        let mut packet = vec![0x82];
-        push_remaining_length(&mut packet, body.len());
-        packet.extend_from_slice(&body);
-        Message::Binary(packet.into())
-    }
-
-    /// Runs a session of user `u1` over `frames`, until they run out, and returns every
-    /// packet it wrote and what it logged at info and above (the deployed
-    /// `RUST_LOG=remarkable_server=info`). The subscriber is attached to this session's
-    /// future only, so tests running alongside don't write into it.
-    async fn session_log(frames: Vec<Message>) -> (Vec<Vec<u8>>, String) {
-        use tracing::instrument::WithSubscriber;
-
-        #[derive(Clone, Default)]
-        struct Log(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
-        impl std::io::Write for Log {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let log = Log::default();
-        let writer = log.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .finish();
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let sink = Box::pin(futures_util::sink::unfold(
-            out_tx,
-            |tx, m: Message| async move {
-                if let Message::Binary(b) = m {
-                    let _ = tx.send(b.to_vec());
-                }
-                Ok::<_, std::convert::Infallible>(tx)
-            },
-        ));
-        let (_notif, notif_rx) = broadcast::channel(4);
-        run_mqtt_session(
-            sink,
-            futures_util::stream::iter(frames.into_iter().map(Ok)),
-            notif_rx,
-            || 42,
-            |_| Some(never_revoked("u1".into())),
-        )
-        .with_subscriber(subscriber)
-        .await;
-        let mut written = Vec::new();
-        while let Ok(p) = out_rx.try_recv() {
-            written.push(p);
-        }
-        let log = String::from_utf8(log.0.lock().clone()).unwrap();
-        (written, log)
-    }
-
-    /// Log volume is per SUBSCRIBE packet, not per filter, and a client's topics reach the
-    /// log cut short and escaped. A SUBSCRIBE is up to [`MAX_MESSAGE_SIZE`], room for tens of
-    /// thousands of filters or a few 64 KiB ones; logging each filter let one frame write
-    /// megabytes, enough for journald's per-service rate limit to drop the server's other
-    /// lines (tablet sync included). A raw newline in a topic would forge a log line.
-    #[tokio::test]
-    async fn a_subscribe_is_logged_once_whatever_its_filters() {
-        let mut fill: Vec<String> = (0..MAX_SUBSCRIPTIONS - 2)
-            .map(|i| format!("t{i}"))
-            .collect();
-        fill.push("evil\n2026-01-01T00:00:00Z  INFO forged".into());
-        fill.push("L".repeat(5000)); // concrete, stored, too long to log whole
-        let flood = (MAX_MESSAGE_SIZE - 8) / 4; // "z" repeated, each past the cap
-        let wildcard = format!("#{}", "A".repeat(65_000));
-        let (written, log) = session_log(vec![
-            connect(),
-            subscribe_all(1, &fill),
-            subscribe_all(2, std::iter::repeat_n("z", flood)),
-            subscribe_all(3, [&wildcard, &wildcard, &wildcard]),
-        ])
-        .await;
-
-        // The SUBACKs are unchanged: all 64 stored, then every filter refused.
-        let subacks: Vec<&Vec<u8>> = written.iter().filter(|p| p[0] == 0x90).collect();
-        assert_eq!(
-            subacks,
-            [
-                &build_suback(1, &[0; MAX_SUBSCRIPTIONS]),
-                &build_suback(2, &vec![SUBACK_FAILURE; flood]),
-                &build_suback(3, &[SUBACK_FAILURE; 3]),
-            ]
-        );
-
-        let lines: Vec<&str> = log.lines().collect();
-        assert!(
-            lines
-                .iter()
-                .all(|l| l.contains(" remarkable_server::mqtt_ws: ")),
-            "every line is a whole event of this module, none forged:\n{log}"
-        );
-        let subscribe_lines: Vec<&&str> =
-            lines.iter().filter(|l| l.contains("SUBSCRIBE")).collect();
-        assert_eq!(subscribe_lines.len(), 3, "one line per SUBSCRIBE:\n{log}");
-        assert!(
-            subscribe_lines[0].contains("stored=64") && subscribe_lines[0].contains("\\n2026"),
-            "stored topics are listed, escaped: {}",
-            subscribe_lines[0]
-        );
-        assert!(
-            subscribe_lines[1].contains(&format!("refused_cap={flood}")),
-            "{}",
-            subscribe_lines[1]
-        );
-        assert!(
-            subscribe_lines[2].contains("refused_wildcard=3"),
-            "{}",
-            subscribe_lines[2]
-        );
-        assert!(
-            !log.contains(&"L".repeat(LOGGED_TOPIC_BYTES + 1))
-                && !log.contains(&"A".repeat(LOGGED_TOPIC_BYTES + 1)),
-            "topics are cut to {LOGGED_TOPIC_BYTES} bytes"
-        );
-        assert!(
-            log.len() < 16 * 1024,
-            "{} bytes logged for ~{} KiB of SUBSCRIBEs",
-            log.len(),
-            (MAX_MESSAGE_SIZE + 3 * 65_000) / 1024
         );
     }
 
