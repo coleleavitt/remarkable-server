@@ -95,38 +95,38 @@ impl GoogleDrive {
         Ok(self.client.request(method, url).bearer_auth(token))
     }
 
-    /// The non-trashed children of `parent` named exactly `name`, oldest first (with
-    /// `folders_only`, only folders). Drive allows same-named siblings, and
-    /// [`list_files`](CloudProvider::list_files) lists the oldest of them at their path, so the
-    /// first of these is the one a sync path names.
-    async fn children_named(
-        &self,
-        parent: &str,
-        name: &str,
-        folders_only: bool,
-    ) -> Result<Vec<DriveFile>> {
-        let mut query = format!(
+    /// The oldest non-trashed child of `parent` named exactly `name`, of any type. Drive allows
+    /// same-named siblings, and [`list_files`](CloudProvider::list_files) lists the oldest of
+    /// them at their path, so this is the one a sync path names.
+    async fn oldest_named(&self, parent: &str, name: &str) -> Result<Option<DriveFile>> {
+        let query = format!(
             "name = '{}' and '{}' in parents and trashed = false",
             escape_query(name),
             escape_query(parent)
         );
-        if folders_only {
-            query.push_str(&format!(" and mimeType = '{}'", FOLDER_MIME));
-        }
-        let mut files = self.list_query(&query).await?;
-        files.retain(|f| f.name == name);
-        Ok(files)
+        let files = self.list_query(&query).await?;
+        Ok(files.into_iter().find(|f| f.name == name))
     }
 
-    /// The oldest non-trashed child folder of `parent` named `name`: the one the listing walks
-    /// into, so a file uploaded to its path is listed there next time.
+    /// The folder the listing walks at `parent`/`name`, so a file uploaded under it is listed
+    /// there next time: the oldest non-trashed child of that name, of any type, as in
+    /// [`list_files`](CloudProvider::list_files). `None` when there is no item of that name.
+    ///
+    /// When that oldest item is not a folder (a file, a Google Docs file, a shortcut), the
+    /// listing shows it at the path and never walks a folder of the same name, so creating one
+    /// (or using a newer one) would put uploads where the next listing can't see them, and a
+    /// sync with kept state would take them for deleted remotely. That is an error instead,
+    /// as [`upload_file`](CloudProvider::upload_file) gives for a folder in the way.
     async fn find_folder(&self, parent: &str, name: &str) -> Result<Option<String>> {
-        Ok(self
-            .children_named(parent, name, true)
-            .await?
-            .into_iter()
-            .next()
-            .map(|f| f.id))
+        match self.oldest_named(parent, name).await? {
+            None => Ok(None),
+            Some(f) if f.mime_type == FOLDER_MIME => Ok(Some(f.id)),
+            Some(f) => Err(IntegrationError::Conflict(format!(
+                "{:?}: a {} of that name is there, not a folder, so nothing can be uploaded \
+                 under it",
+                name, f.mime_type
+            ))),
+        }
     }
 
     /// Replace the content of file `id`, keeping its id, name, parents and (unless `mime` says
@@ -635,12 +635,7 @@ impl CloudProvider for GoogleDrive {
         content: &[u8],
         mime_type: Option<&str>,
     ) -> Result<CloudFile> {
-        let existing = self
-            .children_named(parent_id.unwrap_or("root"), name, false)
-            .await?
-            .into_iter()
-            .next();
-        if let Some(existing) = existing {
+        if let Some(existing) = self.oldest_named(parent_id.unwrap_or("root"), name).await? {
             if existing.mime_type.starts_with(GOOGLE_APPS_MIME) {
                 return Err(IntegrationError::Conflict(format!(
                     "{:?}: a {} of that name is there, which an upload can't replace",
@@ -1856,6 +1851,110 @@ mod tests {
                 assert_eq!(d.lock().unwrap().named(&notes, name).len(), 1, "{name}");
             }
             assert_eq!(d.lock().unwrap().content(&doc), "");
+        }
+
+        /// A directory is walked the way the listing walks it: through the oldest item of that
+        /// name, whatever its type. When that is not a folder (a file, a Google Docs file, a
+        /// shortcut), no folder is created next to it, since the listing would never walk the
+        /// new folder: uploading there is an error, and nothing is added.
+        #[tokio::test]
+        async fn uploads_never_go_into_a_folder_the_listing_skips() {
+            let d = Shared::default();
+            let (notes, pdf, hidden_x) = {
+                let mut d = d.lock().unwrap();
+                let notes = d.folder("root", "Notes");
+                let pdf = d.file(&notes, "pdf", b"a file");
+                d.add(&notes, "doc", "application/vnd.google-apps.document", b"");
+                d.add(&notes, "link", "application/vnd.google-apps.shortcut", b"");
+                // An older file and a newer folder of one name: the listing keeps the file.
+                d.file(&notes, "both", b"a file");
+                let hidden = d.folder(&notes, "both");
+                let hidden_x = d.file(&hidden, "x.pdf", b"hidden");
+                (notes, pdf, hidden_x)
+            };
+            let base = serve(d.clone()).await;
+            let g = drive(&base);
+            let listed = g.list_files(Some(&notes)).await.unwrap();
+            assert!(
+                listed.iter().all(|f| !f.path.starts_with("/both/")),
+                "{listed:?}"
+            );
+            let before = d.lock().unwrap().items.len();
+            for name in ["pdf", "doc", "link", "both"] {
+                let err = g
+                    .upload_file_at(Some(&notes), &[name, "x.pdf"], b"x", None)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(&err, IntegrationError::Conflict(m) if m.contains("not a folder")),
+                    "{name}: {err}"
+                );
+            }
+            let d = d.lock().unwrap();
+            assert_eq!(d.items.len(), before, "nothing created");
+            assert_eq!(d.content(&pdf), "a file");
+            assert_eq!(
+                d.content(&hidden_x),
+                "hidden",
+                "nothing written behind the file"
+            );
+        }
+
+        /// The same through full syncs with kept state: a local directory `A/` where the sync
+        /// folder has a file `A`. The upload under it fails every time (as does the download of
+        /// `A`, a directory being in the way), so nothing is recorded as uploaded, and no later
+        /// sync takes the local files for deleted remotely and moves them aside.
+        #[tokio::test]
+        async fn a_directory_named_like_a_remote_file_is_never_moved_aside() {
+            let d = Shared::default();
+            let (notes, a) = {
+                let mut d = d.lock().unwrap();
+                let notes = d.folder("root", "Notes");
+                let a = d.file(&notes, "A", b"remote A");
+                (notes, a)
+            };
+            let base = serve(d.clone()).await;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            write(root, "A/x.pdf", "x, new here");
+
+            for round in 0..3 {
+                let r = sync(&base, root, &notes, SyncDirection::Bidirectional).await;
+                assert_eq!(
+                    (r.uploaded, r.downloaded, r.deleted),
+                    (0, 0, 0),
+                    "round {round}: {:?}",
+                    r.errors
+                );
+                assert!(
+                    r.errors
+                        .iter()
+                        .any(|e| e.starts_with("Upload /A/x.pdf failed: ")
+                            && e.contains("not a folder")),
+                    "round {round}: {:?}",
+                    r.errors
+                );
+                assert!(
+                    r.notices.iter().all(|n| !n.contains("deleted remotely")),
+                    "round {round}: {:?}",
+                    r.notices
+                );
+                assert_eq!(read(root, "A/x.pdf"), "x, new here");
+            }
+            assert!(
+                !root
+                    .join(crate::integrations::sync::QUARANTINE_DIR)
+                    .exists()
+            );
+            let d = d.lock().unwrap();
+            let named: Vec<&str> = d.named(&notes, "A").iter().map(|i| i.id.as_str()).collect();
+            assert_eq!(
+                named,
+                vec![a.as_str()],
+                "no folder A created next to the file"
+            );
+            assert_eq!(d.items.len(), 2);
+            assert_eq!(d.content(&a), "remote A");
         }
     }
 
