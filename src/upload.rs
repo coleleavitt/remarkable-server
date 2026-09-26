@@ -619,6 +619,9 @@ mod tests {
 /// and nothing left in the staging directory either way.
 #[cfg(test)]
 mod route_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use axum::http::{Method, Request, StatusCode};
     use tower::ServiceExt;
 
@@ -661,10 +664,11 @@ mod route_tests {
     }
 
     async fn send(state: &AppState, req: Request<Body>) -> (StatusCode, bytes::Bytes) {
-        let resp = crate::create_router(state.clone())
-            .oneshot(req)
-            .await
-            .unwrap();
+        send_to(crate::create_router(state.clone()), req).await
+    }
+
+    async fn send_to(router: axum::Router, req: Request<Body>) -> (StatusCode, bytes::Bytes) {
+        let resp = router.oneshot(req).await.unwrap();
         let status = resp.status();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -677,6 +681,146 @@ mod route_tests {
             .map(|d| d.count())
             .unwrap_or(0);
         assert_eq!(left, 0, "staging directory not empty");
+    }
+
+    /// `body` as a request body that notes whether it was ever read.
+    fn watched(body: &'static [u8]) -> (Body, Arc<AtomicBool>) {
+        let read = Arc::new(AtomicBool::new(false));
+        let flag = read.clone();
+        let frames = futures_util::stream::iter([body]).map(move |frame| {
+            flag.store(true, Ordering::SeqCst);
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(frame))
+        });
+        (Body::from_stream(frames), read)
+    }
+
+    /// `MAX_BLOB_BYTES + 1` bytes with no declared length: a few real bytes, then one
+    /// frame of zeros. That frame is a fresh zeroed allocation (untouched pages) that the
+    /// handler refuses on its running count before writing or hashing any of it, so the
+    /// test costs neither memory nor disk.
+    fn one_byte_over_the_blob_limit() -> Body {
+        let head = bytes::Bytes::from_static(b"%PDF-1.4\n");
+        let rest = crate::MAX_BLOB_BYTES + 1 - head.len();
+        let frames: Vec<std::io::Result<bytes::Bytes>> =
+            vec![Ok(head), Ok(bytes::Bytes::from(vec![0u8; rest]))];
+        Body::from_stream(futures_util::stream::iter(frames))
+    }
+
+    /// The uploads whose handlers take a raw `Body` (which ignores `DefaultBodyLimit`)
+    /// and enforce `MAX_BLOB_BYTES` through [`stage_body`] instead.
+    #[derive(Debug, Clone, Copy)]
+    enum RawUpload {
+        SyncV3,
+        BlobStorage,
+        DocV2,
+    }
+
+    impl RawUpload {
+        const ALL: [Self; 3] = [Self::SyncV3, Self::BlobStorage, Self::DocV2];
+
+        /// The blob a successful upload is stored as (a document's file for `DocV2`).
+        fn hash(self) -> String {
+            match self {
+                Self::SyncV3 => "5".repeat(64),
+                Self::BlobStorage => "6".repeat(64),
+                Self::DocV2 => sha(b"%PDF-1.4\n"),
+            }
+        }
+
+        /// A valid upload of `body`, declaring `len` as its content-length.
+        fn request(
+            self,
+            state: &AppState,
+            auth: &str,
+            body: Body,
+            len: Option<u64>,
+        ) -> Request<Body> {
+            let hash = self.hash();
+            let mut req = match self {
+                Self::SyncV3 => Request::put(format!("/sync/v3/files/{hash}"))
+                    .header("authorization", auth)
+                    .header("rm-filename", "limit.rm"),
+                Self::BlobStorage => {
+                    let (token, _) = state.devices.sign_blob(&hash, true).unwrap();
+                    let token = urlencoding::encode(&token);
+                    Request::put(format!("/blobstorage?blob={hash}&token={token}"))
+                }
+                Self::DocV2 => Request::post("/doc/v2/files")
+                    .header("authorization", auth)
+                    .header("rm-meta", STANDARD.encode(br#"{"file_name":"Limit"}"#))
+                    .header("content-type", "application/pdf"),
+            };
+            if let Some(len) = len {
+                req = req.header(header::CONTENT_LENGTH, len);
+            }
+            req.body(body).unwrap()
+        }
+
+        /// Through `router`: one byte over `MAX_BLOB_BYTES` is a 413, declared (before the
+        /// body is read) or streamed (the partly staged file removed, nothing stored);
+        /// a declared length of exactly the limit is accepted.
+        async fn assert_blob_limit(self, router: &axum::Router, state: &AppState, auth: &str) {
+            let limit = crate::MAX_BLOB_BYTES as u64;
+            let generation = state.storage.get_root().generation;
+
+            let (body, read) = watched(b"%PDF-1.4\n");
+            let req = self.request(state, auth, body, Some(limit + 1));
+            let (status, resp) = send_to(router.clone(), req).await;
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{self:?}: {resp:?}");
+            assert!(!read.load(Ordering::SeqCst), "{self:?}: body read");
+
+            let req = self.request(state, auth, one_byte_over_the_blob_limit(), None);
+            let (status, resp) = send_to(router.clone(), req).await;
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{self:?}: {resp:?}");
+            assert!(!state.storage.exists(&self.hash()), "{self:?}");
+            assert_eq!(state.storage.get_root().generation, generation, "{self:?}");
+            clean(state);
+
+            let body = Body::from(&b"%PDF-1.4\n"[..]);
+            let req = self.request(state, auth, body, Some(limit));
+            let (status, resp) = send_to(router.clone(), req).await;
+            assert_eq!(status, StatusCode::OK, "{self:?}: {resp:?}");
+            assert!(state.storage.exists(&self.hash()), "{self:?}");
+            clean(state);
+        }
+    }
+
+    /// The raw-body routes have no `DefaultBodyLimit` layer (it would be a no-op); the
+    /// handlers' own limit still holds through the router.
+    #[tokio::test]
+    async fn raw_body_uploads_enforce_the_blob_limit() {
+        let (state, auth, _tmp) = setup();
+        let router = crate::create_router(state.clone());
+        for upload in RawUpload::ALL {
+            upload.assert_blob_limit(&router, &state, &auth).await;
+        }
+    }
+
+    /// `/sync/v3/files/{hash}` PUT is also served by the other router constructors.
+    #[tokio::test]
+    async fn every_router_enforces_the_sync_v3_limit() {
+        let (state, auth, tmp) = setup();
+        let db = |name: &str| tmp.path().join(name);
+        let calendar =
+            |name: &str| crate::CalendarState::new(crate::CalendarManager::new(&db(name)).unwrap());
+        let readlater = crate::readlater_api::ReadLaterState::new(
+            crate::readlater::ReadLaterManager::new(&db("rl.db"), &db("rl")).unwrap(),
+        );
+        let integrations = crate::IntegrationState::new;
+        let routers = [
+            crate::create_router_with_all(state.clone(), calendar("c1.db"), readlater),
+            crate::create_router_with_calendar(state.clone(), calendar("c2.db")),
+            crate::create_router_with_integrations(state.clone(), integrations()),
+            crate::create_full_router(state.clone(), calendar("c3.db"), integrations()),
+        ];
+        for router in routers {
+            RawUpload::SyncV3
+                .assert_blob_limit(&router, &state, &auth)
+                .await;
+            // Drop the upload the limit check accepted: the next router's refusals expect
+            // the blob to be absent.
+            state.storage.delete(&RawUpload::SyncV3.hash()).unwrap();
+        }
     }
 
     #[tokio::test]

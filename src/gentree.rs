@@ -402,7 +402,6 @@ mod tests {
 #[cfg(test)]
 mod put_file_tests {
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
 
     use axum::Router;
     use axum::extract::DefaultBodyLimit;
@@ -493,8 +492,8 @@ mod put_file_tests {
         (parts.status, parts.headers, body)
     }
 
-    fn staged_bytes(state: &AppState) -> u64 {
-        std::fs::read_dir(state.storage.staging_dir())
+    fn staged_bytes(dir: &std::path::Path) -> u64 {
+        std::fs::read_dir(dir)
             .map(|d| {
                 d.flatten()
                     .filter_map(|e| e.metadata().ok())
@@ -784,39 +783,30 @@ mod put_file_tests {
             .collect();
         let hash = hex::encode(Sha256::digest(&data));
         let b64 = STANDARD.encode(&data);
-        let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(4);
-        let body = Body::from_stream(futures_util::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|frame| (frame, rx))
+        let (first, rest) = b64.as_bytes().split_at(b64.len() / 2);
+        // Blob first, fileHash after it: validated only once the body is in.
+        let mut frames = vec![br#"{"filePath":"doc/big.rm","payload":""#.to_vec()];
+        frames.extend(first.chunks(64 * 1024).map(<[u8]>::to_vec));
+        let second_half = frames.len();
+        frames.extend(rest.chunks(64 * 1024).map(<[u8]>::to_vec));
+        let tail = format!(r#"","fileHash":"{hash}","sizeBytes":{}}}"#, data.len());
+        frames.push(tail.into_bytes());
+        // Bytes on disk in staging as each frame is asked for (the handler finishes with
+        // one frame before asking for the next).
+        let dir = state.storage.staging_dir();
+        let on_disk = Arc::new(Mutex::new(Vec::new()));
+        let log = on_disk.clone();
+        let body = Body::from_stream(futures_util::stream::iter(frames).map(move |frame| {
+            log.lock().unwrap().push(staged_bytes(&dir));
+            Ok::<_, std::io::Error>(Bytes::from(frame))
         }));
         let router = crate::create_router(state.clone());
-        let resp = tokio::spawn(async move { send(&router, request(&auth, body)).await });
-
-        // Blob first, fileHash after it: validated only once the body is in.
-        tx.send(Ok(Bytes::from_static(
-            br#"{"filePath":"doc/big.rm","payload":""#,
-        )))
-        .await
-        .unwrap();
-        let (first, rest) = b64.as_bytes().split_at(b64.len() / 2);
-        for frame in first.chunks(64 * 1024) {
-            tx.send(Ok(Bytes::copy_from_slice(frame))).await.unwrap();
-        }
-        // Half the blob sent, body still open: it's already on disk, so the body isn't
-        // being buffered first.
-        let mut waited = Duration::ZERO;
-        while staged_bytes(&state) < data.len() as u64 / 4 {
-            assert!(waited < Duration::from_secs(60), "nothing staged yet");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            waited += Duration::from_millis(10);
-        }
-        for frame in rest.chunks(64 * 1024) {
-            tx.send(Ok(Bytes::copy_from_slice(frame))).await.unwrap();
-        }
-        let tail = format!(r#"","fileHash":"{hash}","sizeBytes":{}}}"#, data.len());
-        tx.send(Ok(tail.into())).await.unwrap();
-        drop(tx);
-
-        let (status, _, body) = resp.await.unwrap();
+        let (status, _, body) = send(&router, request(&auth, body)).await;
+        // When the second half of the blob was asked for, with the body still open, the
+        // first half (8 MiB decoded, less what the write buffers and the decoder hold) was
+        // already on disk: the body isn't buffered first.
+        let seen = on_disk.lock().unwrap()[second_half];
+        assert!(seen >= data.len() as u64 / 4, "{seen} bytes staged");
         assert_eq!(status, StatusCode::OK, "{body:?}");
         assert_eq!(
             serde_json::from_slice::<Value>(&body).unwrap(),

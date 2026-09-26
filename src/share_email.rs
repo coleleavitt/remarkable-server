@@ -1,7 +1,8 @@
 //! `POST /share/v1/email`: the tablet's "Send by email". Sends via SMTP (STARTTLS).
 //!
 //! Configured by env: `SMTP_HOST`, `SMTP_PORT` (default 587), `SMTP_USER`,
-//! `SMTP_PASSWORD`, `SMTP_FROM`. Without them the endpoint returns 503.
+//! `SMTP_PASSWORD`, `SMTP_FROM`. Without them the endpoint returns 400 `config_error`,
+//! before reading the form.
 //! Form fields (xochitl 3.3.2, sub_A2310): `from`, `reply-to`, `to`, `subject`, `html`,
 //! `attachment` (multipart), plus `?hwc=true` on the URL. Mail goes out From `SMTP_FROM`
 //! with Reply-To set to the tablet's `reply-to` (falling back to its `from`).
@@ -10,8 +11,9 @@
 //! memory, and mail servers refuse bigger messages anyway.
 
 use axum::extract::multipart::MultipartError;
-use axum::extract::{Multipart, State};
+use axum::extract::{DefaultBodyLimit, Multipart, State};
 use axum::http::{HeaderMap, StatusCode, header};
+use axum::routing::{MethodRouter, post};
 use lettre::message::header::ContentType;
 use lettre::message::{Attachment, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
@@ -40,7 +42,12 @@ struct SmtpConfig {
 
 impl SmtpConfig {
     fn from_env() -> Result<Self> {
-        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        Self::from_vars(|k| std::env::var(k).ok())
+    }
+
+    /// From the `SMTP_*` variables `lookup` finds (an empty value counts as unset).
+    fn from_vars(lookup: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let var = |k: &str| lookup(k).filter(|v| !v.is_empty());
         let (Some(host), Some(user), Some(password), Some(from)) = (
             var("SMTP_HOST"),
             var("SMTP_USER"),
@@ -127,12 +134,34 @@ fn strip_ad(body: &str) -> &str {
     body.find(AD_MARKER).map_or(body, |i| &body[..i])
 }
 
-pub async fn send(
-    State(state): State<AppState>,
-    headers: HeaderMap,
+/// `POST /share/v1/email`, limited to [`MAX_BODY`] (`Multipart` enforces the route's
+/// `DefaultBodyLimit`), with SMTP configured from the environment.
+pub(crate) fn route() -> MethodRouter<AppState> {
+    route_with(SmtpConfig::from_env)
+}
+
+/// [`route`] with the SMTP settings from `smtp` instead of the environment.
+fn route_with(smtp: fn() -> Result<SmtpConfig>) -> MethodRouter<AppState> {
+    post(
+        move |State(state): State<AppState>, headers: HeaderMap, form: Multipart| async move {
+            send(&state, &headers, form, smtp).await
+        },
+    )
+    .layer(DefaultBodyLimit::max(MAX_BODY))
+}
+
+async fn send(
+    state: &AppState,
+    headers: &HeaderMap,
     form: Multipart,
+    smtp: fn() -> Result<SmtpConfig>,
 ) -> Result<StatusCode> {
-    state.auth_user(&headers)?;
+    state.auth_user(headers)?;
+    // Before the form is read, so a server without email never takes in the upload.
+    let smtp = smtp().map_err(|e| {
+        tracing::warn!("share by email requested but SMTP is not configured");
+        e
+    })?;
     let declared = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
@@ -140,8 +169,6 @@ pub async fn send(
     if declared.is_some_and(|n| n > MAX_BODY as u64) {
         return Err(too_large());
     }
-    // The form is read (bounded by MAX_BODY) before the SMTP check, so an oversized
-    // request is a 413 whether or not email is configured.
     let ShareForm {
         to,
         from,
@@ -150,10 +177,6 @@ pub async fn send(
         html,
         attachments,
     } = ShareForm::read(form).await?;
-    let smtp = SmtpConfig::from_env().map_err(|e| {
-        tracing::warn!("share by email requested but SMTP is not configured");
-        e
-    })?;
 
     let mut msg = Message::builder().from(smtp.from.clone()).subject(subject);
     for addr in to
@@ -198,8 +221,13 @@ pub async fn send(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use axum::Router;
     use axum::body::Body;
     use axum::http::Request;
+    use futures_util::StreamExt;
     use tower::ServiceExt;
 
     use super::*;
@@ -207,6 +235,7 @@ mod tests {
     use crate::storage::Storage;
 
     const B: &str = "shareboundary";
+    const URI: &str = "/share/v1/email";
 
     fn setup() -> (AppState, String, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -217,8 +246,31 @@ mod tests {
         (AppState::new(storage, devices), format!("Bearer {tk}"), tmp)
     }
 
-    /// A share form with an `attachment_len`-byte PDF. The recipient is not an address,
-    /// so even with SMTP configured in the environment nothing is ever sent.
+    /// SMTP settings for a server that is never contacted: every form below has a
+    /// recipient that is not an address, which is refused before a connection is made.
+    fn configured() -> Result<SmtpConfig> {
+        SmtpConfig::from_vars(|k| match k {
+            "SMTP_HOST" => Some("smtp.invalid".into()),
+            "SMTP_FROM" => Some("tablet@example.invalid".into()),
+            "SMTP_USER" | "SMTP_PASSWORD" => Some("x".into()),
+            _ => None,
+        })
+    }
+
+    /// No SMTP variables set.
+    fn unconfigured() -> Result<SmtpConfig> {
+        SmtpConfig::from_vars(|_| None)
+    }
+
+    /// The share route with SMTP settings from `smtp` (the environment is never read).
+    fn router(state: &AppState, smtp: fn() -> Result<SmtpConfig>) -> Router {
+        Router::new()
+            .route(URI, route_with(smtp))
+            .with_state(state.clone())
+    }
+
+    /// A share form with an `attachment_len`-byte PDF, to a recipient that is not an
+    /// address.
     fn form(attachment_len: usize) -> Vec<u8> {
         let mut body = format!(
             "--{B}\r\nContent-Disposition: form-data; name=\"to\"\r\n\r\nnot an address\r\n--{B}\r\nContent-Disposition: form-data; name=\"subject\"\r\n\r\nNotes\r\n--{B}\r\nContent-Disposition: form-data; name=\"attachment\"; filename=\"n.pdf\"\r\nContent-Type: application/pdf\r\n\r\n"
@@ -238,22 +290,30 @@ mod tests {
         Body::from_stream(futures_util::stream::iter(frames))
     }
 
+    /// `body` as a request body that notes whether it was ever read.
+    fn watched(body: Vec<u8>) -> (Body, Arc<AtomicBool>) {
+        let read = Arc::new(AtomicBool::new(false));
+        let flag = read.clone();
+        let frames = futures_util::stream::iter([body]).map(move |frame| {
+            flag.store(true, Ordering::SeqCst);
+            Ok::<_, std::io::Error>(frame)
+        });
+        (Body::from_stream(frames), read)
+    }
+
     async fn post(
-        state: &AppState,
+        router: Router,
         auth: &str,
         len: Option<usize>,
         body: Body,
     ) -> (StatusCode, String) {
-        let mut req = Request::post("/share/v1/email")
+        let mut req = Request::post(URI)
             .header("authorization", auth)
             .header("content-type", format!("multipart/form-data; boundary={B}"));
         if let Some(len) = len {
             req = req.header("content-length", len);
         }
-        let resp = crate::create_router(state.clone())
-            .oneshot(req.body(body).unwrap())
-            .await
-            .unwrap();
+        let resp = router.oneshot(req.body(body).unwrap()).await.unwrap();
         let status = resp.status();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -262,29 +322,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn without_smtp_the_form_is_never_read() {
+        let (state, auth, _tmp) = setup();
+        // Not configured: the 400 it always was, without taking in the upload.
+        let (body, read) = watched(form(1024));
+        let (status, resp) = post(router(&state, unconfigured), &auth, None, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+        assert!(resp.contains("email not configured"), "{resp}");
+        assert!(!read.load(Ordering::SeqCst), "form read without SMTP");
+        // Even one declared too big: email isn't set up, so that is what the tablet hears.
+        let (body, read) = watched(form(1024));
+        let len = Some(MAX_BODY + 1);
+        let (status, resp) = post(router(&state, unconfigured), &auth, len, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+        assert!(resp.contains("email not configured"), "{resp}");
+        assert!(!read.load(Ordering::SeqCst));
+        // Unauthenticated, through the real router: 401 first, body unread.
+        for smtp in [None, Some(unconfigured as fn() -> _), Some(configured)] {
+            let router = match smtp {
+                None => crate::create_router(state.clone()),
+                Some(smtp) => router(&state, smtp),
+            };
+            let (body, read) = watched(form(1024));
+            let (status, _) = post(router, "Bearer nope", Some(MAX_BODY + 1), body).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert!(!read.load(Ordering::SeqCst));
+        }
+    }
+
+    #[tokio::test]
     async fn oversized_share_is_a_clear_413() {
         let (state, auth, _tmp) = setup();
         // Declared too big: refused before the body is read.
-        let (status, body) = post(&state, &auth, Some(MAX_BODY + 1), Body::empty()).await;
+        let (body, read) = watched(form(1024));
+        let len = Some(MAX_BODY + 1);
+        let (status, resp) = post(router(&state, configured), &auth, len, body).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
-        assert!(body.contains("limited to 25 MiB"), "{body}");
+        assert!(resp.contains("limited to 25 MiB"), "{resp}");
+        assert!(!read.load(Ordering::SeqCst), "body read");
         // Too big without a declared length: refused while reading the form.
-        let (status, body) = post(&state, &auth, None, chunked(form(MAX_BODY))).await;
+        let body = chunked(form(MAX_BODY));
+        let (status, resp) = post(router(&state, configured), &auth, None, body).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
-        assert!(body.contains("limited to 25 MiB"), "{body}");
-        // Unauthenticated: 401 first.
-        let (status, _) = post(&state, "Bearer nope", Some(MAX_BODY + 1), Body::empty()).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(resp.contains("limited to 25 MiB"), "{resp}");
     }
 
     #[tokio::test]
     async fn malformed_form_is_still_a_400() {
         let (state, auth, _tmp) = setup();
         // No closing boundary: the multipart reader's own error, a 400 as before (not
-        // the 413, and not the later recipient or SMTP check).
+        // the 413, and not the later recipient check).
         let mut body = form(1024);
         body.truncate(body.len() - format!("\r\n--{B}--\r\n").len());
-        let (status, body) = post(&state, &auth, None, Body::from(body)).await;
+        let (status, body) = post(router(&state, configured), &auth, None, body.into()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("config_error"), "{body}");
         assert!(body.contains("multipart/form-data"), "{body}");
@@ -294,14 +384,14 @@ mod tests {
     #[tokio::test]
     async fn attachments_past_axums_default_are_read() {
         let (state, auth, _tmp) = setup();
-        // 3 MiB (over axum's 2 MiB default): the form is read in full and the request
-        // then fails on its recipient, or on SMTP not being configured, not on size.
+        // 3 MiB (over axum's 2 MiB default): the form is read to the end, and the request
+        // then fails on its recipient, which is checked after the whole form is in.
         let body = form(3 * 1024 * 1024);
         let len = body.len();
         for (len, body) in [(None, chunked(body.clone())), (Some(len), Body::from(body))] {
-            let (status, body) = post(&state, &auth, len, body).await;
+            let (status, body) = post(router(&state, configured), &auth, len, body).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-            assert!(body.contains("config_error"), "{body}");
+            assert!(body.contains("bad recipient"), "{body}");
         }
     }
 }
