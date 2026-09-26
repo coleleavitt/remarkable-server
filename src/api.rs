@@ -256,7 +256,7 @@ mod tests {
     use axum::http::HeaderValue;
 
     #[tokio::test]
-    async fn device_token_cannot_clear_storage() {
+    async fn non_admin_token_cannot_clear_storage() {
         let tmp = tempfile::TempDir::new().unwrap();
         let storage = Storage::new(tmp.path()).unwrap();
         let hash = storage.put(b"keep me", "doc.pdf").unwrap();
