@@ -410,7 +410,7 @@ pub fn feature_routes(state: AppState, storage_path: &Path, email: Option<email:
 
     let cloud = IntegrationState::new();
     let mut router = Router::new()
-        .nest("/feeds/v1", feeds::feeds_router(feeds::FeedState { manager: feeds, scheduler }))
+        .nest("/feeds/v1", feeds::feeds_router(feeds::FeedState { manager: feeds, scheduler, notification_tx: state.notification_tx.clone() }))
         .nest("/search/v1", search_routes)
         .nest("/versions/v1", versions::version_router(versions))
         .nest("/integrations/v2/calendars", calendar_router(CalendarState::new(init_calendar_manager(storage_path)?)))

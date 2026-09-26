@@ -307,6 +307,7 @@ where
                                 // Parse topic filters
                                 let mut offset = payload_start + 2;
                                 let mut qos_results = Vec::new();
+                                let known = subscriptions.len();
                                 
                                 while offset < payload_start + remaining_len {
                                     if let Some((topic, topic_len)) = parse_mqtt_string(&data[offset..]) {
@@ -330,6 +331,15 @@ where
                                     break;
                                 }
                                 info!(session_id = %session_id, "MQTT SUBACK sent");
+                                // Like /notifications/ws/json/1's initial SyncComplete: anything
+                                // broadcast before this subscription had nowhere to go.
+                                let fresh: Vec<String> = subscriptions[known..].iter().filter(|t| !subscriptions[..known].contains(t)).cloned().collect();
+                                let catch_up = WsMessage::sync_complete(generation(), "local-server", "local-user");
+                                for packet in notification_publishes(&catch_up, &fresh) {
+                                    if sender.send(Message::Binary(packet.into())).await.is_err() {
+                                        return;
+                                    }
+                                }
                             }
                         }
                     }
@@ -461,9 +471,13 @@ mod tests {
         in_tx.send(connect()).unwrap();
         assert_eq!(next(&mut out).await, build_connack(false, 0));
         in_tx.send(subscribe("user/u1/sync")).unwrap();
+        assert_eq!(next(&mut out).await[0], 0x90);
+        let (topic, body) = parse_publish(&next(&mut out).await);
+        assert_eq!((topic.as_str(), &body["message"]["attributes"]["event"]), ("user/u1/sync", &serde_json::json!("SyncComplete")), "catch-up after SUBACK");
         in_tx.send(subscribe("user/+/wild")).unwrap();
+        in_tx.send(subscribe("user/u1/sync")).unwrap();
         assert_eq!(next(&mut out).await[0], 0x90);
-        assert_eq!(next(&mut out).await[0], 0x90);
+        assert_eq!(next(&mut out).await[0], 0x90, "wildcard or repeated subscription gets no catch-up");
 
         notif.send(WsMessage::sync_complete(7, "local-server", "u1")).unwrap();
         let (topic, body) = parse_publish(&next(&mut out).await);
@@ -492,7 +506,8 @@ mod tests {
         in_tx.send(connect()).unwrap();
         next(&mut out).await;
         in_tx.send(subscribe("t")).unwrap();
-        next(&mut out).await;
+        next(&mut out).await; // SUBACK
+        next(&mut out).await; // catch-up SyncComplete
         // Overflow the capacity-4 channel before the session can drain it.
         for i in 0..10 { let mut m = WsMessage::event("DocAdded", "x", "u1"); m.message.attributes.id = Some(i.to_string()); notif.send(m).unwrap(); }
         let (_, first) = parse_publish(&next(&mut out).await);

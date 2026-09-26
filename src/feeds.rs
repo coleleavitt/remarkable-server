@@ -1311,6 +1311,8 @@ pub struct FeedState {
     pub manager: Arc<FeedManager>,
     /// Keeps the scheduler task alive (it exits when all senders drop).
     pub scheduler: Option<mpsc::Sender<SchedulerCommand>>,
+    /// Device push channel (`AppState::notification_tx`): new EPUBs are announced with SyncComplete.
+    pub notification_tx: tokio::sync::broadcast::Sender<crate::notifications::WsMessage>,
 }
 
 /// GET /feeds/v1/subscriptions - List all subscriptions
@@ -1454,6 +1456,11 @@ pub async fn sync_to_device(
     let sub = state.manager.get_subscription(&id)?;
     // Only this subscription's articles, so each lands in its own configured folder.
     let synced = state.manager.sync_articles_to_folder(Some(&sub.id), &sub.folder)?;
+    if synced > 0 {
+        // Tell connected devices to pull the new root, as document uploads do.
+        let generation = state.manager.storage.get_root().generation;
+        let _ = state.notification_tx.send(crate::notifications::WsMessage::sync_complete(generation, "local-server", "local-user"));
+    }
     Ok(Json(serde_json::json!({ "synced": synced })))
 }
 
@@ -1530,5 +1537,22 @@ mod folder_sync_tests {
         assert_eq!(t.iter().filter(|n| n.2 == "CollectionType").count(), 1);
         assert_eq!(t.iter().find(|n| n.1 == "Title a2").unwrap().3, folder.0);
         assert_eq!(t.iter().find(|n| n.1 == "Title b1").unwrap().3, "");
+    }
+
+    #[tokio::test]
+    async fn sync_to_device_notifies_devices_only_when_something_synced() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path().join("storage")).unwrap();
+        let manager = Arc::new(FeedManager::new(&tmp.path().join("feeds.db"), storage.clone(), &tmp.path().join("epub")).unwrap());
+        manager.db.lock().execute("INSERT INTO subscriptions (id, name, url, feed_type, created_at, updated_at) VALUES ('news', 'news', 'news', 'rss', ?1, ?1)", [Utc::now().to_rfc3339()]).unwrap();
+        manager.save_articles(&[article("a1", "news")]).unwrap();
+        let (notification_tx, mut rx) = tokio::sync::broadcast::channel(4);
+        let state = FeedState { manager, scheduler: None, notification_tx };
+
+        sync_to_device(State(state.clone()), UrlPath("news".into())).await.unwrap();
+        let msg = rx.try_recv().expect("SyncComplete after new EPUBs");
+        assert_eq!(msg.message.attributes.event, "SyncComplete");
+        sync_to_device(State(state), UrlPath("news".into())).await.unwrap();
+        assert!(rx.try_recv().is_err(), "nothing new, no push");
     }
 }

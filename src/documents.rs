@@ -32,6 +32,9 @@ impl Entry {
             size: f.next()?.parse().ok()?,
         })
     }
+
+    /// The node id of a root entry; some trees name it `<id>.docSchema` (cf. gentree).
+    fn id(&self) -> &str { self.name.strip_suffix(".docSchema").unwrap_or(&self.name) }
 }
 
 fn index_hash(entries: &mut [Entry]) -> Result<String> {
@@ -125,7 +128,7 @@ pub fn ensure_folder(storage: &Storage, folder: &str) -> Result<String> {
         let root = storage.get_root();
         let entries = root_entries(storage, &root.hash)?;
         let collections: Vec<(String, serde_json::Value)> = entries.iter().filter(|e| e.kind == DOC_TYPE)
-            .filter_map(|e| Some((e.name.clone(), node_metadata(storage, e)?)))
+            .filter_map(|e| Some((e.id().to_owned(), node_metadata(storage, e)?)))
             .filter(|(_, m)| m["type"] == "CollectionType" && m["deleted"] != true && m["parent"] != "trash")
             .collect();
         if collections.iter().any(|(id, _)| id == folder) {
@@ -187,7 +190,7 @@ fn root_entries(storage: &Storage, root_hash: &str) -> Result<Vec<Entry>> {
 /// A node's parsed `<id>.metadata`, if its index and metadata blob are readable.
 fn node_metadata(storage: &Storage, node: &Entry) -> Option<serde_json::Value> {
     let index = storage.get(&node.hash).ok()?;
-    let name = format!("{}.metadata", node.name);
+    let name = format!("{}.metadata", node.id());
     let meta = String::from_utf8_lossy(&index).lines().skip(1).filter_map(Entry::parse).find(|e| e.name == name)?;
     serde_json::from_slice(&storage.get(&meta.hash).ok()?).ok()
 }
@@ -282,5 +285,24 @@ mod tests {
         assert_eq!(meta(&storage, &doc)["parent"], folder.as_str());
         // A document with the folder's name isn't a folder.
         assert_ne!(ensure_folder(&storage, "article").unwrap(), doc);
+    }
+
+    #[test]
+    fn ensure_folder_finds_collection_listed_with_docschema_suffix() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        let id = "11111111-2222-3333-4444-555555555555";
+        let metadata = serde_json::json!({"parent": "", "type": "CollectionType", "visibleName": "News"});
+        let mut files = vec![put_leaf(&storage, format!("{id}.metadata"), &serde_json::to_vec(&metadata).unwrap()).unwrap()];
+        let hash = index_hash(&mut files).unwrap();
+        storage.put_with_hash(&render_index(&files), &hash, &format!("{id}.docSchema")).unwrap();
+        let mut entries = vec![Entry { hash, kind: DOC_TYPE.into(), name: format!("{id}.docSchema"), subfiles: 1, size: files[0].size }];
+        let root_hash = index_hash(&mut entries).unwrap();
+        storage.put_with_hash(&render_index(&entries), &root_hash, "root.docSchema").unwrap();
+        let generation = storage.set_root(root_hash).unwrap().generation;
+
+        assert_eq!(ensure_folder(&storage, "News").unwrap(), id, "resolved by visible name");
+        assert_eq!(ensure_folder(&storage, id).unwrap(), id, "resolved by id");
+        assert_eq!(storage.get_root().generation, generation, "no duplicate folder committed");
     }
 }
