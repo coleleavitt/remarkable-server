@@ -70,6 +70,21 @@ pub enum IntegrationError {
 
 pub type Result<T> = std::result::Result<T, IntegrationError>;
 
+/// Connect timeout for provider / OAuth requests.
+pub(crate) const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Whole-request ceiling (incl. body transfer): generous for large uploads/downloads, but finite
+/// so a hung provider can't hold the sync lock forever.
+pub(crate) const HTTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// HTTP client shared by all providers and the OAuth token/revoke calls.
+pub(crate) fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .timeout(HTTP_REQUEST_TIMEOUT)
+        .build()
+        .expect("reqwest client with timeouts")
+}
+
 /// Cloud file metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudFile {

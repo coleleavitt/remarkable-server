@@ -268,6 +268,8 @@ Handwriting conversion (`POST /convert/v1/handwriting`) runs the local `tesserac
 
 Authenticated feature APIs (Bearer token): `/search/v1/*`, `/versions/v1/*`, `/feeds/v1/*` (RSS/Atom to EPUB), `/integrations/v2/{calendars,readlater,cloud}/*`, `/email/v1/*` (when inbound email is on).
 
+Cloud sync (`POST /integrations/v2/{cloud,storage}/sync`) only reads/writes under `<storage>/integrations/`: `local_path` must be relative to that directory (default `.` = the directory itself), absolute paths, `..` and symlinks leading outside it are rejected with 400, and missing subdirectories are created. Provider requests time out (10 s connect, 10 min total).
+
 See [remarkable-research](https://github.com/coleleavitt/remarkable-research) for device configuration tools.
 
 ## Related Projects

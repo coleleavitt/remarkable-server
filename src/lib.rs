@@ -408,7 +408,8 @@ pub fn feature_routes(state: AppState, storage_path: &Path, email: Option<email:
     let scheduler = tokio::runtime::Handle::try_current().is_ok()
         .then(|| feeds.clone().start_scheduler(FEED_CHECK_SECS));
 
-    let cloud = IntegrationState::new();
+    // Cloud syncs may only touch directories under <storage>/integrations.
+    let cloud = IntegrationState::with_sync_base(storage_path.join("integrations"));
     let mut router = Router::new()
         .nest("/feeds/v1", feeds::feeds_router(feeds::FeedState { manager: feeds, scheduler }))
         .nest("/search/v1", search_routes)

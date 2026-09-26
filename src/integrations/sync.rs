@@ -55,7 +55,7 @@ pub(crate) fn local_path_for(base: &Path, cloud_path: &str) -> Result<PathBuf> {
 /// entry and refusing (`Ok(None)`) any that lands outside the root or isn't a directory, so
 /// a symlinked subdirectory can't make us create directories elsewhere. Returns the
 /// canonical directory. `rel` must already be validated (plain `Normal` components).
-async fn create_dirs_within(root: &Path, rel: &Path) -> Result<Option<PathBuf>> {
+pub(crate) async fn create_dirs_within(root: &Path, rel: &Path) -> Result<Option<PathBuf>> {
     let root = fs::canonicalize(root).await?;
     let mut cur = root.clone();
     for c in rel.components() {
