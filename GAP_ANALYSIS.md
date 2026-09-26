@@ -116,7 +116,7 @@ Two MQTT endpoints exist:
   topic the client subscribed to, because nothing pins the topic xochitl expects; unverified
   against a real tablet.
 - The screenshare broker (`SCREENSHARE_BIND`, MQTT over TLS; :8883 on the Linode). Its sessions
-  are not closed when a device is revoked.
+  are closed when their device is revoked, like those of `/mqtt` and `/notifications/ws`.
 
 ### Full Sync15 Protocol
 The V3/V4 sync handlers exist but may not fully implement:
