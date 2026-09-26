@@ -183,8 +183,10 @@ pub async fn list_files(State(state): State<AppState>, headers: HeaderMap) -> Re
     Ok(Json(state.storage.list().into_iter().map(|(hash, filename, size)| FileInfo { hash, filename, size }).collect()))
 }
 
+/// Admin: delete every blob and reset the root. A device token is not enough: any paired
+/// tablet or client could otherwise wipe the cloud.
 pub async fn clear_storage(State(state): State<AppState>, headers: HeaderMap) -> Result<StatusCode> {
-    state.auth_user(&headers)?;
+    require_admin(&headers)?;
     state.storage.clear()?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -246,4 +248,26 @@ pub async fn check_updates() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "available": false
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[tokio::test]
+    async fn non_admin_token_cannot_clear_storage() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        let hash = storage.put(b"keep me", "doc.pdf").unwrap();
+        let devices = DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        let token = devices.create_user_token("user").unwrap();
+        let state = AppState::new(storage, devices);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {token}")).unwrap());
+
+        let result = clear_storage(State(state.clone()), headers).await;
+        assert!(matches!(result, Err(ServerError::Unauthorized)));
+        assert!(state.storage.exists(&hash));
+    }
 }
