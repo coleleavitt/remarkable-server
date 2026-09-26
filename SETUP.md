@@ -76,7 +76,11 @@ DNS.3 = *.cloud.remarkable.com
 DNS.4 = remarkable.com
 DNS.5 = webapp-production-dot-remarkable-production.appspot.com
 DNS.6 = *.appspot.com
+DNS.7 = *.cloud.remarkable.engineering
 ```
+
+`*.cloud.remarkable.engineering` covers the screenshare broker name (`vernemq-prod.cloud.remarkable.engineering`,
+see below) and, on newer firmware, `backtrace-proxy.cloud.remarkable.engineering`.
 
 ```bash
 openssl genrsa -out server.key 2048
@@ -121,11 +125,18 @@ cat >> /etc/hosts << 'EOF'
 10.11.99.2 local.tectonic.remarkable.com
 10.11.99.2 service-manager-production-dot-remarkable-production.appspot.com
 10.11.99.2 hwr-production-dot-remarkable-production.appspot.com
-10.11.99.3 vernemq-prod-1.tectonic.remarkable.com
-10.11.99.3 vernemq-prod-2.tectonic.remarkable.com
-10.11.99.3 vernemq-prod-3.tectonic.remarkable.com
+10.11.99.3 vernemq-prod.cloud.remarkable.engineering
 EOF
 ```
+
+The screenshare broker name comes from the xochitl 3.3.2 binary, which dials
+`vernemq-prod.cloud.remarkable.engineering:443` (`src/screenshare.rs`); remarkable-rs's notes on the
+same build (`docs/MQTT_NOTES.md`) record the pattern `vernemq-%1.cloud.remarkable.engineering` and
+reMarkable's discovery answering `mqttbroker: vernemq-prod.cloud.remarkable.engineering`. Earlier
+versions of this guide listed `vernemq-prod-{1,2,3}.tectonic.remarkable.com` instead; nothing in the
+repository or those notes supports them (extra lines are harmless). The production tablet's own
+`/etc/hosts` is not in this repository, so which broker names it maps is not recorded here
+(GAP_ANALYSIS.md, "Screen share broker hostname").
 
 ### Restart xochitl
 
@@ -163,7 +174,14 @@ This prints a one-time code (or `POST /devices/v1` with `x-admin-token` returns 
 Once paired, the tablet should sync automatically. You'll see:
 - Generation numbers incrementing in server logs
 - Documents appearing in `remarkable-storage/`
-- WebSocket pings every ~30 seconds (notifications channel)
+- `New notifications WebSocket connection` when the tablet opens its notifications channel
+  (`/notifications/ws/json/1`). The server sends no WebSocket pings of its own, and pings from the
+  tablet are only logged at debug (`RUST_LOG=remarkable_server=info,remarkable_server::notifications=debug`).
+
+The tablet gets sync pushes over `/notifications/ws/json/1`. The MQTT-over-WebSocket `/mqtt` endpoint
+is off unless you set `MQTT_WS_NOTIFICATIONS=1`; the tablet does not use it (GAP_ANALYSIS.md, "MQTT:
+what the tablet actually uses"). Its observed MQTT traffic is screen share signalling on `SCREENSHARE_BIND`;
+whether it also subscribes to sync topics there is unconfirmed.
 
 ## Troubleshooting
 

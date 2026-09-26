@@ -1,26 +1,86 @@
 //! MQTT over WebSocket Handler
 //!
-//! Implements MQTT 3.1.1 protocol over WebSocket for device notifications.
-//! The device expects full MQTT protocol, not plain JSON.
+//! Implements MQTT 3.1.1 over WebSocket as an alternative framing of the
+//! `/notifications/ws/json/1` sync push.
 //!
-//! Served at `/mqtt`. Nothing in the firmware notes or discovery pins a path
-//! (`mqttbroker` in discovery is a bare host, and `/notifications/ws/json/1` is
-//! the JSON endpoint), so this uses the conventional MQTT-over-WebSocket path
-//! (VerneMQ's and Paho's default).
+//! **Off by default.** It is served at `/mqtt` only when [`ENABLE_ENV`]
+//! (`MQTT_WS_NOTIFICATIONS`) is `1`, `true` or `on` (see [`router_if_enabled`]),
+//! because the real tablet does not use it. Checked on the production server
+//! (GAP_ANALYSIS.md, "MQTT: what the tablet actually uses"): xochitl 3.3.2 opened
+//! `/notifications/ws/json/1` for every notification session and, in 15 days of
+//! nginx logs, never requested any path containing `mqtt`, including after this
+//! route went live. Its observed MQTT traffic is screen share signalling, raw MQTT
+//! over TLS to the `SCREENSHARE_BIND` broker (`crate::screenshare`), not WebSocket.
+//! Whether it also subscribes to sync topics on that broker is unconfirmed (accepted
+//! SUBSCRIBE filters are logged at debug there); if it does, sync pushes belong on
+//! that broker, not on this endpoint.
+//!
+//! Path and topic are unverified guesses kept for other clients: nothing verified
+//! pins a path (`mqttbroker` in discovery is a bare host; remarkable-rs only
+//! *expects* `wss://vernemq-.../mqtt`, on the broker host, not this API host), so
+//! this uses the conventional MQTT-over-WebSocket path (VerneMQ's and Paho's
+//! default), and publishes on each concrete topic the client subscribed to. A
+//! wildcard filter has no concrete topic, so its SUBACK says so ([`SUBACK_FAILURE`]).
 
+use std::time::Duration;
+
+use axum::Router;
 use axum::extract::State;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
 use axum::response::IntoResponse;
+use axum::routing::get;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use tokio::sync::broadcast;
+use tower_http::trace::TraceLayer;
 use tracing::{debug, info, warn};
 
 use crate::api::AppState;
 use crate::device::SessionIdentity;
 use crate::error::ServerError;
 use crate::notifications::WsMessage;
+
+/// Environment variable that serves [`PATH`] when set to `1`, `true` or `on`.
+pub const ENABLE_ENV: &str = "MQTT_WS_NOTIFICATIONS";
+
+/// Where the endpoint is served when enabled.
+pub const PATH: &str = "/mqtt";
+
+/// How long a client has, from the WebSocket upgrade, to send its CONNECT. An upgrade
+/// without an `Authorization` header is only authenticated at CONNECT, so without this
+/// such a socket could stay open indefinitely (MQTT 3.1.1 §3.1.4: a server SHOULD close
+/// a connection that sends no CONNECT within a reasonable time).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// SUBACK return code for a filter the server refuses (MQTT 3.1.1 §3.9.3).
+const SUBACK_FAILURE: u8 = 0x80;
+
+/// Distinct topics one session may subscribe to; filters past it are refused in the
+/// SUBACK. Every notification is published once per topic, so this bounds both the
+/// session's state and what one event costs to fan out.
+const MAX_SUBSCRIPTIONS: usize = 64;
+
+/// Largest WebSocket message, and frame, the endpoint reads; a bigger one closes the
+/// socket (a single frame at its header), so no more than this is buffered for a
+/// message. The packets it answers are small: a CONNECT is
+/// a client id, a token and at most a will, and a SUBSCRIBE of [`MAX_SUBSCRIPTIONS`]
+/// ordinary topics is a few KiB. Without this, tungstenite's defaults (64 MiB messages,
+/// 16 MiB frames) let any client, authenticated or not, have that much buffered per socket.
+pub(crate) const MAX_MESSAGE_SIZE: usize = 256 * 1024;
+
+/// The [`PATH`] route, to merge into [`crate::create_router`]'s router, when `flag`
+/// (the value of [`ENABLE_ENV`]) is `1`, `true` or `on`; `None` otherwise, including
+/// when it is unset. No tablet uses it (see the module docs), so it stays off the
+/// public attack surface unless asked for.
+pub fn router_if_enabled(state: AppState, flag: Option<&str>) -> Option<Router> {
+    matches!(flag, Some("1" | "true" | "on")).then(|| {
+        Router::new()
+            .route(PATH, get(mqtt_notifications_ws))
+            .with_state(state)
+            .layer(TraceLayer::new_for_http())
+    })
+}
 
 /// An accepted CONNECT: the session's user, and a future that resolves when the device it
 /// authenticated as is revoked (the session is then closed).
@@ -98,6 +158,26 @@ fn parse_remaining_length(data: &[u8]) -> Option<(usize, usize)> {
     Some((value, idx))
 }
 
+/// The variable header and payload of the MQTT packet in `frame` (everything after the
+/// fixed header). `None` when its remaining length is malformed or does not end exactly
+/// at the end of the frame: this endpoint reads one whole packet per frame.
+fn packet_body(frame: &[u8]) -> Option<&[u8]> {
+    let (len, n) = parse_remaining_length(frame.get(1..)?)?;
+    (frame.len() - 1 - n == len).then(|| &frame[1 + n..])
+}
+
+/// Append `len` in MQTT's variable-length remaining-length encoding.
+fn push_remaining_length(packet: &mut Vec<u8>, mut len: usize) {
+    loop {
+        let byte = (len % 128) as u8;
+        len /= 128;
+        packet.push(if len > 0 { byte | 0x80 } else { byte });
+        if len == 0 {
+            break;
+        }
+    }
+}
+
 /// Parse MQTT binary data (2-byte length prefix)
 fn parse_mqtt_bytes(data: &[u8]) -> Option<(&[u8], usize)> {
     if data.len() < 2 {
@@ -116,32 +196,69 @@ fn parse_mqtt_string(data: &[u8]) -> Option<(&str, usize)> {
     Some((std::str::from_utf8(b).ok()?, n))
 }
 
+/// Why a CONNECT is refused before its credentials are looked at.
+#[derive(Debug, PartialEq)]
+enum ConnectError {
+    /// Not a conforming CONNECT (MQTT 3.1.1 §3.1): the connection is closed without a
+    /// CONNACK [MQTT-3.1.4-1].
+    Malformed,
+    /// A protocol level other than MQTT 3.1.1 (or 3.1 as `MQIsdp`): CONNACK 0x01, then
+    /// close [MQTT-3.1.2-2].
+    UnsupportedLevel,
+}
+
 /// The token a CONNECT (variable header + payload) carries: its password, or its
 /// username when the password is empty or absent, as the screenshare broker reads it.
-/// `None` when it has no credentials or is malformed.
-fn connect_token(body: &[u8]) -> Option<String> {
-    let (_, mut at) = parse_mqtt_string(body)?; // protocol name
-    let flags = *body.get(at + 1)?; // after the protocol level
-    at += 4; // level, flags, keep alive
-    at += parse_mqtt_bytes(body.get(at..)?)?.1; // client id
-    if flags & 0x04 != 0 {
-        for _ in 0..2 {
-            at += parse_mqtt_bytes(body.get(at..)?)?.1;
-        } // will topic, will message
+/// `Ok(None)` when it has no credentials, or only non-UTF-8 ones. Every field its flags
+/// declare must be there and nothing may follow them, so a malformed CONNECT is refused
+/// even on an upgrade already authenticated by its `Authorization` header.
+fn connect_token(body: &[u8]) -> Result<Option<String>, ConnectError> {
+    use ConnectError::Malformed;
+    let (protocol, mut at) = parse_mqtt_string(body).ok_or(Malformed)?;
+    let &[level, flags, _, _] = body.get(at..at + 4).ok_or(Malformed)? else {
+        return Err(Malformed); // level, flags, keep alive
+    };
+    at += 4;
+    match (protocol, level) {
+        ("MQTT", 4) | ("MQIsdp", 3) => {}
+        ("MQTT" | "MQIsdp", _) => return Err(ConnectError::UnsupportedLevel),
+        _ => return Err(Malformed), // [MQTT-3.1.2-1]
     }
-    let mut username = None;
-    if flags & 0x80 != 0 {
-        let (u, n) = parse_mqtt_bytes(body.get(at..)?)?;
-        username = Some(u);
+    // Reserved bit [MQTT-3.1.2-3]; will QoS/retain without a will [MQTT-3.1.2-11/-13/-15];
+    // a password without a username [MQTT-3.1.2-22].
+    let (will, username_flag, password_flag) =
+        (flags & 0x04 != 0, flags & 0x80 != 0, flags & 0x40 != 0);
+    if flags & 0x01 != 0 || (!will && flags & 0x38 != 0) || (password_flag && !username_flag) {
+        return Err(Malformed);
+    }
+    let mut field = |string: bool| -> Result<&[u8], ConnectError> {
+        let (b, n) = parse_mqtt_bytes(body.get(at..).ok_or(Malformed)?).ok_or(Malformed)?;
+        if string && std::str::from_utf8(b).is_err() {
+            return Err(Malformed);
+        }
         at += n;
+        Ok(b)
+    };
+    field(true)?; // client id
+    if will {
+        field(true)?; // will topic
+        field(false)?; // will message
     }
-    let password = if flags & 0x40 != 0 {
-        Some(parse_mqtt_bytes(body.get(at..)?)?.0)
+    let username = if username_flag {
+        Some(field(true)?)
     } else {
         None
     };
-    let token = password.filter(|p| !p.is_empty()).or(username)?;
-    String::from_utf8(token.to_vec()).ok()
+    let password = if password_flag {
+        Some(field(false)?)
+    } else {
+        None
+    };
+    if at != body.len() {
+        return Err(Malformed);
+    }
+    let token = password.filter(|p| !p.is_empty()).or(username);
+    Ok(token.and_then(|t| String::from_utf8(t.to_vec()).ok()))
 }
 
 /// Build CONNACK packet
@@ -156,12 +273,9 @@ fn build_connack(session_present: bool, return_code: u8) -> Vec<u8> {
 
 /// Build SUBACK packet
 fn build_suback(packet_id: u16, qos_levels: &[u8]) -> Vec<u8> {
-    let mut packet = vec![
-        0x90,                         // SUBACK packet type
-        (2 + qos_levels.len()) as u8, // Remaining length
-        (packet_id >> 8) as u8,       // Packet ID MSB
-        packet_id as u8,              // Packet ID LSB
-    ];
+    let mut packet = vec![0x90]; // SUBACK packet type
+    push_remaining_length(&mut packet, 2 + qos_levels.len());
+    packet.extend_from_slice(&packet_id.to_be_bytes());
     packet.extend_from_slice(qos_levels);
     packet
 }
@@ -185,20 +299,7 @@ fn build_publish(topic: &str, payload: &[u8], qos: u8, packet_id: Option<u16>) -
     let mut packet = vec![
         0x30 | (qos << 1), // PUBLISH with QoS
     ];
-
-    // Encode remaining length
-    let mut len = remaining_len;
-    loop {
-        let mut byte = (len % 128) as u8;
-        len /= 128;
-        if len > 0 {
-            byte |= 0x80;
-        }
-        packet.push(byte);
-        if len == 0 {
-            break;
-        }
-    }
+    push_remaining_length(&mut packet, remaining_len);
 
     // Topic length + topic
     packet.push((topic_len >> 8) as u8);
@@ -217,14 +318,26 @@ fn build_publish(topic: &str, payload: &[u8], qos: u8, packet_id: Option<u16>) -
     packet
 }
 
-/// WebSocket upgrade handler for MQTT notifications endpoint (`/mqtt`).
+/// WebSocket upgrade handler for MQTT notifications endpoint (`/mqtt`, only routed
+/// when enabled; see [`router_if_enabled`]).
 ///
 /// Authenticated with the same tokens as `/notifications/ws/json/1`: a bearer
 /// `Authorization` header on the upgrade (an invalid one is rejected with 401),
 /// or, when there is no such header, the token as the MQTT CONNECT password (or
 /// username), as the screenshare broker accepts. A CONNECT without a valid token
-/// gets CONNACK "not authorized" and the socket is closed. A connected session is
-/// closed once the device its token belongs to is revoked (deleted or re-paired).
+/// gets CONNACK "not authorized" and the socket is closed. The first packet must be
+/// a well-formed CONNECT, sent within [`CONNECT_TIMEOUT`]: a malformed or truncated
+/// CONNECT (checked field by field before any token, header or CONNECT, is looked at),
+/// any other packet first, or none in time closes the socket without a CONNACK (MQTT
+/// 3.1.1 §3.1.0, §3.1.4); a protocol level other than 3.1.1 or 3.1 gets CONNACK 0x01.
+/// Each binary frame is read as one whole packet, as Paho and mqtt.js send them;
+/// packets split across frames or sharing one (which §6.0 allows) are not handled, so
+/// such a CONNECT counts as malformed. A text frame, before or after CONNECT, closes the
+/// socket (close code 1003; [MQTT-6.0.0-1]: MQTT is carried only in binary frames), and
+/// its contents are not logged. A message or frame over [`MAX_MESSAGE_SIZE`] closes it
+/// too. A connected
+/// session is closed once the device its token belongs to is revoked (deleted or
+/// re-paired).
 pub async fn mqtt_notifications_ws(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
@@ -241,6 +354,8 @@ pub async fn mqtt_notifications_ws(
     info!("MQTT WebSocket upgrade request for notifications");
     Ok(ws
         .protocols(["mqtt"])
+        .max_message_size(MAX_MESSAGE_SIZE)
+        .max_frame_size(MAX_MESSAGE_SIZE)
         .on_upgrade(move |socket| handle_mqtt_socket(socket, state, header_identity)))
 }
 
@@ -283,12 +398,20 @@ async fn handle_mqtt_socket(
 /// landing in the single shared sync tree); every authenticated user gets those.
 const SERVER_USER: &str = "local-user";
 
+/// Whether notifications can go out on `filter`: a non-empty topic without `+`/`#`.
+/// A wildcard filter names no single topic to publish on, and nothing verified pins
+/// the topic a sync push would use to match it against; such filters are refused in
+/// the SUBACK ([`SUBACK_FAILURE`]) instead of being acknowledged and never served.
+fn is_concrete(filter: &str) -> bool {
+    !filter.is_empty() && !filter.contains(['+', '#'])
+}
+
 /// MQTT PUBLISH packets (QoS 0) carrying `msg` for the session of `user_id`.
 ///
-/// Assumption: nothing in this codebase pins the topic xochitl expects for
-/// sync pushes over MQTT-over-WebSocket, so the notification goes out on each
-/// concrete (wildcard-free) topic the client SUBSCRIBEd to. Filters with `+`/`#`
-/// have no single concrete topic and are skipped. The payload is the same
+/// Assumption: nothing pins a topic for sync pushes over MQTT-over-WebSocket
+/// (xochitl does not use this endpoint), so the notification goes out on each
+/// concrete topic the client SUBSCRIBEd to ([`is_concrete`]; the session only
+/// keeps those, and others are skipped here too). The payload is the same
 /// `WsMessage` JSON the `/notifications/ws/json/1` endpoint sends. Only events
 /// for `user_id` (or [`SERVER_USER`]) are forwarded; screenshare events have
 /// their own broker and are never forwarded here.
@@ -309,7 +432,7 @@ fn notification_publishes(
     let mut seen: Vec<&str> = Vec::new();
     subscriptions
         .iter()
-        .filter(|t| !t.is_empty() && !t.contains(['+', '#']))
+        .filter(|t| is_concrete(t))
         .filter(|t| {
             if seen.contains(&t.as_str()) {
                 false
@@ -347,10 +470,17 @@ async fn run_mqtt_session<S, R>(
         Box::pin(std::future::pending());
     let mut subscriptions: Vec<String> = Vec::new();
     let mut notifications_open = true;
+    let connect_deadline = tokio::time::sleep(CONNECT_TIMEOUT);
+    tokio::pin!(connect_deadline);
 
     loop {
         let result = tokio::select! {
             incoming = receiver.next() => match incoming { Some(r) => r, None => break },
+            () = &mut connect_deadline, if !connected => {
+                warn!(session_id = %session_id, "no MQTT CONNECT within {CONNECT_TIMEOUT:?}, closing");
+                let _ = sender.send(Message::Close(None)).await;
+                break;
+            }
             () = &mut revoked => {
                 info!(session_id = %session_id, "device revoked, closing MQTT session");
                 // MQTT 3.1.1 has no server DISCONNECT; closing the connection is how a broker ends it.
@@ -381,17 +511,19 @@ async fn run_mqtt_session<S, R>(
             Ok(Message::Binary(data)) => {
                 debug!(session_id = %session_id, "Received MQTT binary: {} bytes", data.len());
 
-                if data.is_empty() {
-                    continue;
+                let packet_type_byte = data.first().map(|b| b >> 4);
+                let packet_type = packet_type_byte.and_then(|t| PacketType::try_from(t).ok());
+                if !connected && packet_type != Some(PacketType::Connect) {
+                    // [MQTT-3.1.0-1]: the client's first packet MUST be CONNECT.
+                    warn!(session_id = %session_id, "first MQTT packet is not CONNECT, closing");
+                    break;
                 }
-
-                let packet_type_byte = (data[0] >> 4) & 0x0F;
-                let packet_type = match PacketType::try_from(packet_type_byte) {
-                    Ok(t) => t,
-                    Err(_) => {
-                        warn!(session_id = %session_id, "Unknown packet type: {}", packet_type_byte);
-                        continue;
-                    }
+                let Some(packet_type_byte) = packet_type_byte else {
+                    continue;
+                };
+                let Some(packet_type) = packet_type else {
+                    warn!(session_id = %session_id, "Unknown packet type: {}", packet_type_byte);
+                    continue;
                 };
 
                 debug!(session_id = %session_id, "MQTT packet type: {:?}", packet_type);
@@ -402,42 +534,46 @@ async fn run_mqtt_session<S, R>(
                             warn!(session_id = %session_id, "second MQTT CONNECT, closing");
                             break;
                         }
-                        // Parse CONNECT packet
-                        if let Some((remaining_len, len_bytes)) = parse_remaining_length(&data[1..])
+                        // Validated before authentication, which a header token would
+                        // otherwise pass whatever the CONNECT says.
+                        let token = match packet_body(&data)
+                            .ok_or(ConnectError::Malformed)
+                            .and_then(connect_token)
                         {
-                            let payload_start = 1 + len_bytes;
-                            if data.len() >= payload_start + remaining_len {
-                                info!(session_id = %session_id, "MQTT CONNECT received");
-                                let token = connect_token(
-                                    &data[payload_start..payload_start + remaining_len],
-                                );
-                                let Some(auth) = authenticate(token.as_deref()) else {
-                                    warn!(session_id = %session_id, "MQTT CONNECT without a valid token, refusing");
-                                    let _ = sender
-                                        .send(Message::Binary(build_connack(false, 5).into()))
-                                        .await; // not authorized
-                                    break;
-                                };
-                                user_id = auth.user_id;
-                                revoked = auth.revoked;
-                                connected = true;
-
-                                // Send CONNACK
-                                let connack = build_connack(false, 0); // Accepted
-                                if sender.send(Message::Binary(connack.into())).await.is_err() {
-                                    break;
-                                }
-                                info!(session_id = %session_id, "MQTT CONNACK sent");
+                            Ok(token) => token,
+                            Err(ConnectError::Malformed) => {
+                                warn!(session_id = %session_id, "malformed MQTT CONNECT, closing");
+                                break;
                             }
+                            Err(ConnectError::UnsupportedLevel) => {
+                                warn!(session_id = %session_id, "MQTT CONNECT for an unsupported protocol level, refusing");
+                                let _ = sender
+                                    .send(Message::Binary(build_connack(false, 1).into()))
+                                    .await; // unacceptable protocol version
+                                break;
+                            }
+                        };
+                        info!(session_id = %session_id, "MQTT CONNECT received");
+                        let Some(auth) = authenticate(token.as_deref()) else {
+                            warn!(session_id = %session_id, "MQTT CONNECT without a valid token, refusing");
+                            let _ = sender
+                                .send(Message::Binary(build_connack(false, 5).into()))
+                                .await; // not authorized
+                            break;
+                        };
+                        user_id = auth.user_id;
+                        revoked = auth.revoked;
+                        connected = true;
+
+                        // Send CONNACK
+                        let connack = build_connack(false, 0); // Accepted
+                        if sender.send(Message::Binary(connack.into())).await.is_err() {
+                            break;
                         }
+                        info!(session_id = %session_id, "MQTT CONNACK sent");
                     }
 
                     PacketType::Subscribe => {
-                        if !connected {
-                            warn!(session_id = %session_id, "SUBSCRIBE before CONNECT");
-                            continue;
-                        }
-
                         // Parse SUBSCRIBE packet
                         if let Some((remaining_len, len_bytes)) = parse_remaining_length(&data[1..])
                         {
@@ -462,9 +598,20 @@ async fn run_mqtt_session<S, R>(
                                             let qos = data[offset] & 0x03;
                                             offset += 1;
 
-                                            info!(session_id = %session_id, "MQTT SUBSCRIBE to topic: {} (QoS {})", topic, qos);
-                                            subscriptions.push(topic.to_string());
-                                            qos_results.push(qos);
+                                            if !is_concrete(topic) {
+                                                info!(session_id = %session_id, "MQTT SUBSCRIBE refused, no concrete topic: {:?}", topic);
+                                                qos_results.push(SUBACK_FAILURE);
+                                            } else if subscriptions.iter().any(|t| t == topic) {
+                                                // A repeat replaces the subscription (§3.8.4); it is stored once.
+                                                qos_results.push(qos);
+                                            } else if subscriptions.len() >= MAX_SUBSCRIPTIONS {
+                                                warn!(session_id = %session_id, "MQTT SUBSCRIBE refused, {MAX_SUBSCRIPTIONS} topics already");
+                                                qos_results.push(SUBACK_FAILURE);
+                                            } else {
+                                                info!(session_id = %session_id, "MQTT SUBSCRIBE to topic: {} (QoS {})", topic, qos);
+                                                subscriptions.push(topic.to_string());
+                                                qos_results.push(qos);
+                                            }
                                         }
                                     } else {
                                         break;
@@ -479,17 +626,13 @@ async fn run_mqtt_session<S, R>(
                                 info!(session_id = %session_id, "MQTT SUBACK sent");
                                 // Like /notifications/ws/json/1's initial SyncComplete: anything
                                 // broadcast before this subscription had nowhere to go.
-                                let fresh: Vec<String> = subscriptions[known..]
-                                    .iter()
-                                    .filter(|t| !subscriptions[..known].contains(t))
-                                    .cloned()
-                                    .collect();
+                                let fresh = &subscriptions[known..]; // stored once each
                                 let catch_up = WsMessage::sync_complete(
                                     generation(),
                                     "local-server",
                                     &user_id,
                                 );
-                                for packet in notification_publishes(&catch_up, &fresh, &user_id) {
+                                for packet in notification_publishes(&catch_up, fresh, &user_id) {
                                     if sender.send(Message::Binary(packet.into())).await.is_err() {
                                         return;
                                     }
@@ -537,7 +680,16 @@ async fn run_mqtt_session<S, R>(
             }
 
             Ok(Message::Text(text)) => {
-                warn!(session_id = %session_id, "Unexpected text message: {}", text);
+                // [MQTT-6.0.0-1]: any non-binary data frame MUST close the connection. Only
+                // the length is logged, so the client can't write into the journal.
+                warn!(session_id = %session_id, "WebSocket text frame ({} bytes), closing", text.len());
+                let _ = sender
+                    .send(Message::Close(Some(CloseFrame {
+                        code: close_code::UNSUPPORTED,
+                        reason: "MQTT needs binary frames".into(),
+                    })))
+                    .await;
+                break;
             }
 
             Err(e) => {
@@ -723,10 +875,14 @@ mod tests {
         );
         in_tx.send(subscribe("user/+/wild")).unwrap();
         in_tx.send(subscribe("user/u1/sync")).unwrap();
-        assert_eq!(next(&mut out).await[0], 0x90);
         assert_eq!(
-            next(&mut out).await[0],
-            0x90,
+            next(&mut out).await,
+            build_suback(1, &[SUBACK_FAILURE]),
+            "a wildcard filter is refused, not acknowledged and never served"
+        );
+        assert_eq!(
+            next(&mut out).await,
+            build_suback(1, &[0]),
             "wildcard or repeated subscription gets no catch-up"
         );
 
@@ -837,6 +993,249 @@ mod tests {
     }
 
     #[test]
+    fn remaining_length_round_trips_and_packet_body_bounds_the_frame() {
+        // Every encoding-width boundary, up to the 4-byte maximum.
+        for len in [
+            0,
+            127,
+            128,
+            16_383,
+            16_384,
+            2_097_151,
+            2_097_152,
+            268_435_455,
+        ] {
+            let mut encoded = Vec::new();
+            push_remaining_length(&mut encoded, len);
+            assert_eq!(
+                parse_remaining_length(&encoded),
+                Some((len, encoded.len())),
+                "{len}"
+            );
+        }
+        assert_eq!(
+            parse_remaining_length(&[0xFF, 0xFF, 0xFF, 0xFF, 0x01]),
+            None,
+            "5 bytes"
+        );
+
+        assert_eq!(packet_body(&[0x10, 2, 7, 8]), Some(&[7, 8][..]));
+        assert_eq!(
+            packet_body(&[0x10, 1, 7, 8]),
+            None,
+            "one packet per frame: bytes past the packet are refused"
+        );
+        assert_eq!(packet_body(&[0x10, 3, 7, 8]), None, "truncated");
+        assert_eq!(packet_body(&[0x10, 0x80]), None, "unterminated length");
+        assert_eq!(packet_body(&[0x10]), None, "no length");
+        assert_eq!(packet_body(&[]), None);
+
+        // A SUBACK for more than 125 filters needs a two-byte remaining length.
+        let suback = build_suback(7, &[0; 200]);
+        assert_eq!(&suback[..5], &[0x90, 0xCA, 0x01, 0, 7]);
+        assert_eq!(packet_body(&suback).map(<[u8]>::len), Some(202));
+        assert_eq!(build_suback(1, &[SUBACK_FAILURE]), [0x90, 3, 0, 1, 0x80]);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn remaining_length_round_trips(len in 0usize..=268_435_455) {
+            let mut encoded = Vec::new();
+            push_remaining_length(&mut encoded, len);
+            proptest::prop_assert_eq!(parse_remaining_length(&encoded), Some((len, encoded.len())));
+        }
+
+        #[test]
+        fn packet_parsers_never_panic(frame in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64)) {
+            if let Some(body) = packet_body(&frame) {
+                proptest::prop_assert!(body.len() < frame.len());
+            }
+            let _ = connect_token(&frame);
+        }
+    }
+
+    /// A session's topics are stored once each and capped at [`MAX_SUBSCRIPTIONS`]; a
+    /// notification goes out once per stored topic.
+    #[tokio::test]
+    async fn subscriptions_are_distinct_and_capped() {
+        let (in_tx, mut out, notif, _task) = start();
+        in_tx.send(connect()).unwrap();
+        assert_eq!(next(&mut out).await, build_connack(false, 0));
+        // One SUBSCRIBE: "t0" twice, then enough new topics to pass the cap by one.
+        let topics: Vec<String> = std::iter::once("t0".to_string())
+            .chain((0..=MAX_SUBSCRIPTIONS).map(|i| format!("t{i}")))
+            .collect();
+        let mut body = vec![0, 9]; // packet id 9
+        for t in &topics {
+            body.extend_from_slice(&(t.len() as u16).to_be_bytes());
+            body.extend_from_slice(t.as_bytes());
+            body.push(0);
+        }
+        let mut packet = vec![0x82];
+        push_remaining_length(&mut packet, body.len());
+        packet.extend_from_slice(&body);
+        in_tx.send(Message::Binary(packet.into())).unwrap();
+
+        let mut codes = vec![0; MAX_SUBSCRIPTIONS + 1]; // t0, t0 again, t1..
+        codes.push(SUBACK_FAILURE); // one past the cap
+        assert_eq!(next(&mut out).await, build_suback(9, &codes));
+        let mut catch_up = Vec::new();
+        for _ in 0..MAX_SUBSCRIPTIONS {
+            catch_up.push(parse_publish(&next(&mut out).await).0);
+        }
+        assert_eq!(
+            catch_up,
+            topics[1..=MAX_SUBSCRIPTIONS],
+            "one catch-up per stored topic"
+        );
+
+        notif
+            .send(WsMessage::sync_complete(3, "local-server", "u1"))
+            .unwrap();
+        for _ in 0..MAX_SUBSCRIPTIONS {
+            parse_publish(&next(&mut out).await);
+        }
+        in_tx
+            .send(Message::Binary(vec![0xC0, 0x00].into()))
+            .unwrap(); // PINGREQ
+        assert_eq!(
+            next(&mut out).await,
+            build_pingresp(),
+            "nothing past the cap was published"
+        );
+    }
+
+    /// The session ended without writing a single packet (no CONNACK, no PINGRESP).
+    async fn ended_silently(
+        case: &str,
+        mut out: mpsc::UnboundedReceiver<Vec<u8>>,
+        task: tokio::task::JoinHandle<()>,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap_or_else(|_| panic!("{case}: session still open"))
+            .unwrap_or_else(|e| panic!("{case}: {e}"));
+        assert_eq!(out.recv().await, None, "{case}: nothing written");
+    }
+
+    #[tokio::test]
+    async fn anything_but_a_well_formed_connect_first_closes_without_connack() {
+        let cases = [
+            (
+                "truncated CONNECT",
+                vec![0x10, 13, 0, 4, b'M', b'Q', b'T', b'T', 4, 2, 0, 60],
+            ),
+            (
+                "5-byte remaining length",
+                vec![0x10, 0xFF, 0xFF, 0xFF, 0xFF, 0x01],
+            ),
+            ("CONNECT without a remaining length", vec![0x10]),
+            ("SUBSCRIBE first", vec![0x82, 6, 0, 1, 0, 1, b't', 0]),
+            ("PINGREQ first", vec![0xC0, 0x00]),
+            ("reserved packet type first", vec![0xF0, 0x00]),
+            ("empty frame first", vec![]),
+            // Well framed, but not a CONNECT body: authentication (which a header token
+            // would pass whatever the CONNECT says) is never reached.
+            ("CONNECT with an empty body", vec![0x10, 0]),
+            (
+                "CONNECT cut inside its protocol name",
+                vec![0x10, 3, 0, 9, b'M'],
+            ),
+            (
+                "CONNECT and a second packet in one frame",
+                vec![
+                    0x10, 13, 0, 4, b'M', b'Q', b'T', b'T', 4, 2, 0, 60, 0, 1, b'c', 0xC0, 0,
+                ],
+            ),
+        ];
+        for (case, frame) in cases {
+            let (in_tx, out, _notif, task) =
+                start_with(|_| unreachable!("nothing reaches authentication"));
+            in_tx.send(Message::Binary(frame.into())).unwrap();
+            ended_silently(case, out, task).await;
+        }
+
+        // Another protocol level is a well-formed CONNECT this server doesn't speak.
+        let (in_tx, mut out, _notif, task) =
+            start_with(|_| unreachable!("nothing reaches authentication"));
+        in_tx
+            .send(Message::Binary(
+                vec![
+                    0x10, 13, 0, 4, b'M', b'Q', b'T', b'T', 5, 2, 0, 60, 0, 1, b'c',
+                ]
+                .into(),
+            ))
+            .unwrap();
+        assert_eq!(
+            next(&mut out).await,
+            build_connack(false, 1),
+            "unacceptable protocol version"
+        );
+        ended_silently("MQTT 5 CONNECT", out, task).await;
+    }
+
+    /// [MQTT-6.0.0-1]: MQTT is carried only in binary frames, and a text frame closes the
+    /// session whether or not it has CONNECTed; it isn't ignored while the socket stays open.
+    /// (The close code sent with it is checked on a real socket in `lib.rs`.)
+    #[tokio::test]
+    async fn a_text_frame_closes_the_session() {
+        let (in_tx, out, _notif, task) =
+            start_with(|_| unreachable!("nothing reaches authentication"));
+        in_tx.send(Message::Text("x".repeat(4096).into())).unwrap();
+        in_tx.send(connect()).unwrap(); // never read
+        ended_silently("text frame first", out, task).await;
+
+        let (in_tx, mut out, _notif, task) = start();
+        in_tx.send(connect()).unwrap();
+        assert_eq!(next(&mut out).await, build_connack(false, 0));
+        in_tx.send(Message::Text("{}".into())).unwrap();
+        in_tx
+            .send(Message::Binary(vec![0xC0, 0x00].into()))
+            .unwrap(); // PINGREQ, never answered
+        ended_silently("text frame after CONNECT", out, task).await;
+    }
+
+    /// Paused clock: `advance` and the runtime's auto-advance move time, nothing sleeps.
+    #[tokio::test(start_paused = true)]
+    async fn connect_must_arrive_within_the_deadline() {
+        let (_in_tx, mut out, _notif, task) =
+            start_with(|_| unreachable!("nothing reaches authentication"));
+        let opened = tokio::time::Instant::now();
+        tokio::time::timeout(CONNECT_TIMEOUT * 2, task)
+            .await
+            .expect("an idle socket is closed")
+            .unwrap();
+        assert!(
+            opened.elapsed() >= CONNECT_TIMEOUT,
+            "closed at the deadline, not before"
+        );
+        assert_eq!(
+            out.recv().await,
+            None,
+            "idle socket closed, nothing written"
+        );
+
+        let (in_tx, mut out, _notif, _task) = start();
+        tokio::task::yield_now().await; // the session starts its deadline
+        tokio::time::advance(CONNECT_TIMEOUT - Duration::from_secs(1)).await;
+        in_tx.send(connect()).unwrap();
+        assert_eq!(
+            next(&mut out).await,
+            build_connack(false, 0),
+            "a CONNECT just inside the deadline"
+        );
+        tokio::time::advance(CONNECT_TIMEOUT * 2).await;
+        in_tx
+            .send(Message::Binary(vec![0xC0, 0x00].into()))
+            .unwrap(); // PINGREQ
+        assert_eq!(
+            next(&mut out).await,
+            build_pingresp(),
+            "no deadline once connected"
+        );
+    }
+
+    #[test]
     fn connect_token_reads_password_else_username() {
         let body = |m: Message| {
             let Message::Binary(b) = m else {
@@ -844,23 +1243,53 @@ mod tests {
             };
             b[2..].to_vec()
         };
+        let token = |b: &[u8]| connect_token(b).map(|t| t.unwrap_or_else(|| "<none>".into()));
+        assert_eq!(token(&body(connect_with_password("tok"))), Ok("tok".into()));
         assert_eq!(
-            connect_token(&body(connect_with_password("tok"))).as_deref(),
-            Some("tok")
-        );
-        assert_eq!(
-            connect_token(&body(connect_with_password(""))).as_deref(),
-            Some("dev"),
+            token(&body(connect_with_password(""))),
+            Ok("dev".into()),
             "empty password falls back to username"
         );
-        assert_eq!(connect_token(&body(connect())), None, "no credentials");
+        assert_eq!(connect_token(&body(connect())), Ok(None), "no credentials");
         // Will flag set: will topic and message come before the username/password.
         let will = [
             0, 4, b'M', b'Q', b'T', b'T', 4, 0xC6, 0, 60, 0, 1, b'c', 0, 1, b'w', 0, 2, 1, 2, 0, 1,
             b'u', 0, 2, b'p', b'w',
         ];
-        assert_eq!(connect_token(&will).as_deref(), Some("pw"));
-        assert_eq!(connect_token(&will[..will.len() - 1]), None, "truncated");
+        assert_eq!(token(&will), Ok("pw".into()));
+        let mqtt31 = [
+            0, 6, b'M', b'Q', b'I', b's', b'd', b'p', 3, 0xC2, 0, 60, 0, 1, b'c', 0, 1, b'u', 0, 1,
+            b't',
+        ];
+        assert_eq!(token(&mqtt31), Ok("t".into()), "MQTT 3.1");
+
+        // Each of these is refused before any token is looked at.
+        let with = |i: usize, b: u8| {
+            let mut w = will.to_vec();
+            w[i] = b;
+            w
+        };
+        let mut trailing = will.to_vec();
+        trailing.push(0);
+        let malformed: [(&str, Vec<u8>); 9] = [
+            ("empty", vec![]),
+            ("truncated", will[..will.len() - 1].to_vec()),
+            ("trailing byte", trailing),
+            ("protocol name", with(2, b'X')),
+            ("reserved flag bit", with(7, 0xC7)),
+            ("password without username", with(7, 0x46)),
+            ("will QoS without a will", with(7, 0xCA)),
+            ("client id not UTF-8", with(12, 0xFF)),
+            ("keep alive missing", will[..8].to_vec()),
+        ];
+        for (case, b) in malformed {
+            assert_eq!(connect_token(&b), Err(ConnectError::Malformed), "{case}");
+        }
+        assert_eq!(
+            connect_token(&with(6, 5)),
+            Err(ConnectError::UnsupportedLevel),
+            "MQTT 5"
+        );
     }
 
     #[tokio::test]

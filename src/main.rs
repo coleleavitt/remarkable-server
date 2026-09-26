@@ -127,7 +127,21 @@ async fn main() -> Result<()> {
         email_server,
     )?;
     let viewer = screenshare_viewer(screenshare_broker, &state)?;
+    // MQTT-over-WebSocket push at /mqtt: opt-in, since no tablet uses it (see mqtt_ws.rs).
+    let mqtt_ws = remarkable_server::mqtt_ws::router_if_enabled(
+        state.clone(),
+        env::var(remarkable_server::mqtt_ws::ENABLE_ENV)
+            .ok()
+            .as_deref(),
+    );
     let mut app = create_router(state).merge(features);
+    if let Some(mqtt_ws) = mqtt_ws {
+        tracing::info!(
+            "MQTT-over-WebSocket notifications enabled at {}",
+            remarkable_server::mqtt_ws::PATH
+        );
+        app = app.merge(mqtt_ws);
+    }
     if let Some(viewer) = viewer {
         app = app.merge(remarkable_server::screenshare_viewer::router(viewer));
     }

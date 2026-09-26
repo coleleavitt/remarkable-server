@@ -544,6 +544,9 @@ impl Broker {
                         Packet::Subscribe(s) => {
                             let codes = s.filters.iter().map(|f| {
                                 if acl_allows(&user_id, &f.path.replace(['+', '#'], "x"), false) || f.path.starts_with(&format!("user/{user_id}/")) {
+                                    // Filters carry only user and client ids. Debug level, so it is
+                                    // off at the deployed `remarkable_server=info` (GAP_ANALYSIS.md, MQTT).
+                                    tracing::debug!(client = %client_id, filter = %f.path, "mqtt subscribe");
                                     let qos = if f.qos == QoS::ExactlyOnce { QoS::AtLeastOnce } else { f.qos };
                                     if let Some(c) = self.inner.clients.lock().get_mut(&client_id).filter(|c| c.session == session) {
                                         c.subscriptions.retain(|(p, _)| p != &f.path);
