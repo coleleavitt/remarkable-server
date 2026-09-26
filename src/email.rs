@@ -23,7 +23,7 @@ use parking_lot::RwLock;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
 
@@ -33,6 +33,12 @@ use crate::storage::Storage;
 
 /// Supported attachment types
 const SUPPORTED_EXTENSIONS: &[&str] = &["pdf", "epub"];
+
+/// Maximum message size, advertised in EHLO (`SIZE`) and enforced during DATA.
+const MAX_MESSAGE_BYTES: usize = 50 * 1024 * 1024;
+/// Longest single line read at once; longer lines are consumed in pieces, so one
+/// newline-less stream can't grow the line buffer without bound.
+const MAX_LINE_BYTES: u64 = 1024 * 1024;
 
 /// SMTP server configuration
 #[derive(Debug, Clone)]
@@ -208,14 +214,14 @@ impl EmailServer {
     async fn handle_connection(&self, stream: TcpStream, peer: SocketAddr) -> Result<()> {
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
-        let mut line = String::new();
+        let mut line: Vec<u8> = Vec::new();
 
         // Session state
         let session_id = Uuid::new_v4().to_string();
         let mut mail_from: Option<String> = None;
         let mut rcpt_to: Vec<String> = Vec::new();
         let mut in_data = false;
-        let mut data_buf: Vec<u8> = Vec::new();
+        let mut data_buf = DataBuf::new(MAX_MESSAGE_BYTES);
 
         // Send greeting
         let greeting = format!(
@@ -226,22 +232,29 @@ impl EmailServer {
 
         loop {
             line.clear();
-            let bytes_read = reader.read_line(&mut line).await?;
+            let bytes_read = (&mut reader)
+                .take(MAX_LINE_BYTES)
+                .read_until(b'\n', &mut line)
+                .await?;
             if bytes_read == 0 {
                 break; // Connection closed
             }
 
-            let line_trimmed = line.trim();
-            tracing::trace!("SMTP [{session_id}] <- {}", line_trimmed);
-
             if in_data {
                 // Check for end of data
-                if line_trimmed == "." {
+                if line.trim_ascii() == b"." {
                     in_data = false;
 
-                    // Process the email
-                    if let Some(from) = &mail_from {
-                        match self.process_email(from, &rcpt_to, &data_buf).await {
+                    if data_buf.overflowed() {
+                        tracing::warn!(
+                            "SMTP [{session_id}] message over {MAX_MESSAGE_BYTES} bytes discarded"
+                        );
+                        writer
+                            .write_all(b"552 Message size exceeds fixed maximum message size\r\n")
+                            .await?;
+                    } else if let Some(from) = &mail_from {
+                        // Process the email
+                        match self.process_email(from, &rcpt_to, data_buf.bytes()).await {
                             Ok(count) => {
                                 let msg =
                                     format!("250 OK: {} attachment(s) queued for sync\r\n", count);
@@ -259,70 +272,74 @@ impl EmailServer {
                     rcpt_to.clear();
                     data_buf.clear();
                 } else {
-                    // Handle dot-stuffing
-                    let content = if line.starts_with("..") {
-                        &line[1..]
-                    } else {
-                        &line
-                    };
-                    data_buf.extend_from_slice(content.as_bytes());
+                    data_buf.push_line(&line);
                 }
                 continue;
             }
 
-            // Parse SMTP commands
-            let cmd = line_trimmed.to_uppercase();
+            let text = String::from_utf8_lossy(&line);
+            let line_trimmed = text.trim();
+            tracing::trace!("SMTP [{session_id}] <- {}", line_trimmed);
 
-            if cmd.starts_with("HELO") || cmd.starts_with("EHLO") {
-                let response = format!(
-                    "250-{} Hello {}\r\n250-SIZE 52428800\r\n250-8BITMIME\r\n250 OK\r\n",
-                    self.inner.config.domain,
-                    peer.ip()
-                );
-                writer.write_all(response.as_bytes()).await?;
-            } else if cmd.starts_with("MAIL FROM:") {
-                let from = extract_email_address(&line_trimmed[10..]);
-                if from.is_empty() {
-                    writer.write_all(b"501 Invalid sender address\r\n").await?;
-                } else {
-                    mail_from = Some(from);
+            match parse_command(line_trimmed) {
+                SmtpCommand::Hello => {
+                    let response = format!(
+                        "250-{} Hello {}\r\n250-SIZE {MAX_MESSAGE_BYTES}\r\n250-8BITMIME\r\n250 OK\r\n",
+                        self.inner.config.domain,
+                        peer.ip()
+                    );
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                SmtpCommand::MailFrom(arg) => {
+                    let from = extract_email_address(arg);
+                    if from.is_empty() {
+                        writer.write_all(b"501 Invalid sender address\r\n").await?;
+                    } else {
+                        mail_from = Some(from);
+                        writer.write_all(b"250 OK\r\n").await?;
+                    }
+                }
+                SmtpCommand::RcptTo(arg) => {
+                    let to = extract_email_address(arg);
+                    if to.is_empty() {
+                        writer
+                            .write_all(b"501 Invalid recipient address\r\n")
+                            .await?;
+                    } else if !self.validate_recipient(&to) {
+                        writer.write_all(b"550 Unknown recipient\r\n").await?;
+                    } else {
+                        rcpt_to.push(to);
+                        writer.write_all(b"250 OK\r\n").await?;
+                    }
+                }
+                SmtpCommand::Data => {
+                    if mail_from.is_none() || rcpt_to.is_empty() {
+                        writer
+                            .write_all(b"503 MAIL FROM and RCPT TO required first\r\n")
+                            .await?;
+                    } else {
+                        in_data = true;
+                        writer
+                            .write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n")
+                            .await?;
+                    }
+                }
+                SmtpCommand::Quit => {
+                    writer.write_all(b"221 Bye\r\n").await?;
+                    break;
+                }
+                SmtpCommand::Rset => {
+                    mail_from = None;
+                    rcpt_to.clear();
+                    data_buf.clear();
                     writer.write_all(b"250 OK\r\n").await?;
                 }
-            } else if cmd.starts_with("RCPT TO:") {
-                let to = extract_email_address(&line_trimmed[8..]);
-                if to.is_empty() {
-                    writer
-                        .write_all(b"501 Invalid recipient address\r\n")
-                        .await?;
-                } else if !self.validate_recipient(&to) {
-                    writer.write_all(b"550 Unknown recipient\r\n").await?;
-                } else {
-                    rcpt_to.push(to);
+                SmtpCommand::Noop => {
                     writer.write_all(b"250 OK\r\n").await?;
                 }
-            } else if cmd == "DATA" {
-                if mail_from.is_none() || rcpt_to.is_empty() {
-                    writer
-                        .write_all(b"503 MAIL FROM and RCPT TO required first\r\n")
-                        .await?;
-                } else {
-                    in_data = true;
-                    writer
-                        .write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n")
-                        .await?;
+                SmtpCommand::Unknown => {
+                    writer.write_all(b"500 Unknown command\r\n").await?;
                 }
-            } else if cmd == "QUIT" {
-                writer.write_all(b"221 Bye\r\n").await?;
-                break;
-            } else if cmd == "RSET" {
-                mail_from = None;
-                rcpt_to.clear();
-                data_buf.clear();
-                writer.write_all(b"250 OK\r\n").await?;
-            } else if cmd == "NOOP" {
-                writer.write_all(b"250 OK\r\n").await?;
-            } else {
-                writer.write_all(b"500 Unknown command\r\n").await?;
             }
         }
 
@@ -723,6 +740,97 @@ pub struct EmailStats {
     pub total_bytes: u64,
 }
 
+/// One parsed SMTP command line; `MailFrom`/`RcptTo` carry the text after the colon.
+#[derive(Debug, PartialEq, Eq)]
+enum SmtpCommand<'a> {
+    Hello,
+    MailFrom(&'a str),
+    RcptTo(&'a str),
+    Data,
+    Quit,
+    Rset,
+    Noop,
+    Unknown,
+}
+
+/// `s` without `prefix`, matched ASCII-case-insensitively on the original string.
+/// Uses `get` so a multi-byte char straddling the prefix length can't panic.
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &s[prefix.len()..])
+}
+
+/// Parse a (trimmed) SMTP command line. Never panics, whatever the input.
+fn parse_command(line: &str) -> SmtpCommand<'_> {
+    if strip_prefix_ci(line, "HELO").is_some() || strip_prefix_ci(line, "EHLO").is_some() {
+        SmtpCommand::Hello
+    } else if let Some(arg) = strip_prefix_ci(line, "MAIL FROM:") {
+        SmtpCommand::MailFrom(arg)
+    } else if let Some(arg) = strip_prefix_ci(line, "RCPT TO:") {
+        SmtpCommand::RcptTo(arg)
+    } else if line.eq_ignore_ascii_case("DATA") {
+        SmtpCommand::Data
+    } else if line.eq_ignore_ascii_case("QUIT") {
+        SmtpCommand::Quit
+    } else if line.eq_ignore_ascii_case("RSET") {
+        SmtpCommand::Rset
+    } else if line.eq_ignore_ascii_case("NOOP") {
+        SmtpCommand::Noop
+    } else {
+        SmtpCommand::Unknown
+    }
+}
+
+/// DATA accumulator: undoes dot-stuffing and stops buffering once the message would
+/// exceed `max` bytes (the rest is read and discarded; the caller then replies 552).
+#[derive(Debug)]
+struct DataBuf {
+    buf: Vec<u8>,
+    max: usize,
+    overflow: bool,
+}
+
+impl DataBuf {
+    fn new(max: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            max,
+            overflow: false,
+        }
+    }
+
+    fn push_line(&mut self, line: &[u8]) {
+        if self.overflow {
+            return;
+        }
+        let content = if line.starts_with(b"..") {
+            &line[1..]
+        } else {
+            line
+        };
+        if self.buf.len() + content.len() > self.max {
+            self.overflow = true;
+            self.buf = Vec::new(); // release the memory now, not at end of DATA
+        } else {
+            self.buf.extend_from_slice(content);
+        }
+    }
+
+    fn overflowed(&self) -> bool {
+        self.overflow
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.buf
+    }
+
+    fn clear(&mut self) {
+        self.buf.clear();
+        self.overflow = false;
+    }
+}
+
 /// Extract email address from SMTP command argument
 fn extract_email_address(s: &str) -> String {
     let s = s.trim();
@@ -804,6 +912,85 @@ mod tests {
         );
         assert_eq!(sanitize_filename("Report<>|:*?"), "Report");
         assert_eq!(sanitize_filename("a".repeat(100).as_str()).len(), 50);
+    }
+
+    #[test]
+    fn parse_command_is_case_insensitive_and_keeps_argument() {
+        assert_eq!(parse_command("EHLO client"), SmtpCommand::Hello);
+        assert_eq!(parse_command("helo x"), SmtpCommand::Hello);
+        assert_eq!(
+            parse_command("mail from:<A@b.c>"),
+            SmtpCommand::MailFrom("<A@b.c>")
+        );
+        assert_eq!(
+            parse_command("Rcpt To: <send@x.remarkable.local>"),
+            SmtpCommand::RcptTo(" <send@x.remarkable.local>")
+        );
+        assert_eq!(parse_command("data"), SmtpCommand::Data);
+        assert_eq!(parse_command("QUIT"), SmtpCommand::Quit);
+        assert_eq!(parse_command("rset"), SmtpCommand::Rset);
+        assert_eq!(parse_command("NoOp"), SmtpCommand::Noop);
+        assert_eq!(parse_command("DATAX"), SmtpCommand::Unknown);
+        assert_eq!(parse_command(""), SmtpCommand::Unknown);
+    }
+
+    #[test]
+    fn parse_command_never_panics_on_non_ascii() {
+        // `to_uppercase` changes byte lengths ('ß' -> "SS", 'ı' 2 bytes -> 'I' 1 byte),
+        // which made the old `line[10..]` slice land off a char boundary.
+        for line in [
+            "maıl from:<x@y>",
+            "MAIL FROMß",
+            "mail from:ßßß",
+            "rcpt to:ﬀ",
+            "MAIL FRO\u{e9}:",
+            "RCPT T\u{f6}:x",
+            "ä",
+            "RCPT TO",
+        ] {
+            let _ = parse_command(line);
+        }
+        assert_eq!(
+            parse_command("maıl from:<x@y>"),
+            SmtpCommand::Unknown,
+            "dotless i is not ASCII 'i'"
+        );
+        assert_eq!(
+            parse_command("MAIL FROM:<ü@y>"),
+            SmtpCommand::MailFrom("<ü@y>")
+        );
+    }
+
+    #[test]
+    fn data_buf_unstuffs_dots() {
+        let mut d = DataBuf::new(1000);
+        d.push_line(b"Subject: x\r\n");
+        d.push_line(b"..leading dot\r\n");
+        assert_eq!(d.bytes(), b"Subject: x\r\n.leading dot\r\n");
+        assert!(!d.overflowed());
+    }
+
+    #[test]
+    fn data_buf_enforces_size_limit() {
+        let mut d = DataBuf::new(10);
+        d.push_line(b"12345\r\n"); // 7
+        d.push_line(b"abc"); // 10: exactly at the limit is fine
+        assert!(!d.overflowed());
+        d.push_line(b"x"); // 11 > 10
+        assert!(d.overflowed());
+        assert!(d.bytes().is_empty(), "buffer released on overflow");
+        assert_eq!(d.buf.capacity(), 0);
+        d.push_line(&[b'y'; 100]); // further lines discarded
+        assert!(d.bytes().is_empty());
+        d.clear(); // next message (after 552 / RSET) starts fresh
+        assert!(!d.overflowed());
+        d.push_line(b"ok");
+        assert_eq!(d.bytes(), b"ok");
+    }
+
+    #[test]
+    fn data_buf_default_limit_matches_advertised_size() {
+        assert_eq!(MAX_MESSAGE_BYTES, 52_428_800);
     }
 
     #[test]
