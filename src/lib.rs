@@ -235,10 +235,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/debug/files", get(api::list_files))
         .route("/debug/clear", delete(api::clear_storage))
         // Notifications (MQTT over WebSocket)
-        .route(
-            "/notifications/ws/json/1",
-            get(notifications::notifications_ws),
-        )
+        .route("/notifications/ws/json/1", get(notifications::notifications_ws))
+        // Same notifications as MQTT 3.1.1 over WebSocket; path and auth: see mqtt_ws.rs.
+        .route("/mqtt", get(mqtt_ws::mqtt_notifications_ws))
+
         // Screenshare REST room broker (xochitl 3.27+/3.28)
         .route("/screenshare/v1/rooms", post(screenshare_rest::create_room))
         .route(
@@ -269,10 +269,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/oauth/device/code", post(oauth::device_code))
         .route("/oauth/token", post(oauth::token))
         .route("/oauth/revoke", post(oauth::revoke))
-        .route(
-            "/token/json/4/device/exchange",
-            post(oauth::device_exchange),
-        )
+        .route("/oauth/verify", get(oauth::verify_page).post(oauth::verify))
+        .route("/admin/oauth/approve", post(oauth::admin_approve))
+        .route("/token/json/4/device/exchange", post(oauth::device_exchange))
         // Settings and updates
         .route(
             "/settings/v1/beta",
@@ -607,15 +606,10 @@ pub fn feature_routes(
         .is_ok()
         .then(|| feeds.clone().start_scheduler(FEED_CHECK_SECS));
 
-    let cloud = IntegrationState::new();
+    // Cloud syncs may only touch directories under <storage>/integrations.
+    let cloud = IntegrationState::with_sync_base(storage_path.join("integrations"));
     let mut router = Router::new()
-        .nest(
-            "/feeds/v1",
-            feeds::feeds_router(feeds::FeedState {
-                manager: feeds,
-                scheduler,
-            }),
-        )
+        .nest("/feeds/v1", feeds::feeds_router(feeds::FeedState { manager: feeds, scheduler, notification_tx: state.notification_tx.clone() }))
         .nest("/search/v1", search_routes)
         .nest("/versions/v1", versions::version_router(versions))
         .nest(
@@ -627,8 +621,8 @@ pub fn feature_routes(
             readlater_router(ReadLaterState::new(init_readlater_manager(storage_path)?)),
         )
         // xochitl 3.29 uses /storage/; older builds use /cloud. Share one state so both see the same accounts.
-        .nest("/integrations/v2/cloud", integration_router(cloud.clone()))
-        .nest("/integrations/v2/storage", integration_router(cloud));
+        .nest("/integrations/v2/cloud", integrations::integration_api_router(cloud.clone()))
+        .nest("/integrations/v2/storage", integrations::integration_api_router(cloud.clone()));
 
     if let Some(server) = email {
         router = router.nest(
@@ -656,7 +650,12 @@ pub fn feature_routes(
         }
     }
 
-    Ok(router.layer(axum::middleware::from_fn_with_state(state, require_auth)))
+    // The OAuth callback/success pages are hit by the user's browser (no device token), so they
+    // are merged after the auth layer; the callback is authenticated by its one-time PKCE state.
+    let oauth = Router::new()
+        .nest("/integrations/v2/cloud", integrations::integration_oauth_router(cloud.clone()))
+        .nest("/integrations/v2/storage", integrations::integration_oauth_router(cloud));
+    Ok(router.layer(axum::middleware::from_fn_with_state(state, require_auth)).merge(oauth))
 }
 
 #[cfg(test)]
@@ -674,5 +673,75 @@ mod router_tests {
         let state = AppState::new(storage, devices);
         let _ = create_router(state.clone());
         let _ = feature_routes(state, tmp.path(), None).unwrap();
+    }
+
+    /// `/mqtt` is served, refuses clients without a valid token, and pushes an
+    /// authenticated client its own user's SyncComplete but not another user's.
+    #[tokio::test]
+    async fn mqtt_ws_route_requires_auth_and_filters_by_user() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let devices = DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        let token = devices.create_user_token("u1@test").unwrap();
+        let state = AppState::new(Storage::new(tmp.path().join("storage")).unwrap(), devices);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/mqtt", listener.local_addr().unwrap());
+        let router = create_router(state.clone());
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let connect = |auth: Option<&str>| {
+            let mut req = url.as_str().into_client_request().unwrap();
+            if let Some(a) = auth { req.headers_mut().insert("authorization", a.parse().unwrap()); }
+            tokio_tungstenite::connect_async(req)
+        };
+        async fn recv<S: futures_util::Stream<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin>(ws: &mut S) -> Option<Vec<u8>> {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await.expect("timed out") { Some(Ok(Message::Binary(b))) => Some(b.to_vec()), _ => None }
+        }
+        const CONNECT: [u8; 15] = [0x10, 13, 0, 4, b'M', b'Q', b'T', b'T', 4, 2, 0, 60, 0, 1, b'c'];
+
+        match connect(Some("Bearer not-a-token")).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(r)) => assert_eq!(r.status(), 401),
+            other => panic!("bad token must be refused, got {:?}", other.map(|_| ())),
+        }
+        let (mut anon, _) = connect(None).await.unwrap();
+        anon.send(Message::Binary(CONNECT.to_vec().into())).await.unwrap();
+        assert_eq!(recv(&mut anon).await, Some(vec![0x20, 2, 0, 5]), "CONNACK not authorized");
+        let _ = state.notification_tx.send(notifications::WsMessage::sync_complete(1, "d", "u1@test"));
+        assert_eq!(recv(&mut anon).await, None, "closed, nothing published");
+
+        let (mut ws, _) = connect(Some(&format!("Bearer {token}"))).await.unwrap();
+        ws.send(Message::Binary(CONNECT.to_vec().into())).await.unwrap();
+        assert_eq!(recv(&mut ws).await, Some(vec![0x20, 2, 0, 0]));
+        ws.send(Message::Binary(vec![0x82, 6, 0, 1, 0, 1, b't', 0].into())).await.unwrap(); // SUBSCRIBE "t"
+        assert_eq!(recv(&mut ws).await.unwrap()[0], 0x90);
+        assert_eq!(recv(&mut ws).await.unwrap()[0], 0x30, "catch-up SyncComplete");
+        state.notification_tx.send(notifications::WsMessage::sync_complete(2, "d", "other@test")).unwrap();
+        state.notification_tx.send(notifications::WsMessage::sync_complete(3, "d", "u1@test")).unwrap();
+        let publish = recv(&mut ws).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&publish[publish.iter().position(|&b| b == b'{').unwrap()..]).unwrap(); // after topic "t"
+        assert_eq!(body["message"]["attributes"]["auth0UserID"], "u1@test", "other user's SyncComplete was not forwarded");
+        assert_eq!(body["message"]["attributes"]["event"], "SyncComplete");
+    }
+
+    /// A browser returning from the OAuth provider carries no device token: the callback and
+    /// success page must be reachable through the production auth layer; the API must not.
+    #[tokio::test]
+    async fn oauth_browser_routes_bypass_device_auth() {
+        use tower::ServiceExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        let devices = DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        let state = AppState::new(storage, devices);
+        // Merged exactly as main.rs does, so any route conflict would panic here too.
+        let app = create_router(state.clone()).merge(feature_routes(state, tmp.path(), None).unwrap());
+        let get = |uri: &str| axum::http::Request::get(uri).body(axum::body::Body::empty()).unwrap();
+        for mount in ["/integrations/v2/cloud", "/integrations/v2/storage"] {
+            let status = |uri: String| { let app = app.clone(); async move { app.oneshot(get(&uri)).await.unwrap().status() } };
+            assert_eq!(status(format!("{mount}/providers/dropbox/success")).await, axum::http::StatusCode::OK);
+            // Reaches the handler (unknown PKCE state -> 400), not the auth layer (401).
+            assert_eq!(status(format!("{mount}/callback?code=c&state=bogus")).await, axum::http::StatusCode::BAD_REQUEST);
+            assert_eq!(status(format!("{mount}/providers")).await, axum::http::StatusCode::UNAUTHORIZED);
+            assert_eq!(status(format!("{mount}/providers/dropbox/status")).await, axum::http::StatusCode::UNAUTHORIZED);
+        }
     }
 }

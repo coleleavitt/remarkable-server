@@ -224,38 +224,13 @@ impl CalendarManager {
 
     fn load_calendars(&mut self) -> Result<()> {
         let mut stmt = self.db.prepare("SELECT id, name, color, provider, is_primary, read_only, sync_token, last_sync, config FROM calendars").map_err(|e| CalendarError::Database(e.to_string()))?;
-        let calendars = stmt
-            .query_map([], |row| {
-                let config_str: String = row.get(8)?;
-                let config: CalendarConfig =
-                    serde_json::from_str(&config_str).unwrap_or(CalendarConfig::Ics {
-                        path: PathBuf::new(),
-                        watch: false,
-                    });
-                let provider_str: String = row.get(3)?;
-                let provider = match provider_str.as_str() {
-                    "ics" => CalendarProvider::Ics,
-                    "caldav" => CalendarProvider::Caldav,
-                    "google" => CalendarProvider::Google,
-                    "exchange" => CalendarProvider::Exchange,
-                    _ => CalendarProvider::Ics,
-                };
-                Ok(Calendar {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    color: row.get(2)?,
-                    provider,
-                    primary: row.get::<_, i32>(4)? != 0,
-                    read_only: row.get::<_, i32>(5)? != 0,
-                    sync_token: row.get(6)?,
-                    last_sync: row
-                        .get::<_, Option<String>>(7)?
-                        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                        .map(|dt| dt.with_timezone(&Utc)),
-                    config,
-                })
-            })
-            .map_err(|e| CalendarError::Database(e.to_string()))?;
+        let calendars = stmt.query_map([], |row| {
+            let config_str: String = row.get(8)?;
+            let config: CalendarConfig = serde_json::from_str(&config_str).unwrap_or(CalendarConfig::Ics { path: PathBuf::new(), watch: false });
+            let provider_str: String = row.get(3)?;
+            let provider = match provider_str.as_str() { "ics" => CalendarProvider::Ics, "caldav" => CalendarProvider::Caldav, "google" => CalendarProvider::Google, "exchange" => CalendarProvider::Exchange, "office365" => CalendarProvider::Office365, _ => CalendarProvider::Ics };
+            Ok(Calendar { id: row.get(0)?, name: row.get(1)?, color: row.get(2)?, provider, primary: row.get::<_, i32>(4)? != 0, read_only: row.get::<_, i32>(5)? != 0, sync_token: row.get(6)?, last_sync: row.get::<_, Option<String>>(7)?.and_then(|s| DateTime::parse_from_rfc3339(&s).ok()).map(|dt| dt.with_timezone(&Utc)), config })
+        }).map_err(|e| CalendarError::Database(e.to_string()))?;
         let mut cal_map = self.calendars.write();
         for cal in calendars.flatten() {
             cal_map.insert(cal.id.clone(), cal);
@@ -447,56 +422,51 @@ impl CalendarManager {
 
 /// Parse ICS file
 pub fn parse_ics_file(path: &Path, calendar_id: &str) -> Result<Vec<CalendarEvent>> {
-    let content = std::fs::read_to_string(path)?;
+    Ok(parse_ics_str(&std::fs::read_to_string(path)?, calendar_id))
+}
+
+/// Undo RFC 5545 section 3.1 line folding: a line starting with a space or tab continues the
+/// previous line, minus that one leading whitespace character.
+fn unfold_ics_lines(content: &str) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for raw in content.lines() {
+        match (raw.strip_prefix(' ').or_else(|| raw.strip_prefix('\t')), lines.last_mut()) {
+            (Some(rest), Some(prev)) => prev.push_str(rest),
+            _ => lines.push(raw.to_string()),
+        }
+    }
+    lines
+}
+
+/// Parse VEVENTs from ICS text. A DTSTART with `VALUE=DATE` or a bare 8-digit date marks an all-day event.
+pub fn parse_ics_str(content: &str, calendar_id: &str) -> Vec<CalendarEvent> {
     let mut events = Vec::new();
     let mut in_vevent = false;
-    let (mut uid, mut summary, mut dtstart, mut dtend) = (None, None, None, None);
-    for line in content.lines() {
+    let (mut uid, mut summary, mut dtstart, mut dtend, mut all_day) = (None, None, None, None, false);
+    for line in unfold_ics_lines(content) {
         let line = line.trim();
-        if line == "BEGIN:VEVENT" {
-            in_vevent = true;
-            uid = None;
-            summary = None;
-            dtstart = None;
-            dtend = None;
-        } else if line == "END:VEVENT" && in_vevent {
+        if line == "BEGIN:VEVENT" { in_vevent = true; uid = None; summary = None; dtstart = None; dtend = None; all_day = false; }
+        else if line == "END:VEVENT" && in_vevent {
             if let (Some(u), Some(s), Some(start)) = (uid.take(), summary.take(), dtstart.take()) {
-                let end = dtend.take().unwrap_or_else(|| start + Duration::hours(1));
+                let end = dtend.take().unwrap_or_else(|| start + if all_day { Duration::days(1) } else { Duration::hours(1) });
                 let now = Utc::now();
-                events.push(CalendarEvent {
-                    id: format!("{}:{}", calendar_id, u),
-                    calendar_id: calendar_id.to_string(),
-                    uid: u,
-                    summary: s,
-                    description: None,
-                    location: None,
-                    start,
-                    end,
-                    all_day: false,
-                    attendees: Vec::new(),
-                    organizer: None,
-                    meeting_url: None,
-                    status: EventStatus::Confirmed,
-                    created: now,
-                    updated: now,
-                    etag: None,
-                });
+                events.push(CalendarEvent { id: format!("{}:{}", calendar_id, u), calendar_id: calendar_id.to_string(), uid: u, summary: s, description: None, location: None, start, end, all_day, attendees: Vec::new(), organizer: None, meeting_url: None, status: EventStatus::Confirmed, created: now, updated: now, etag: None });
             }
             in_vevent = false;
         } else if in_vevent {
             if let Some((key, value)) = line.split_once(':') {
                 let key_base = key.split(';').next().unwrap_or(key);
-                match key_base {
-                    "UID" => uid = Some(value.to_string()),
-                    "SUMMARY" => summary = Some(value.to_string()),
-                    "DTSTART" => dtstart = parse_ics_datetime(value),
-                    "DTEND" => dtend = parse_ics_datetime(value),
-                    _ => {}
-                }
+                match key_base { "UID" => uid = Some(value.to_string()), "SUMMARY" => summary = Some(value.to_string()), "DTSTART" => { dtstart = parse_ics_datetime(value); all_day = is_ics_date_only(key, value); } "DTEND" => dtend = parse_ics_datetime(value), _ => {} }
             }
         }
     }
-    Ok(events)
+    events
+}
+
+/// True for `DTSTART;VALUE=DATE:...` or a value that is exactly an 8-digit `YYYYMMDD` date.
+fn is_ics_date_only(key: &str, value: &str) -> bool {
+    let value = value.trim();
+    key.split(';').skip(1).any(|p| p.eq_ignore_ascii_case("VALUE=DATE")) || (value.len() == 8 && value.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn parse_ics_datetime(value: &str) -> Option<DateTime<Utc>> {
@@ -525,7 +495,41 @@ pub struct SyncConfig {
 mod tests {
     use super::*;
     #[test]
-    fn test_provider_display() {
-        assert_eq!(CalendarProvider::Google.to_string(), "google");
+    fn test_provider_display() { assert_eq!(CalendarProvider::Google.to_string(), "google"); }
+
+    #[test]
+    fn office365_provider_round_trips_through_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cal.db");
+        let mut mgr = CalendarManager::new(&db).unwrap();
+        let config = CalendarConfig::Office365 { tenant_id: "t".into(), access_token: None, refresh_token: None };
+        mgr.add_calendar(Calendar { id: "c1".into(), name: "Work".into(), color: None, provider: CalendarProvider::Office365, primary: false, read_only: false, sync_token: None, last_sync: None, config }).unwrap();
+        drop(mgr);
+        let cal = CalendarManager::new(&db).unwrap().get_calendar("c1").unwrap();
+        assert_eq!(cal.provider, CalendarProvider::Office365);
+        assert!(matches!(cal.config, CalendarConfig::Office365 { .. }));
+    }
+
+    #[test]
+    fn date_only_events_are_all_day() {
+        let ics = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:a\nSUMMARY:Holiday\nDTSTART;VALUE=DATE:20250704\nDTEND;VALUE=DATE:20250705\nEND:VEVENT\nBEGIN:VEVENT\nUID:b\nSUMMARY:Bare date\nDTSTART:20250801\nEND:VEVENT\nBEGIN:VEVENT\nUID:c\nSUMMARY:Meeting\nDTSTART:20250801T090000Z\nEND:VEVENT\nBEGIN:VEVENT\nUID:d\nSUMMARY:Explicit datetime\nDTSTART;VALUE=DATE-TIME:20250801T090000\nEND:VEVENT\nEND:VCALENDAR\n";
+        let events = parse_ics_str(ics, "cal");
+        let by_uid = |u: &str| events.iter().find(|e| e.uid == u).unwrap();
+        assert!(by_uid("a").all_day);
+        assert_eq!(by_uid("a").end - by_uid("a").start, Duration::days(1));
+        assert!(by_uid("b").all_day);
+        assert_eq!(by_uid("b").end - by_uid("b").start, Duration::days(1));
+        assert!(!by_uid("c").all_day);
+        assert_eq!(by_uid("c").end - by_uid("c").start, Duration::hours(1));
+        assert!(!by_uid("d").all_day);
+    }
+
+    #[test]
+    fn folded_lines_are_unfolded() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:long-\r\n uid@example.com\r\nSUMMARY:Quarterly planning\r\n\t review: part 2\r\nDTSTART:20250801T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let events = parse_ics_str(ics, "cal");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].uid, "long-uid@example.com");
+        assert_eq!(events[0].summary, "Quarterly planning review: part 2");
     }
 }

@@ -7,6 +7,83 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tokio::fs;
+use crate::integrations::IntegrationError;
+
+/// Split a *relative* sync path into components, rejecting anything that could escape
+/// the sync root: absolute paths, `..`/`.`/empty segments, backslashes, NUL, drive prefixes.
+/// Remote file names are attacker-controlled, so every local path is built from this.
+pub(crate) fn safe_components(path: &str) -> Result<Vec<&str>> {
+    let bad = |why: &str| Err(IntegrationError::InvalidPath(format!("{:?}: {}", path, why)));
+    if path.is_empty() { return bad("empty"); }
+    if path.contains('\0') { return bad("NUL byte"); }
+    if path.contains('\\') { return bad("backslash"); }
+    if path.starts_with('/') { return bad("absolute path"); }
+    let parts: Vec<&str> = path.split('/').collect();
+    if let Some(first) = parts.first() {
+        let b = first.as_bytes();
+        if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' { return bad("drive prefix"); }
+    }
+    for part in &parts {
+        if part.is_empty() || *part == "." || *part == ".." { return bad("empty, '.' or '..' segment"); }
+        let mut comps = Path::new(part).components();
+        if !matches!((comps.next(), comps.next()), (Some(std::path::Component::Normal(_)), None)) {
+            return bad("not a plain path segment");
+        }
+    }
+    Ok(parts)
+}
+
+/// Components of a provider path. Providers root paths at `/` (e.g. `/Notes/a.pdf`), meaning
+/// the sync root, so exactly one leading slash is stripped before validation.
+pub(crate) fn cloud_path_components(cloud_path: &str) -> Result<Vec<&str>> {
+    safe_components(cloud_path.strip_prefix('/').unwrap_or(cloud_path))
+}
+
+/// Local destination for a provider path, guaranteed (lexically) to stay under `base`.
+pub(crate) fn local_path_for(base: &Path, cloud_path: &str) -> Result<PathBuf> {
+    let joined = cloud_path_components(cloud_path)?.iter().fold(base.to_path_buf(), |p, c| p.join(c));
+    if !joined.starts_with(base) || joined == base {
+        return Err(IntegrationError::InvalidPath(format!("{:?} escapes sync root", cloud_path)));
+    }
+    Ok(joined)
+}
+
+/// Create `root/rel` one level at a time from the canonical root, resolving each existing
+/// entry and refusing (`Ok(None)`) any that lands outside the root or isn't a directory, so
+/// a symlinked subdirectory can't make us create directories elsewhere. Returns the
+/// canonical directory. `rel` must already be validated (plain `Normal` components).
+pub(crate) async fn create_dirs_within(root: &Path, rel: &Path) -> Result<Option<PathBuf>> {
+    let root = fs::canonicalize(root).await?;
+    let mut cur = root.clone();
+    for c in rel.components() {
+        let next = cur.join(c);
+        match fs::create_dir(&next).await {
+            Ok(()) => { cur = next; continue; }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+        let real = fs::canonicalize(&next).await?;
+        if !real.starts_with(&root) || !fs::metadata(&real).await?.is_dir() { return Ok(None); }
+        cur = real;
+    }
+    Ok(Some(cur))
+}
+
+/// Replace `target` (in `dir`) via a fresh temp file + rename: `create_new` never follows a
+/// symlink and `rename` replaces the directory entry rather than writing through it, so a
+/// symlink swapped in after our checks can't redirect the content. Also makes writes atomic.
+async fn write_replace(dir: &Path, target: &Path, content: &[u8]) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let tmp = dir.join(format!(".rms-sync-{}.tmp", uuid::Uuid::new_v4()));
+    let res = async {
+        let mut f = fs::OpenOptions::new().write(true).create_new(true).open(&tmp).await?;
+        f.write_all(content).await?;
+        f.sync_all().await?;
+        fs::rename(&tmp, target).await
+    }.await;
+    if res.is_err() { let _ = fs::remove_file(&tmp).await; }
+    Ok(res?)
+}
 
 use crate::integrations::conflict::{
     Conflict,
@@ -481,21 +558,15 @@ impl<P: CloudProvider> CloudSync<P> {
 
     /// Upload a file to cloud
     async fn upload_file(&mut self, path: &str, local_info: &(PathBuf, i64, u64)) -> Result<()> {
+        // Keep the relative path (not just the basename) so nested files with the same
+        // name don't collide remotely; validated like downloads.
+        let components = cloud_path_components(path)?;
         let content = fs::read(&local_info.0).await?;
-
-        let name = local_info
-            .0
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".into());
 
         // Determine parent folder
         let parent_id = self.config.cloud_folder.as_deref();
 
-        let cloud_file = self
-            .provider
-            .upload_file(parent_id, &name, &content, None)
-            .await?;
+        let cloud_file = self.provider.upload_file_at(parent_id, &components, &content, None).await?;
 
         // Update state
         self.state.file_map.insert(path.to_string(), cloud_file.id);
@@ -509,19 +580,27 @@ impl<P: CloudProvider> CloudSync<P> {
 
     /// Download a file from cloud
     async fn download_file(&mut self, cloud_file: &CloudFile) -> Result<()> {
+        // Validate before touching the network or the filesystem.
+        let local_path = local_path_for(&self.config.local_path, &cloud_file.path).inspect_err(|e| {
+            tracing::error!("cloud sync: skipping download of {:?}: {}", cloud_file.path, e);
+        })?;
         let content = self.provider.download_file(&cloud_file.id).await?;
 
-        let local_path = self
-            .config
-            .local_path
-            .join(cloud_file.path.trim_start_matches('/'));
-
-        // Create parent directories
-        if let Some(parent) = local_path.parent() {
-            fs::create_dir_all(parent).await?;
+        // Symlinks already inside the sync root must not redirect the write (or any mkdir) elsewhere.
+        let escape = || {
+            tracing::error!("cloud sync: {:?} resolves outside sync root, skipping", cloud_file.path);
+            IntegrationError::InvalidPath(format!("{:?} resolves outside sync root", cloud_file.path))
+        };
+        let (rel_dir, name) = match (local_path.parent().and_then(|p| p.strip_prefix(&self.config.local_path).ok()), local_path.file_name()) {
+            (Some(d), Some(n)) => (d, n),
+            _ => return Err(escape()),
+        };
+        let dir = create_dirs_within(&self.config.local_path, rel_dir).await?.ok_or_else(escape)?;
+        let target = dir.join(name);
+        if fs::symlink_metadata(&target).await.map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+            return Err(escape());
         }
-
-        fs::write(&local_path, &content).await?;
+        write_replace(&dir, &target, &content).await?;
 
         // Update state
         self.state
@@ -563,10 +642,14 @@ impl<P: CloudProvider> CloudSync<P> {
                 continue;
             }
 
-            let local_path = self
-                .config
-                .local_path
-                .join(cloud_file.path.trim_start_matches('/'));
+            let local_path = match local_path_for(&self.config.local_path, &cloud_file.path) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!("cloud sync: skipping change {:?}: {}", cloud_file.path, e);
+                    result.errors.push(format!("Skipped {}: {}", cloud_file.path, e));
+                    continue;
+                }
+            };
 
             // Check if local file exists
             let local_exists = local_path.exists();
@@ -637,6 +720,140 @@ impl<P: CloudProvider> CloudSync<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integrations::{CloudFolder, OAuthToken, ProviderType, StorageQuota};
+    use async_trait::async_trait;
+    use std::sync::Mutex;
+
+    /// In-memory provider: serves `files` (content = id bytes) and records upload names.
+    #[derive(Default)]
+    struct MockProvider { files: Vec<CloudFile>, uploads: Mutex<Vec<String>> }
+
+    fn cf(id: &str, path: &str) -> CloudFile {
+        CloudFile { id: id.into(), name: path.rsplit('/').next().unwrap().into(), mime_type: None, size: 1, modified_at: 1,
+            content_hash: None, parent_id: None, is_folder: false, path: path.into() }
+    }
+
+    #[async_trait]
+    impl CloudProvider for MockProvider {
+        fn provider_type(&self) -> ProviderType { ProviderType::Dropbox }
+        fn is_authenticated(&self) -> bool { true }
+        fn get_token(&self) -> Option<&OAuthToken> { None }
+        fn set_token(&mut self, _: OAuthToken) {}
+        async fn refresh_token(&mut self) -> Result<()> { Ok(()) }
+        async fn list_files(&self, _: Option<&str>) -> Result<Vec<CloudFile>> { Ok(self.files.clone()) }
+        async fn list_folders(&self) -> Result<Vec<CloudFolder>> { Ok(vec![]) }
+        async fn get_file_metadata(&self, id: &str) -> Result<CloudFile> { Err(IntegrationError::NotFound(id.into())) }
+        async fn download_file(&self, id: &str) -> Result<Vec<u8>> { Ok(id.as_bytes().to_vec()) }
+        async fn upload_file(&self, _: Option<&str>, name: &str, _: &[u8], _: Option<&str>) -> Result<CloudFile> {
+            self.uploads.lock().unwrap().push(name.into());
+            Ok(cf(name, &format!("/{}", name)))
+        }
+        async fn create_folder(&self, _: Option<&str>, _: &str) -> Result<CloudFolder> { unimplemented!() }
+        async fn delete(&self, _: &str) -> Result<()> { Ok(()) }
+        async fn move_file(&self, id: &str, _: &str, _: Option<&str>) -> Result<CloudFile> { Err(IntegrationError::NotFound(id.into())) }
+        async fn get_changes(&self, _: Option<&str>) -> Result<(Vec<CloudFile>, Option<String>)> { Ok((self.files.clone(), None)) }
+        async fn get_quota(&self) -> Result<StorageQuota> { Ok(StorageQuota { used: 0, total: None, trash: None }) }
+    }
+
+    fn cfg(dir: &Path, direction: SyncDirection) -> SyncConfig {
+        SyncConfig { local_path: dir.to_path_buf(), direction, ..Default::default() }
+    }
+
+    const EVIL: &[&str] = &["../x", "/../x", "//etc/x", "a/../../x", "..\\x", "a\\..\\..\\x", "C:/x", "c:x", "a/./b", "a//b", "", "/", "x\0y", ".."];
+
+    #[test]
+    fn traversal_names_rejected() {
+        for p in ["../x", "/etc/x", "a/../../x", "..\\x", "C:\\x", "a\0b", "./x", "a//b", "", ".."] {
+            assert!(safe_components(p).is_err(), "accepted {:?}", p);
+        }
+        let base = Path::new("/srv/sync");
+        for p in EVIL {
+            assert!(local_path_for(base, p).is_err(), "accepted {:?}", p);
+        }
+        // A provider-rooted path maps under the base, never to the real /etc.
+        assert_eq!(local_path_for(base, "/etc/x").unwrap(), base.join("etc/x"));
+        assert_eq!(local_path_for(base, "/Notes/a b.pdf").unwrap(), base.join("Notes").join("a b.pdf"));
+        assert_eq!(safe_components("a/b/c.pdf").unwrap(), vec!["a", "b", "c.pdf"]);
+    }
+
+    #[tokio::test]
+    async fn download_skips_traversal_and_keeps_syncing() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let mut files: Vec<CloudFile> = EVIL.iter().enumerate().map(|(i, p)| cf(&format!("evil{}", i), p)).collect();
+        files.push(cf("good", "/sub/ok.txt"));
+        let mut sync = CloudSync::new(MockProvider { files: files.clone(), ..Default::default() }, cfg(&root, SyncDirection::Download));
+        let r = sync.sync().await.unwrap();
+        assert_eq!(r.downloaded, 1);
+        assert_eq!(r.status, SyncStatus::PartialSuccess);
+        assert_eq!(r.errors.len(), EVIL.len());
+        assert_eq!(std::fs::read(root.join("sub/ok.txt")).unwrap(), b"good");
+        assert!(!outer.path().join("x").exists());
+        // Delta sync applies the same validation (fresh root so nothing conflicts).
+        let root2 = outer.path().join("root2");
+        std::fs::create_dir(&root2).unwrap();
+        let mut sync = CloudSync::new(MockProvider { files, ..Default::default() }, cfg(&root2, SyncDirection::Download));
+        let r = sync.delta_sync().await.unwrap();
+        assert_eq!(r.downloaded, 1);
+        assert_eq!(r.errors.len(), EVIL.len());
+        assert!(root2.join("sub/ok.txt").exists());
+        assert!(!outer.path().join("x").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_refuses_symlinked_dir_escape() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(outer.path(), root.join("link")).unwrap();
+        let files = vec![cf("evil", "/link/pwned.txt")];
+        let mut sync = CloudSync::new(MockProvider { files, ..Default::default() }, cfg(&root, SyncDirection::Download));
+        let r = sync.sync().await.unwrap();
+        assert_eq!(r.downloaded, 0);
+        assert!(!outer.path().join("pwned.txt").exists());
+    }
+
+    /// No directory may be created through a symlinked subdirectory, a symlinked target file
+    /// is never written through, and symlinks that stay inside the root still work.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_never_creates_or_writes_through_escaping_symlinks() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("root");
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(outer.path(), root.join("link")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
+        // Hidden, so the local scan skips it and the cloud copy is a pure download.
+        std::fs::write(outer.path().join("victim.txt"), "orig").unwrap();
+        std::os::unix::fs::symlink(outer.path().join("victim.txt"), root.join(".f.txt")).unwrap();
+        let files = vec![cf("evil1", "/link/new/deep/pwned.txt"), cf("evil2", "/.f.txt"), cf("ok", "/alias/sub/ok.txt")];
+        let mut sync = CloudSync::new(MockProvider { files, ..Default::default() }, cfg(&root, SyncDirection::Download));
+        let r = sync.sync().await.unwrap();
+        assert_eq!((r.downloaded, r.errors.len()), (1, 2), "{:?}", r.errors);
+        assert!(!outer.path().join("new").exists(), "mkdir escaped through symlink");
+        assert_eq!(std::fs::read(outer.path().join("victim.txt")).unwrap(), b"orig");
+        assert_eq!(std::fs::read(root.join("real/sub/ok.txt")).unwrap(), b"ok");
+        // Temp files from the atomic write don't linger.
+        assert!(std::fs::read_dir(root.join("real/sub")).unwrap().all(|e| e.unwrap().file_name() == "ok.txt"));
+    }
+
+    #[tokio::test]
+    async fn upload_preserves_nested_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        for sub in ["a", "b/c"] {
+            std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+            std::fs::write(dir.path().join(sub).join("same.pdf"), sub).unwrap();
+        }
+        std::fs::write(dir.path().join("top.pdf"), "t").unwrap();
+        let mut sync = CloudSync::new(MockProvider::default(), cfg(dir.path(), SyncDirection::Upload));
+        let r = sync.sync().await.unwrap();
+        assert_eq!(r.uploaded, 3, "{:?}", r.errors);
+        let mut names = sync.provider.uploads.lock().unwrap().clone();
+        names.sort();
+        assert_eq!(names, vec!["a/same.pdf", "b/c/same.pdf", "top.pdf"]);
+    }
 
     #[test]
     fn test_glob_match() {

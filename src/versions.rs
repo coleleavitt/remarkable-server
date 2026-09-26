@@ -193,12 +193,11 @@ impl VersionManager {
         device_id: Option<&str>,
         message: Option<&str>,
     ) -> Result<VersionInfo> {
-        let db = self
-            .inner
-            .db
-            .lock()
-            .map_err(|e| ServerError::Internal(e.to_string()))?;
-        let config = self.inner.config.read();
+        // Lock order: never hold `config` while acquiring (or holding) `db`.
+        // Copy what we need out of the config first so a queued
+        // `set_retention` writer can never deadlock against `apply_retention`.
+        let store_content_snapshots = self.inner.config.read().store_content_snapshots;
+        let db = self.inner.db.lock().map_err(|e| ServerError::Internal(e.to_string()))?;
 
         // Calculate content hash
         let mut hasher = Sha256::new();
@@ -236,7 +235,7 @@ impl VersionManager {
         }
 
         // Store content snapshot if configured
-        let has_snapshot = if config.store_content_snapshots {
+        let has_snapshot = if store_content_snapshots {
             let version_path = self.version_path(doc_id, next_version);
             if let Some(parent) = version_path.parent() {
                 fs::create_dir_all(parent)?;
@@ -265,7 +264,6 @@ impl VersionManager {
             ],
         )?;
 
-        drop(config);
         drop(db);
 
         // Apply retention policy
@@ -447,16 +445,15 @@ impl VersionManager {
         Ok(restored)
     }
 
-    /// Apply retention policy to a document's versions
-    fn apply_retention(&self, doc_id: &str) -> Result<()> {
-        let config = self.inner.config.read();
-        let db = self
-            .inner
-            .db
-            .lock()
-            .map_err(|e| ServerError::Internal(e.to_string()))?;
+    /// Apply retention policy to a document's versions; returns how many were deleted
+    fn apply_retention(&self, doc_id: &str) -> Result<usize> {
+        // Snapshot the policy and release the config lock before taking `db`
+        // (see lock-order note in `create_version`).
+        let retention = self.inner.config.read().retention.clone();
+        let db = self.inner.db.lock().map_err(|e| ServerError::Internal(e.to_string()))?;
+        let mut deleted = 0;
 
-        match &config.retention {
+        match &retention {
             RetentionPolicy::Count { max_versions } => {
                 // Delete versions beyond the limit
                 let mut stmt = db.prepare(
@@ -474,6 +471,7 @@ impl VersionManager {
 
                 for v in versions_to_delete {
                     self.delete_version_internal(&db, doc_id, v)?;
+                    deleted += 1;
                 }
             }
             RetentionPolicy::TimeBased { max_age_days } => {
@@ -491,6 +489,7 @@ impl VersionManager {
 
                 for v in versions_to_delete {
                     self.delete_version_internal(&db, doc_id, v)?;
+                    deleted += 1;
                 }
             }
             RetentionPolicy::Combined {
@@ -523,6 +522,7 @@ impl VersionManager {
 
                 for v in versions_to_delete {
                     self.delete_version_internal(&db, doc_id, v)?;
+                    deleted += 1;
                 }
             }
             RetentionPolicy::Unlimited => {
@@ -530,7 +530,7 @@ impl VersionManager {
             }
         }
 
-        Ok(())
+        Ok(deleted)
     }
 
     /// Delete a version (internal, assumes db lock held)
@@ -647,10 +647,9 @@ impl VersionManager {
         let mut pruned = 0;
 
         for doc_id in docs {
-            let before = self.version_count(&doc_id)?;
-            self.apply_retention(&doc_id)?;
-            let after = self.version_count(&doc_id)?;
-            pruned += before - after;
+            // Count deletions directly: a before/after count across separate
+            // lock acquisitions underflows if a concurrent sync adds versions.
+            pruned += self.apply_retention(&doc_id)?;
         }
 
         Ok(pruned)
@@ -977,5 +976,40 @@ mod tests {
         let stats = manager.stats().unwrap();
         assert_eq!(stats.total_versions, 3);
         assert_eq!(stats.total_documents, 2);
+    }
+
+    /// Regression: create_version used to take db -> config while
+    /// apply_retention took config -> db; with a queued set_retention writer
+    /// (parking_lot is writer-fair) that deadlocked. Hammer all three paths
+    /// concurrently and fail (instead of hanging) if they don't finish.
+    #[test]
+    fn test_concurrent_create_and_set_retention_no_deadlock() {
+        let (_tmp, manager) = setup();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut handles = Vec::new();
+        for t in 0..4 {
+            let m = manager.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..40 {
+                    m.create_version(&format!("doc{}", t % 2), format!("c{} {}", t, i).as_bytes(), None, None).unwrap();
+                }
+            }));
+        }
+        for t in 0..2 {
+            let m = manager.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..300 {
+                    let p = if (i + t) % 2 == 0 { RetentionPolicy::Count { max_versions: 3 } } else { RetentionPolicy::Unlimited };
+                    m.set_retention(p);
+                    let _ = m.get_retention();
+                    let _ = m.stats().unwrap();
+                }
+            }));
+        }
+        let m = manager.clone();
+        handles.push(std::thread::spawn(move || { for _ in 0..10 { m.prune_all().unwrap(); } }));
+        std::thread::spawn(move || { let ok = handles.into_iter().all(|h| h.join().is_ok()); let _ = done_tx.send(ok); });
+        let ok = done_rx.recv_timeout(std::time::Duration::from_secs(60)).expect("create_version/set_retention deadlocked");
+        assert!(ok, "a worker thread panicked");
     }
 }

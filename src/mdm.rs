@@ -45,29 +45,12 @@ pub async fn get_instruction(
 }
 
 /// `POST /mdm/v1/instruction/status` -> record the device's report and clear the instruction.
-pub async fn post_status(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<Value>,
-) -> Result<StatusCode> {
-    state.auth_user(&headers)?;
-    let id = body
-        .get("id")
-        .or_else(|| body.get("instructionId"))
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    let status = body
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("received");
-    let detail = body
-        .get("detail")
-        .or_else(|| body.get("details"))
-        .or_else(|| body.get("extendedStatus"))
-        .and_then(|v| v.as_str());
-    if !id.is_empty() {
-        state.devices.mdm_set_status(id, status, detail)?;
-    }
+pub async fn post_status(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<Value>) -> Result<StatusCode> {
+    let user = state.auth_user(&headers)?;
+    let id = body.get("id").or_else(|| body.get("instructionId")).and_then(|v| v.as_str()).unwrap_or_default();
+    let status = body.get("status").and_then(|v| v.as_str()).unwrap_or("received");
+    let detail = body.get("detail").or_else(|| body.get("details")).or_else(|| body.get("extendedStatus")).and_then(|v| v.as_str());
+    if !id.is_empty() { state.devices.mdm_set_status(&user, id, status, detail)?; }
     Ok(StatusCode::OK)
 }
 
@@ -182,5 +165,26 @@ mod tests {
                 .status(),
             StatusCode::NO_CONTENT
         );
+    }
+
+    #[tokio::test]
+    async fn status_update_is_scoped_to_owner() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        let devices = DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        let other = devices.create_user_token("someone-else").unwrap();
+        let state = AppState::new(storage, devices);
+        let id = state.devices.mdm_enqueue(LOCAL_USER, "remoteWipe", None, None).unwrap();
+        let mut h = HeaderMap::new();
+        h.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {other}")).unwrap());
+
+        // another user reporting on local-user's instruction is a no-op
+        post_status(State(state.clone()), h, Json(json!({"id": id, "status": "completed"}))).await.unwrap();
+        assert!(!state.devices.mdm_set_status("someone-else", &id, "failed", None).unwrap());
+        assert_eq!(state.devices.mdm_list(LOCAL_USER).unwrap()[0].2, "pending");
+        assert_eq!(state.devices.mdm_next_pending(LOCAL_USER).unwrap().unwrap().0, id);
+        // the owner can still update it
+        assert!(state.devices.mdm_set_status(LOCAL_USER, &id, "completed", None).unwrap());
+        assert!(state.devices.mdm_next_pending(LOCAL_USER).unwrap().is_none());
     }
 }
