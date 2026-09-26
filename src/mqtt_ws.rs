@@ -10,10 +10,12 @@ use axum::{
     },
     response::IntoResponse,
 };
-use futures_util::{SinkExt, StreamExt};
-use tracing::{debug, info, warn, error};
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
+use tokio::sync::broadcast;
+use tracing::{debug, info, warn};
 
 use crate::api::AppState;
+use crate::notifications::WsMessage;
 
 /// MQTT packet types
 #[repr(u8)]
@@ -181,17 +183,73 @@ pub async fn mqtt_notifications_ws(
 
 /// Handle an individual MQTT WebSocket connection
 async fn handle_mqtt_socket(socket: WebSocket, state: AppState) {
+    let (sender, receiver) = socket.split();
+    // Subscribe to broadcast channel for sync notifications
+    let rx = state.notification_tx.subscribe();
+    let storage = state.storage.clone();
+    run_mqtt_session(sender, receiver, rx, move || storage.get_root().generation).await;
+}
+
+/// MQTT PUBLISH packets (QoS 0) carrying `msg` for this session.
+///
+/// Assumption: nothing in this codebase pins the topic xochitl expects for
+/// sync pushes over MQTT-over-WebSocket, so the notification goes out on each
+/// concrete (wildcard-free) topic the client SUBSCRIBEd to. Filters with `+`/`#`
+/// have no single concrete topic and are skipped. The payload is the same
+/// `WsMessage` JSON the `/notifications/ws/json/1` endpoint sends. Screenshare
+/// events are per account and this endpoint is unauthenticated, so they are
+/// never forwarded here.
+fn notification_publishes(msg: &WsMessage, subscriptions: &[String]) -> Vec<Vec<u8>> {
+    if msg.message.attributes.event.starts_with("Screenshare") {
+        return Vec::new();
+    }
+    let Ok(payload) = serde_json::to_vec(msg) else { return Vec::new() };
+    let mut seen: Vec<&str> = Vec::new();
+    subscriptions.iter()
+        .filter(|t| !t.is_empty() && !t.contains(['+', '#']))
+        .filter(|t| if seen.contains(&t.as_str()) { false } else { seen.push(t); true })
+        .map(|t| build_publish(t, &payload, 0, None))
+        .collect()
+}
+
+/// The MQTT session loop: answers the client's packets and pushes broadcast
+/// notifications to it once it has CONNECTed. `generation` supplies the current
+/// root generation for the catch-up SyncComplete sent after a lagged receiver.
+async fn run_mqtt_session<S, R>(mut sender: S, mut receiver: R, mut rx: broadcast::Receiver<WsMessage>, generation: impl Fn() -> u64)
+where
+    S: Sink<Message> + Unpin,
+    R: Stream<Item = Result<Message, axum::Error>> + Unpin,
+{
     let session_id = uuid::Uuid::new_v4().to_string();
     info!(session_id = %session_id, "New MQTT WebSocket connection");
     
-    let (mut sender, mut receiver) = socket.split();
     let mut connected = false;
     let mut subscriptions: Vec<String> = Vec::new();
+    let mut notifications_open = true;
     
-    // Subscribe to broadcast channel for sync notifications
-    let mut rx = state.notification_tx.subscribe();
-    
-    while let Some(result) = receiver.next().await {
+    loop {
+        let result = tokio::select! {
+            incoming = receiver.next() => match incoming { Some(r) => r, None => break },
+            notif = rx.recv(), if notifications_open => {
+                let msg = match notif {
+                    Ok(msg) => msg,
+                    // A skipped SyncComplete would leave the client stale; send a fresh one instead.
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(session_id = %session_id, "MQTT notification client lagged, skipped {n} events");
+                        WsMessage::sync_complete(generation(), "local-server", "local-user")
+                    }
+                    Err(broadcast::error::RecvError::Closed) => { notifications_open = false; continue }
+                };
+                if !connected { continue }
+                for packet in notification_publishes(&msg, &subscriptions) {
+                    if sender.send(Message::Binary(packet.into())).await.is_err() {
+                        info!(session_id = %session_id, "MQTT WebSocket connection closed");
+                        return;
+                    }
+                }
+                continue;
+            }
+        };
         match result {
             Ok(Message::Binary(data)) => {
                 debug!(session_id = %session_id, "Received MQTT binary: {} bytes", data.len());
@@ -348,5 +406,112 @@ impl NotificationMessage {
             source_device_id,
             generation: Some(generation),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    type Harness = (mpsc::UnboundedSender<Message>, mpsc::UnboundedReceiver<Vec<u8>>, broadcast::Sender<WsMessage>, tokio::task::JoinHandle<()>);
+
+    /// In-process MQTT client: feed packets in, read what the server wrote back.
+    fn start() -> Harness {
+        let (in_tx, in_rx) = mpsc::unbounded_channel::<Message>();
+        let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (notif_tx, notif_rx) = broadcast::channel(4);
+        let incoming = Box::pin(futures_util::stream::unfold(in_rx, |mut rx| async move { rx.recv().await.map(|m| (Ok(m), rx)) }));
+        let sink = Box::pin(futures_util::sink::unfold(out_tx, |tx, m: Message| async move {
+            if let Message::Binary(b) = m { let _ = tx.send(b.to_vec()); }
+            Ok::<_, std::convert::Infallible>(tx)
+        }));
+        let task = tokio::spawn(run_mqtt_session(sink, incoming, notif_rx, || 42));
+        (in_tx, out_rx, notif_tx, task)
+    }
+
+    async fn next(rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) -> Vec<u8> {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("timed out").expect("closed")
+    }
+
+    fn connect() -> Message {
+        // CONNECT, MQTT 3.1.1, clean session, keepalive 60, client id "c"
+        Message::Binary(vec![0x10, 13, 0, 4, b'M', b'Q', b'T', b'T', 4, 2, 0, 60, 0, 1, b'c'].into())
+    }
+
+    fn subscribe(topic: &str) -> Message {
+        let mut p = vec![0x82, (2 + 2 + topic.len() + 1) as u8, 0, 1, 0, topic.len() as u8];
+        p.extend_from_slice(topic.as_bytes());
+        p.push(0);
+        Message::Binary(p.into())
+    }
+
+    /// (topic, payload) of a QoS 0 PUBLISH with a one-byte remaining length.
+    fn parse_publish(p: &[u8]) -> (String, serde_json::Value) {
+        assert_eq!(p[0], 0x30, "QoS 0 PUBLISH");
+        let (_, n) = parse_remaining_length(&p[1..]).unwrap();
+        let (topic, tl) = parse_mqtt_string(&p[1 + n..]).unwrap();
+        (topic.to_string(), serde_json::from_slice(&p[1 + n + tl..]).unwrap())
+    }
+
+    #[tokio::test]
+    async fn sync_complete_is_published_to_subscribed_topic() {
+        let (in_tx, mut out, notif, _task) = start();
+        in_tx.send(connect()).unwrap();
+        assert_eq!(next(&mut out).await, build_connack(false, 0));
+        in_tx.send(subscribe("user/u1/sync")).unwrap();
+        in_tx.send(subscribe("user/+/wild")).unwrap();
+        assert_eq!(next(&mut out).await[0], 0x90);
+        assert_eq!(next(&mut out).await[0], 0x90);
+
+        notif.send(WsMessage::sync_complete(7, "local-server", "u1")).unwrap();
+        let (topic, body) = parse_publish(&next(&mut out).await);
+        assert_eq!(topic, "user/u1/sync");
+        assert_eq!(body["message"]["attributes"]["event"], "SyncComplete");
+
+        // Screenshare traffic is per account; this endpoint has no identity.
+        notif.send(WsMessage::screenshare_room_created("u1", "tablet", "r")).unwrap();
+        notif.send(WsMessage::sync_complete(8, "local-server", "u1")).unwrap();
+        let (_, body) = parse_publish(&next(&mut out).await);
+        assert_eq!(body["message"]["attributes"]["event"], "SyncComplete", "wildcard filter and screenshare event produced nothing");
+        assert!(out.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn nothing_is_pushed_before_connect() {
+        let (in_tx, mut out, notif, _task) = start();
+        notif.send(WsMessage::sync_complete(1, "local-server", "u1")).unwrap();
+        in_tx.send(connect()).unwrap();
+        assert_eq!(next(&mut out).await, build_connack(false, 0), "first packet must be CONNACK");
+    }
+
+    #[tokio::test]
+    async fn lagged_receiver_gets_fresh_sync_complete_and_closed_channel_keeps_session() {
+        let (in_tx, mut out, notif, task) = start();
+        in_tx.send(connect()).unwrap();
+        next(&mut out).await;
+        in_tx.send(subscribe("t")).unwrap();
+        next(&mut out).await;
+        // Overflow the capacity-4 channel before the session can drain it.
+        for i in 0..10 { let mut m = WsMessage::event("DocAdded", "x", "u1"); m.message.attributes.id = Some(i.to_string()); notif.send(m).unwrap(); }
+        let (_, first) = parse_publish(&next(&mut out).await);
+        assert_eq!(first["message"]["attributes"]["event"], "SyncComplete", "lag is replaced by a catch-up SyncComplete");
+        for _ in 0..4 { next(&mut out).await; }
+
+        drop(notif);
+        in_tx.send(Message::Binary(vec![0xC0, 0x00].into())).unwrap(); // PINGREQ
+        assert_eq!(next(&mut out).await, build_pingresp(), "session survives a closed broadcast channel");
+        in_tx.send(Message::Binary(vec![0xE0, 0x00].into())).unwrap(); // DISCONNECT
+        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn publish_topics_are_deduplicated_and_concrete() {
+        let subs = vec!["a".to_string(), "a".to_string(), "#".to_string(), "b/+".to_string(), String::new()];
+        let msg = WsMessage::sync_complete(1, "local-server", "u");
+        let packets = notification_publishes(&msg, &subs);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(parse_publish(&packets[0]).0, "a");
     }
 }

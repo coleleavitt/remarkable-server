@@ -615,12 +615,18 @@ impl FeedManager {
         Ok(epub_path)
     }
     
-    /// Sync articles as EPUBs to device folder
-    pub fn sync_articles_to_folder(&self, folder: &str) -> Result<u32> {
+    /// Sync unsynced articles (of `subscription_id`, or all when `None`) as EPUBs
+    /// into the device folder `folder` (see [`crate::documents::ensure_folder`]).
+    pub fn sync_articles_to_folder(&self, subscription_id: Option<&str>, folder: &str) -> Result<u32> {
         let articles = self.list_articles(ArticleQuery {
+            subscription_id: subscription_id.map(String::from),
             unsynced: Some(true),
             ..Default::default()
         })?;
+        if articles.is_empty() {
+            return Ok(0);
+        }
+        let parent = crate::documents::ensure_folder(&self.storage, folder)?;
         
         let mut synced = 0;
         for article in articles {
@@ -635,7 +641,7 @@ impl FeedManager {
             
             // Add to the sync tree as a real document so the device pulls it.
             let epub_data = std::fs::read(&epub_path)?;
-            let (doc_id, _) = crate::documents::create_document(&self.storage, &article.title, "epub", &epub_data)?;
+            let (doc_id, _) = crate::documents::create_document_in(&self.storage, &article.title, "epub", &epub_data, &parent)?;
             tracing::info!("Feed article {:?} ({}) synced as document {}", article.title, folder, doc_id);
             
             // Mark as synced
@@ -1446,7 +1452,8 @@ pub async fn sync_to_device(
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<serde_json::Value>> {
     let sub = state.manager.get_subscription(&id)?;
-    let synced = state.manager.sync_articles_to_folder(&sub.folder)?;
+    // Only this subscription's articles, so each lands in its own configured folder.
+    let synced = state.manager.sync_articles_to_folder(Some(&sub.id), &sub.folder)?;
     Ok(Json(serde_json::json!({ "synced": synced })))
 }
 
@@ -1475,4 +1482,53 @@ pub fn feeds_router(state: FeedState) -> Router {
         .route("/export/opml", get(export_opml))
         .route("/stats", get(get_stats))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod folder_sync_tests {
+    use super::*;
+
+    fn article(id: &str, sub: &str) -> Article {
+        // article_to_epub slices the first 8 chars of the id (real ids are uuids).
+        Article { id: format!("{id}-000000000"), subscription_id: sub.into(), title: format!("Title {id}"), url: format!("https://example.com/{id}"),
+            author: None, summary: None, content_html: Some("<p>hi</p>".into()), content_text: None, published_at: None,
+            fetched_at: Utc::now(), read: false, synced: false, epub_path: None, word_count: None, reading_time_mins: None }
+    }
+
+    /// (visibleName, type, parent) of every node in the current root.
+    fn tree(storage: &Storage) -> Vec<(String, String, String, String)> {
+        let lines = |b: Vec<u8>| String::from_utf8_lossy(&b).lines().skip(1).map(|l| l.split(':').map(String::from).collect::<Vec<_>>()).collect::<Vec<_>>();
+        lines(storage.get(&storage.get_root().hash).unwrap()).into_iter().map(|node| {
+            let meta = lines(storage.get(&node[0]).unwrap()).into_iter().find(|f| f[2] == format!("{}.metadata", node[2])).unwrap();
+            let m: serde_json::Value = serde_json::from_slice(&storage.get(&meta[0]).unwrap()).unwrap();
+            (node[2].clone(), m["visibleName"].as_str().unwrap().into(), m["type"].as_str().unwrap().into(), m["parent"].as_str().unwrap().into())
+        }).collect()
+    }
+
+    #[test]
+    fn sync_places_articles_in_configured_folder() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path().join("storage")).unwrap();
+        let manager = FeedManager::new(&tmp.path().join("feeds.db"), storage.clone(), &tmp.path().join("epub")).unwrap();
+        for sub in ["news", "other"] {
+            manager.db.lock().execute("INSERT INTO subscriptions (id, name, url, feed_type, created_at, updated_at) VALUES (?1, ?1, ?1, 'rss', '', '')", [sub]).unwrap();
+        }
+        manager.save_articles(&[article("a1", "news"), article("b1", "other")]).unwrap();
+
+        assert_eq!(manager.sync_articles_to_folder(Some("news"), "News").unwrap(), 1, "only this subscription's articles");
+        let t = tree(&storage);
+        let folder = t.iter().find(|n| n.2 == "CollectionType").expect("folder created");
+        assert_eq!((folder.1.as_str(), folder.3.as_str()), ("News", ""));
+        let doc = t.iter().find(|n| n.1 == "Title a1").unwrap();
+        assert_eq!(doc.3, folder.0, "document parent is the folder id");
+
+        // Next sync reuses the folder; an empty folder setting keeps the top level.
+        manager.save_articles(&[article("a2", "news")]).unwrap();
+        manager.sync_articles_to_folder(Some("news"), "News").unwrap();
+        manager.sync_articles_to_folder(Some("other"), "").unwrap();
+        let t = tree(&storage);
+        assert_eq!(t.iter().filter(|n| n.2 == "CollectionType").count(), 1);
+        assert_eq!(t.iter().find(|n| n.1 == "Title a2").unwrap().3, folder.0);
+        assert_eq!(t.iter().find(|n| n.1 == "Title b1").unwrap().3, "");
+    }
 }
