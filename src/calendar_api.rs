@@ -133,7 +133,7 @@ pub async fn list_meeting_notes(State(state): State<CalendarState>, Path(id): Pa
 }
 
 #[derive(Serialize)]
-pub struct SyncResponse { pub calendar_id: String, pub events_synced: usize, pub success: bool }
+pub struct SyncResponse { pub calendar_id: String, pub events_synced: usize, pub success: bool, #[serde(skip_serializing_if = "Option::is_none")] pub error: Option<String> }
 
 pub async fn sync_calendar_endpoint(State(state): State<CalendarState>, Path(id): Path<String>) -> Result<Json<SyncResponse>> {
     let calendar = state.manager.lock().get_calendar(&id).ok_or_else(|| ServerError::NotFound(id.clone()))?;
@@ -147,23 +147,32 @@ pub async fn sync_calendar_endpoint(State(state): State<CalendarState>, Path(id)
         }
         _ => 0,
     };
-    Ok(Json(SyncResponse { calendar_id: id, events_synced: count, success: true }))
+    Ok(Json(SyncResponse { calendar_id: id, events_synced: count, success: true, error: None }))
 }
 
 pub async fn sync_all_calendars(State(state): State<CalendarState>) -> Result<Json<Vec<SyncResponse>>> {
     let calendars = state.manager.lock().list_calendars();
     let mut results = Vec::new();
     for calendar in calendars {
-        let count = match &calendar.config {
+        // Per-calendar failures are reported in that calendar's entry (success=false + error)
+        // instead of being swallowed; the rest still sync.
+        let (count, error) = match &calendar.config {
             CalendarConfig::Ics { path, .. } => {
                 match parse_ics_file(path, &calendar.id) {
-                    Ok(events) => { let c = events.len(); let mut mgr = state.manager.lock(); for e in events { let _ = mgr.upsert_event(&e); } c }
-                    Err(_) => 0,
+                    Ok(events) => {
+                        let total = events.len();
+                        let mut mgr = state.manager.lock();
+                        let failures: Vec<String> = events.iter().filter_map(|e| mgr.upsert_event(e).err().map(|err| format!("{}: {}", e.uid, err))).collect();
+                        let error = (!failures.is_empty()).then(|| format!("{} of {} events failed to save: {}", failures.len(), total, failures.join("; ")));
+                        (total - failures.len(), error)
+                    }
+                    Err(e) => (0, Some(format!("ICS load failed: {}", e))),
                 }
             }
-            _ => 0,
+            _ => (0, None),
         };
-        results.push(SyncResponse { calendar_id: calendar.id, events_synced: count, success: true });
+        if let Some(err) = &error { tracing::warn!("calendar {} sync failed: {}", calendar.id, err); }
+        results.push(SyncResponse { calendar_id: calendar.id, events_synced: count, success: error.is_none(), error });
     }
     Ok(Json(results))
 }
@@ -182,3 +191,32 @@ pub async fn get_upcoming_events(State(state): State<CalendarState>, Query(param
 pub struct WebhookPayload { pub resource_id: Option<String> }
 
 pub async fn calendar_webhook(State(_state): State<CalendarState>, Json(_payload): Json<WebhookPayload>) -> Result<impl IntoResponse> { Ok(StatusCode::OK) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ics_calendar(id: &str, path: std::path::PathBuf) -> Calendar {
+        Calendar { id: id.into(), name: id.into(), color: None, provider: CalendarProvider::Ics, primary: false, read_only: false, sync_token: None, last_sync: None, config: CalendarConfig::Ics { path, watch: false } }
+    }
+
+    #[tokio::test]
+    async fn sync_all_reports_per_calendar_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.ics");
+        std::fs::write(&good, "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:1\nSUMMARY:x\nDTSTART:20250101T100000Z\nEND:VEVENT\nEND:VCALENDAR\n").unwrap();
+        let mut mgr = CalendarManager::new(&dir.path().join("cal.db")).unwrap();
+        mgr.add_calendar(ics_calendar("good", good)).unwrap();
+        mgr.add_calendar(ics_calendar("missing", dir.path().join("nope.ics"))).unwrap();
+        let Json(results) = sync_all_calendars(State(CalendarState::new(mgr))).await.unwrap();
+        let good = results.iter().find(|r| r.calendar_id == "good").unwrap();
+        assert!(good.success && good.error.is_none());
+        assert_eq!(good.events_synced, 1);
+        let missing = results.iter().find(|r| r.calendar_id == "missing").unwrap();
+        assert!(!missing.success);
+        assert!(missing.error.as_deref().unwrap().contains("ICS load failed"));
+        // Backward-compatible shape: existing fields still present, `error` only when set.
+        let json = serde_json::to_value(good).unwrap();
+        assert_eq!(json, serde_json::json!({"calendar_id": "good", "events_synced": 1, "success": true}));
+    }
+}
