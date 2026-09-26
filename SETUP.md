@@ -229,3 +229,19 @@ Each document is a tree of blobs referenced by SHA-256 hash. `sync.db` holds the
 ## Remote deployment
 
 For running the server on a VPS (remarkable.unwrap.rs) and the two ways to point the tablet at it (on-tablet `rm-proxy` vs. direct `/etc/hosts`), see [DEPLOYMENT.md](DEPLOYMENT.md).
+
+## Working on remarkable-rs at the same time
+
+The `remarkable-*` crates come from `coleleavitt/remarkable-rs` as git dependencies pinned to a commit
+(see `Cargo.toml`). To build against a local checkout instead, add an uncommitted override in
+`.cargo/config.toml`:
+
+```toml
+[patch."https://github.com/coleleavitt/remarkable-rs"]
+remarkable-lines = { path = "../remarkable/crates/remarkable-lines" }
+remarkable-core = { path = "../remarkable/crates/remarkable-core" }
+remarkable-screenshare = { path = "../remarkable/crates/remarkable-screenshare" }
+remarkable-mqtt = { path = "../remarkable/crates/remarkable-mqtt" }
+```
+
+To move to a newer remarkable-rs, push it, then bump the `rev` in `Cargo.toml` and run `cargo update`.

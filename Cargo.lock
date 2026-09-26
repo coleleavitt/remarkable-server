@@ -2860,6 +2860,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "remarkable-core"
 version = "0.1.0"
+source = "git+https://github.com/coleleavitt/remarkable-rs?rev=9fe198ac95f84d70161236b04234e6c1f13864f7#9fe198ac95f84d70161236b04234e6c1f13864f7"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2873,6 +2874,7 @@ dependencies = [
 [[package]]
 name = "remarkable-lines"
 version = "0.1.0"
+source = "git+https://github.com/coleleavitt/remarkable-rs?rev=9fe198ac95f84d70161236b04234e6c1f13864f7#9fe198ac95f84d70161236b04234e6c1f13864f7"
 dependencies = [
  "byteorder",
  "remarkable-core",
@@ -2882,6 +2884,7 @@ dependencies = [
 [[package]]
 name = "remarkable-mqtt"
 version = "0.1.0"
+source = "git+https://github.com/coleleavitt/remarkable-rs?rev=9fe198ac95f84d70161236b04234e6c1f13864f7#9fe198ac95f84d70161236b04234e6c1f13864f7"
 dependencies = [
  "base64 0.22.1",
  "rumqttc",
@@ -2896,6 +2899,7 @@ dependencies = [
 [[package]]
 name = "remarkable-screenshare"
 version = "0.1.0"
+source = "git+https://github.com/coleleavitt/remarkable-rs?rev=9fe198ac95f84d70161236b04234e6c1f13864f7#9fe198ac95f84d70161236b04234e6c1f13864f7"
 dependencies = [
  "bytes",
  "flate2",
