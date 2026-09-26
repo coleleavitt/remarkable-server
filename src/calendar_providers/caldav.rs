@@ -1,6 +1,10 @@
 //! CalDAV (RFC 4791): find the calendar collection, then run a `calendar-query` REPORT over
 //! the sync window and feed each returned VCALENDAR through the ICS parser.
 //!
+//! Recurring events come back expanded into their occurrences (`<C:expand>`); from servers
+//! that cannot expand, the masters are expanded here (see [`parse_ics_expanded`]). `TZID=`
+//! times are converted with the VTIMEZONEs sent along.
+//!
 //! Discovery (RFC 4791 section 7 / RFC 6764) starts at the configured URL: a calendar
 //! collection is used as is; otherwise its `calendar-home-set` (directly or through
 //! `current-user-principal`) is listed and the calendar holding events is chosen, by display
@@ -11,16 +15,28 @@
 //! Redirects and hrefs are followed, but credentials only go to the configured host and hosts
 //! of the same site (iCloud serves calendar homes from per-user hosts), a hop to another
 //! origin must stay on HTTPS, and it may not lead to another host's loopback or private
-//! address.
+//! address: not by IP literal ([`follow`]), and not by a name that resolves to one
+//! ([`super::dns`]).
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
+use std::sync::Arc;
 
 use reqwest::header::{CONTENT_TYPE, LOCATION};
 use reqwest::{Method, StatusCode, Url};
 
+use super::dns::{Lookup, is_internal_ip};
 use super::xml::{self, CALDAV, DAV, Element};
-use super::{Fetched, MAX_BODY_BYTES, SyncWindow, network_error, read_body, redact, snippet};
-use crate::calendar::{Calendar, CalendarError, Result, parse_ics_str};
+use super::{
+    Fetched,
+    MAX_BODY_BYTES,
+    SyncWindow,
+    caldav_client,
+    network_error,
+    read_body,
+    redact,
+    snippet,
+};
+use crate::calendar::{Calendar, CalendarError, Expansion, Result, parse_ics_expanded};
 
 /// Redirect hops followed per request (e.g. `/.well-known/caldav` to the DAV root).
 const MAX_REDIRECTS: usize = 5;
@@ -166,7 +182,7 @@ impl Dav<'_> {
 /// Resolve a redirect or href. A hop may only leave the current origin for HTTPS (e.g. iCloud
 /// serves calendar homes from per-user hosts), and never for another host's loopback, private
 /// or link-local address: the server must not be able to aim this process at internal
-/// services.
+/// services. Host names are vetted again when they are resolved, see [`super::dns`].
 fn follow(from: &Url, target: &str) -> Result<Url> {
     let next = from.join(target).map_err(|e| {
         CalendarError::Backend(format!(
@@ -195,41 +211,18 @@ fn follow(from: &Url, target: &str) -> Result<Url> {
     Ok(next)
 }
 
-/// `localhost`, or an IP literal that is not a public unicast address.
+/// `localhost`, or an IP literal that is not a public unicast address. Other names are
+/// checked when they resolve.
 fn is_internal(url: &Url) -> bool {
     if let Some(domain) = url.domain() {
         let domain = domain.trim_end_matches('.');
         return domain.eq_ignore_ascii_case("localhost") || domain.ends_with(".localhost");
     }
     let host = url.host_str().unwrap_or("");
-    let Ok(ip) = host
-        .trim_start_matches('[')
+    host.trim_start_matches('[')
         .trim_end_matches(']')
         .parse::<IpAddr>()
-    else {
-        return true;
-    };
-    let internal_v4 = |v4: Ipv4Addr| {
-        let [a, b, ..] = v4.octets();
-        v4.is_loopback()
-            || v4.is_private()
-            || v4.is_link_local()
-            || v4.is_unspecified()
-            || v4.is_broadcast()
-            || a == 0
-            // 100.64.0.0/10, carrier-grade NAT.
-            || (a == 100 && b & 0xc0 == 64)
-    };
-    match ip {
-        IpAddr::V4(v4) => internal_v4(v4),
-        IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_unique_local()
-                || v6.is_unicast_link_local()
-                || v6.to_ipv4_mapped().is_some_and(internal_v4)
-        }
-    }
+        .map_or(true, is_internal_ip)
 }
 
 /// Whether the credentials configured for `configured` may go to `target`: always to the same
@@ -248,8 +241,21 @@ fn may_send_credentials(configured: &Url, target: &Url) -> bool {
 
 /// The registrable domain of a DNS name, approximated without a public-suffix list: its last
 /// two labels, or three under a two-letter country code with a short second level
-/// (`example.co.uk`, `example.com.au`). Single-label names (`localhost`) have none. Where the
-/// guess is too narrow, credentials are withheld rather than sent too widely.
+/// (`example.co.uk`, `example.com.au`). Single-label names (`localhost`) have none.
+///
+/// Limits of the approximation, as there is no Public Suffix List here (it would be a new
+/// dependency that needs updating):
+/// - Too narrow, under a country code with a short name (`dav.abc.de` and `p1.abc.de` are
+///   taken as two sites): credentials are withheld from the other host and the sync fails
+///   with "not sending the credentials"; configuring the calendar collection's own URL
+///   avoids the hop.
+/// - Too wide, under suffixes where unrelated parties get sibling names (shared hosting such
+///   as `*.github.io` or `*.herokuapp.com`, and two-label public suffixes the country-code
+///   rule misses): a server there that redirects or links to another tenant's host sends
+///   the credentials along, over HTTPS. Such a hop starts at the configured server, which
+///   holds the credentials already.
+///
+/// Every such hop still has to use HTTPS and pass [`follow`] and [`super::dns`].
 fn site(domain: &str) -> Option<&str> {
     let domain = domain.trim_end_matches('.');
     let mut labels = domain.rsplit('.');
@@ -578,10 +584,8 @@ async fn report(
     let mut response = dav
         .send("REPORT", collection, "1", &calendar_query(window, true))
         .await?;
-    // Servers without `expand` support reject the query; ask for the plain data instead. Not
-    // after a 5xx, which is usually transient: the plain data stores a recurring event as one
-    // master instead of one event per occurrence, so the occurrences would be dropped until
-    // the next sync.
+    // Servers without `expand` support reject the query; ask for the plain data instead and
+    // expand the recurring events here. Not after a 5xx, which is usually transient.
     if matches!(
         response.status,
         StatusCode::BAD_REQUEST
@@ -611,21 +615,40 @@ async fn report(
             r.href.as_ref().map_or_else(|| "a resource".into(), redact)
         ))
     });
+    // Expanded here too: a server may also ignore `expand` and send the masters anyway.
+    let mut expansion = Expansion::new(window.start, window.end);
     let mut events = Vec::new();
     for resource in resources {
         let Some(data) = resource.calendar_data else {
             continue;
         };
-        for mut event in parse_ics_str(&data, calendar_id) {
+        for mut event in parse_ics_expanded(&data, calendar_id, &mut expansion) {
             event.etag = resource.etag.clone();
             events.push(event);
         }
     }
+    let unknown: Vec<&str> = expansion.unknown_zones().collect();
+    if !unknown.is_empty() {
+        tracing::warn!(
+            "caldav: REPORT {}: time zones without a VTIMEZONE ({}) were read as UTC",
+            redact(&response.url),
+            unknown.join(", ")
+        );
+    }
+    let incomplete = incomplete.or_else(|| {
+        expansion.truncated().then(|| {
+            format!(
+                "caldav: REPORT {}: too many recurring event occurrences or time zone rules \
+                 to go through in one sync, so stored events it did not list were kept",
+                redact(&response.url)
+            )
+        })
+    });
     Ok(Fetched { events, incomplete })
 }
 
 pub(super) async fn fetch(
-    http: &reqwest::Client,
+    lookup: &Arc<dyn Lookup>,
     account: &Account<'_>,
     collection_url: &mut Option<String>,
     calendar: &Calendar,
@@ -634,8 +657,9 @@ pub(super) async fn fetch(
     let start = Url::parse(account.url.trim()).map_err(|e| {
         CalendarError::Backend(format!("caldav: invalid url {:?}: {}", account.url, e))
     })?;
+    let http = caldav_client(start.host_str().unwrap_or(""), lookup.clone())?;
     let dav = Dav {
-        http,
+        http: &http,
         account,
         configured: &start,
     };
@@ -659,9 +683,124 @@ pub(super) async fn fetch(
 
 #[cfg(test)]
 mod tests {
+    use axum::http::{Method as HttpMethod, Uri};
+    use axum::response::IntoResponse;
     use chrono::{TimeZone, Utc};
+    use parking_lot::Mutex;
 
+    use super::super::dns::tests::FakeLookup;
     use super::*;
+    use crate::calendar::{CalendarConfig, CalendarProvider};
+
+    fn calendar() -> Calendar {
+        Calendar {
+            id: "c".into(),
+            name: "Work".into(),
+            color: None,
+            provider: CalendarProvider::Caldav,
+            primary: false,
+            read_only: false,
+            sync_token: None,
+            last_sync: None,
+            config: CalendarConfig::Ics {
+                path: Default::default(),
+                watch: false,
+            },
+        }
+    }
+
+    /// A DAV server on a loopback port: `/cal/` is a calendar collection with one event, and
+    /// `/moved/` redirects to `redirect_to`. Returns its port and the paths it was asked for.
+    async fn loopback_dav(redirect_to: &'static str) -> (u16, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = axum::Router::new().fallback({
+            let seen = seen.clone();
+            move |method: HttpMethod, uri: Uri| async move {
+                seen.lock().push(format!("{} {}", method, uri.path()));
+                let multistatus = |inner: &str| {
+                    (
+                        StatusCode::MULTI_STATUS,
+                        format!(
+                            r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">{}</d:multistatus>"#,
+                            inner
+                        ),
+                    )
+                        .into_response()
+                };
+                match (method.as_str(), uri.path()) {
+                    (_, "/moved/") => (
+                        StatusCode::MOVED_PERMANENTLY,
+                        [("location", redirect_to.replace("PORT", &port.to_string()))],
+                    )
+                        .into_response(),
+                    ("PROPFIND", "/cal/") => multistatus(
+                        r#"<d:response><d:href>/cal/</d:href><d:propstat><d:prop>
+                           <d:resourcetype><d:collection/><c:calendar/></d:resourcetype>
+                           </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"#,
+                    ),
+                    ("REPORT", "/cal/") => multistatus(
+                        "<d:response><d:href>/cal/a.ics</d:href><d:propstat><d:prop>\
+                         <c:calendar-data>BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:a\nDTSTART:20260105T090000Z\nEND:VEVENT\nEND:VCALENDAR\n</c:calendar-data>\
+                         </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>",
+                    ),
+                    _ => StatusCode::NOT_FOUND.into_response(),
+                }
+            }
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (port, seen)
+    }
+
+    async fn sync(url: &str, lookup: Arc<dyn Lookup>) -> Result<Fetched> {
+        let account = Account {
+            url,
+            username: "alice",
+            password: Some("pw"),
+            bearer_token: None,
+        };
+        let window = SyncWindow {
+            start: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            end: Utc.with_ymd_and_hms(2027, 1, 1, 0, 0, 0).unwrap(),
+        };
+        fetch(&lookup, &account, &mut None, &calendar(), window).await
+    }
+
+    #[tokio::test]
+    async fn the_configured_host_may_resolve_to_an_internal_address() {
+        let (port, seen) = loopback_dav("unused").await;
+        // A LAN server known by name, e.g. a Nextcloud at nextcloud.lan.
+        let lookup = FakeLookup::new(&[("nextcloud.lan", &["127.0.0.1"])]);
+        let fetched = sync(&format!("http://nextcloud.lan:{}/cal/", port), lookup)
+            .await
+            .unwrap();
+        assert_eq!(fetched.events.len(), 1);
+        assert_eq!(*seen.lock(), ["PROPFIND /cal/", "REPORT /cal/"]);
+    }
+
+    #[tokio::test]
+    async fn other_hosts_resolving_to_internal_addresses_are_not_contacted() {
+        // A hop to a host of the same site over HTTPS passes every check made on the URL
+        // (credentials may go there, it is no IP literal); its name resolves to loopback.
+        let (port, seen) = loopback_dav("https://internal.example.test:PORT/cal/").await;
+        let lookup = FakeLookup::new(&[
+            ("dav.example.test", &["127.0.0.1"]),
+            ("internal.example.test", &["127.0.0.1"]),
+        ]);
+        let err = sync(&format!("http://dav.example.test:{}/moved/", port), lookup)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("resolves only to internal addresses"),
+            "{}",
+            err
+        );
+        assert!(!err.contains("pw"), "{}", err);
+        // Only the configured host was ever asked.
+        assert_eq!(*seen.lock(), ["PROPFIND /moved/"]);
+    }
 
     #[test]
     fn multistatus_resources_keep_only_ok_propstats() {

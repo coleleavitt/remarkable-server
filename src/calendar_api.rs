@@ -684,19 +684,20 @@ fn sync_ics(state: &CalendarState, calendar: &Calendar, path: &std::path::Path) 
                         .map(|err| format!("{}: {}", e.uid, err))
                 })
                 .collect();
-            let error = (!failures.is_empty()).then(|| {
-                format!(
+            let error = if failures.is_empty() {
+                // Reported like a remote sync's: a sync whose time was not saved did not
+                // fully succeed.
+                mgr.set_last_sync(&calendar.id, Utc::now())
+                    .err()
+                    .map(|e| format!("saving sync time failed: {}", e))
+            } else {
+                Some(format!(
                     "{} of {} events failed to save: {}",
                     failures.len(),
                     total,
                     failures.join("; ")
-                )
-            });
-            if error.is_none() {
-                if let Err(e) = mgr.set_last_sync(&calendar.id, Utc::now()) {
-                    tracing::warn!("calendar {}: saving sync time failed: {}", calendar.id, e);
-                }
-            }
+                ))
+            };
             (total - failures.len(), error)
         }
         Err(e) => (0, Some(format!("ICS load failed: {}", e))),
@@ -829,6 +830,48 @@ mod tests {
             last_sync: None,
             config: CalendarConfig::Ics { path, watch: false },
         }
+    }
+
+    #[tokio::test]
+    async fn sync_all_reports_an_ics_sync_time_that_was_not_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let ics = dir.path().join("good.ics");
+        std::fs::write(
+            &ics,
+            "BEGIN:VEVENT\nUID:1\nDTSTART:20250101T100000Z\nEND:VEVENT\n",
+        )
+        .unwrap();
+        let db = dir.path().join("cal.db");
+        let mut mgr = CalendarManager::new(&db).unwrap();
+        mgr.add_calendar(ics_calendar("ics", ics)).unwrap();
+        // The database refuses to record sync times from now on.
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER no_sync_time BEFORE UPDATE OF last_sync ON calendars \
+                 BEGIN SELECT RAISE(ABORT, 'disk is full'); END;",
+            )
+            .unwrap();
+        let state = CalendarState::new(mgr);
+        let Json(results) = sync_all_calendars(State(state.clone())).await.unwrap();
+        let result = &results[0];
+        assert!(!result.success);
+        assert_eq!(result.events_synced, 1);
+        let error = result.error.as_deref().unwrap();
+        assert!(
+            error.contains("saving sync time failed") && error.contains("disk is full"),
+            "{}",
+            error
+        );
+        assert!(
+            state
+                .manager
+                .lock()
+                .get_calendar("ics")
+                .unwrap()
+                .last_sync
+                .is_none()
+        );
     }
 
     #[tokio::test]

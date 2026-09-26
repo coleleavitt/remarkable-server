@@ -73,8 +73,21 @@ impl<'a> Session<'a> {
         self.http
     }
 
+    /// The refresh token, unless it is missing or blank.
+    fn refresh_token(&self) -> Option<String> {
+        self.tokens
+            .refresh_token
+            .clone()
+            .filter(|t| !t.trim().is_empty())
+    }
+
+    /// The client id, unless it is missing or blank.
+    fn client_id(&self) -> Option<&'a str> {
+        self.client.client_id.filter(|id| !id.trim().is_empty())
+    }
+
     fn can_refresh(&self) -> bool {
-        !self.refreshed && self.tokens.refresh_token.is_some() && self.client.client_id.is_some()
+        !self.refreshed && self.refresh_token().is_some() && self.client_id().is_some()
     }
 
     /// A usable access token: the stored one unless it is missing or about to expire.
@@ -94,13 +107,13 @@ impl<'a> Session<'a> {
     /// Exchange the refresh token for a new access token and record both.
     async fn refresh(&mut self) -> Result<String> {
         let provider = self.client.provider;
-        let refresh_token = self.tokens.refresh_token.clone().ok_or_else(|| {
+        let refresh_token = self.refresh_token().ok_or_else(|| {
             CalendarError::AuthRequired(format!(
                 "{}: no usable access token and no refresh_token configured",
                 provider
             ))
         })?;
-        let client_id = self.client.client_id.ok_or_else(|| {
+        let client_id = self.client_id().ok_or_else(|| {
             CalendarError::AuthRequired(format!(
                 "{}: client_id is required to refresh the access token",
                 provider
@@ -194,5 +207,46 @@ pub(super) fn api_error(context: &str, status: StatusCode, body: &str) -> Calend
         CalendarError::AuthRequired(message)
     } else {
         CalendarError::Backend(message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn blank_refresh_tokens_and_client_ids_are_not_used() {
+        let http = reqwest::Client::new();
+        for (refresh_token, client_id, expected) in [
+            ("", "app", "no refresh_token configured"),
+            ("  ", "app", "no refresh_token configured"),
+            ("r1", "", "client_id is required"),
+        ] {
+            let (mut access, mut refresh, mut expires) =
+                (None, Some(refresh_token.to_string()), None);
+            let mut session = Session::new(
+                &http,
+                Client {
+                    provider: "test",
+                    // Never contacted: nothing usable to send.
+                    token_url: "http://127.0.0.1:9/token".into(),
+                    client_id: Some(client_id),
+                    client_secret: None,
+                    scope: None,
+                },
+                Tokens {
+                    access_token: &mut access,
+                    refresh_token: &mut refresh,
+                    expires_at: &mut expires,
+                },
+            );
+            assert!(!session.can_refresh());
+            let err = session.access_token().await.unwrap_err();
+            assert!(
+                matches!(&err, CalendarError::AuthRequired(m) if m.contains(expected)),
+                "{:?}",
+                err
+            );
+        }
     }
 }

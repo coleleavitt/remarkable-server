@@ -846,6 +846,138 @@ END:VCALENDAR
     assert_eq!(events[0].start, midnight(day) + Duration::hours(15));
 }
 
+#[tokio::test]
+async fn caldav_fallback_expands_recurring_events_in_their_time_zone() {
+    // A server without `expand` sends the weekly master with its RRULE, local TZID times and
+    // the VTIMEZONE, plus the VEVENT of one moved occurrence.
+    let today = Utc::now().date_naive();
+    let d = |n: i64| (today + Duration::days(n)).format("%Y%m%d").to_string();
+    let exdates = Arc::new(Mutex::new(vec![d(7)]));
+    let reports = Arc::new(Mutex::new(Vec::new()));
+    let base = serve({
+        let (exdates, reports) = (exdates.clone(), reports.clone());
+        move |_| {
+            Router::new().fallback(move |method: Method, body: String| async move {
+                match method.as_str() {
+                    "PROPFIND" => multistatus(
+                        r#"<d:response><d:href>/cal/</d:href><d:propstat><d:prop>
+                            <d:resourcetype><d:collection/><cal:calendar/></d:resourcetype>
+                           </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"#,
+                    ),
+                    "REPORT" if body.contains("expand") => {
+                        reports.lock().push("expand");
+                        (StatusCode::NOT_IMPLEMENTED, "expand unsupported").into_response()
+                    }
+                    "REPORT" => {
+                        reports.lock().push("plain");
+                        let d = |n: i64| (today + Duration::days(n)).format("%Y%m%d").to_string();
+                        let ex: String = exdates
+                            .lock()
+                            .iter()
+                            .map(|day| format!("EXDATE;TZID=Asia/Kolkata:{}T090000\r\n", day))
+                            .collect();
+                        let ics = format!(
+                            "BEGIN:VCALENDAR\r\nBEGIN:VTIMEZONE\r\nTZID:Asia/Kolkata\r\nBEGIN:STANDARD\r\nTZOFFSETFROM:+0530\r\nTZOFFSETTO:+0530\r\nDTSTART:19700101T000000\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:weekly@dav\r\nSUMMARY:Sync\r\nDTSTART;TZID=Asia/Kolkata:{start}T090000\r\nDURATION:PT30M\r\nRRULE:FREQ=WEEKLY;COUNT=5\r\n{ex}END:VEVENT\r\nBEGIN:VEVENT\r\nUID:weekly@dav\r\nRECURRENCE-ID;TZID=Asia/Kolkata:{moved}T090000\r\nSUMMARY:Sync (later)\r\nDTSTART;TZID=Asia/Kolkata:{moved}T100000\r\nDURATION:PT30M\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+                            start = d(-7),
+                            moved = d(14),
+                            ex = ex
+                        );
+                        multistatus(&format!(
+                            r#"<d:response><d:href>/cal/weekly.ics</d:href><d:propstat><d:prop>
+                                <d:getetag>"w1"</d:getetag>
+                                <cal:calendar-data>{}</cal:calendar-data>
+                               </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"#,
+                            ics_escape_xml(&ics)
+                        ))
+                    }
+                    _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+                }
+            })
+        }
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut mgr = CalendarManager::new(&dir.path().join("calendars.db")).unwrap();
+    mgr.add_calendar(calendar(
+        "w",
+        "Team",
+        CalendarProvider::Caldav,
+        CalendarConfig::Caldav {
+            url: format!("{}/cal/", base),
+            username: String::new(),
+            password: None,
+            bearer_token: None,
+            collection_url: None,
+        },
+    ))
+    .unwrap();
+    let state = CalendarState::new(mgr);
+    let sync = || {
+        let state = state.clone();
+        async move {
+            let axum::Json(r) = sync_calendar_endpoint(State(state), Path("w".into()))
+                .await
+                .unwrap();
+            r
+        }
+    };
+
+    let first = sync().await;
+    assert!(first.success, "{:?}", first.error);
+    assert_eq!(*reports.lock(), ["expand", "plain"]);
+    // COUNT=5 weekly from a week ago; the second week is cancelled (EXDATE) and the fourth
+    // moved, so: two occurrences of the rule, the moved one, and the last one.
+    assert_eq!(first.events_synced, 4);
+    let at = |days: i64, hour: u32, minute: u32| {
+        (today + Duration::days(days))
+            .and_hms_opt(hour, minute, 0)
+            .unwrap()
+            .and_utc()
+    };
+    let mut events: Vec<_> = all_events(&state, "w")
+        .into_iter()
+        .map(|e| (e.start, e.end - e.start, e.summary, e.id))
+        .collect();
+    events.sort();
+    // 09:00 in India is 03:30 UTC.
+    assert_eq!(
+        events,
+        [
+            (
+                at(-7, 3, 30),
+                Duration::minutes(30),
+                "Sync".to_string(),
+                format!("w:weekly@dav:{}T033000Z", d(-7))
+            ),
+            (
+                at(0, 3, 30),
+                Duration::minutes(30),
+                "Sync".to_string(),
+                format!("w:weekly@dav:{}T033000Z", d(0))
+            ),
+            (
+                at(14, 4, 30),
+                Duration::minutes(30),
+                "Sync (later)".to_string(),
+                format!("w:weekly@dav:{}T033000Z", d(14))
+            ),
+            (
+                at(21, 3, 30),
+                Duration::minutes(30),
+                "Sync".to_string(),
+                format!("w:weekly@dav:{}T033000Z", d(21))
+            ),
+        ]
+    );
+
+    // Occurrence ids are stable, so one cancelled upstream is removed on the next sync.
+    exdates.lock().push(d(21));
+    let second = sync().await;
+    assert!(second.success, "{:?}", second.error);
+    assert_eq!((second.events_synced, second.events_removed), (3, 1));
+    assert_eq!(all_events(&state, "w").len(), 3);
+}
+
 // ---------------------------------------------------------------------------------------
 // Error reporting and secrecy
 // ---------------------------------------------------------------------------------------

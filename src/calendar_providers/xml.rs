@@ -94,6 +94,10 @@ fn element(
     })
 }
 
+/// A well-formed document has exactly one root element; anything after it is a broken or
+/// concatenated response, not more of the answer.
+const SECOND_ROOT: &str = "XML document has more than one root element";
+
 /// Parse a document into its root element.
 pub(super) fn parse(xml: &str) -> Result<Element, String> {
     parse_limited(xml, MAX_NODES)
@@ -112,20 +116,26 @@ fn parse_limited(xml: &str, max_nodes: usize) -> Result<Element, String> {
                 if stack.len() >= MAX_DEPTH {
                     return Err("XML nested too deeply".into());
                 }
+                if stack.is_empty() && root.is_some() {
+                    return Err(SECOND_ROOT.into());
+                }
                 stack.push(element(namespace(&res), &e, &mut budget, max_nodes)?);
             }
             Event::Empty(e) => {
+                if stack.is_empty() && root.is_some() {
+                    return Err(SECOND_ROOT.into());
+                }
                 let el = element(namespace(&res), &e, &mut budget, max_nodes)?;
                 match stack.last_mut() {
                     Some(parent) => parent.children.push(el),
-                    None => root = root.or(Some(el)),
+                    None => root = Some(el),
                 }
             }
             Event::End(_) => {
                 let el = stack.pop().ok_or("unbalanced end tag")?;
                 match stack.last_mut() {
                     Some(parent) => parent.children.push(el),
-                    None => root = root.or(Some(el)),
+                    None => root = Some(el),
                 }
             }
             Event::Text(t) => {
@@ -197,6 +207,11 @@ mod tests {
         assert!(parse("<a>").is_err());
         assert!(parse("").is_err());
         assert!(parse("<a>&bogus;</a>").is_err());
+        for two_roots in ["<a/><b/>", "<a></a><b>x</b>", "<a/><b></b>", "<a></a><b/>"] {
+            assert_eq!(parse(two_roots).unwrap_err(), SECOND_ROOT, "{}", two_roots);
+        }
+        // Comments, processing instructions and whitespace around the root are fine.
+        assert!(parse("<?xml version=\"1.0\"?>\n<a/>\n<!-- done -->\n").is_ok());
     }
 
     #[test]

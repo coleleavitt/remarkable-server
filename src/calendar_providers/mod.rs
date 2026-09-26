@@ -13,6 +13,7 @@
 //! the same trust level as ICS file paths.
 
 mod caldav;
+mod dns;
 mod google;
 mod graph;
 mod oauth;
@@ -106,8 +107,35 @@ impl Fetched {
 /// Shared HTTP client and endpoints for remote calendar syncs.
 #[derive(Clone)]
 pub struct RemoteSync {
+    /// For the hosted APIs (Google, Microsoft Graph), whose hosts are fixed.
     http: reqwest::Client,
     endpoints: Arc<ProviderEndpoints>,
+    /// Name resolution under the CalDAV clients, see [`caldav_client`].
+    lookup: Arc<dyn dns::Lookup>,
+}
+
+/// Timeouts, no automatic redirects and the user agent, for every provider client.
+fn client_builder() -> reqwest::ClientBuilder {
+    // Redirects are not followed automatically: CalDAV needs them followed with the same
+    // method and body (REPORT/PROPFIND), and the hosted APIs never redirect.
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("remarkable-server/", env!("CARGO_PKG_VERSION")))
+}
+
+/// A client for one CalDAV account configured at `configured_host`. Its names resolve
+/// through [`dns::GuardedResolver`]: only the configured host (and the proxies from the
+/// environment) may reach internal addresses, so a server cannot point this process at
+/// internal services by redirecting it to a name that resolves to one.
+fn caldav_client(configured_host: &str, lookup: Arc<dyn dns::Lookup>) -> Result<reqwest::Client> {
+    let proxies = dns::proxy_hosts(|name| std::env::var(name).ok());
+    let trusted = std::iter::once(configured_host).chain(proxies.iter().map(String::as_str));
+    client_builder()
+        .dns_resolver(Arc::new(dns::GuardedResolver::new(trusted, lookup)))
+        .build()
+        .map_err(|e| CalendarError::Backend(format!("caldav: cannot set up HTTP client: {}", e)))
 }
 
 impl Default for RemoteSync {
@@ -118,13 +146,7 @@ impl Default for RemoteSync {
 
 impl RemoteSync {
     pub fn new(endpoints: ProviderEndpoints) -> Self {
-        // Redirects are not followed automatically: CalDAV needs them followed with the same
-        // method and body (REPORT/PROPFIND), and the hosted APIs never redirect.
-        let http = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent(concat!("remarkable-server/", env!("CARGO_PKG_VERSION")))
+        let http = client_builder()
             .build()
             // Only fails if the TLS backend cannot initialise, which every other client in
             // the process would hit as well.
@@ -132,6 +154,7 @@ impl RemoteSync {
         Self {
             http,
             endpoints: Arc::new(endpoints),
+            lookup: Arc::new(dns::SystemLookup),
         }
     }
 
@@ -164,7 +187,7 @@ impl RemoteSync {
                     password: password.as_deref(),
                     bearer_token: bearer_token.as_deref(),
                 };
-                caldav::fetch(&self.http, &account, collection_url, calendar, window).await
+                caldav::fetch(&self.lookup, &account, collection_url, calendar, window).await
             }
             CalendarConfig::Google {
                 calendar_id,
