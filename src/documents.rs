@@ -86,6 +86,17 @@ fn file_type(content_type: &str) -> Result<&'static str> {
     }
 }
 
+/// The current root and its entries, or an error if the root index isn't one we can safely rewrite.
+fn current_root_entries(storage: &Storage) -> Result<(crate::types::SyncRoot, Vec<Entry>)> {
+    let root = storage.get_root();
+    if root.hash.is_empty() { return Ok((root, Vec::new())); }
+    let entries = parse_root(&storage.get(&root.hash)?).map_err(|why| {
+        tracing::error!(root = %root.hash, generation = root.generation, %why, "refusing to add document: root index not understood");
+        ServerError::Internal(format!("refusing to modify root index: {why}"))
+    })?;
+    Ok((root, entries))
+}
+
 /// Add a new PDF/EPUB document at the top level and commit a new root. Returns the document id.
 pub fn create_document(storage: &Storage, name: &str, ext: &str, data: &[u8]) -> Result<(String, u64)> {
     let id = uuid::Uuid::new_v4().to_string();
@@ -100,6 +111,9 @@ pub fn create_document(storage: &Storage, name: &str, ext: &str, data: &[u8]) ->
         "pages": [], "textScale": 1,
     });
 
+    // Refuse up front, before writing any blobs, so a root we won't rewrite doesn't leave
+    // an orphaned document behind on every rejected upload. (Re-checked on each attempt below.)
+    current_root_entries(storage)?;
     let mut files = vec![
         put_leaf(storage, format!("{id}.metadata"), &serde_json::to_vec_pretty(&metadata)?)?,
         put_leaf(storage, format!("{id}.content"), &serde_json::to_vec_pretty(&content)?)?,
@@ -113,15 +127,7 @@ pub fn create_document(storage: &Storage, name: &str, ext: &str, data: &[u8]) ->
     };
 
     for _ in 0..ROOT_RETRIES {
-        let root = storage.get_root();
-        let mut entries: Vec<Entry> = if root.hash.is_empty() {
-            Vec::new()
-        } else {
-            parse_root(&storage.get(&root.hash)?).map_err(|why| {
-                tracing::error!(root = %root.hash, generation = root.generation, %why, "refusing to add document: root index not understood");
-                ServerError::Internal(format!("refusing to modify root index: {why}"))
-            })?
-        };
+        let (root, mut entries) = current_root_entries(storage)?;
         entries.push(doc_entry());
         let root_hash = index_hash(&mut entries)?;
         storage.put_with_hash(&render_index(&entries), &root_hash, "root.docSchema")?;
@@ -199,8 +205,9 @@ mod tests {
         ];
         for index in bad {
             let (storage, root_hash, _tmp) = storage_with_root(&index);
-            let before = storage.get_root();
+            let (before, blobs) = (storage.get_root(), storage.list_hashes().unwrap().len());
             assert!(create_document(&storage, "Book", "pdf", b"%PDF-1.4").is_err(), "{index:?}");
+            assert_eq!(storage.list_hashes().unwrap().len(), blobs, "rejected upload must not leave orphan blobs");
             let after = storage.get_root();
             assert_eq!((after.hash.as_str(), after.generation), (root_hash.as_str(), before.generation), "root must be unchanged");
             assert_eq!(storage.get(&root_hash).unwrap(), index.as_bytes());

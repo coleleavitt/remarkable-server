@@ -42,7 +42,7 @@ pub fn parse_goog_hash_strict(header: &str) -> Option<u32> {
     let mut crc = None;
     for part in header.split(',') {
         let (key, value) = part.trim().split_once('=')?;
-        if value.trim().is_empty() { return None; }
+        if key.trim().is_empty() || value.trim().is_empty() { return None; }
         if key.trim().eq_ignore_ascii_case("crc32c") {
             let bytes: [u8; 4] = STANDARD.decode(value.trim()).ok()?.try_into().ok()?;
             if crc.replace(u32::from_be_bytes(bytes)).is_some() { return None; }
@@ -113,7 +113,7 @@ mod tests {
         assert_eq!(parse_goog_hash_strict("crc32c=4waSgw==,md5=XUFAKrxLKna5cZ2REBfFkg=="), Some(0xE3069283));
         assert_eq!(parse_goog_hash_strict("md5=XUFAKrxLKna5cZ2REBfFkg==, crc32c=4waSgw=="), Some(0xE3069283));
         for bad in ["", "invalid", "crc32c=", "crc32c=!!!", "crc32c=AAAAAAAA", "md5=XUFAKrxLKna5cZ2REBfFkg==",
-                    "crc32c=4waSgw==,crc32c=4waSgw==", "crc32c=4waSgw==,junk"] {
+                    "crc32c=4waSgw==,crc32c=4waSgw==", "crc32c=4waSgw==,junk", "crc32c=4waSgw==,=anything", "crc32c=4waSgw==, =x"] {
             assert_eq!(parse_goog_hash_strict(bad), None, "{bad:?}");
         }
     }
