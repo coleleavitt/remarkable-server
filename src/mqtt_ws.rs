@@ -146,10 +146,11 @@ fn parse_remaining_length(data: &[u8]) -> Option<(usize, usize)> {
 }
 
 /// The variable header and payload of the MQTT packet in `frame` (everything after the
-/// fixed header). `None` when its remaining length is malformed or runs past the frame.
+/// fixed header). `None` when its remaining length is malformed or does not end exactly
+/// at the end of the frame: this endpoint reads one whole packet per frame.
 fn packet_body(frame: &[u8]) -> Option<&[u8]> {
     let (len, n) = parse_remaining_length(frame.get(1..)?)?;
-    frame.get(1 + n..1 + n + len)
+    (frame.len() - 1 - n == len).then(|| &frame[1 + n..])
 }
 
 /// Append `len` in MQTT's variable-length remaining-length encoding.
@@ -182,32 +183,69 @@ fn parse_mqtt_string(data: &[u8]) -> Option<(&str, usize)> {
     Some((std::str::from_utf8(b).ok()?, n))
 }
 
+/// Why a CONNECT is refused before its credentials are looked at.
+#[derive(Debug, PartialEq)]
+enum ConnectError {
+    /// Not a conforming CONNECT (MQTT 3.1.1 §3.1): the connection is closed without a
+    /// CONNACK [MQTT-3.1.4-1].
+    Malformed,
+    /// A protocol level other than MQTT 3.1.1 (or 3.1 as `MQIsdp`): CONNACK 0x01, then
+    /// close [MQTT-3.1.2-2].
+    UnsupportedLevel,
+}
+
 /// The token a CONNECT (variable header + payload) carries: its password, or its
 /// username when the password is empty or absent, as the screenshare broker reads it.
-/// `None` when it has no credentials or is malformed.
-fn connect_token(body: &[u8]) -> Option<String> {
-    let (_, mut at) = parse_mqtt_string(body)?; // protocol name
-    let flags = *body.get(at + 1)?; // after the protocol level
-    at += 4; // level, flags, keep alive
-    at += parse_mqtt_bytes(body.get(at..)?)?.1; // client id
-    if flags & 0x04 != 0 {
-        for _ in 0..2 {
-            at += parse_mqtt_bytes(body.get(at..)?)?.1;
-        } // will topic, will message
+/// `Ok(None)` when it has no credentials, or only non-UTF-8 ones. Every field its flags
+/// declare must be there and nothing may follow them, so a malformed CONNECT is refused
+/// even on an upgrade already authenticated by its `Authorization` header.
+fn connect_token(body: &[u8]) -> Result<Option<String>, ConnectError> {
+    use ConnectError::Malformed;
+    let (protocol, mut at) = parse_mqtt_string(body).ok_or(Malformed)?;
+    let &[level, flags, _, _] = body.get(at..at + 4).ok_or(Malformed)? else {
+        return Err(Malformed); // level, flags, keep alive
+    };
+    at += 4;
+    match (protocol, level) {
+        ("MQTT", 4) | ("MQIsdp", 3) => {}
+        ("MQTT" | "MQIsdp", _) => return Err(ConnectError::UnsupportedLevel),
+        _ => return Err(Malformed), // [MQTT-3.1.2-1]
     }
-    let mut username = None;
-    if flags & 0x80 != 0 {
-        let (u, n) = parse_mqtt_bytes(body.get(at..)?)?;
-        username = Some(u);
+    // Reserved bit [MQTT-3.1.2-3]; will QoS/retain without a will [MQTT-3.1.2-11/-13/-15];
+    // a password without a username [MQTT-3.1.2-22].
+    let (will, username_flag, password_flag) =
+        (flags & 0x04 != 0, flags & 0x80 != 0, flags & 0x40 != 0);
+    if flags & 0x01 != 0 || (!will && flags & 0x38 != 0) || (password_flag && !username_flag) {
+        return Err(Malformed);
+    }
+    let mut field = |string: bool| -> Result<&[u8], ConnectError> {
+        let (b, n) = parse_mqtt_bytes(body.get(at..).ok_or(Malformed)?).ok_or(Malformed)?;
+        if string && std::str::from_utf8(b).is_err() {
+            return Err(Malformed);
+        }
         at += n;
+        Ok(b)
+    };
+    field(true)?; // client id
+    if will {
+        field(true)?; // will topic
+        field(false)?; // will message
     }
-    let password = if flags & 0x40 != 0 {
-        Some(parse_mqtt_bytes(body.get(at..)?)?.0)
+    let username = if username_flag {
+        Some(field(true)?)
     } else {
         None
     };
-    let token = password.filter(|p| !p.is_empty()).or(username)?;
-    String::from_utf8(token.to_vec()).ok()
+    let password = if password_flag {
+        Some(field(false)?)
+    } else {
+        None
+    };
+    if at != body.len() {
+        return Err(Malformed);
+    }
+    let token = password.filter(|p| !p.is_empty()).or(username);
+    Ok(token.and_then(|t| String::from_utf8(t.to_vec()).ok()))
 }
 
 /// Build CONNACK packet
@@ -276,10 +314,12 @@ fn build_publish(topic: &str, payload: &[u8], qos: u8, packet_id: Option<u16>) -
 /// username), as the screenshare broker accepts. A CONNECT without a valid token
 /// gets CONNACK "not authorized" and the socket is closed. The first packet must be
 /// a well-formed CONNECT, sent within [`CONNECT_TIMEOUT`]: a malformed or truncated
-/// CONNECT, any other packet first, or none in time closes the socket without a
-/// CONNACK (MQTT 3.1.1 §3.1.0, §3.1.4). Each binary frame is read as one whole
-/// packet, as Paho and mqtt.js send them; packets split across frames (which §6.0
-/// allows) are not reassembled, so a split CONNECT counts as truncated. A connected
+/// CONNECT (checked field by field before any token, header or CONNECT, is looked at),
+/// any other packet first, or none in time closes the socket without a CONNACK (MQTT
+/// 3.1.1 §3.1.0, §3.1.4); a protocol level other than 3.1.1 or 3.1 gets CONNACK 0x01.
+/// Each binary frame is read as one whole packet, as Paho and mqtt.js send them;
+/// packets split across frames or sharing one (which §6.0 allows) are not handled, so
+/// such a CONNECT counts as malformed. A connected
 /// session is closed once the device its token belongs to is revoked (deleted or
 /// re-paired).
 pub async fn mqtt_notifications_ws(
@@ -476,14 +516,26 @@ async fn run_mqtt_session<S, R>(
                             warn!(session_id = %session_id, "second MQTT CONNECT, closing");
                             break;
                         }
-                        // [MQTT-3.1.4-1]: a CONNECT that does not parse closes the
-                        // connection without a CONNACK.
-                        let Some(body) = packet_body(&data) else {
-                            warn!(session_id = %session_id, "malformed MQTT CONNECT, closing");
-                            break;
+                        // Validated before authentication, which a header token would
+                        // otherwise pass whatever the CONNECT says.
+                        let token = match packet_body(&data)
+                            .ok_or(ConnectError::Malformed)
+                            .and_then(connect_token)
+                        {
+                            Ok(token) => token,
+                            Err(ConnectError::Malformed) => {
+                                warn!(session_id = %session_id, "malformed MQTT CONNECT, closing");
+                                break;
+                            }
+                            Err(ConnectError::UnsupportedLevel) => {
+                                warn!(session_id = %session_id, "MQTT CONNECT for an unsupported protocol level, refusing");
+                                let _ = sender
+                                    .send(Message::Binary(build_connack(false, 1).into()))
+                                    .await; // unacceptable protocol version
+                                break;
+                            }
                         };
                         info!(session_id = %session_id, "MQTT CONNECT received");
-                        let token = connect_token(body);
                         let Some(auth) = authenticate(token.as_deref()) else {
                             warn!(session_id = %session_id, "MQTT CONNECT without a valid token, refusing");
                             let _ = sender
@@ -941,8 +993,8 @@ mod tests {
         assert_eq!(packet_body(&[0x10, 2, 7, 8]), Some(&[7, 8][..]));
         assert_eq!(
             packet_body(&[0x10, 1, 7, 8]),
-            Some(&[7][..]),
-            "bytes past the packet are not its body"
+            None,
+            "one packet per frame: bytes past the packet are refused"
         );
         assert_eq!(packet_body(&[0x10, 3, 7, 8]), None, "truncated");
         assert_eq!(packet_body(&[0x10, 0x80]), None, "unterminated length");
@@ -1002,6 +1054,19 @@ mod tests {
             ("PINGREQ first", vec![0xC0, 0x00]),
             ("reserved packet type first", vec![0xF0, 0x00]),
             ("empty frame first", vec![]),
+            // Well framed, but not a CONNECT body: authentication (which a header token
+            // would pass whatever the CONNECT says) is never reached.
+            ("CONNECT with an empty body", vec![0x10, 0]),
+            (
+                "CONNECT cut inside its protocol name",
+                vec![0x10, 3, 0, 9, b'M'],
+            ),
+            (
+                "CONNECT and a second packet in one frame",
+                vec![
+                    0x10, 13, 0, 4, b'M', b'Q', b'T', b'T', 4, 2, 0, 60, 0, 1, b'c', 0xC0, 0,
+                ],
+            ),
         ];
         for (case, frame) in cases {
             let (in_tx, out, _notif, task) =
@@ -1010,14 +1075,23 @@ mod tests {
             ended_silently(case, out, task).await;
         }
 
-        // A well-formed CONNECT with a malformed payload still parses as a CONNECT, so it
-        // gets the usual not-authorized CONNACK.
-        let (in_tx, mut out, _notif, task) = start_with(|t| t.map(|_| "u1".to_string()));
+        // Another protocol level is a well-formed CONNECT this server doesn't speak.
+        let (in_tx, mut out, _notif, task) =
+            start_with(|_| unreachable!("nothing reaches authentication"));
         in_tx
-            .send(Message::Binary(vec![0x10, 3, 0, 9, b'M'].into()))
+            .send(Message::Binary(
+                vec![
+                    0x10, 13, 0, 4, b'M', b'Q', b'T', b'T', 5, 2, 0, 60, 0, 1, b'c',
+                ]
+                .into(),
+            ))
             .unwrap();
-        assert_eq!(next(&mut out).await, build_connack(false, 5));
-        ended_silently("bad CONNECT payload", out, task).await;
+        assert_eq!(
+            next(&mut out).await,
+            build_connack(false, 1),
+            "unacceptable protocol version"
+        );
+        ended_silently("MQTT 5 CONNECT", out, task).await;
     }
 
     /// Paused clock: `advance` and the runtime's auto-advance move time, nothing sleeps.
@@ -1068,23 +1142,53 @@ mod tests {
             };
             b[2..].to_vec()
         };
+        let token = |b: &[u8]| connect_token(b).map(|t| t.unwrap_or_else(|| "<none>".into()));
+        assert_eq!(token(&body(connect_with_password("tok"))), Ok("tok".into()));
         assert_eq!(
-            connect_token(&body(connect_with_password("tok"))).as_deref(),
-            Some("tok")
-        );
-        assert_eq!(
-            connect_token(&body(connect_with_password(""))).as_deref(),
-            Some("dev"),
+            token(&body(connect_with_password(""))),
+            Ok("dev".into()),
             "empty password falls back to username"
         );
-        assert_eq!(connect_token(&body(connect())), None, "no credentials");
+        assert_eq!(connect_token(&body(connect())), Ok(None), "no credentials");
         // Will flag set: will topic and message come before the username/password.
         let will = [
             0, 4, b'M', b'Q', b'T', b'T', 4, 0xC6, 0, 60, 0, 1, b'c', 0, 1, b'w', 0, 2, 1, 2, 0, 1,
             b'u', 0, 2, b'p', b'w',
         ];
-        assert_eq!(connect_token(&will).as_deref(), Some("pw"));
-        assert_eq!(connect_token(&will[..will.len() - 1]), None, "truncated");
+        assert_eq!(token(&will), Ok("pw".into()));
+        let mqtt31 = [
+            0, 6, b'M', b'Q', b'I', b's', b'd', b'p', 3, 0xC2, 0, 60, 0, 1, b'c', 0, 1, b'u', 0, 1,
+            b't',
+        ];
+        assert_eq!(token(&mqtt31), Ok("t".into()), "MQTT 3.1");
+
+        // Each of these is refused before any token is looked at.
+        let with = |i: usize, b: u8| {
+            let mut w = will.to_vec();
+            w[i] = b;
+            w
+        };
+        let mut trailing = will.to_vec();
+        trailing.push(0);
+        let malformed: [(&str, Vec<u8>); 9] = [
+            ("empty", vec![]),
+            ("truncated", will[..will.len() - 1].to_vec()),
+            ("trailing byte", trailing),
+            ("protocol name", with(2, b'X')),
+            ("reserved flag bit", with(7, 0xC7)),
+            ("password without username", with(7, 0x46)),
+            ("will QoS without a will", with(7, 0xCA)),
+            ("client id not UTF-8", with(12, 0xFF)),
+            ("keep alive missing", will[..8].to_vec()),
+        ];
+        for (case, b) in malformed {
+            assert_eq!(connect_token(&b), Err(ConnectError::Malformed), "{case}");
+        }
+        assert_eq!(
+            connect_token(&with(6, 5)),
+            Err(ConnectError::UnsupportedLevel),
+            "MQTT 5"
+        );
     }
 
     #[tokio::test]

@@ -820,6 +820,13 @@ mod router_tests {
             .send(notifications::WsMessage::sync_complete(1, "d", "u1@test"));
         assert_eq!(recv(&mut anon).await, None, "closed, nothing published");
 
+        // A valid header token does not excuse a malformed CONNECT (here an empty body).
+        let (mut bad, _) = connect(Some(&format!("Bearer {token}"))).await.unwrap();
+        bad.send(Message::Binary(vec![0x10, 0].into()))
+            .await
+            .unwrap();
+        assert_eq!(recv(&mut bad).await, None, "closed without a CONNACK");
+
         let (mut ws, _) = connect(Some(&format!("Bearer {token}"))).await.unwrap();
         ws.send(Message::Binary(CONNECT.to_vec().into()))
             .await
