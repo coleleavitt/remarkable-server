@@ -139,7 +139,7 @@ The community's top *concrete* pains. Small, bounded, high-value.
   content hash matches, #34). Needs per-folder sync state kept between runs.
 - ✅ **Screenshare MQTT broker vs revocation** *(#31)* — sessions on the
   `SCREENSHARE_BIND` broker now close when their device is revoked, like the
-  `/notifications/ws` and `/mqtt` ones, and a revoked device leaves its REST
+  `/notifications/ws` and (when enabled) `/mqtt` ones, and a revoked device leaves its REST
   screenshare rooms.
 - ✅ **Remaining buffered bodies** — gentree `PutFile` streams its JSON body
   (the base64 blob is decoded to disk as it arrives); handwriting convert (64
@@ -147,8 +147,14 @@ The community's top *concrete* pains. Small, bounded, high-value.
   request into memory, but with limits sized to what they carry instead of 1 GiB.
 - ⬜ **Remote calendar providers** — only local ICS files sync; CalDAV, Google
   and Office 365 calendars answer "not implemented".
-- 🧪 **`/mqtt` topic** — MQTT-over-WebSocket push publishes on whatever concrete
-  topics the client subscribes to; not yet verified against a real tablet.
+- ✅ **`/mqtt` topic** — checked against the production logs: the tablet
+  (xochitl 3.3.2) never requests `/mqtt` and gets sync pushes over
+  `/notifications/ws/json/1`; its observed MQTT is screen share signalling on
+  the `SCREENSHARE_BIND` broker (sync subscriptions there: unconfirmed, below). `/mqtt` is now opt-in (`MQTT_WS_NOTIFICATIONS=1`),
+  off by default (GAP_ANALYSIS.md, "MQTT: what the tablet actually uses").
+- 🧪 **Tablet's screenshare broker subscriptions** — all were inside the ACL (no
+  denials logged), but the exact filters weren't logged; accepted filters now
+  log at debug (`remarkable_server::screenshare=debug`).
 
 ---
 

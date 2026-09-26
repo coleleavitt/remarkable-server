@@ -63,6 +63,8 @@ tokio-util = { version = "0.7.19", features = ["io"] }
 diffy = "0.5.2"
 
 [dev-dependencies]
+# Paused clock (`start_paused`, `time::advance`) for deadline tests; same tokio, no new crate
+tokio = { version = "1", features = ["test-util"] }
 tokio-test = "0.4"
 # WebSocket client for the /mqtt route test (same version axum's ws uses)
 tokio-tungstenite = "0.29"
