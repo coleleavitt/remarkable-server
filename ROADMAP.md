@@ -93,7 +93,8 @@ The community's top *concrete* pains. Small, bounded, high-value.
 - ✅ **Large-file upload robustness** *(#29)* — upload bodies are streamed to
   `<storage>/.uploads/` with the checksum computed on the fly (sync v3
   `put_file`, sync15 `blob_put`, the v2/v4 blob PUTs, document uploads, share
-  links; gentree `PutFile` decodes its base64 straight to disk), instead of
+  links; gentree `PutFile` reads its JSON incrementally and decodes the base64
+  blob straight to disk), instead of
   holding whole files in RAM. The official cloud's `302 → Google-upload`
   redirect that resets progress to 0% does **not** apply here (we accept the
   PUT directly). Resumable/chunked upload only if a client needs it.
@@ -125,9 +126,10 @@ The community's top *concrete* pains. Small, bounded, high-value.
 - ⬜ **Screenshare MQTT broker vs revocation** — sessions on the `SCREENSHARE_BIND`
   broker are not closed when their device is revoked (the `/notifications/ws`
   and `/mqtt` sessions are).
-- ⬜ **Remaining buffered bodies** — gentree `PutFile` (base64 inside JSON),
-  handwriting convert and share-by-email still read the whole request into
-  memory.
+- ✅ **Remaining buffered bodies** — gentree `PutFile` streams its JSON body
+  (the base64 blob is decoded to disk as it arrives); handwriting convert (64
+  MiB, read after auth) and share-by-email (25 MiB, 413 over it) still read the
+  request into memory, but with limits sized to what they carry instead of 1 GiB.
 - ⬜ **Remote calendar providers** — only local ICS files sync; CalDAV, Google
   and Office 365 calendars answer "not implemented".
 - 🧪 **`/mqtt` topic** — MQTT-over-WebSocket push publishes on whatever concrete
