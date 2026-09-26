@@ -1,5 +1,6 @@
 //! Read-it-later integrations module
-//! Supports Pocket, Instapaper, Wallabag, and Omnivore
+//! Supports Pocket, Instapaper and Wallabag. Omnivore (shut down November 2024) is kept only
+//! as a discontinued marker so existing database rows still load.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -40,7 +41,13 @@ pub enum ReadLaterError {
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("{0}")]
+    Discontinued(String),
 }
+
+/// Message for anything that tries to use the Omnivore provider.
+pub(crate) const OMNIVORE_DISCONTINUED: &str =
+    "Omnivore shut down in November 2024 and is no longer supported; delete this account";
 
 pub type Result<T> = std::result::Result<T, ReadLaterError>;
 
@@ -54,6 +61,9 @@ pub enum ReadLaterProvider {
     Pocket,
     Instapaper,
     Wallabag,
+    /// Discontinued (the service shut down in November 2024). Retained only so accounts and
+    /// articles saved before the removal still load; every operation on it fails with
+    /// [`ReadLaterError::Discontinued`].
     Omnivore,
 }
 
@@ -145,6 +155,9 @@ pub struct ProviderAccount {
     pub created_at: DateTime<Utc>,
 }
 
+/// Provider settings. Credential fields are `skip_serializing` so they never appear in JSON
+/// sent to clients (or in the `config` column); they are persisted separately in the
+/// `secrets` column via [`ProviderSecrets`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ProviderConfig {
@@ -171,12 +184,112 @@ pub enum ProviderConfig {
         #[serde(skip_serializing)]
         refresh_token: Option<String>,
         token_expires_at: Option<DateTime<Utc>>,
+        /// Wallabag account used for the OAuth password grant when there is no usable
+        /// refresh token.
+        #[serde(default)]
+        username: Option<String>,
+        #[serde(default, skip_serializing)]
+        password: Option<String>,
     },
-    Omnivore {
-        #[serde(skip_serializing)]
-        api_key: Option<String>,
-        api_url: Option<String>,
-    },
+    /// Discontinued provider; any legacy fields (`api_key`, `api_url`) are ignored.
+    Omnivore {},
+}
+
+/// Credential fields of a [`ProviderConfig`], stored as JSON in the `secrets` column of
+/// `readlater_accounts`. Kept out of the `config` column and all API responses.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct ProviderSecrets {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    access_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refresh_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    oauth_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    oauth_token_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    password: Option<String>,
+}
+
+impl ProviderConfig {
+    fn secrets(&self) -> ProviderSecrets {
+        match self {
+            Self::Pocket { access_token, .. } => ProviderSecrets {
+                access_token: access_token.clone(),
+                ..Default::default()
+            },
+            Self::Instapaper {
+                oauth_token,
+                oauth_token_secret,
+                ..
+            } => ProviderSecrets {
+                oauth_token: oauth_token.clone(),
+                oauth_token_secret: oauth_token_secret.clone(),
+                ..Default::default()
+            },
+            Self::Wallabag {
+                client_secret,
+                access_token,
+                refresh_token,
+                password,
+                ..
+            } => ProviderSecrets {
+                access_token: access_token.clone(),
+                refresh_token: refresh_token.clone(),
+                client_secret: client_secret.clone(),
+                password: password.clone(),
+                ..Default::default()
+            },
+            Self::Omnivore {} => ProviderSecrets::default(),
+        }
+    }
+
+    /// Fill credential fields from stored secrets. A secret that is absent from the store
+    /// leaves the field as deserialized, so configs written before secrets were split out
+    /// (when they were still inside the `config` JSON) keep working.
+    fn apply_secrets(&mut self, s: ProviderSecrets) {
+        fn set(field: &mut Option<String>, v: Option<String>) {
+            if v.is_some() {
+                *field = v;
+            }
+        }
+        match self {
+            Self::Pocket { access_token, .. } => set(access_token, s.access_token),
+            Self::Instapaper {
+                oauth_token,
+                oauth_token_secret,
+                ..
+            } => {
+                set(oauth_token, s.oauth_token);
+                set(oauth_token_secret, s.oauth_token_secret);
+            }
+            Self::Wallabag {
+                client_secret,
+                access_token,
+                refresh_token,
+                password,
+                ..
+            } => {
+                set(client_secret, s.client_secret);
+                set(access_token, s.access_token);
+                set(refresh_token, s.refresh_token);
+                set(password, s.password);
+            }
+            Self::Omnivore {} => {}
+        }
+    }
+
+    /// Whether the config holds the credentials its provider needs for API calls.
+    pub fn is_authenticated(&self) -> bool {
+        match self {
+            Self::Pocket { access_token, .. } => access_token.is_some(),
+            Self::Instapaper { oauth_token, .. } => oauth_token.is_some(),
+            Self::Wallabag { access_token, .. } => access_token.is_some(),
+            Self::Omnivore {} => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +346,11 @@ pub struct OAuthCallback {
     pub oauth_token: Option<String>,
     pub oauth_verifier: Option<String>,
     pub state: Option<String>,
+    /// Account credentials for username/password flows (Instapaper xAuth). Never echoed back.
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub password: Option<String>,
 }
 
 // ============================================================================
@@ -337,6 +455,31 @@ pub trait ReadLaterProviderTrait: Send + Sync {
         tags: &[String],
     ) -> Result<Article>;
     async fn delete_article(&self, config: &ProviderConfig, provider_id: &str) -> Result<()>;
+
+    /// The config produced by the most recent credential refresh this provider performed
+    /// inside one of the calls above (e.g. a refresh-and-retry after a 401), if any. Taking it
+    /// clears it. Callers persist it and pass it to subsequent calls, since the old tokens may
+    /// have been rotated out.
+    fn take_refreshed_config(&self) -> Option<ProviderConfig> {
+        None
+    }
+}
+
+/// Construct the provider implementation for `kind`. Instapaper's consumer key/secret come
+/// from `INSTAPAPER_CONSUMER_KEY` / `INSTAPAPER_CONSUMER_SECRET`.
+pub fn provider_for(kind: ReadLaterProvider) -> Result<Box<dyn ReadLaterProviderTrait>> {
+    Ok(match kind {
+        ReadLaterProvider::Pocket => Box::new(PocketProvider::new()),
+        ReadLaterProvider::Instapaper => {
+            let key = std::env::var("INSTAPAPER_CONSUMER_KEY").unwrap_or_default();
+            let secret = std::env::var("INSTAPAPER_CONSUMER_SECRET").unwrap_or_default();
+            Box::new(InstapaperProvider::new(key, secret))
+        }
+        ReadLaterProvider::Wallabag => Box::new(WallabagProvider::new()),
+        ReadLaterProvider::Omnivore => {
+            return Err(ReadLaterError::Discontinued(OMNIVORE_DISCONTINUED.into()));
+        }
+    })
 }
 
 // ============================================================================
@@ -823,6 +966,7 @@ pub struct InstapaperProvider {
     client: reqwest::Client,
     consumer_key: String,
     consumer_secret: String,
+    api_base: String,
 }
 
 impl InstapaperProvider {
@@ -833,28 +977,38 @@ impl InstapaperProvider {
             client: reqwest::Client::new(),
             consumer_key,
             consumer_secret,
+            api_base: Self::API_BASE.to_string(),
         }
     }
 
+    /// Point the provider at a different API root (used by tests against a local server).
+    pub fn with_api_base(mut self, api_base: impl Into<String>) -> Self {
+        self.api_base = api_base.into().trim_end_matches('/').to_string();
+        self
+    }
+
     /// Build a POST request signed with OAuth 1.0a HMAC-SHA1 (the only method Instapaper accepts).
-    /// `body` params are form-encoded and included in the signature base string.
+    /// `body` params are form-encoded and included in the signature base string. `oauth_token`
+    /// is omitted for the xAuth access-token request, which has no token yet.
     fn signed_post(
         &self,
         url: &str,
-        oauth_token: &str,
+        oauth_token: Option<&str>,
         token_secret: Option<&str>,
         body: &[(&str, &str)],
     ) -> reqwest::RequestBuilder {
         let timestamp = Utc::now().timestamp().to_string();
         let nonce = uuid::Uuid::new_v4().simple().to_string();
-        let oauth: Vec<(&str, &str)> = vec![
+        let mut oauth: Vec<(&str, &str)> = vec![
             ("oauth_consumer_key", self.consumer_key.as_str()),
             ("oauth_nonce", &nonce),
             ("oauth_signature_method", "HMAC-SHA1"),
             ("oauth_timestamp", &timestamp),
-            ("oauth_token", oauth_token),
-            ("oauth_version", "1.0"),
         ];
+        if let Some(token) = oauth_token {
+            oauth.push(("oauth_token", token));
+        }
+        oauth.push(("oauth_version", "1.0"));
         let mut all = oauth.clone();
         all.extend_from_slice(body);
         let signature = oauth1_signature("POST", url, &all, &self.consumer_secret, token_secret);
@@ -876,6 +1030,22 @@ impl InstapaperProvider {
             .header("Authorization", format!("OAuth {}", header))
             .form(body)
     }
+}
+
+/// Parse an `application/x-www-form-urlencoded` body into decoded name/value pairs.
+fn parse_form_urlencoded(body: &str) -> Vec<(String, String)> {
+    let decode = |s: &str| {
+        let s = s.replace('+', " ");
+        urlencoding::decode(&s).map(|c| c.into_owned()).unwrap_or(s)
+    };
+    body.trim()
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            (decode(k), decode(v))
+        })
+        .collect()
 }
 
 /// RFC 3986 percent-encoding as required by OAuth 1.0a (RFC 5849 section 3.6):
@@ -951,16 +1121,74 @@ impl ReadLaterProviderTrait for InstapaperProvider {
         })
     }
 
+    /// xAuth: exchange the user's Instapaper username/password (from the callback) for an
+    /// access token via a signed `oauth/access_token` request with `x_auth_mode=client_auth`.
     async fn complete_oauth(
         &self,
         callback: &OAuthCallback,
         _state: &OAuthState,
     ) -> Result<ProviderConfig> {
-        // For Instapaper, callback contains username/password via xAuth
-        // This is a simplified implementation
-        Err(ReadLaterError::OAuth(
-            "Instapaper requires xAuth with username/password".into(),
-        ))
+        if self.consumer_key.is_empty() || self.consumer_secret.is_empty() {
+            return Err(ReadLaterError::OAuth(
+                "INSTAPAPER_CONSUMER_KEY / INSTAPAPER_CONSUMER_SECRET not set".into(),
+            ));
+        }
+        let username = callback
+            .username
+            .as_deref()
+            .filter(|u| !u.is_empty())
+            .ok_or_else(|| ReadLaterError::OAuth("Instapaper xAuth requires a username".into()))?;
+        // Instapaper accounts may have no password; send an empty one in that case.
+        let password = callback.password.as_deref().unwrap_or("");
+
+        let url = format!("{}/oauth/access_token", self.api_base);
+        let resp = self
+            .signed_post(
+                &url,
+                None,
+                None,
+                &[
+                    ("x_auth_username", username),
+                    ("x_auth_password", password),
+                    ("x_auth_mode", "client_auth"),
+                ],
+            )
+            .send()
+            .await
+            .map_err(|e| ReadLaterError::Network(e.to_string()))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(ReadLaterError::OAuth(format!(
+                "Instapaper xAuth failed: {}",
+                status
+            )));
+        }
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| ReadLaterError::Network(e.to_string()))?;
+        let mut oauth_token = None;
+        let mut oauth_token_secret = None;
+        for (k, v) in parse_form_urlencoded(&body) {
+            match k.as_str() {
+                "oauth_token" => oauth_token = Some(v),
+                "oauth_token_secret" => oauth_token_secret = Some(v),
+                _ => {}
+            }
+        }
+        let (Some(oauth_token), Some(oauth_token_secret)) = (oauth_token, oauth_token_secret)
+        else {
+            return Err(ReadLaterError::OAuth(
+                "Instapaper xAuth response missing oauth_token/oauth_token_secret".into(),
+            ));
+        };
+
+        Ok(ProviderConfig::Instapaper {
+            oauth_token: Some(oauth_token),
+            oauth_token_secret: Some(oauth_token_secret),
+            username: Some(username.to_string()),
+        })
     }
 
     async fn refresh_auth(&self, config: &ProviderConfig) -> Result<ProviderConfig> {
@@ -994,9 +1222,9 @@ impl ReadLaterProviderTrait for InstapaperProvider {
             .ok_or_else(|| ReadLaterError::AuthRequired("Instapaper".into()))?;
         let token_secret = oauth_token_secret.as_deref();
 
-        let url = format!("{}/bookmarks/list", Self::API_BASE);
+        let url = format!("{}/bookmarks/list", self.api_base);
         let resp = self
-            .signed_post(&url, oauth_token, token_secret, &[("limit", "500")])
+            .signed_post(&url, Some(oauth_token), token_secret, &[("limit", "500")])
             .send()
             .await
             .map_err(|e| ReadLaterError::Network(e.to_string()))?;
@@ -1104,11 +1332,11 @@ impl ReadLaterProviderTrait for InstapaperProvider {
             .ok_or_else(|| ReadLaterError::AuthRequired("Instapaper".into()))?;
         let token_secret = oauth_token_secret.as_deref();
 
-        let url = format!("{}/bookmarks/get_text", Self::API_BASE);
+        let url = format!("{}/bookmarks/get_text", self.api_base);
         let resp = self
             .signed_post(
                 &url,
-                oauth_token,
+                Some(oauth_token),
                 token_secret,
                 &[("bookmark_id", article.provider_id.as_str())],
             )
@@ -1161,11 +1389,11 @@ impl ReadLaterProviderTrait for InstapaperProvider {
             ReadStatus::Read | ReadStatus::InProgress => return Ok(()),
         };
 
-        let url = format!("{}/{}", Self::API_BASE, endpoint);
+        let url = format!("{}/{}", self.api_base, endpoint);
         let resp = self
             .signed_post(
                 &url,
-                oauth_token,
+                Some(oauth_token),
                 token_secret,
                 &[("bookmark_id", provider_id)],
             )
@@ -1203,9 +1431,9 @@ impl ReadLaterProviderTrait for InstapaperProvider {
             .ok_or_else(|| ReadLaterError::AuthRequired("Instapaper".into()))?;
         let token_secret = oauth_token_secret.as_deref();
 
-        let api_url = format!("{}/bookmarks/add", Self::API_BASE);
+        let api_url = format!("{}/bookmarks/add", self.api_base);
         let resp = self
-            .signed_post(&api_url, oauth_token, token_secret, &[("url", url)])
+            .signed_post(&api_url, Some(oauth_token), token_secret, &[("url", url)])
             .send()
             .await
             .map_err(|e| ReadLaterError::Network(e.to_string()))?;
@@ -1273,11 +1501,11 @@ impl ReadLaterProviderTrait for InstapaperProvider {
             .ok_or_else(|| ReadLaterError::AuthRequired("Instapaper".into()))?;
         let token_secret = oauth_token_secret.as_deref();
 
-        let url = format!("{}/bookmarks/delete", Self::API_BASE);
+        let url = format!("{}/bookmarks/delete", self.api_base);
         let resp = self
             .signed_post(
                 &url,
-                oauth_token,
+                Some(oauth_token),
                 token_secret,
                 &[("bookmark_id", provider_id)],
             )
@@ -1302,23 +1530,37 @@ impl ReadLaterProviderTrait for InstapaperProvider {
 
 pub struct WallabagProvider {
     client: reqwest::Client,
+    /// Config from the latest token refresh, handed out by `take_refreshed_config`.
+    refreshed: parking_lot::Mutex<Option<ProviderConfig>>,
+}
+
+/// Wallabag's default access-token lifetime, assumed when a token response omits `expires_in`.
+const WALLABAG_DEFAULT_TOKEN_SECS: i64 = 3600;
+
+#[derive(Deserialize)]
+struct WallabagToken {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<i64>,
 }
 
 impl WallabagProvider {
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::new(),
+            refreshed: parking_lot::Mutex::new(None),
         }
     }
 
+    /// Return `config` unchanged unless its token needs refreshing (see
+    /// [`wallabag_token_needs_refresh`]), in which case refresh it.
     async fn ensure_token(&self, config: &ProviderConfig) -> Result<ProviderConfig> {
         let ProviderConfig::Wallabag {
-            instance_url,
-            client_id,
-            client_secret,
             access_token,
-            refresh_token,
             token_expires_at,
+            ..
         } = config
         else {
             return Err(ReadLaterError::Api("Invalid config".into()));
@@ -1327,75 +1569,190 @@ impl WallabagProvider {
         if !wallabag_token_needs_refresh(
             access_token.as_deref(),
             *token_expires_at,
-            refresh_token.is_some(),
+            wallabag_can_refresh(config),
             Utc::now(),
         ) {
             return Ok(config.clone());
         }
+        self.refresh_token(config).await
+    }
 
-        let refresh = refresh_token
-            .as_ref()
-            .ok_or_else(|| ReadLaterError::AuthRequired("Wallabag".into()))?;
+    /// Obtain a new access token unconditionally: the refresh-token grant first, then the
+    /// password grant if that fails or there is no refresh token. The new config is recorded
+    /// for [`ReadLaterProviderTrait::take_refreshed_config`].
+    async fn refresh_token(&self, config: &ProviderConfig) -> Result<ProviderConfig> {
+        let ProviderConfig::Wallabag {
+            instance_url,
+            client_id,
+            client_secret,
+            refresh_token,
+            username,
+            password,
+            ..
+        } = config
+        else {
+            return Err(ReadLaterError::Api("Invalid config".into()));
+        };
 
         let client_secret = client_secret
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| ReadLaterError::AuthRequired("Wallabag client secret".into()))?;
+        let token_url = format!("{}/oauth/v2/token", instance_url.trim_end_matches('/'));
 
+        let mut last_err = None;
+        let mut token = None;
+        if let Some(refresh) = refresh_token {
+            match self
+                .request_token(
+                    &token_url,
+                    &[
+                        ("grant_type", "refresh_token"),
+                        ("refresh_token", refresh),
+                        ("client_id", client_id),
+                        ("client_secret", client_secret),
+                    ],
+                )
+                .await
+            {
+                Ok(t) => token = Some(t),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if token.is_none() {
+            if let (Some(user), Some(pass)) = (username, password) {
+                match self
+                    .request_token(
+                        &token_url,
+                        &[
+                            ("grant_type", "password"),
+                            ("client_id", client_id),
+                            ("client_secret", client_secret),
+                            ("username", user),
+                            ("password", pass),
+                        ],
+                    )
+                    .await
+                {
+                    Ok(t) => token = Some(t),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+        }
+        let Some(token) = token else {
+            return Err(last_err.unwrap_or_else(|| ReadLaterError::AuthRequired("Wallabag".into())));
+        };
+
+        let mut new_config = config.clone();
+        if let ProviderConfig::Wallabag {
+            access_token,
+            refresh_token,
+            token_expires_at,
+            ..
+        } = &mut new_config
+        {
+            *access_token = Some(token.access_token);
+            if token.refresh_token.is_some() {
+                *refresh_token = token.refresh_token;
+            }
+            *token_expires_at = Some(
+                Utc::now()
+                    + Duration::seconds(token.expires_in.unwrap_or(WALLABAG_DEFAULT_TOKEN_SECS)),
+            );
+        }
+        *self.refreshed.lock() = Some(new_config.clone());
+        Ok(new_config)
+    }
+
+    async fn request_token(&self, url: &str, form: &[(&str, &str)]) -> Result<WallabagToken> {
         let resp = self
             .client
-            .post(format!("{}/oauth/v2/token", instance_url))
-            .form(&[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", refresh),
-                ("client_id", client_id),
-                ("client_secret", client_secret),
-            ])
+            .post(url)
+            .form(form)
             .send()
             .await
             .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-
         if !resp.status().is_success() {
             return Err(ReadLaterError::OAuth(format!(
-                "Token refresh failed: {}",
+                "Token request failed: {}",
                 resp.status()
             )));
         }
-
-        #[derive(Deserialize)]
-        struct TokenResponse {
-            access_token: String,
-            refresh_token: String,
-            expires_in: i64,
-        }
-
-        let token: TokenResponse = resp
-            .json()
+        resp.json()
             .await
-            .map_err(|e| ReadLaterError::OAuth(e.to_string()))?;
+            .map_err(|e| ReadLaterError::OAuth(e.to_string()))
+    }
 
-        Ok(ProviderConfig::Wallabag {
-            instance_url: instance_url.clone(),
-            client_id: client_id.clone(),
-            client_secret: Some(client_secret.clone()),
-            access_token: Some(token.access_token),
-            refresh_token: Some(token.refresh_token),
-            token_expires_at: Some(Utc::now() + Duration::seconds(token.expires_in)),
-        })
+    /// Send an authenticated API request built by `build(client, instance_url)`, refreshing the
+    /// token first when it is missing or expiring. If the server still answers 401 (a revoked
+    /// token, or one whose expiry was never recorded), refresh once and retry once.
+    async fn send_authed<F>(&self, config: &ProviderConfig, build: F) -> Result<reqwest::Response>
+    where
+        F: Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder + Send + Sync,
+    {
+        let config = self.ensure_token(config).await?;
+        let resp = self.send_with_token(&config, &build).await?;
+        if resp.status() != reqwest::StatusCode::UNAUTHORIZED || !wallabag_can_refresh(&config) {
+            return Ok(resp);
+        }
+        let config = self.refresh_token(&config).await?;
+        self.send_with_token(&config, &build).await
+    }
+
+    async fn send_with_token<F>(
+        &self,
+        config: &ProviderConfig,
+        build: &F,
+    ) -> Result<reqwest::Response>
+    where
+        F: Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder + Send + Sync,
+    {
+        let ProviderConfig::Wallabag {
+            instance_url,
+            access_token,
+            ..
+        } = config
+        else {
+            return Err(ReadLaterError::Api("Invalid config".into()));
+        };
+        let token = access_token
+            .as_deref()
+            .ok_or_else(|| ReadLaterError::AuthRequired("Wallabag".into()))?;
+        build(&self.client, instance_url.trim_end_matches('/'))
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| ReadLaterError::Network(e.to_string()))
     }
 }
 
+/// Whether a new Wallabag token can be obtained: a client secret plus either a refresh token
+/// or password-grant credentials.
+fn wallabag_can_refresh(config: &ProviderConfig) -> bool {
+    matches!(
+        config,
+        ProviderConfig::Wallabag {
+            client_secret: Some(_),
+            refresh_token,
+            username,
+            password,
+            ..
+        } if refresh_token.is_some() || (username.is_some() && password.is_some())
+    )
+}
+
 /// Refresh only when there is no access token, or it has an expiry that is past or within
-/// five minutes. A token with no recorded expiry is refreshed when a refresh token exists (the
-/// refresh records an expiry, so this happens once) and otherwise used as-is.
+/// five minutes. A token with no recorded expiry is refreshed when new credentials can be
+/// obtained (the refresh records an expiry, so this happens once) and otherwise used as-is;
+/// a 401 on use still triggers a refresh-and-retry.
 fn wallabag_token_needs_refresh(
     access_token: Option<&str>,
     expires_at: Option<DateTime<Utc>>,
-    has_refresh_token: bool,
+    can_refresh: bool,
     now: DateTime<Utc>,
 ) -> bool {
     match (access_token, expires_at) {
         (None, _) => true,
-        (Some(_), None) => has_refresh_token,
+        (Some(_), None) => can_refresh,
         (Some(_), Some(exp)) => exp <= now + Duration::minutes(5),
     }
 }
@@ -1447,37 +1804,16 @@ impl ReadLaterProviderTrait for WallabagProvider {
         config: &ProviderConfig,
         since: Option<DateTime<Utc>>,
     ) -> Result<Vec<Article>> {
-        let config = self.ensure_token(config).await?;
-
-        let ProviderConfig::Wallabag {
-            instance_url,
-            access_token,
-            ..
-        } = &config
-        else {
-            return Err(ReadLaterError::Api("Invalid config".into()));
-        };
-
-        let token = access_token
-            .as_ref()
-            .ok_or_else(|| ReadLaterError::AuthRequired("Wallabag".into()))?;
-
-        let mut url = format!(
-            "{}/api/entries.json?perPage=100&sort=created&order=desc",
-            instance_url
-        );
-
+        let mut query = "perPage=100&sort=created&order=desc".to_string();
         if let Some(ts) = since {
-            url.push_str(&format!("&since={}", ts.timestamp()));
+            query.push_str(&format!("&since={}", ts.timestamp()));
         }
 
         let resp = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .send()
-            .await
-            .map_err(|e| ReadLaterError::Network(e.to_string()))?;
+            .send_authed(config, |c, base| {
+                c.get(format!("{}/api/entries.json?{}", base, query))
+            })
+            .await?;
 
         if !resp.status().is_success() {
             return Err(ReadLaterError::Api(format!(
@@ -1584,31 +1920,11 @@ impl ReadLaterProviderTrait for WallabagProvider {
         config: &ProviderConfig,
         article: &Article,
     ) -> Result<ArticleContent> {
-        let config = self.ensure_token(config).await?;
-
-        let ProviderConfig::Wallabag {
-            instance_url,
-            access_token,
-            ..
-        } = &config
-        else {
-            return Err(ReadLaterError::Api("Invalid config".into()));
-        };
-
-        let token = access_token
-            .as_ref()
-            .ok_or_else(|| ReadLaterError::AuthRequired("Wallabag".into()))?;
-
         let resp = self
-            .client
-            .get(format!(
-                "{}/api/entries/{}.json",
-                instance_url, article.provider_id
-            ))
-            .header("Authorization", format!("Bearer {}", token))
-            .send()
-            .await
-            .map_err(|e| ReadLaterError::Network(e.to_string()))?;
+            .send_authed(config, |c, base| {
+                c.get(format!("{}/api/entries/{}.json", base, article.provider_id))
+            })
+            .await?;
 
         if !resp.status().is_success() {
             return Err(ReadLaterError::Api(format!(
@@ -1648,34 +1964,18 @@ impl ReadLaterProviderTrait for WallabagProvider {
         provider_id: &str,
         status: ReadStatus,
     ) -> Result<()> {
-        let config = self.ensure_token(config).await?;
-
-        let ProviderConfig::Wallabag {
-            instance_url,
-            access_token,
-            ..
-        } = &config
-        else {
-            return Err(ReadLaterError::Api("Invalid config".into()));
-        };
-
-        let token = access_token
-            .as_ref()
-            .ok_or_else(|| ReadLaterError::AuthRequired("Wallabag".into()))?;
-
         let archive = match status {
             ReadStatus::Archived | ReadStatus::Read => 1,
             ReadStatus::Unread | ReadStatus::InProgress => 0,
         };
+        let body = serde_json::json!({ "archive": archive });
 
         let resp = self
-            .client
-            .patch(format!("{}/api/entries/{}.json", instance_url, provider_id))
-            .header("Authorization", format!("Bearer {}", token))
-            .json(&serde_json::json!({ "archive": archive }))
-            .send()
-            .await
-            .map_err(|e| ReadLaterError::Network(e.to_string()))?;
+            .send_authed(config, |c, base| {
+                c.patch(format!("{}/api/entries/{}.json", base, provider_id))
+                    .json(&body)
+            })
+            .await?;
 
         if !resp.status().is_success() {
             return Err(ReadLaterError::Api(format!(
@@ -1693,32 +1993,16 @@ impl ReadLaterProviderTrait for WallabagProvider {
         url: &str,
         tags: &[String],
     ) -> Result<Article> {
-        let config = self.ensure_token(config).await?;
-
-        let ProviderConfig::Wallabag {
-            instance_url,
-            access_token,
-            ..
-        } = &config
-        else {
-            return Err(ReadLaterError::Api("Invalid config".into()));
-        };
-
-        let token = access_token
-            .as_ref()
-            .ok_or_else(|| ReadLaterError::AuthRequired("Wallabag".into()))?;
+        let body = serde_json::json!({
+            "url": url,
+            "tags": tags.join(","),
+        });
 
         let resp = self
-            .client
-            .post(format!("{}/api/entries.json", instance_url))
-            .header("Authorization", format!("Bearer {}", token))
-            .json(&serde_json::json!({
-                "url": url,
-                "tags": tags.join(","),
-            }))
-            .send()
-            .await
-            .map_err(|e| ReadLaterError::Network(e.to_string()))?;
+            .send_authed(config, |c, base| {
+                c.post(format!("{}/api/entries.json", base)).json(&body)
+            })
+            .await?;
 
         if !resp.status().is_success() {
             return Err(ReadLaterError::Api(format!(
@@ -1765,621 +2049,11 @@ impl ReadLaterProviderTrait for WallabagProvider {
     }
 
     async fn delete_article(&self, config: &ProviderConfig, provider_id: &str) -> Result<()> {
-        let config = self.ensure_token(config).await?;
-
-        let ProviderConfig::Wallabag {
-            instance_url,
-            access_token,
-            ..
-        } = &config
-        else {
-            return Err(ReadLaterError::Api("Invalid config".into()));
-        };
-
-        let token = access_token
-            .as_ref()
-            .ok_or_else(|| ReadLaterError::AuthRequired("Wallabag".into()))?;
-
         let resp = self
-            .client
-            .delete(format!("{}/api/entries/{}.json", instance_url, provider_id))
-            .header("Authorization", format!("Bearer {}", token))
-            .send()
-            .await
-            .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(ReadLaterError::Api(format!(
-                "Failed to delete: {}",
-                resp.status()
-            )));
-        }
-
-        Ok(())
-    }
-}
-
-// ============================================================================
-// Omnivore Provider (GraphQL API)
-// ============================================================================
-
-pub struct OmnivoreProvider {
-    client: reqwest::Client,
-}
-
-impl OmnivoreProvider {
-    const DEFAULT_API_URL: &'static str = "https://api-prod.omnivore.app/api/graphql";
-
-    pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::new(),
-        }
-    }
-
-    fn api_url(config: &ProviderConfig) -> &str {
-        match config {
-            ProviderConfig::Omnivore { api_url, .. } => {
-                api_url.as_deref().unwrap_or(Self::DEFAULT_API_URL)
-            }
-            _ => Self::DEFAULT_API_URL,
-        }
-    }
-
-    /// The hosted Omnivore service shut down in November 2024, so requests to the default
-    /// endpoint can only fail. Fail fast with a clear message; self-hosted instances (an
-    /// explicit `api_url`) are still attempted on a best-effort basis.
-    fn ensure_available(config: &ProviderConfig) -> Result<()> {
-        if Self::api_url(config).trim_end_matches('/') == Self::DEFAULT_API_URL {
-            return Err(ReadLaterError::Api(
-                "Omnivore's hosted service was discontinued in November 2024; set api_url to a self-hosted Omnivore instance".into()));
-        }
-        Ok(())
-    }
-}
-
-#[async_trait::async_trait]
-impl ReadLaterProviderTrait for OmnivoreProvider {
-    fn provider_type(&self) -> ReadLaterProvider {
-        ReadLaterProvider::Omnivore
-    }
-
-    async fn start_oauth(&self, redirect_uri: &str) -> Result<OAuthState> {
-        // Omnivore uses API keys, not OAuth
-        Ok(OAuthState {
-            provider: ReadLaterProvider::Omnivore,
-            request_token: None,
-            redirect_uri: redirect_uri.to_string(),
-            created_at: Utc::now(),
-        })
-    }
-
-    async fn complete_oauth(
-        &self,
-        callback: &OAuthCallback,
-        _state: &OAuthState,
-    ) -> Result<ProviderConfig> {
-        // API key is provided directly
-        let api_key = callback
-            .code
-            .clone()
-            .ok_or_else(|| ReadLaterError::OAuth("API key required".into()))?;
-
-        Ok(ProviderConfig::Omnivore {
-            api_key: Some(api_key),
-            api_url: None,
-        })
-    }
-
-    async fn refresh_auth(&self, config: &ProviderConfig) -> Result<ProviderConfig> {
-        // API keys don't expire
-        Ok(config.clone())
-    }
-
-    fn is_authenticated(&self, config: &ProviderConfig) -> bool {
-        match config {
-            ProviderConfig::Omnivore { api_key, .. } => api_key.is_some(),
-            _ => false,
-        }
-    }
-
-    async fn fetch_articles(
-        &self,
-        config: &ProviderConfig,
-        since: Option<DateTime<Utc>>,
-    ) -> Result<Vec<Article>> {
-        let ProviderConfig::Omnivore { api_key, .. } = config else {
-            return Err(ReadLaterError::Api("Invalid config".into()));
-        };
-        Self::ensure_available(config)?;
-
-        let api_key = api_key
-            .as_ref()
-            .ok_or_else(|| ReadLaterError::AuthRequired("Omnivore".into()))?;
-
-        let query = r#"
-            query Search($after: String, $first: Int, $query: String) {
-                search(after: $after, first: $first, query: $query) {
-                    ... on SearchSuccess {
-                        edges {
-                            node {
-                                id
-                                slug
-                                url
-                                title
-                                description
-                                author
-                                readingProgressPercent
-                                isArchived
-                                labels {
-                                    name
-                                }
-                                savedAt
-                                updatedAt
-                                readAt
-                                wordsCount
-                                image
-                            }
-                        }
-                        pageInfo {
-                            hasNextPage
-                            endCursor
-                        }
-                    }
-                    ... on SearchError {
-                        errorCodes
-                    }
-                }
-            }
-        "#;
-
-        let search_query = since
-            .map(|ts| format!("saved:{}", ts.format("%Y-%m-%d")))
-            .unwrap_or_default();
-
-        let resp = self
-            .client
-            .post(Self::api_url(config))
-            .header("Authorization", api_key)
-            .header("Content-Type", "application/json")
-            .json(&serde_json::json!({
-                "query": query,
-                "variables": {
-                    "first": 100,
-                    "query": search_query,
-                }
-            }))
-            .send()
-            .await
-            .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(ReadLaterError::Api(format!(
-                "Omnivore API error: {}",
-                resp.status()
-            )));
-        }
-
-        #[derive(Deserialize)]
-        struct GraphQLResponse {
-            data: Option<DataWrapper>,
-            errors: Option<Vec<serde_json::Value>>,
-        }
-
-        #[derive(Deserialize)]
-        struct DataWrapper {
-            search: SearchResult,
-        }
-
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum SearchResult {
-            Success {
-                edges: Vec<Edge>,
-            },
-            Error {
-                #[serde(rename = "errorCodes")]
-                error_codes: Vec<String>,
-            },
-        }
-
-        #[derive(Deserialize)]
-        struct Edge {
-            node: OmnivoreArticle,
-        }
-
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct OmnivoreArticle {
-            id: String,
-            slug: String,
-            url: String,
-            title: String,
-            description: Option<String>,
-            author: Option<String>,
-            reading_progress_percent: f64,
-            is_archived: bool,
-            labels: Vec<Label>,
-            saved_at: String,
-            updated_at: String,
-            read_at: Option<String>,
-            words_count: Option<u32>,
-            image: Option<String>,
-        }
-
-        #[derive(Deserialize)]
-        struct Label {
-            name: String,
-        }
-
-        let gql: GraphQLResponse = resp
-            .json()
-            .await
-            .map_err(|e| ReadLaterError::Api(e.to_string()))?;
-
-        if let Some(errors) = gql.errors {
-            return Err(ReadLaterError::Api(format!("GraphQL errors: {:?}", errors)));
-        }
-
-        let data = gql
-            .data
-            .ok_or_else(|| ReadLaterError::Api("No data".into()))?;
-
-        let edges = match data.search {
-            SearchResult::Success { edges } => edges,
-            SearchResult::Error { error_codes } => {
-                return Err(ReadLaterError::Api(format!(
-                    "Search error: {:?}",
-                    error_codes
-                )));
-            }
-        };
-
-        let articles = edges
-            .into_iter()
-            .map(|edge| {
-                let item = edge.node;
-
-                let status = if item.is_archived {
-                    ReadStatus::Archived
-                } else if item.reading_progress_percent >= 100.0 {
-                    ReadStatus::Read
-                } else if item.reading_progress_percent > 0.0 {
-                    ReadStatus::InProgress
-                } else {
-                    ReadStatus::Unread
-                };
-
-                let tags: Vec<String> = item.labels.into_iter().map(|l| l.name).collect();
-
-                let saved_at = DateTime::parse_from_rfc3339(&item.saved_at)
-                    .map(|d| d.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-
-                let updated_at = DateTime::parse_from_rfc3339(&item.updated_at)
-                    .map(|d| d.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-
-                let read_at = item.read_at.and_then(|r| {
-                    DateTime::parse_from_rfc3339(&r)
-                        .map(|d| d.with_timezone(&Utc))
-                        .ok()
-                });
-
-                let reading_time = item.words_count.map(|w| (w / 200).max(1));
-
-                Article {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    provider: ReadLaterProvider::Omnivore,
-                    provider_id: item.id,
-                    url: item.url,
-                    title: item.title,
-                    excerpt: item.description,
-                    author: item.author,
-                    word_count: item.words_count,
-                    reading_time_minutes: reading_time,
-                    tags,
-                    status,
-                    favorite: false,
-                    added_at: saved_at,
-                    updated_at,
-                    read_at,
-                    content: None,
-                    image_url: item.image,
-                    document_id: None,
-                    synced_to_device: false,
-                    last_sync: None,
-                }
+            .send_authed(config, |c, base| {
+                c.delete(format!("{}/api/entries/{}.json", base, provider_id))
             })
-            .collect();
-
-        Ok(articles)
-    }
-
-    async fn fetch_article_content(
-        &self,
-        config: &ProviderConfig,
-        article: &Article,
-    ) -> Result<ArticleContent> {
-        let ProviderConfig::Omnivore { api_key, .. } = config else {
-            return Err(ReadLaterError::Api("Invalid config".into()));
-        };
-        Self::ensure_available(config)?;
-
-        let api_key = api_key
-            .as_ref()
-            .ok_or_else(|| ReadLaterError::AuthRequired("Omnivore".into()))?;
-
-        let query = r#"
-            query GetArticle($username: String!, $slug: String!) {
-                article(username: $username, slug: $slug) {
-                    ... on ArticleSuccess {
-                        article {
-                            id
-                            content
-                        }
-                    }
-                    ... on ArticleError {
-                        errorCodes
-                    }
-                }
-            }
-        "#;
-
-        // Extract slug from provider_id or use the article URL
-        let slug = &article.provider_id;
-
-        let resp = self
-            .client
-            .post(Self::api_url(config))
-            .header("Authorization", api_key)
-            .header("Content-Type", "application/json")
-            .json(&serde_json::json!({
-                "query": query,
-                "variables": {
-                    "username": "me",
-                    "slug": slug,
-                }
-            }))
-            .send()
-            .await
-            .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(ReadLaterError::Api(format!(
-                "Failed to get content: {}",
-                resp.status()
-            )));
-        }
-
-        #[derive(Deserialize)]
-        struct Response {
-            data: Option<DataWrapper>,
-        }
-
-        #[derive(Deserialize)]
-        struct DataWrapper {
-            article: ArticleResult,
-        }
-
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum ArticleResult {
-            Success {
-                article: ArticleContent2,
-            },
-            Error {
-                #[serde(rename = "errorCodes")]
-                error_codes: Vec<String>,
-            },
-        }
-
-        #[derive(Deserialize)]
-        struct ArticleContent2 {
-            content: String,
-        }
-
-        let data: Response = resp
-            .json()
-            .await
-            .map_err(|e| ReadLaterError::Api(e.to_string()))?;
-
-        let content = match data.data {
-            Some(DataWrapper {
-                article: ArticleResult::Success { article },
-            }) => article.content,
-            Some(DataWrapper {
-                article: ArticleResult::Error { error_codes },
-            }) => {
-                return Err(ReadLaterError::Api(format!(
-                    "Article error: {:?}",
-                    error_codes
-                )));
-            }
-            None => {
-                return Err(ReadLaterError::Api("No data returned".into()));
-            }
-        };
-
-        Ok(ArticleContent {
-            html: content,
-            images: Vec::new(),
-            styles: None,
-        })
-    }
-
-    async fn update_read_status(
-        &self,
-        config: &ProviderConfig,
-        provider_id: &str,
-        status: ReadStatus,
-    ) -> Result<()> {
-        let ProviderConfig::Omnivore { api_key, .. } = config else {
-            return Err(ReadLaterError::Api("Invalid config".into()));
-        };
-        Self::ensure_available(config)?;
-
-        let api_key = api_key
-            .as_ref()
-            .ok_or_else(|| ReadLaterError::AuthRequired("Omnivore".into()))?;
-
-        let mutation = match status {
-            ReadStatus::Archived => {
-                r#"
-                mutation SetArchive($input: ArchiveLinkInput!) {
-                    setLinkArchived(input: $input) {
-                        ... on ArchiveLinkSuccess { linkId }
-                        ... on ArchiveLinkError { errorCodes }
-                    }
-                }
-            "#
-            }
-            _ => return Ok(()),
-        };
-
-        let resp = self
-            .client
-            .post(Self::api_url(config))
-            .header("Authorization", api_key)
-            .header("Content-Type", "application/json")
-            .json(&serde_json::json!({
-                "query": mutation,
-                "variables": {
-                    "input": {
-                        "linkId": provider_id,
-                        "archived": status == ReadStatus::Archived,
-                    }
-                }
-            }))
-            .send()
-            .await
-            .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(ReadLaterError::Api(format!(
-                "Failed to update: {}",
-                resp.status()
-            )));
-        }
-
-        Ok(())
-    }
-
-    async fn add_article(
-        &self,
-        config: &ProviderConfig,
-        url: &str,
-        tags: &[String],
-    ) -> Result<Article> {
-        let ProviderConfig::Omnivore { api_key, .. } = config else {
-            return Err(ReadLaterError::Api("Invalid config".into()));
-        };
-        Self::ensure_available(config)?;
-
-        let api_key = api_key
-            .as_ref()
-            .ok_or_else(|| ReadLaterError::AuthRequired("Omnivore".into()))?;
-
-        let mutation = r#"
-            mutation SaveUrl($input: SaveUrlInput!) {
-                saveUrl(input: $input) {
-                    ... on SaveSuccess {
-                        url
-                        clientRequestId
-                    }
-                    ... on SaveError {
-                        errorCodes
-                    }
-                }
-            }
-        "#;
-
-        let client_request_id = uuid::Uuid::new_v4().to_string();
-
-        let resp = self.client
-            .post(Self::api_url(config))
-            .header("Authorization", api_key)
-            .header("Content-Type", "application/json")
-            .json(&serde_json::json!({
-                "query": mutation,
-                "variables": {
-                    "input": {
-                        "url": url,
-                        "clientRequestId": client_request_id,
-                        "labels": tags.iter().map(|t| serde_json::json!({"name": t})).collect::<Vec<_>>(),
-                    }
-                }
-            }))
-            .send()
-            .await
-            .map_err(|e| ReadLaterError::Network(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(ReadLaterError::Api(format!(
-                "Failed to add: {}",
-                resp.status()
-            )));
-        }
-
-        Ok(Article {
-            id: uuid::Uuid::new_v4().to_string(),
-            provider: ReadLaterProvider::Omnivore,
-            provider_id: client_request_id,
-            url: url.to_string(),
-            title: String::new(),
-            excerpt: None,
-            author: None,
-            word_count: None,
-            reading_time_minutes: None,
-            tags: tags.to_vec(),
-            status: ReadStatus::Unread,
-            favorite: false,
-            added_at: Utc::now(),
-            updated_at: Utc::now(),
-            read_at: None,
-            content: None,
-            image_url: None,
-            document_id: None,
-            synced_to_device: false,
-            last_sync: None,
-        })
-    }
-
-    async fn delete_article(&self, config: &ProviderConfig, provider_id: &str) -> Result<()> {
-        let ProviderConfig::Omnivore { api_key, .. } = config else {
-            return Err(ReadLaterError::Api("Invalid config".into()));
-        };
-        Self::ensure_available(config)?;
-
-        let api_key = api_key
-            .as_ref()
-            .ok_or_else(|| ReadLaterError::AuthRequired("Omnivore".into()))?;
-
-        let mutation = r#"
-            mutation SetBookmarkArticle($input: SetBookmarkArticleInput!) {
-                setBookmarkArticle(input: $input) {
-                    ... on SetBookmarkArticleSuccess { bookmarkedArticle { id } }
-                    ... on SetBookmarkArticleError { errorCodes }
-                }
-            }
-        "#;
-
-        let resp = self
-            .client
-            .post(Self::api_url(config))
-            .header("Authorization", api_key)
-            .header("Content-Type", "application/json")
-            .json(&serde_json::json!({
-                "query": mutation,
-                "variables": {
-                    "input": {
-                        "articleID": provider_id,
-                        "bookmark": false,
-                    }
-                }
-            }))
-            .send()
-            .await
-            .map_err(|e| ReadLaterError::Network(e.to_string()))?;
+            .await?;
 
         if !resp.status().is_success() {
             return Err(ReadLaterError::Api(format!(
@@ -2389,6 +2063,10 @@ impl ReadLaterProviderTrait for OmnivoreProvider {
         }
 
         Ok(())
+    }
+
+    fn take_refreshed_config(&self) -> Option<ProviderConfig> {
+        self.refreshed.lock().take()
     }
 }
 
@@ -2766,12 +2444,37 @@ impl ReadLaterManager {
         )
         .map_err(|e| ReadLaterError::Database(e.to_string()))?;
 
+        // Provider credentials (JSON `ProviderSecrets`), split from `config` so they survive
+        // restarts without ever being part of the client-facing config JSON.
+        Self::ensure_column(db, "readlater_accounts", "secrets", "TEXT")?;
+
+        Ok(())
+    }
+
+    /// `ALTER TABLE ... ADD COLUMN` unless the column already exists, so databases created
+    /// by older versions are migrated in place.
+    fn ensure_column(db: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+        let mut stmt = db
+            .prepare(&format!("PRAGMA table_info({})", table))
+            .map_err(|e| ReadLaterError::Database(e.to_string()))?;
+        let exists = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| ReadLaterError::Database(e.to_string()))?
+            .filter_map(|name| name.ok())
+            .any(|name| name == column);
+        if !exists {
+            db.execute_batch(&format!(
+                "ALTER TABLE {} ADD COLUMN {} {}",
+                table, column, decl
+            ))
+            .map_err(|e| ReadLaterError::Database(e.to_string()))?;
+        }
         Ok(())
     }
 
     fn load_accounts(&mut self) -> Result<()> {
         let mut stmt = self.db.prepare(
-            "SELECT id, name, provider, enabled, config, sync_settings, last_sync, created_at FROM readlater_accounts"
+            "SELECT id, name, provider, enabled, config, sync_settings, last_sync, created_at, secrets FROM readlater_accounts"
         ).map_err(|e| ReadLaterError::Database(e.to_string()))?;
 
         let rows = stmt
@@ -2784,6 +2487,7 @@ impl ReadLaterManager {
                 let sync_json: String = row.get(5)?;
                 let last_sync: Option<String> = row.get(6)?;
                 let created_at: String = row.get(7)?;
+                let secrets_json: Option<String> = row.get(8)?;
 
                 Ok((
                     id,
@@ -2794,6 +2498,7 @@ impl ReadLaterManager {
                     sync_json,
                     last_sync,
                     created_at,
+                    secrets_json,
                 ))
             })
             .map_err(|e| ReadLaterError::Database(e.to_string()))?;
@@ -2801,15 +2506,29 @@ impl ReadLaterManager {
         let mut accounts = self.accounts.write();
 
         for row in rows {
-            let (id, name, provider_str, enabled, config_json, sync_json, last_sync, created_at) =
-                row.map_err(|e| ReadLaterError::Database(e.to_string()))?;
+            let (
+                id,
+                name,
+                provider_str,
+                enabled,
+                config_json,
+                sync_json,
+                last_sync,
+                created_at,
+                secrets_json,
+            ) = row.map_err(|e| ReadLaterError::Database(e.to_string()))?;
 
             let provider: ReadLaterProvider =
                 serde_json::from_str(&format!("\"{}\"", provider_str))
                     .map_err(|e| ReadLaterError::Database(e.to_string()))?;
 
-            let config: ProviderConfig = serde_json::from_str(&config_json)
+            let mut config: ProviderConfig = serde_json::from_str(&config_json)
                 .map_err(|e| ReadLaterError::Database(e.to_string()))?;
+            if let Some(secrets_json) = secrets_json {
+                let secrets: ProviderSecrets = serde_json::from_str(&secrets_json)
+                    .map_err(|e| ReadLaterError::Database(e.to_string()))?;
+                config.apply_secrets(secrets);
+            }
 
             let sync_settings: SyncSettings = serde_json::from_str(&sync_json)
                 .map_err(|e| ReadLaterError::Database(e.to_string()))?;
@@ -2967,12 +2686,23 @@ impl ReadLaterManager {
 
     // Account management
 
+    /// Serialize a config into its `config` (credential-free) and `secrets` column values.
+    fn config_columns(config: &ProviderConfig) -> Result<(String, String)> {
+        Ok((
+            serde_json::to_string(config)?,
+            serde_json::to_string(&config.secrets())?,
+        ))
+    }
+
     pub fn add_account(&mut self, account: ProviderAccount) -> Result<()> {
-        let config_json = serde_json::to_string(&account.config)?;
+        if account.provider == ReadLaterProvider::Omnivore {
+            return Err(ReadLaterError::Discontinued(OMNIVORE_DISCONTINUED.into()));
+        }
+        let (config_json, secrets_json) = Self::config_columns(&account.config)?;
         let sync_json = serde_json::to_string(&account.sync_settings)?;
 
         self.db.execute(
-            "INSERT INTO readlater_accounts (id, name, provider, enabled, config, sync_settings, last_sync, created_at)              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO readlater_accounts (id, name, provider, enabled, config, sync_settings, last_sync, created_at, secrets)              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 account.id,
                 account.name,
@@ -2982,6 +2712,7 @@ impl ReadLaterManager {
                 sync_json,
                 account.last_sync.map(|d| d.to_rfc3339()),
                 account.created_at.to_rfc3339(),
+                secrets_json,
             ],
         ).map_err(|e| ReadLaterError::Database(e.to_string()))?;
 
@@ -2990,11 +2721,11 @@ impl ReadLaterManager {
     }
 
     pub fn update_account(&mut self, account: ProviderAccount) -> Result<()> {
-        let config_json = serde_json::to_string(&account.config)?;
+        let (config_json, secrets_json) = Self::config_columns(&account.config)?;
         let sync_json = serde_json::to_string(&account.sync_settings)?;
 
         self.db.execute(
-            "UPDATE readlater_accounts SET name=?2, enabled=?3, config=?4, sync_settings=?5, last_sync=?6 WHERE id=?1",
+            "UPDATE readlater_accounts SET name=?2, enabled=?3, config=?4, sync_settings=?5, last_sync=?6, secrets=?7 WHERE id=?1",
             params![
                 account.id,
                 account.name,
@@ -3002,11 +2733,48 @@ impl ReadLaterManager {
                 config_json,
                 sync_json,
                 account.last_sync.map(|d| d.to_rfc3339()),
+                secrets_json,
             ],
         ).map_err(|e| ReadLaterError::Database(e.to_string()))?;
 
         self.accounts.write().insert(account.id.clone(), account);
         Ok(())
+    }
+
+    /// Persist a new provider config (e.g. refreshed tokens) for an account, touching only
+    /// the credential columns so concurrent edits to name/settings are not overwritten.
+    pub fn update_account_config(&mut self, id: &str, config: &ProviderConfig) -> Result<()> {
+        let (config_json, secrets_json) = Self::config_columns(config)?;
+        let changed = self
+            .db
+            .execute(
+                "UPDATE readlater_accounts SET config=?2, secrets=?3 WHERE id=?1",
+                params![id, config_json, secrets_json],
+            )
+            .map_err(|e| ReadLaterError::Database(e.to_string()))?;
+        if changed == 0 {
+            return Err(ReadLaterError::ProviderNotFound(id.into()));
+        }
+        if let Some(account) = self.accounts.write().get_mut(id) {
+            account.config = config.clone();
+        }
+        Ok(())
+    }
+
+    /// Pick up a token refresh the provider did inside its last call: adopt the new config
+    /// for the rest of the sync and persist it right away, so rotated tokens aren't lost.
+    fn absorb_refreshed_config(
+        &mut self,
+        provider: &dyn ReadLaterProviderTrait,
+        account: &mut ProviderAccount,
+        errors: &mut Vec<String>,
+    ) {
+        if let Some(config) = provider.take_refreshed_config() {
+            account.config = config;
+            if let Err(e) = self.update_account_config(&account.id, &account.config) {
+                errors.push(format!("Persist refreshed credentials: {}", e));
+            }
+        }
     }
 
     pub fn delete_account(&mut self, id: &str) -> Result<()> {
@@ -3260,25 +3028,36 @@ impl ReadLaterManager {
 
         result.provider = account.provider;
 
-        // Create provider instance
-        let provider: Box<dyn ReadLaterProviderTrait> = match account.provider {
-            ReadLaterProvider::Pocket => Box::new(PocketProvider::new()),
-            ReadLaterProvider::Instapaper => {
-                let key = std::env::var("INSTAPAPER_CONSUMER_KEY").unwrap_or_default();
-                let secret = std::env::var("INSTAPAPER_CONSUMER_SECRET").unwrap_or_default();
-                Box::new(InstapaperProvider::new(key, secret))
+        // Create provider instance. A discontinued provider (Omnivore) is reported as a sync
+        // error rather than failing `sync_all` for every other account.
+        let provider = match provider_for(account.provider) {
+            Ok(p) => p,
+            Err(e) => {
+                result.errors.push(e.to_string());
+                result.duration_ms = start.elapsed().as_millis() as u64;
+                result.completed_at = Utc::now();
+                return Ok(result);
             }
-            ReadLaterProvider::Wallabag => Box::new(WallabagProvider::new()),
-            ReadLaterProvider::Omnivore => Box::new(OmnivoreProvider::new()),
         };
+        let provider = provider.as_ref();
 
         // Refresh credentials once per sync (a no-op unless expired/near expiry) so the
-        // individual API calls below don't each trigger their own refresh.
+        // individual API calls below don't each trigger their own refresh. A refreshed token is
+        // persisted immediately.
         // A failed refresh aborts the sync without touching `last_sync`, so the failure stays
         // visible and the next sync retries the same window.
         let mut account = account;
         match provider.refresh_auth(&account.config).await {
-            Ok(config) => account.config = config,
+            Ok(config) => {
+                account.config = config;
+                if provider.take_refreshed_config().is_some() {
+                    if let Err(e) = self.update_account_config(&account.id, &account.config) {
+                        result
+                            .errors
+                            .push(format!("Persist refreshed credentials: {}", e));
+                    }
+                }
+            }
             Err(e) => {
                 result.errors.push(format!("Auth refresh: {}", e));
                 result.duration_ms = start.elapsed().as_millis() as u64;
@@ -3290,7 +3069,9 @@ impl ReadLaterManager {
         // Fetch articles
         let since = account.last_sync;
         let mut fetched = false;
-        match provider.fetch_articles(&account.config, since).await {
+        let fetch_result = provider.fetch_articles(&account.config, since).await;
+        self.absorb_refreshed_config(provider, &mut account, &mut result.errors);
+        match fetch_result {
             Ok(articles) => {
                 fetched = true;
                 result.articles_fetched = articles.len() as u32;
@@ -3309,10 +3090,11 @@ impl ReadLaterManager {
 
                     // Convert to device format
                     if account.sync_settings.convert_format != ArticleFormat::Html {
-                        match provider
+                        let content = provider
                             .fetch_article_content(&account.config, &article)
-                            .await
-                        {
+                            .await;
+                        self.absorb_refreshed_config(provider, &mut account, &mut result.errors);
+                        match content {
                             Ok(content) => {
                                 match self
                                     .converter
@@ -3360,10 +3142,11 @@ impl ReadLaterManager {
                 .collect();
 
             for article in articles_to_sync {
-                match provider
+                let updated = provider
                     .update_read_status(&account.config, &article.provider_id, article.status)
-                    .await
-                {
+                    .await;
+                self.absorb_refreshed_config(provider, &mut account, &mut result.errors);
+                match updated {
                     Ok(()) => {
                         result.read_status_synced += 1;
                     }
@@ -3526,12 +3309,6 @@ impl Default for PocketProvider {
 }
 
 impl Default for WallabagProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Default for OmnivoreProvider {
     fn default() -> Self {
         Self::new()
     }
@@ -3873,6 +3650,8 @@ mod tests {
             access_token: None,
             refresh_token: None,
             token_expires_at: None,
+            username: None,
+            password: None,
         };
         mgr.add_account(test_account(
             "wb",
@@ -3885,40 +3664,533 @@ mod tests {
         assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
         assert!(r.errors[0].starts_with("Auth refresh"));
         assert_eq!(mgr.get_account("wb").unwrap().last_sync, Some(last));
-        // Hosted Omnivore: refresh is a no-op but the fetch fails.
-        let om = ProviderConfig::Omnivore {
-            api_key: Some("k".into()),
-            api_url: None,
-        };
+        // Valid (unexpired) token but an unreachable server: refresh is a no-op, fetch fails.
+        let unreachable = wallabag_config(
+            "http://127.0.0.1:9",
+            Some("t"),
+            None,
+            Some(Utc::now() + Duration::hours(1)),
+        );
         mgr.add_account(test_account(
-            "om",
-            ReadLaterProvider::Omnivore,
-            om,
+            "wb2",
+            ReadLaterProvider::Wallabag,
+            unreachable,
             Some(last),
         ))
         .unwrap();
-        let r = mgr.sync_account("om").await.unwrap();
+        let r = mgr.sync_account("wb2").await.unwrap();
         assert!(
             r.errors.iter().any(|e| e.starts_with("Fetch")),
             "{:?}",
             r.errors
         );
-        assert_eq!(mgr.get_account("om").unwrap().last_sync, Some(last));
+        assert_eq!(mgr.get_account("wb2").unwrap().last_sync, Some(last));
+    }
+
+    fn wallabag_config(
+        instance_url: &str,
+        access_token: Option<&str>,
+        refresh_token: Option<&str>,
+        token_expires_at: Option<DateTime<Utc>>,
+    ) -> ProviderConfig {
+        ProviderConfig::Wallabag {
+            instance_url: instance_url.into(),
+            client_id: "cid".into(),
+            client_secret: Some("csecret".into()),
+            access_token: access_token.map(Into::into),
+            refresh_token: refresh_token.map(Into::into),
+            token_expires_at,
+            username: None,
+            password: None,
+        }
+    }
+
+    async fn spawn_server(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{}", addr)
+    }
+
+    #[test]
+    fn credentials_persist_across_restart_but_not_in_config_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rl.db");
+        let mut mgr = ReadLaterManager::new(&db, dir.path()).unwrap();
+        let mut wb = wallabag_config("https://wb.example", Some("AT"), Some("RT"), None);
+        if let ProviderConfig::Wallabag {
+            username, password, ..
+        } = &mut wb
+        {
+            *username = Some("alice".into());
+            *password = Some("PW".into());
+        }
+        mgr.add_account(test_account("wb", ReadLaterProvider::Wallabag, wb, None))
+            .unwrap();
+        let ip = ProviderConfig::Instapaper {
+            oauth_token: Some("OT".into()),
+            oauth_token_secret: Some("OTS".into()),
+            username: Some("bob".into()),
+        };
+        mgr.add_account(test_account("ip", ReadLaterProvider::Instapaper, ip, None))
+            .unwrap();
+
+        // The client-facing/config JSON carries no secrets.
+        let config_cols: Vec<String> = mgr
+            .db
+            .prepare("SELECT config FROM readlater_accounts")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        for secret in ["AT", "RT", "csecret", "PW", "OT", "OTS"] {
+            for col in &config_cols {
+                assert!(!col.contains(&format!("\"{secret}\"")), "{col}");
+            }
+            let json = serde_json::to_string(&mgr.list_accounts()).unwrap();
+            assert!(!json.contains(&format!("\"{secret}\"")), "{json}");
+        }
+
+        // A refreshed token is persisted by update_account_config.
+        let refreshed = wallabag_config("https://wb.example", Some("AT2"), Some("RT2"), None);
+        let refreshed = {
+            let mut c = refreshed;
+            if let ProviderConfig::Wallabag {
+                username, password, ..
+            } = &mut c
+            {
+                *username = Some("alice".into());
+                *password = Some("PW".into());
+            }
+            c
+        };
+        mgr.update_account_config("wb", &refreshed).unwrap();
+        drop(mgr);
+
+        let mgr = ReadLaterManager::new(&db, dir.path()).unwrap();
+        let ProviderConfig::Wallabag {
+            client_secret,
+            access_token,
+            refresh_token,
+            username,
+            password,
+            ..
+        } = mgr.get_account("wb").unwrap().config
+        else {
+            panic!("wrong variant")
+        };
+        assert_eq!(client_secret.as_deref(), Some("csecret"));
+        assert_eq!(access_token.as_deref(), Some("AT2"));
+        assert_eq!(refresh_token.as_deref(), Some("RT2"));
+        assert_eq!(username.as_deref(), Some("alice"));
+        assert_eq!(password.as_deref(), Some("PW"));
+        let ProviderConfig::Instapaper {
+            oauth_token,
+            oauth_token_secret,
+            ..
+        } = mgr.get_account("ip").unwrap().config
+        else {
+            panic!("wrong variant")
+        };
+        assert_eq!(oauth_token.as_deref(), Some("OT"));
+        assert_eq!(oauth_token_secret.as_deref(), Some("OTS"));
+    }
+
+    /// A database from before the `secrets` column (and with Omnivore rows) still loads.
+    #[tokio::test]
+    async fn migrates_legacy_db_and_loads_omnivore_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("rl.db");
+        {
+            let db = Connection::open(&db_path).unwrap();
+            db.execute_batch(
+                r#"
+                CREATE TABLE readlater_accounts (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL, provider TEXT NOT NULL,
+                    enabled INTEGER DEFAULT 1, config TEXT NOT NULL, sync_settings TEXT NOT NULL,
+                    last_sync TEXT, created_at TEXT NOT NULL
+                );
+                CREATE TABLE readlater_articles (
+                    id TEXT PRIMARY KEY, provider TEXT NOT NULL, provider_id TEXT NOT NULL,
+                    account_id TEXT, url TEXT NOT NULL, title TEXT NOT NULL, excerpt TEXT,
+                    author TEXT, word_count INTEGER, reading_time_minutes INTEGER, tags TEXT,
+                    status TEXT NOT NULL, favorite INTEGER DEFAULT 0, added_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL, read_at TEXT, image_url TEXT, document_id TEXT,
+                    synced_to_device INTEGER DEFAULT 0, last_sync TEXT,
+                    UNIQUE(provider, provider_id)
+                );
+                "#,
+            )
+            .unwrap();
+            let settings = serde_json::to_string(&SyncSettings::default()).unwrap();
+            let now = Utc::now().to_rfc3339();
+            db.execute(
+                "INSERT INTO readlater_accounts (id, name, provider, enabled, config, sync_settings, created_at) VALUES ('om', 'Omni', 'omnivore', 1, ?1, ?2, ?3)",
+                params![r#"{"type":"omnivore","api_url":null}"#, settings, now],
+            )
+            .unwrap();
+            // Very old rows could still carry a token inside the config JSON.
+            db.execute(
+                "INSERT INTO readlater_accounts (id, name, provider, enabled, config, sync_settings, created_at) VALUES ('pk', 'Pocket', 'pocket', 1, ?1, ?2, ?3)",
+                params![
+                    r#"{"type":"pocket","consumer_key":"ck","access_token":"legacy","username":null}"#,
+                    settings,
+                    now
+                ],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO readlater_articles (id, provider, provider_id, url, title, status, added_at, updated_at) VALUES ('a1', 'omnivore', 'x', 'https://ex.com', 'T', 'unread', ?1, ?1)",
+                params![now],
+            )
+            .unwrap();
+        }
+
+        let mut mgr = ReadLaterManager::new(&db_path, dir.path()).unwrap();
+        let om = mgr.get_account("om").unwrap();
+        assert_eq!(om.provider, ReadLaterProvider::Omnivore);
+        assert!(!om.config.is_authenticated());
+        assert_eq!(
+            mgr.get_article("a1").unwrap().provider,
+            ReadLaterProvider::Omnivore
+        );
+        let ProviderConfig::Pocket { access_token, .. } = mgr.get_account("pk").unwrap().config
+        else {
+            panic!("wrong variant")
+        };
+        assert_eq!(access_token.as_deref(), Some("legacy"));
+
+        // Syncing the discontinued account reports it instead of failing.
+        let r = mgr.sync_account("om").await.unwrap();
+        assert!(
+            r.errors.iter().any(|e| e.contains("Omnivore shut down")),
+            "{:?}",
+            r.errors
+        );
+        let err = provider_for(ReadLaterProvider::Omnivore).err().unwrap();
+        assert!(matches!(err, ReadLaterError::Discontinued(_)));
+        // New Omnivore accounts are rejected; the old one can still be deleted.
+        let err = mgr
+            .add_account(test_account(
+                "om2",
+                ReadLaterProvider::Omnivore,
+                ProviderConfig::Omnivore {},
+                None,
+            ))
+            .unwrap_err();
+        assert!(matches!(err, ReadLaterError::Discontinued(_)));
+        mgr.delete_account("om").unwrap();
+
+        // The migration added the column and is idempotent; the legacy token was kept.
+        mgr.update_account(mgr.get_account("pk").unwrap()).unwrap();
+        drop(mgr);
+        let mgr = ReadLaterManager::new(&db_path, dir.path()).unwrap();
+        let secrets: String = mgr
+            .db
+            .query_row(
+                "SELECT secrets FROM readlater_accounts WHERE id='pk'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(secrets.contains("legacy"));
+        assert!(mgr.get_account("om").is_none());
+    }
+
+    #[derive(Default)]
+    struct MockWallabag {
+        token_requests: std::sync::Mutex<Vec<HashMap<String, String>>>,
+        /// Access token the API accepts.
+        valid_token: String,
+        /// Access token the token endpoint hands out.
+        issued_token: String,
+    }
+
+    async fn mock_wallabag(valid_token: &str, issued_token: &str) -> (String, Arc<MockWallabag>) {
+        use axum::extract::State;
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::routing::{get, post};
+
+        let state = Arc::new(MockWallabag {
+            valid_token: valid_token.into(),
+            issued_token: issued_token.into(),
+            ..Default::default()
+        });
+        let app = axum::Router::new()
+            .route(
+                "/oauth/v2/token",
+                post(
+                    |State(s): State<Arc<MockWallabag>>,
+                     axum::Form(form): axum::Form<HashMap<String, String>>| async move {
+                        s.token_requests.lock().unwrap().push(form);
+                        axum::Json(serde_json::json!({
+                            "access_token": s.issued_token,
+                            "refresh_token": "rotated-refresh",
+                            "expires_in": 3600,
+                            "token_type": "bearer",
+                        }))
+                    },
+                ),
+            )
+            .route(
+                "/api/entries.json",
+                get(
+                    |State(s): State<Arc<MockWallabag>>, headers: HeaderMap| async move {
+                        let auth = headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("");
+                        if auth != format!("Bearer {}", s.valid_token) {
+                            return Err(StatusCode::UNAUTHORIZED);
+                        }
+                        Ok(axum::Json(serde_json::json!({"_embedded": {"items": [{
+                            "id": 7, "url": "https://ex.com/7", "title": "Seven",
+                            "content": "<p>7</p>", "reading_time": 1, "is_archived": 0,
+                            "is_starred": 0, "tags": [],
+                            "created_at": "2025-01-01T00:00:00+00:00",
+                            "updated_at": "2025-01-01T00:00:00+00:00",
+                            "preview_picture": null
+                        }]}})))
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&state));
+        (spawn_server(app).await, state)
+    }
+
+    /// A revoked token (unexpired as far as we know) gets a 401: refresh once, retry, persist.
+    #[tokio::test]
+    async fn wallabag_401_refreshes_retries_and_persists_token() {
+        let (base, mock) = mock_wallabag("fresh", "fresh").await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rl.db");
+        let mut mgr = ReadLaterManager::new(&db, dir.path()).unwrap();
+        let mut account = test_account(
+            "wb",
+            ReadLaterProvider::Wallabag,
+            wallabag_config(
+                &base,
+                Some("revoked"),
+                Some("old-refresh"),
+                Some(Utc::now() + Duration::hours(1)),
+            ),
+            None,
+        );
+        account.sync_settings.convert_format = ArticleFormat::Html;
+        mgr.add_account(account).unwrap();
+
+        let r = mgr.sync_account("wb").await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(r.articles_fetched, 1);
+        {
+            let reqs = mock.token_requests.lock().unwrap();
+            assert_eq!(reqs.len(), 1);
+            assert_eq!(reqs[0]["grant_type"], "refresh_token");
+            assert_eq!(reqs[0]["refresh_token"], "old-refresh");
+            assert_eq!(reqs[0]["client_secret"], "csecret");
+        }
+        drop(mgr);
+
+        let mgr = ReadLaterManager::new(&db, dir.path()).unwrap();
+        let ProviderConfig::Wallabag {
+            access_token,
+            refresh_token,
+            token_expires_at,
+            ..
+        } = mgr.get_account("wb").unwrap().config
+        else {
+            panic!("wrong variant")
+        };
+        assert_eq!(access_token.as_deref(), Some("fresh"));
+        assert_eq!(refresh_token.as_deref(), Some("rotated-refresh"));
+        assert!(token_expires_at.unwrap() > Utc::now());
+    }
+
+    /// No refresh token: the password grant is used, and a retry that still gets 401 is not
+    /// retried again.
+    #[tokio::test]
+    async fn wallabag_401_uses_password_grant_and_retries_only_once() {
+        let (base, mock) = mock_wallabag("fresh", "fresh").await;
+        let provider = WallabagProvider::new();
+        let mut config = wallabag_config(&base, Some("revoked"), None, None);
+        // Without refresh credentials a token with no expiry is used as-is; the 401 is final.
+        let err = provider.fetch_articles(&config, None).await.unwrap_err();
+        assert!(err.to_string().contains("401"), "{err}");
+        assert!(mock.token_requests.lock().unwrap().is_empty());
+        assert!(provider.take_refreshed_config().is_none());
+
+        if let ProviderConfig::Wallabag {
+            username,
+            password,
+            token_expires_at,
+            ..
+        } = &mut config
+        {
+            *username = Some("alice".into());
+            *password = Some("pw".into());
+            *token_expires_at = Some(Utc::now() + Duration::hours(1));
+        }
+        let articles = provider.fetch_articles(&config, None).await.unwrap();
+        assert_eq!(articles.len(), 1);
+        {
+            let reqs = mock.token_requests.lock().unwrap();
+            assert_eq!(reqs.len(), 1);
+            assert_eq!(reqs[0]["grant_type"], "password");
+            assert_eq!(reqs[0]["username"], "alice");
+            assert_eq!(reqs[0]["password"], "pw");
+        }
+        let Some(ProviderConfig::Wallabag { access_token, .. }) = provider.take_refreshed_config()
+        else {
+            panic!("expected a refreshed config")
+        };
+        assert_eq!(access_token.as_deref(), Some("fresh"));
+
+        // The server rejects even the new token: exactly one refresh, then the 401 surfaces.
+        let (base, mock) = mock_wallabag("never", "also-bad").await;
+        let config = wallabag_config(
+            &base,
+            Some("revoked"),
+            Some("r"),
+            Some(Utc::now() + Duration::hours(1)),
+        );
+        let err = provider.fetch_articles(&config, None).await.unwrap_err();
+        assert!(err.to_string().contains("401"), "{err}");
+        assert_eq!(mock.token_requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn parse_form_urlencoded_decodes() {
+        assert_eq!(
+            parse_form_urlencoded("oauth_token=a%2Bb&oauth_token_secret=c+d&flag\n"),
+            vec![
+                ("oauth_token".to_string(), "a+b".to_string()),
+                ("oauth_token_secret".to_string(), "c d".to_string()),
+                ("flag".to_string(), String::new()),
+            ]
+        );
     }
 
     #[tokio::test]
-    async fn omnivore_hosted_service_reports_discontinued() {
-        let provider = OmnivoreProvider::new();
-        let config = ProviderConfig::Omnivore {
-            api_key: Some("k".into()),
-            api_url: None,
+    async fn instapaper_xauth_signs_request_and_parses_tokens() {
+        use axum::http::HeaderMap;
+        use axum::routing::post;
+
+        type Captured = Arc<std::sync::Mutex<Option<(String, String)>>>;
+        let captured: Captured = Default::default();
+        let app = axum::Router::new()
+            .route(
+                "/oauth/access_token",
+                post(
+                    |axum::extract::State(c): axum::extract::State<Captured>,
+                     headers: HeaderMap,
+                     body: String| async move {
+                        let auth = headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        *c.lock().unwrap() = Some((auth, body));
+                        "oauth_token=tok%2B1&oauth_token_secret=sec+ret"
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&captured));
+        let base = spawn_server(app).await;
+
+        let provider =
+            InstapaperProvider::new("ckey".into(), "csecret".into()).with_api_base(&base);
+        let state = provider.start_oauth("http://cb").await.unwrap();
+        let callback = OAuthCallback {
+            code: None,
+            oauth_token: None,
+            oauth_verifier: None,
+            state: None,
+            username: Some("u@example.com".into()),
+            password: Some("p&w =".into()),
         };
-        let err = provider.fetch_articles(&config, None).await.unwrap_err();
-        assert!(err.to_string().contains("discontinued"), "{err}");
-        let err = provider
-            .add_article(&config, "https://ex.com", &[])
+        let config = provider.complete_oauth(&callback, &state).await.unwrap();
+        let ProviderConfig::Instapaper {
+            oauth_token,
+            oauth_token_secret,
+            username,
+        } = &config
+        else {
+            panic!("wrong variant")
+        };
+        assert_eq!(oauth_token.as_deref(), Some("tok+1"));
+        assert_eq!(oauth_token_secret.as_deref(), Some("sec ret"));
+        assert_eq!(username.as_deref(), Some("u@example.com"));
+
+        // Verify the request the server saw: xAuth body params and a valid HMAC-SHA1 signature
+        // over the oauth params plus the body (no oauth_token, empty token secret).
+        let (auth, body) = captured.lock().unwrap().clone().unwrap();
+        let body_params = parse_form_urlencoded(&body);
+        let get = |k: &str| {
+            body_params
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("x_auth_username"), Some("u@example.com"));
+        assert_eq!(get("x_auth_password"), Some("p&w ="));
+        assert_eq!(get("x_auth_mode"), Some("client_auth"));
+        let header = auth.strip_prefix("OAuth ").expect("OAuth header");
+        let mut oauth: Vec<(String, String)> = header
+            .split(", ")
+            .map(|kv| {
+                let (k, v) = kv.split_once('=').unwrap();
+                let v = urlencoding::decode(v.trim_matches('"'))
+                    .unwrap()
+                    .into_owned();
+                (k.to_string(), v)
+            })
+            .collect();
+        assert!(oauth.iter().all(|(k, _)| k != "oauth_token"));
+        assert!(oauth.contains(&("oauth_consumer_key".into(), "ckey".into())));
+        let sig_pos = oauth
+            .iter()
+            .position(|(k, _)| k == "oauth_signature")
+            .unwrap();
+        let (_, signature) = oauth.remove(sig_pos);
+        let all: Vec<(&str, &str)> = oauth
+            .iter()
+            .chain(body_params.iter())
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let url = format!("{}/oauth/access_token", base);
+        assert_eq!(
+            oauth1_signature("POST", &url, &all, "csecret", None),
+            signature
+        );
+
+        // The obtained tokens persist with the account.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rl.db");
+        let mut mgr = ReadLaterManager::new(&db, dir.path()).unwrap();
+        mgr.add_account(test_account(
+            "ip",
+            ReadLaterProvider::Instapaper,
+            config,
+            None,
+        ))
+        .unwrap();
+        drop(mgr);
+        let mgr = ReadLaterManager::new(&db, dir.path()).unwrap();
+        assert!(mgr.get_account("ip").unwrap().config.is_authenticated());
+
+        // Missing username / consumer credentials are clear errors, not requests.
+        let no_user = OAuthCallback {
+            username: None,
+            ..callback.clone()
+        };
+        assert!(provider.complete_oauth(&no_user, &state).await.is_err());
+        let unconfigured =
+            InstapaperProvider::new(String::new(), String::new()).with_api_base(&base);
+        let err = unconfigured
+            .complete_oauth(&callback, &state)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("discontinued"), "{err}");
+        assert!(err.to_string().contains("INSTAPAPER_CONSUMER_KEY"), "{err}");
     }
 }
