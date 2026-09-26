@@ -35,23 +35,25 @@ pub async fn create(
                 metadata =
                     serde_json::from_str(&field.text().await.map_err(bad)?).unwrap_or(Value::Null)
             }
-            "page" => png = Some(field.bytes().await.map_err(bad)?),
+            // Streamed to a staged file in the store, then renamed into `shared/`.
+            "page" => png = Some(crate::upload::stage_field(&state.storage, field, false).await?),
             _ => {}
         }
     }
     let png = png.ok_or_else(|| bad("missing 'page'"))?;
-    if !png.starts_with(b"\x89PNG") {
+    if !png.head().starts_with(b"\x89PNG") {
         return Err(bad("'page' is not a PNG"));
     }
     let id = uuid::Uuid::new_v4().to_string();
     let dir = shared_dir(&state);
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join(format!("{id}.png")), &png)?;
+    let bytes = png.len();
+    png.persist(&dir.join(format!("{id}.png")))?;
     let link = format!(
         "https://{}/share/v1/link/{id}.png",
         state.devices.get_endpoint()
     );
-    tracing::info!(doc = %metadata["DocID"], %link, bytes = png.len(), "page shared as link");
+    tracing::info!(doc = %metadata["DocID"], %link, bytes, "page shared as link");
     Ok(Json(json!({ "link": link })))
 }
 

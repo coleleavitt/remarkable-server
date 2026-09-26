@@ -592,6 +592,53 @@ impl Storage {
         Ok(())
     }
 
+    /// Directory for in-flight streamed uploads ([`crate::upload`]). It lives inside the
+    /// store so a finished upload is on the same filesystem and can be renamed into place
+    /// atomically; its name is not a 2-char prefix, so the blob scan never reads it.
+    pub fn staging_dir(&self) -> PathBuf {
+        self.inner.base_path.join(".uploads")
+    }
+
+    /// Store an already-written file under the client-supplied hash by renaming it into
+    /// place: the streaming counterpart of [`Storage::put_with_hash`], with the same
+    /// catalogue semantics (the hash is not recomputed; the caller checks integrity).
+    ///
+    /// `staged` must be on the store's filesystem (see [`Storage::staging_dir`]) and should
+    /// already be fsynced. Like `put_with_hash`, the file lands before its row. On error the
+    /// staged file is left where it is for the caller to remove. Returns the stored size.
+    pub fn put_file_with_hash(&self, staged: &Path, hash: &str, filename: &str) -> Result<u64> {
+        if !is_valid_hash(hash) {
+            return Err(ServerError::InvalidHash(hash.to_string()));
+        }
+        let size = fs::metadata(staged)?.len();
+        let path = self.hash_path(hash);
+        let dir = path.parent().unwrap_or(&self.inner.base_path).to_path_buf();
+        if !dir.exists() {
+            fs::create_dir_all(&dir)?;
+            // Best-effort: make the new prefix directory's entry durable too.
+            if let Ok(base) = fs::File::open(&self.inner.base_path) {
+                let _ = base.sync_all();
+            }
+        }
+        fs::rename(staged, &path)?;
+        // Best-effort: fsync the directory so the rename itself survives a crash.
+        if let Ok(d) = fs::File::open(&dir) {
+            let _ = d.sync_all();
+        }
+
+        self.inner.db.lock().execute(
+            "INSERT INTO blobs (hash, filename, size, updated_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(hash) DO UPDATE SET filename = excluded.filename, size = excluded.size, updated_at = excluded.updated_at",
+            params![hash, filename, size as i64, unix_now()],
+        )?;
+        // New bytes under this hash: forget any earlier parse of it.
+        self.inner
+            .db
+            .lock()
+            .execute("DELETE FROM indexes WHERE hash = ?1", [hash])?;
+        Ok(size)
+    }
+
     /// Mark stored blobs as just used. A client told a blob is present won't upload it
     /// again, so this keeps it inside the unreachable report's grace period until the
     /// root that references it is committed.
