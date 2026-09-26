@@ -569,7 +569,13 @@ impl Storage {
         }
         let path = self.hash_path(hash);
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            if !parent.exists() {
+                fs::create_dir_all(parent)?;
+                // Best-effort: make the new prefix directory's entry durable too.
+                if let Ok(base) = fs::File::open(&self.inner.base_path) {
+                    let _ = base.sync_all();
+                }
+            }
         }
         atomic_write(&path, data)?;
 
@@ -927,7 +933,10 @@ impl Storage {
             let mut db = self.inner.db.lock();
             let tx = db.transaction()?;
             tx.execute_batch("DELETE FROM entries; DELETE FROM indexes; DELETE FROM blobs;")?;
-            tx.execute("UPDATE root SET hash = '', generation = 0 WHERE id = 1", [])?;
+            tx.execute(
+                "UPDATE root SET hash = '', generation = 0, previous_hash = '' WHERE id = 1",
+                [],
+            )?;
             tx.commit()?;
         }
         *self.inner.root.write() = SyncRoot::empty();
@@ -1078,6 +1087,22 @@ mod tests {
             storage.delete("../../etc"),
             Err(ServerError::InvalidHash(_))
         ));
+    }
+
+    #[test]
+    fn clear_forgets_previous_root() {
+        let tmp = TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        crate::documents::create_document(&storage, "One", "pdf", b"%PDF-1.4 one").unwrap();
+        crate::documents::create_document(&storage, "Two", "pdf", b"%PDF-1.4 two").unwrap();
+        storage.clear().unwrap();
+
+        // Nothing from the pre-clear trees counts as live any more.
+        let orphan = storage.put(b"after clear", "x.rm").unwrap();
+        assert_eq!(
+            storage.unreachable_blobs(Duration::ZERO).unwrap(),
+            vec![orphan]
+        );
     }
 
     #[test]
