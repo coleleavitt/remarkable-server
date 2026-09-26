@@ -185,6 +185,8 @@ impl FirmwareManager {
     /// Create new firmware manager, scanning the archive directory
     pub fn new(archive_path: impl Into<PathBuf>, base_url: &str) -> Result<Self> {
         let archive_path = archive_path.into();
+        // PUBLIC_URL may end in '/'; avoid `//firmware/...` URLs the router won't match.
+        let base_url = base_url.trim_end_matches('/');
         if !archive_path.exists() {
             return Err(ServerError::NotFound(format!(
                 "Firmware archive not found: {}",
@@ -863,6 +865,15 @@ mod tests {
         assert_eq!(fetch(router.clone(), "/firmware/v1/download/3.23.0.1?device=rm2").await.0, StatusCode::NOT_FOUND);
         assert_eq!(fetch(router.clone(), "/firmware/v1/download/3.22.0.64?device=bogus").await.0, StatusCode::BAD_REQUEST);
         assert_eq!(fetch(router, "/firmware/v1/download/9.9.9.9").await.0, StatusCode::NOT_FOUND);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn trailing_slash_base_url_has_no_double_slash() {
+        let dir = temp_archive("slash");
+        fs::write(dir.join("remarkable-production-image-3.22.0.64-rm2-public.swu"), b"rm2 image").unwrap();
+        let mgr = FirmwareManager::new(&dir, "http://h/").unwrap();
+        assert_eq!(mgr.get_version(DeviceType::Rm2, "3.22.0.64").unwrap().download_url, "http://h/firmware/v1/download/3.22.0.64?device=rm2");
         fs::remove_dir_all(dir).ok();
     }
 

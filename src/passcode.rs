@@ -59,7 +59,9 @@ fn approve_and_notify(state: &AppState, request_id: &str, owner: Option<&str>) -
 
 /// A device can't vouch for its own reset: approve/deny must come from a *different* device of the
 /// requesting user. Other users' requests (and unknown/expired ids) are 404, same device is 403.
+/// Expired rows are swept here since the lookup 404s them before deny could delete them.
 fn require_other_device(state: &AppState, request_id: &str, user_id: &str, device_id: &str) -> Result<()> {
+    state.devices.purge_expired_passcode_resets(user_id)?;
     let reset = state.devices.get_passcode_reset(request_id, user_id)?;
     if reset.device_id == device_id {
         tracing::warn!(%request_id, device = %device_id, "passcode reset self-approval/denial rejected");
@@ -164,6 +166,18 @@ mod tests {
         assert_eq!(status_of(device_approve(State(state.clone()), Path(REQ.into()), mallory.clone()).await), StatusCode::NOT_FOUND);
         assert_eq!(status_of(device_deny(State(state.clone()), Path(REQ.into()), mallory).await), StatusCode::NOT_FOUND);
         assert!(!get(State(state.clone()), Path(REQ.into()), a).await.unwrap().0.approved);
+    }
+
+    #[tokio::test]
+    async fn deny_of_expired_request_removes_the_row() {
+        let (state, _tmp) = setup();
+        let now = Utc::now();
+        let stale = PasscodeReset { device_id: "tablet-a".into(), device_name: "reMarkable".into(), request_id: REQ.into(), created: now - Duration::hours(48), expires: now - Duration::hours(24), approved: false };
+        assert!(state.devices.create_passcode_reset(&stale, "user-1").unwrap());
+        let b = device(&state, "user-1", "tablet-b");
+        assert_eq!(status_of(device_deny(State(state.clone()), Path(REQ.into()), b).await), StatusCode::NOT_FOUND);
+        // row is gone: the same id can be stored again
+        assert!(state.devices.create_passcode_reset(&stale, "user-1").unwrap());
     }
 
     #[tokio::test]

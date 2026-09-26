@@ -256,8 +256,17 @@ impl DeviceManager {
             .map_err(|_| ServerError::NotFound(request_id.into()))?;
         if owner.is_some_and(|o| o != user_id) { return Err(ServerError::NotFound(request_id.into())); }
         let reset = self.get_passcode_reset(request_id, &user_id)?;
-        self.inner.conn.lock().execute("UPDATE passcode_resets SET approved = 1 WHERE request_id = ?", params![request_id])?;
+        // A concurrent deny may have deleted the row since the lookup: don't report (or notify) an approval.
+        if self.inner.conn.lock().execute("UPDATE passcode_resets SET approved = 1 WHERE request_id = ? AND user_id = ?", params![request_id, user_id])? == 0 {
+            return Err(ServerError::NotFound(request_id.into()));
+        }
         Ok((user_id, PasscodeReset { approved: true, ..reset }))
+    }
+
+    /// Drop `user_id`'s expired reset requests (lookups already treat them as missing).
+    pub fn purge_expired_passcode_resets(&self, user_id: &str) -> Result<usize> {
+        // rfc3339 strings from `to_rfc3339()` share one format/offset, so they compare chronologically.
+        Ok(self.inner.conn.lock().execute("DELETE FROM passcode_resets WHERE user_id = ? AND expires < ?", params![user_id, Utc::now().to_rfc3339()])?)
     }
 
     /// Drop a reset request owned by `user_id` (deny). Returns whether one existed.
