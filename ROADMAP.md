@@ -19,18 +19,22 @@ Legend: ✅ shipped · 🔵 in progress · ⬜ planned · 🧪 spike/research.
 
 These are done and, in several cases, ahead of rmfakecloud:
 
-- ✅ **Self-hosted sync** — protocol v1.0 / v1.5 / v2 / v3 / v4 + gentree; no
-  50-day expiry, no Connect gating (self-hosting *is* the escape from the
-  paywall the community complains about).
+- ✅ **Self-hosted sync** — protocol v1.0 / v1.5 / v2 / v3 + gentree (v4 is
+  partial: root/file routes only); no 50-day expiry, no Connect gating
+  (self-hosting *is* the escape from the paywall the community complains about).
 - ✅ **Device pairing + auth** — one-time pairing code, per-install random
   `jwt_secret`, device→user JWT bundle (software 3.28 OAuth device flow).
 - ✅ **Generation-guarded root writes** — optimistic concurrency
-  (`set_root_if`, GCS `if-generation-match` semantics).
-- ✅ **WebSocket sync push** — `SyncComplete` broadcast to connected devices on
-  root update (`/notifications/ws`), so a tablet learns about changes without
-  polling.
+  (`set_root_if`, GCS `if-generation-match` semantics). Like GCS, a sync15
+  root write *without* the header is unconditional; rejecting a present but
+  malformed header is in PR `fix/sync-root-integrity`.
+- ✅ **WebSocket sync push** — `SyncComplete` on `/notifications/ws`, so a
+  tablet learns about changes without polling. Sent on gentree commits,
+  server-side uploads and `sync-complete`; a sync v3 root `PUT` only broadcasts
+  when the client sets `broadcast: true`.
 - ✅ **Handwriting** — convert + **full-text handwriting search** (rmfakecloud
-  has convert only, no search).
+  has convert only, no search). Recognition runs **locally** (the `tesseract`
+  binary, or any recogniser via `HWR_COMMAND`) — no MyScript keys, no paywall.
 - ✅ **Screen-share browser viewer** — `/screenshare/view`, WebRTC from the
   tablet, MQTT **and** REST-room brokers, with a **pen-tip presenter cursor**
   (the "show the pen pointer" ask) and correct cursor/frame pairing.
@@ -48,14 +52,23 @@ These are done and, in several cases, ahead of rmfakecloud:
 
 The community's top *concrete* pains. Small, bounded, high-value.
 
-- 🔵 **Atomic durable writes** *(PR: `fix/atomic-storage-writes`)* — `root.json`
-  and blobs currently persist with in-place `fs::write`; a crash mid-write can
-  truncate `root.json` and **empty the whole cloud** on next sync (the #2
-  community-reported failure). Fix: write-temp → fsync → atomic rename.
+- 🔵 **Atomic durable writes** *(PR #12)* — `root.json` and blobs currently
+  persist with in-place `fs::write`; a crash mid-write can truncate `root.json`
+  (the server then fails to start until it's repaired) or leave a torn blob that
+  the tablet syncs as corrupt. The community's "corrupt root empties the cloud"
+  failure is this class of bug. Fix: write-temp → fsync → atomic rename.
   *Effort: S.*
-- ⬜ **Large-file upload robustness** — stream blob uploads to disk instead of
-  buffering the full body in memory (`put_file`/`blob_put` take `Bytes` = whole
-  file in RAM); verify checksum on the fly. The official cloud's
+- 🔵 **SQLite sync index (`sync.db`)** *(PR #13, stacked on #12)* — root
+  hash/generation as a compare-and-swap in one SQLite transaction (safe across
+  processes; `root.json` kept as a mirror and adopted if a rolled-back build
+  moved it ahead), a `blobs` table replacing `meta/*.meta`, and a derived-only
+  projection of the index files (the tablet is still served the stored bytes).
+  Adds a read-only unreachable-blob report. *Effort: M.*
+- ⬜ **Large-file upload robustness** — stream uploads to disk instead of
+  buffering the full body in memory: every upload route takes `Bytes` (whole
+  file in RAM) — sync v3 `put_file`, sync15 `blob_put`, gentree `PutFile`, the
+  v2/v4 blob PUTs in `protocol.rs`, and `documents::upload_v2`; verify checksum
+  on the fly. The official cloud's
   `302 → Google-upload` redirect that resets progress to 0% does **not** apply
   here (we accept the PUT directly) — document that as a self-hosting win, and
   add resumable/chunked upload only if a client needs it. *Effort: M.*
@@ -63,10 +76,11 @@ The community's top *concrete* pains. Small, bounded, high-value.
   storage moves / binary swaps don't force re-pairing (today `jwt_secret` +
   `devices.db` must move together or every token invalidates). Harden + document.
   *Effort: S–M.*
-- ⬜ **Self-hostable OCR backend** — pluggable handwriting-recognition backend
-  behind the existing `/convert` + `/handwriting/v1/search` endpoints: keep the
-  MyScript/iink-compatible path, add a **local** option (Tesseract, or a local
-  model) so OCR isn't paywalled. Default off; opt-in. Directly answers a
+- ⬜ **Better local handwriting recognition** — local OCR already ships
+  (Tesseract by default, pluggable via `HWR_COMMAND`, e.g.
+  `contrib/hwr/trocr_hwr.py`), but Tesseract is a *print* OCR. Next: make a
+  handwriting model the documented default, and optionally a
+  MyScript/iink-compatible backend for people who have keys. Directly answers a
   recurring, paywalled pain (and rmfakecloud's #1 request). *Effort: M.*
 - ⬜ **Integration hub (phase 1)** — first-class **WebDAV / Nextcloud** export
   of synced docs (most-requested integration), then CalDAV and an Obsidian-
