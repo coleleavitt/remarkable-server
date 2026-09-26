@@ -62,10 +62,19 @@ impl GoogleDrive {
         let esc = |s: &str| s.replace('\\', "\\\\").replace('\'', "\\'");
         let query = format!(
             "name = '{}' and '{}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
-            esc(name), esc(parent)
+            esc(name),
+            esc(parent)
         );
-        let url = format!("{}/files?q={}&fields=files(id,name,mimeType,parents)", API_BASE, urlencoding::encode(&query));
-        let response = self.request(reqwest::Method::GET, &url).await?.send().await
+        let url = format!(
+            "{}/files?q={}&fields=files(id,name,mimeType,parents)",
+            API_BASE,
+            urlencoding::encode(&query)
+        );
+        let response = self
+            .request(reqwest::Method::GET, &url)
+            .await?
+            .send()
+            .await
             .map_err(|e| IntegrationError::Network(e.to_string()))?;
         let list: ListFilesResponse = self.handle_response(response).await?;
         Ok(list.files.into_iter().next().map(|f| f.id))
@@ -389,7 +398,9 @@ impl CloudProvider for GoogleDrive {
         mime_type: Option<&str>,
     ) -> Result<CloudFile> {
         // Drive addresses folders by ID, not path: walk (find or create) each directory.
-        let (name, dirs) = components.split_last().ok_or_else(|| IntegrationError::InvalidPath("empty path".into()))?;
+        let (name, dirs) = components
+            .split_last()
+            .ok_or_else(|| IntegrationError::InvalidPath("empty path".into()))?;
         let mut parent = parent_id.unwrap_or("root").to_string();
         for dir in dirs {
             parent = match self.find_folder(&parent, dir).await? {
@@ -397,7 +408,9 @@ impl CloudProvider for GoogleDrive {
                 None => self.create_folder(Some(&parent), dir).await?.id,
             };
         }
-        let mut file = self.upload_file(Some(&parent), name, content, mime_type).await?;
+        let mut file = self
+            .upload_file(Some(&parent), name, content, mime_type)
+            .await?;
         file.path = format!("/{}", components.join("/")); // full relative path, not just the basename
         Ok(file)
     }

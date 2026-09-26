@@ -2,30 +2,14 @@
 //!
 //! REST API for managing cloud storage integrations.
 
-use crate::integrations::{
-    dropbox::Dropbox,
-    google_drive::GoogleDrive,
-    oauth::{OAuthConfig, OAuthToken, PkceFlow, validate_state},
-    onedrive::OneDrive,
-    sync::{CloudSync, SyncConfig, SyncState},
-    CloudProvider, ProviderType,
-};
-use axum::{
-    extract::{OriginalUri, Path, Query, State},
-    http::StatusCode,
-    response::{Html, Redirect},
-    Json,
-};
-use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{OriginalUri, Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::Redirect;
+use axum::response::{Html, Redirect};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
@@ -289,7 +273,9 @@ pub async fn oauth_callback(
 
 /// `<mount>/callback` -> `<mount>/providers/{provider}/success` (a routed path).
 fn success_redirect_path(callback_path: &str, provider: ProviderType) -> String {
-    let mount = callback_path.strip_suffix("/callback").unwrap_or("/integrations/v2/cloud");
+    let mount = callback_path
+        .strip_suffix("/callback")
+        .unwrap_or("/integrations/v2/cloud");
     format!("{}/providers/{}/success", mount, provider)
 }
 
@@ -366,19 +352,40 @@ pub async fn refresh_token(
 /// components are accepted (no absolute paths, `..`, backslashes or NUL), missing directories are
 /// created one level at a time, and every existing level is canonicalized and must stay under the
 /// canonical base, so a symlink can't redirect the sync elsewhere. `None`/`"."` is the base itself.
-async fn resolve_sync_dir(base: &FsPath, local_path: Option<&str>) -> std::result::Result<PathBuf, (StatusCode, String)> {
-    let bad = |why: &str| (StatusCode::BAD_REQUEST, format!("invalid local_path: {}", why));
+async fn resolve_sync_dir(
+    base: &FsPath,
+    local_path: Option<&str>,
+) -> std::result::Result<PathBuf, (StatusCode, String)> {
+    let bad = |why: &str| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid local_path: {}", why),
+        )
+    };
     let rel = FsPath::new(local_path.unwrap_or("."));
-    if local_path.is_some_and(|p| p.contains('\0') || p.contains('\\')) { return Err(bad("NUL or backslash")); }
-    if !rel.components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir)) {
+    if local_path.is_some_and(|p| p.contains('\0') || p.contains('\\')) {
+        return Err(bad("NUL or backslash"));
+    }
+    if !rel
+        .components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+    {
         return Err(bad("must be a relative path without '..'"));
     }
-    let internal = |e: std::io::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("sync base: {}", e));
+    let internal = |e: std::io::Error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("sync base: {}", e),
+        )
+    };
     tokio::fs::create_dir_all(base).await.map_err(internal)?;
     match crate::integrations::sync::create_dirs_within(base, rel).await {
         Ok(Some(dir)) => Ok(dir),
         Ok(None) => Err(bad("escapes the integrations directory")),
-        Err(e) => Err((StatusCode::BAD_REQUEST, format!("invalid local_path: {}", e))),
+        Err(e) => Err((
+            StatusCode::BAD_REQUEST,
+            format!("invalid local_path: {}", e),
+        )),
     }
 }
 
@@ -387,8 +394,10 @@ pub async fn trigger_sync(
     State(state): State<IntegrationState>,
     Json(req): Json<SyncRequest>,
 ) -> std::result::Result<Json<SyncResponse>, (StatusCode, String)> {
-    let base = state.inner.sync_base.as_deref()
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "Sync directory not configured".to_string()))?;
+    let base = state.inner.sync_base.as_deref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Sync directory not configured".to_string(),
+    ))?;
     let local_path = resolve_sync_dir(base, req.local_path.as_deref()).await?;
 
     // Create sync config
@@ -549,10 +558,19 @@ pub async fn disconnect_provider(
     state.inner.sync_states.write().remove(&provider_type);
 
     if let Some(token) = token {
-        match crate::integrations::oauth::revoke_token(provider_type, &token, &state.inner.client).await {
+        match crate::integrations::oauth::revoke_token(provider_type, &token, &state.inner.client)
+            .await
+        {
             Ok(true) => tracing::info!("revoked {} grant at provider", provider_type),
-            Ok(false) => tracing::info!("{} has no revoke endpoint; grant must be removed in the account's app settings", provider_type),
-            Err(e) => tracing::warn!("failed to revoke {} grant at provider (deleted locally): {}", provider_type, e),
+            Ok(false) => tracing::info!(
+                "{} has no revoke endpoint; grant must be removed in the account's app settings",
+                provider_type
+            ),
+            Err(e) => tracing::warn!(
+                "failed to revoke {} grant at provider (deleted locally): {}",
+                provider_type,
+                e
+            ),
         }
     }
 
@@ -597,28 +615,44 @@ pub fn integration_api_router(state: IntegrationState) -> axum::Router {
         .route("/providers/{provider}/status", get(get_token_status))
         .route("/providers/{provider}/refresh", post(refresh_token))
         .route("/providers/{provider}/quota", get(get_quota))
-        .route("/providers/{provider}/disconnect", delete(disconnect_provider))
+        .route(
+            "/providers/{provider}/disconnect",
+            delete(disconnect_provider),
+        )
         .route("/sync", post(trigger_sync))
         .with_state(state)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use axum::body::Body;
     use tower::ServiceExt;
+
+    use super::*;
 
     #[tokio::test]
     async fn callback_redirect_target_is_routed() {
         for mount in ["/integrations/v2/cloud", "/integrations/v2/storage"] {
-            let target = success_redirect_path(&format!("{}/callback", mount), ProviderType::Dropbox);
+            let target =
+                success_redirect_path(&format!("{}/callback", mount), ProviderType::Dropbox);
             assert_eq!(target, format!("{}/providers/dropbox/success", mount));
             let app = axum::Router::new().nest(mount, integration_router(IntegrationState::new()));
-            let resp = app.oneshot(axum::http::Request::get(&target).body(Body::empty()).unwrap()).await.unwrap();
+            let resp = app
+                .oneshot(
+                    axum::http::Request::get(&target)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
             assert_eq!(resp.status(), StatusCode::OK, "{} not routed", target);
         }
         // Every provider's Display name must round-trip through parse_provider.
-        for p in [ProviderType::GoogleDrive, ProviderType::Dropbox, ProviderType::OneDrive] {
+        for p in [
+            ProviderType::GoogleDrive,
+            ProviderType::Dropbox,
+            ProviderType::OneDrive,
+        ] {
             assert_eq!(parse_provider(&p.to_string()).unwrap(), p);
         }
     }
@@ -626,10 +660,19 @@ mod tests {
     #[tokio::test]
     async fn disconnect_deletes_locally_when_revoke_unavailable() {
         let state = IntegrationState::new();
-        state.set_token(ProviderType::OneDrive, OAuthToken {
-            access_token: "a".into(), refresh_token: Some("r".into()), token_type: "Bearer".into(), expires_at: None, scope: None,
-        });
-        let status = disconnect_provider(State(state.clone()), Path("onedrive".into())).await.unwrap();
+        state.set_token(
+            ProviderType::OneDrive,
+            OAuthToken {
+                access_token: "a".into(),
+                refresh_token: Some("r".into()),
+                token_type: "Bearer".into(),
+                expires_at: None,
+                scope: None,
+            },
+        );
+        let status = disconnect_provider(State(state.clone()), Path("onedrive".into()))
+            .await
+            .unwrap();
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert!(state.get_token(ProviderType::OneDrive).is_none());
         assert!(crate::integrations::oauth::revoke_endpoint(ProviderType::GoogleDrive).is_some());
@@ -640,26 +683,59 @@ mod tests {
     async fn queued_sync_rechecks_token_after_lock() {
         let tmp = tempfile::TempDir::new().unwrap();
         let state = IntegrationState::with_sync_base(tmp.path());
-        state.configure_provider(OAuthConfig::onedrive("id".into(), None, "http://localhost/cb".into()));
-        state.set_token(ProviderType::OneDrive, OAuthToken {
-            access_token: "old".into(), refresh_token: None, token_type: "Bearer".into(), expires_at: None, scope: None,
-        });
+        state.configure_provider(OAuthConfig::onedrive(
+            "id".into(),
+            None,
+            "http://localhost/cb".into(),
+        ));
+        state.set_token(
+            ProviderType::OneDrive,
+            OAuthToken {
+                access_token: "old".into(),
+                refresh_token: None,
+                token_type: "Bearer".into(),
+                expires_at: None,
+                scope: None,
+            },
+        );
         // A sync is "running": hold the lock while a second sync queues behind it.
         let running = state.inner.sync_lock.lock().await;
-        let req = SyncRequest { provider: ProviderType::OneDrive, local_path: None, cloud_folder: None, direction: None };
+        let req = SyncRequest {
+            provider: ProviderType::OneDrive,
+            local_path: None,
+            cloud_folder: None,
+            direction: None,
+        };
         let queued = tokio::spawn(trigger_sync(State(state.clone()), Json(req)));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(!queued.is_finished());
-        disconnect_provider(State(state.clone()), Path("onedrive".into())).await.unwrap();
+        disconnect_provider(State(state.clone()), Path("onedrive".into()))
+            .await
+            .unwrap();
         drop(running);
-        let err = queued.await.unwrap().err().expect("queued sync must not run with the revoked token");
-        assert_eq!(err, (StatusCode::BAD_REQUEST, "Not authenticated".to_string()));
+        let err = queued
+            .await
+            .unwrap()
+            .err()
+            .expect("queued sync must not run with the revoked token");
+        assert_eq!(
+            err,
+            (StatusCode::BAD_REQUEST, "Not authenticated".to_string())
+        );
     }
 
     #[tokio::test]
     async fn sync_disabled_without_base() {
-        let req = SyncRequest { provider: ProviderType::OneDrive, local_path: None, cloud_folder: None, direction: None };
-        let err = trigger_sync(State(IntegrationState::new()), Json(req)).await.err().unwrap();
+        let req = SyncRequest {
+            provider: ProviderType::OneDrive,
+            local_path: None,
+            cloud_folder: None,
+            direction: None,
+        };
+        let err = trigger_sync(State(IntegrationState::new()), Json(req))
+            .await
+            .err()
+            .unwrap();
         assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
     }
 
@@ -670,14 +746,29 @@ mod tests {
         // Default and "." map to the (created) base itself.
         let canon_base = || std::fs::canonicalize(&base).unwrap();
         assert_eq!(resolve_sync_dir(&base, None).await.unwrap(), canon_base());
-        assert_eq!(resolve_sync_dir(&base, Some(".")).await.unwrap(), canon_base());
+        assert_eq!(
+            resolve_sync_dir(&base, Some(".")).await.unwrap(),
+            canon_base()
+        );
         // Relative paths land (and are created) under the base.
         let dir = resolve_sync_dir(&base, Some("gdrive/notes")).await.unwrap();
         assert_eq!(dir, canon_base().join("gdrive/notes"));
         assert!(dir.is_dir());
         // Absolute paths, `..` and odd separators are rejected.
-        for p in ["/etc", "/", "..", "../x", "a/../../x", "a/..", "a\\..\\x", "a\0b"] {
-            let err = resolve_sync_dir(&base, Some(p)).await.err().unwrap_or_else(|| panic!("accepted {:?}", p));
+        for p in [
+            "/etc",
+            "/",
+            "..",
+            "../x",
+            "a/../../x",
+            "a/..",
+            "a\\..\\x",
+            "a\0b",
+        ] {
+            let err = resolve_sync_dir(&base, Some(p))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("accepted {:?}", p));
             assert_eq!(err.0, StatusCode::BAD_REQUEST, "{:?}", p);
         }
         // A symlink inside the base can't redirect the sync outside it.
@@ -685,7 +776,10 @@ mod tests {
         std::fs::create_dir(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, base.join("escape")).unwrap();
         for p in ["escape", "escape/sub"] {
-            let err = resolve_sync_dir(&base, Some(p)).await.err().unwrap_or_else(|| panic!("accepted {:?}", p));
+            let err = resolve_sync_dir(&base, Some(p))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("accepted {:?}", p));
             assert_eq!(err.0, StatusCode::BAD_REQUEST, "{:?}", p);
         }
         assert!(!outside.join("sub").exists());

@@ -710,10 +710,14 @@ impl FeedManager {
 
         Ok(epub_path)
     }
-    
+
     /// Sync unsynced articles (of `subscription_id`, or all when `None`) as EPUBs
     /// into the device folder `folder` (see [`crate::documents::ensure_folder`]).
-    pub fn sync_articles_to_folder(&self, subscription_id: Option<&str>, folder: &str) -> Result<u32> {
+    pub fn sync_articles_to_folder(
+        &self,
+        subscription_id: Option<&str>,
+        folder: &str,
+    ) -> Result<u32> {
         let articles = self.list_articles(ArticleQuery {
             subscription_id: subscription_id.map(String::from),
             unsynced: Some(true),
@@ -723,7 +727,7 @@ impl FeedManager {
             return Ok(0);
         }
         let parent = crate::documents::ensure_folder(&self.storage, folder)?;
-        
+
         let mut synced = 0;
         for article in articles {
             // Generate EPUB if not exists
@@ -737,9 +741,20 @@ impl FeedManager {
 
             // Add to the sync tree as a real document so the device pulls it.
             let epub_data = std::fs::read(&epub_path)?;
-            let (doc_id, _) = crate::documents::create_document_in(&self.storage, &article.title, "epub", &epub_data, &parent)?;
-            tracing::info!("Feed article {:?} ({}) synced as document {}", article.title, folder, doc_id);
-            
+            let (doc_id, _) = crate::documents::create_document_in(
+                &self.storage,
+                &article.title,
+                "epub",
+                &epub_data,
+                &parent,
+            )?;
+            tracing::info!(
+                "Feed article {:?} ({}) synced as document {}",
+                article.title,
+                folder,
+                doc_id
+            );
+
             // Mark as synced
             self.mark_article_synced(&article.id)?;
             synced += 1;
@@ -1646,13 +1661,21 @@ pub async fn sync_to_device(
     let sub = state.manager.get_subscription(&id)?;
     let before = state.manager.storage.get_root().generation;
     // Only this subscription's articles, so each lands in its own configured folder.
-    let result = state.manager.sync_articles_to_folder(Some(&sub.id), &sub.folder);
+    let result = state
+        .manager
+        .sync_articles_to_folder(Some(&sub.id), &sub.folder);
     // Articles (and the folder) are committed one by one and marked synced, so a later
     // failure must not swallow the push for what already landed: retries skip those.
     let generation = state.manager.storage.get_root().generation;
     if generation != before {
         // Tell connected devices to pull the new root, as document uploads do.
-        let _ = state.notification_tx.send(crate::notifications::WsMessage::sync_complete(generation, "local-server", "local-user"));
+        let _ = state
+            .notification_tx
+            .send(crate::notifications::WsMessage::sync_complete(
+                generation,
+                "local-server",
+                "local-user",
+            ));
     }
     Ok(Json(serde_json::json!({ "synced": result? })))
 }
@@ -1690,41 +1713,91 @@ mod folder_sync_tests {
 
     fn article(id: &str, sub: &str) -> Article {
         // article_to_epub slices the first 8 chars of the id (real ids are uuids).
-        Article { id: format!("{id}-000000000"), subscription_id: sub.into(), title: format!("Title {id}"), url: format!("https://example.com/{id}"),
-            author: None, summary: None, content_html: Some("<p>hi</p>".into()), content_text: None, published_at: None,
-            fetched_at: Utc::now(), read: false, synced: false, epub_path: None, word_count: None, reading_time_mins: None }
+        Article {
+            id: format!("{id}-000000000"),
+            subscription_id: sub.into(),
+            title: format!("Title {id}"),
+            url: format!("https://example.com/{id}"),
+            author: None,
+            summary: None,
+            content_html: Some("<p>hi</p>".into()),
+            content_text: None,
+            published_at: None,
+            fetched_at: Utc::now(),
+            read: false,
+            synced: false,
+            epub_path: None,
+            word_count: None,
+            reading_time_mins: None,
+        }
     }
 
     /// (visibleName, type, parent) of every node in the current root.
     fn tree(storage: &Storage) -> Vec<(String, String, String, String)> {
-        let lines = |b: Vec<u8>| String::from_utf8_lossy(&b).lines().skip(1).map(|l| l.split(':').map(String::from).collect::<Vec<_>>()).collect::<Vec<_>>();
-        lines(storage.get(&storage.get_root().hash).unwrap()).into_iter().map(|node| {
-            let meta = lines(storage.get(&node[0]).unwrap()).into_iter().find(|f| f[2] == format!("{}.metadata", node[2])).unwrap();
-            let m: serde_json::Value = serde_json::from_slice(&storage.get(&meta[0]).unwrap()).unwrap();
-            (node[2].clone(), m["visibleName"].as_str().unwrap().into(), m["type"].as_str().unwrap().into(), m["parent"].as_str().unwrap().into())
-        }).collect()
+        let lines = |b: Vec<u8>| {
+            String::from_utf8_lossy(&b)
+                .lines()
+                .skip(1)
+                .map(|l| l.split(':').map(String::from).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        };
+        lines(storage.get(&storage.get_root().hash).unwrap())
+            .into_iter()
+            .map(|node| {
+                let meta = lines(storage.get(&node[0]).unwrap())
+                    .into_iter()
+                    .find(|f| f[2] == format!("{}.metadata", node[2]))
+                    .unwrap();
+                let m: serde_json::Value =
+                    serde_json::from_slice(&storage.get(&meta[0]).unwrap()).unwrap();
+                (
+                    node[2].clone(),
+                    m["visibleName"].as_str().unwrap().into(),
+                    m["type"].as_str().unwrap().into(),
+                    m["parent"].as_str().unwrap().into(),
+                )
+            })
+            .collect()
     }
 
     #[test]
     fn sync_places_articles_in_configured_folder() {
         let tmp = tempfile::TempDir::new().unwrap();
         let storage = Storage::new(tmp.path().join("storage")).unwrap();
-        let manager = FeedManager::new(&tmp.path().join("feeds.db"), storage.clone(), &tmp.path().join("epub")).unwrap();
+        let manager = FeedManager::new(
+            &tmp.path().join("feeds.db"),
+            storage.clone(),
+            &tmp.path().join("epub"),
+        )
+        .unwrap();
         for sub in ["news", "other"] {
             manager.db.lock().execute("INSERT INTO subscriptions (id, name, url, feed_type, created_at, updated_at) VALUES (?1, ?1, ?1, 'rss', '', '')", [sub]).unwrap();
         }
-        manager.save_articles(&[article("a1", "news"), article("b1", "other")]).unwrap();
+        manager
+            .save_articles(&[article("a1", "news"), article("b1", "other")])
+            .unwrap();
 
-        assert_eq!(manager.sync_articles_to_folder(Some("news"), "News").unwrap(), 1, "only this subscription's articles");
+        assert_eq!(
+            manager
+                .sync_articles_to_folder(Some("news"), "News")
+                .unwrap(),
+            1,
+            "only this subscription's articles"
+        );
         let t = tree(&storage);
-        let folder = t.iter().find(|n| n.2 == "CollectionType").expect("folder created");
+        let folder = t
+            .iter()
+            .find(|n| n.2 == "CollectionType")
+            .expect("folder created");
         assert_eq!((folder.1.as_str(), folder.3.as_str()), ("News", ""));
         let doc = t.iter().find(|n| n.1 == "Title a1").unwrap();
         assert_eq!(doc.3, folder.0, "document parent is the folder id");
 
         // Next sync reuses the folder; an empty folder setting keeps the top level.
         manager.save_articles(&[article("a2", "news")]).unwrap();
-        manager.sync_articles_to_folder(Some("news"), "News").unwrap();
+        manager
+            .sync_articles_to_folder(Some("news"), "News")
+            .unwrap();
         manager.sync_articles_to_folder(Some("other"), "").unwrap();
         let t = tree(&storage);
         assert_eq!(t.iter().filter(|n| n.2 == "CollectionType").count(), 1);
@@ -1736,16 +1809,31 @@ mod folder_sync_tests {
     async fn sync_to_device_notifies_devices_only_when_something_synced() {
         let tmp = tempfile::TempDir::new().unwrap();
         let storage = Storage::new(tmp.path().join("storage")).unwrap();
-        let manager = Arc::new(FeedManager::new(&tmp.path().join("feeds.db"), storage.clone(), &tmp.path().join("epub")).unwrap());
+        let manager = Arc::new(
+            FeedManager::new(
+                &tmp.path().join("feeds.db"),
+                storage.clone(),
+                &tmp.path().join("epub"),
+            )
+            .unwrap(),
+        );
         manager.db.lock().execute("INSERT INTO subscriptions (id, name, url, feed_type, created_at, updated_at) VALUES ('news', 'news', 'news', 'rss', ?1, ?1)", [Utc::now().to_rfc3339()]).unwrap();
         manager.save_articles(&[article("a1", "news")]).unwrap();
         let (notification_tx, mut rx) = tokio::sync::broadcast::channel(4);
-        let state = FeedState { manager, scheduler: None, notification_tx };
+        let state = FeedState {
+            manager,
+            scheduler: None,
+            notification_tx,
+        };
 
-        sync_to_device(State(state.clone()), UrlPath("news".into())).await.unwrap();
+        sync_to_device(State(state.clone()), UrlPath("news".into()))
+            .await
+            .unwrap();
         let msg = rx.try_recv().expect("SyncComplete after new EPUBs");
         assert_eq!(msg.message.attributes.event, "SyncComplete");
-        sync_to_device(State(state), UrlPath("news".into())).await.unwrap();
+        sync_to_device(State(state), UrlPath("news".into()))
+            .await
+            .unwrap();
         assert!(rx.try_recv().is_err(), "nothing new, no push");
     }
 
@@ -1753,18 +1841,38 @@ mod folder_sync_tests {
     async fn sync_to_device_notifies_committed_articles_even_when_a_later_one_fails() {
         let tmp = tempfile::TempDir::new().unwrap();
         let storage = Storage::new(tmp.path().join("storage")).unwrap();
-        let manager = Arc::new(FeedManager::new(&tmp.path().join("feeds.db"), storage.clone(), &tmp.path().join("epub")).unwrap());
+        let manager = Arc::new(
+            FeedManager::new(
+                &tmp.path().join("feeds.db"),
+                storage.clone(),
+                &tmp.path().join("epub"),
+            )
+            .unwrap(),
+        );
         manager.db.lock().execute("INSERT INTO subscriptions (id, name, url, feed_type, created_at, updated_at, folder) VALUES ('news', 'news', 'news', 'rss', ?1, ?1, 'News')", [Utc::now().to_rfc3339()]).unwrap();
         // Newest first: a1 syncs, then a2's EPUB can't be read.
-        let mut ok = article("a1", "news"); ok.published_at = Some(Utc::now());
-        let mut bad = article("a2", "news"); bad.published_at = Some(Utc::now() - chrono::Duration::days(1));
+        let mut ok = article("a1", "news");
+        ok.published_at = Some(Utc::now());
+        let mut bad = article("a2", "news");
+        bad.published_at = Some(Utc::now() - chrono::Duration::days(1));
         bad.epub_path = Some(tmp.path().join("missing.epub").to_string_lossy().into());
         manager.save_articles(&[ok, bad]).unwrap();
         let (notification_tx, mut rx) = tokio::sync::broadcast::channel(4);
-        let state = FeedState { manager, scheduler: None, notification_tx };
+        let state = FeedState {
+            manager,
+            scheduler: None,
+            notification_tx,
+        };
 
-        assert!(sync_to_device(State(state.clone()), UrlPath("news".into())).await.is_err(), "the failure is still reported");
-        let msg = rx.try_recv().expect("SyncComplete for the article that did land");
+        assert!(
+            sync_to_device(State(state.clone()), UrlPath("news".into()))
+                .await
+                .is_err(),
+            "the failure is still reported"
+        );
+        let msg = rx
+            .try_recv()
+            .expect("SyncComplete for the article that did land");
         assert_eq!(msg.message.attributes.event, "SyncComplete");
         assert!(tree(&storage).iter().any(|n| n.1 == "Title a1"));
         assert!(rx.try_recv().is_err());

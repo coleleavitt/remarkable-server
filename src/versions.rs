@@ -197,7 +197,11 @@ impl VersionManager {
         // Copy what we need out of the config first so a queued
         // `set_retention` writer can never deadlock against `apply_retention`.
         let store_content_snapshots = self.inner.config.read().store_content_snapshots;
-        let db = self.inner.db.lock().map_err(|e| ServerError::Internal(e.to_string()))?;
+        let db = self
+            .inner
+            .db
+            .lock()
+            .map_err(|e| ServerError::Internal(e.to_string()))?;
 
         // Calculate content hash
         let mut hasher = Sha256::new();
@@ -450,7 +454,11 @@ impl VersionManager {
         // Snapshot the policy and release the config lock before taking `db`
         // (see lock-order note in `create_version`).
         let retention = self.inner.config.read().retention.clone();
-        let db = self.inner.db.lock().map_err(|e| ServerError::Internal(e.to_string()))?;
+        let db = self
+            .inner
+            .db
+            .lock()
+            .map_err(|e| ServerError::Internal(e.to_string()))?;
         let mut deleted = 0;
 
         match &retention {
@@ -991,7 +999,13 @@ mod tests {
             let m = manager.clone();
             handles.push(std::thread::spawn(move || {
                 for i in 0..40 {
-                    m.create_version(&format!("doc{}", t % 2), format!("c{} {}", t, i).as_bytes(), None, None).unwrap();
+                    m.create_version(
+                        &format!("doc{}", t % 2),
+                        format!("c{} {}", t, i).as_bytes(),
+                        None,
+                        None,
+                    )
+                    .unwrap();
                 }
             }));
         }
@@ -999,7 +1013,11 @@ mod tests {
             let m = manager.clone();
             handles.push(std::thread::spawn(move || {
                 for i in 0..300 {
-                    let p = if (i + t) % 2 == 0 { RetentionPolicy::Count { max_versions: 3 } } else { RetentionPolicy::Unlimited };
+                    let p = if (i + t) % 2 == 0 {
+                        RetentionPolicy::Count { max_versions: 3 }
+                    } else {
+                        RetentionPolicy::Unlimited
+                    };
                     m.set_retention(p);
                     let _ = m.get_retention();
                     let _ = m.stats().unwrap();
@@ -1007,9 +1025,18 @@ mod tests {
             }));
         }
         let m = manager.clone();
-        handles.push(std::thread::spawn(move || { for _ in 0..10 { m.prune_all().unwrap(); } }));
-        std::thread::spawn(move || { let ok = handles.into_iter().all(|h| h.join().is_ok()); let _ = done_tx.send(ok); });
-        let ok = done_rx.recv_timeout(std::time::Duration::from_secs(60)).expect("create_version/set_retention deadlocked");
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..10 {
+                m.prune_all().unwrap();
+            }
+        }));
+        std::thread::spawn(move || {
+            let ok = handles.into_iter().all(|h| h.join().is_ok());
+            let _ = done_tx.send(ok);
+        });
+        let ok = done_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("create_version/set_retention deadlocked");
         assert!(ok, "a worker thread panicked");
     }
 }

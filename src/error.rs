@@ -6,25 +6,44 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum ServerError {
-    #[error("Not found: {0}")] NotFound(String),
-    #[error("Missing header: {0}")] MissingHeader(String),
-    #[error("Invalid header: {0}")] InvalidHeader(String),
-    #[error("Checksum mismatch: expected {expected}, actual {actual}")] ChecksumMismatch { expected: String, actual: String },
-    #[error("Invalid hash: {0}")] InvalidHash(String),
-    #[error("Generation mismatch: current {current}")] GenerationMismatch { current: u64 },
-    #[error("Storage error: {0}")] Storage(#[from] std::io::Error),
-    #[error("JSON error: {0}")] Json(#[from] serde_json::Error),
-    #[error("Database error: {0}")] Database(String),
-    #[error("Unauthorized")] Unauthorized,
-    #[error("Invalid token")] InvalidToken,
-    #[error("Invalid code: {0}")] InvalidCode(String),
-    #[error("Token error: {0}")] TokenError(String),
-    #[error("Internal error: {0}")] Internal(String),
-    #[error("Email error: {0}")] Email(String),
-    #[error("IO error: {0}")] Io(String),
-    #[error("Config error: {0}")] Config(String),
-    #[error("Forbidden: {0}")] Forbidden(String),
-    #[error("Bad request: {0}")] BadRequest(String),
+    #[error("Not found: {0}")]
+    NotFound(String),
+    #[error("Missing header: {0}")]
+    MissingHeader(String),
+    #[error("Invalid header: {0}")]
+    InvalidHeader(String),
+    #[error("Checksum mismatch: expected {expected}, actual {actual}")]
+    ChecksumMismatch { expected: String, actual: String },
+    #[error("Invalid hash: {0}")]
+    InvalidHash(String),
+    #[error("Generation mismatch: current {current}")]
+    GenerationMismatch { current: u64 },
+    #[error("Storage error: {0}")]
+    Storage(#[from] std::io::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("Database error: {0}")]
+    Database(String),
+    #[error("Unauthorized")]
+    Unauthorized,
+    #[error("Invalid token")]
+    InvalidToken,
+    #[error("Invalid code: {0}")]
+    InvalidCode(String),
+    #[error("Token error: {0}")]
+    TokenError(String),
+    #[error("Internal error: {0}")]
+    Internal(String),
+    #[error("Email error: {0}")]
+    Email(String),
+    #[error("IO error: {0}")]
+    Io(String),
+    #[error("Config error: {0}")]
+    Config(String),
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+    #[error("Bad request: {0}")]
+    BadRequest(String),
 }
 
 impl From<rusqlite::Error> for ServerError {
@@ -45,7 +64,11 @@ impl IntoResponse for ServerError {
             Self::NotFound(m) => (StatusCode::NOT_FOUND, "not_found", Some(m.clone())),
             Self::MissingHeader(h) => (StatusCode::BAD_REQUEST, "missing_header", Some(h.clone())),
             Self::InvalidHeader(h) => (StatusCode::BAD_REQUEST, "invalid_header", Some(h.clone())),
-            Self::ChecksumMismatch { expected, actual } => (StatusCode::BAD_REQUEST, "checksum_mismatch", Some(format!("expected={}, actual={}", expected, actual))),
+            Self::ChecksumMismatch { expected, actual } => (
+                StatusCode::BAD_REQUEST,
+                "checksum_mismatch",
+                Some(format!("expected={}, actual={}", expected, actual)),
+            ),
             Self::InvalidHash(h) => (StatusCode::BAD_REQUEST, "invalid_hash", Some(h.clone())),
             Self::GenerationMismatch { current } => (
                 StatusCode::PRECONDITION_FAILED,

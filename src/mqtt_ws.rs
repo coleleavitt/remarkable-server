@@ -8,14 +8,11 @@
 //! the JSON endpoint), so this uses the conventional MQTT-over-WebSocket path
 //! (VerneMQ's and Paho's default).
 
-use axum::{
-    extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
-    },
-    http::{header::AUTHORIZATION, HeaderMap},
-    response::IntoResponse,
-};
+use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::http::HeaderMap;
+use axum::http::header::AUTHORIZATION;
+use axum::response::IntoResponse;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -101,7 +98,7 @@ fn parse_mqtt_bytes(data: &[u8]) -> Option<(&[u8], usize)> {
     if data.len() < 2 + len {
         return None;
     }
-    Some((&data[2..2+len], 2 + len))
+    Some((&data[2..2 + len], 2 + len))
 }
 
 /// Parse MQTT string (2-byte length prefix + UTF-8)
@@ -119,7 +116,9 @@ fn connect_token(body: &[u8]) -> Option<String> {
     at += 4; // level, flags, keep alive
     at += parse_mqtt_bytes(body.get(at..)?)?.1; // client id
     if flags & 0x04 != 0 {
-        for _ in 0..2 { at += parse_mqtt_bytes(body.get(at..)?)?.1; } // will topic, will message
+        for _ in 0..2 {
+            at += parse_mqtt_bytes(body.get(at..)?)?.1;
+        } // will topic, will message
     }
     let mut username = None;
     if flags & 0x80 != 0 {
@@ -127,7 +126,11 @@ fn connect_token(body: &[u8]) -> Option<String> {
         username = Some(u);
         at += n;
     }
-    let password = if flags & 0x40 != 0 { Some(parse_mqtt_bytes(body.get(at..)?)?.0) } else { None };
+    let password = if flags & 0x40 != 0 {
+        Some(parse_mqtt_bytes(body.get(at..)?)?.0)
+    } else {
+        None
+    };
     let token = password.filter(|p| !p.is_empty()).or(username)?;
     String::from_utf8(token.to_vec()).ok()
 }
@@ -217,9 +220,14 @@ pub async fn mqtt_notifications_ws(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> crate::error::Result<impl IntoResponse> {
-    let header_user = match headers.get(AUTHORIZATION) { Some(_) => Some(state.auth_user(&headers)?), None => None };
+    let header_user = match headers.get(AUTHORIZATION) {
+        Some(_) => Some(state.auth_user(&headers)?),
+        None => None,
+    };
     info!("MQTT WebSocket upgrade request for notifications");
-    Ok(ws.protocols(["mqtt"]).on_upgrade(move |socket| handle_mqtt_socket(socket, state, header_user)))
+    Ok(ws
+        .protocols(["mqtt"])
+        .on_upgrade(move |socket| handle_mqtt_socket(socket, state, header_user)))
 }
 
 /// Handle an individual MQTT WebSocket connection
@@ -229,9 +237,19 @@ async fn handle_mqtt_socket(socket: WebSocket, state: AppState, header_user: Opt
     let rx = state.notification_tx.subscribe();
     let storage = state.storage.clone();
     let devices = state.devices.clone();
-    let authenticate = move |token: Option<&str>| header_user.clone()
-        .or_else(|| devices.validate_token(&format!("Bearer {}", token?)).ok());
-    run_mqtt_session(sender, receiver, rx, move || storage.get_root().generation, authenticate).await;
+    let authenticate = move |token: Option<&str>| {
+        header_user
+            .clone()
+            .or_else(|| devices.validate_token(&format!("Bearer {}", token?)).ok())
+    };
+    run_mqtt_session(
+        sender,
+        receiver,
+        rx,
+        move || storage.get_root().generation,
+        authenticate,
+    )
+    .await;
 }
 
 /// `auth0UserID` of server-originated events not tied to an account (feed EPUBs
@@ -247,16 +265,32 @@ const SERVER_USER: &str = "local-user";
 /// `WsMessage` JSON the `/notifications/ws/json/1` endpoint sends. Only events
 /// for `user_id` (or [`SERVER_USER`]) are forwarded; screenshare events have
 /// their own broker and are never forwarded here.
-fn notification_publishes(msg: &WsMessage, subscriptions: &[String], user_id: &str) -> Vec<Vec<u8>> {
+fn notification_publishes(
+    msg: &WsMessage,
+    subscriptions: &[String],
+    user_id: &str,
+) -> Vec<Vec<u8>> {
     let a = &msg.message.attributes;
-    if a.event.starts_with("Screenshare") || (a.auth0_user_id != user_id && a.auth0_user_id != SERVER_USER) {
+    if a.event.starts_with("Screenshare")
+        || (a.auth0_user_id != user_id && a.auth0_user_id != SERVER_USER)
+    {
         return Vec::new();
     }
-    let Ok(payload) = serde_json::to_vec(msg) else { return Vec::new() };
+    let Ok(payload) = serde_json::to_vec(msg) else {
+        return Vec::new();
+    };
     let mut seen: Vec<&str> = Vec::new();
-    subscriptions.iter()
+    subscriptions
+        .iter()
         .filter(|t| !t.is_empty() && !t.contains(['+', '#']))
-        .filter(|t| if seen.contains(&t.as_str()) { false } else { seen.push(t); true })
+        .filter(|t| {
+            if seen.contains(&t.as_str()) {
+                false
+            } else {
+                seen.push(t);
+                true
+            }
+        })
         .map(|t| build_publish(t, &payload, 0, None))
         .collect()
 }
@@ -266,19 +300,24 @@ fn notification_publishes(msg: &WsMessage, subscriptions: &[String], user_id: &s
 /// root generation for the catch-up SyncComplete sent after a lagged receiver.
 /// `authenticate` maps the CONNECT's token (if any) to the session's user id;
 /// `None` refuses the CONNECT and ends the session.
-async fn run_mqtt_session<S, R>(mut sender: S, mut receiver: R, mut rx: broadcast::Receiver<WsMessage>, generation: impl Fn() -> u64, authenticate: impl Fn(Option<&str>) -> Option<String>)
-where
+async fn run_mqtt_session<S, R>(
+    mut sender: S,
+    mut receiver: R,
+    mut rx: broadcast::Receiver<WsMessage>,
+    generation: impl Fn() -> u64,
+    authenticate: impl Fn(Option<&str>) -> Option<String>,
+) where
     S: Sink<Message> + Unpin,
     R: Stream<Item = Result<Message, axum::Error>> + Unpin,
 {
     let session_id = uuid::Uuid::new_v4().to_string();
     info!(session_id = %session_id, "New MQTT WebSocket connection");
-    
+
     let mut connected = false;
     let mut user_id = String::new();
     let mut subscriptions: Vec<String> = Vec::new();
     let mut notifications_open = true;
-    
+
     loop {
         let result = tokio::select! {
             incoming = receiver.next() => match incoming { Some(r) => r, None => break },
@@ -333,10 +372,14 @@ where
                             let payload_start = 1 + len_bytes;
                             if data.len() >= payload_start + remaining_len {
                                 info!(session_id = %session_id, "MQTT CONNECT received");
-                                let token = connect_token(&data[payload_start..payload_start + remaining_len]);
+                                let token = connect_token(
+                                    &data[payload_start..payload_start + remaining_len],
+                                );
                                 let Some(user) = authenticate(token.as_deref()) else {
                                     warn!(session_id = %session_id, "MQTT CONNECT without a valid token, refusing");
-                                    let _ = sender.send(Message::Binary(build_connack(false, 5).into())).await; // not authorized
+                                    let _ = sender
+                                        .send(Message::Binary(build_connack(false, 5).into()))
+                                        .await; // not authorized
                                     break;
                                 };
                                 user_id = user;
@@ -372,7 +415,7 @@ where
                                 let mut offset = payload_start + 2;
                                 let mut qos_results = Vec::new();
                                 let known = subscriptions.len();
-                                
+
                                 while offset < payload_start + remaining_len {
                                     if let Some((topic, topic_len)) =
                                         parse_mqtt_string(&data[offset..])
@@ -399,8 +442,16 @@ where
                                 info!(session_id = %session_id, "MQTT SUBACK sent");
                                 // Like /notifications/ws/json/1's initial SyncComplete: anything
                                 // broadcast before this subscription had nowhere to go.
-                                let fresh: Vec<String> = subscriptions[known..].iter().filter(|t| !subscriptions[..known].contains(t)).cloned().collect();
-                                let catch_up = WsMessage::sync_complete(generation(), "local-server", &user_id);
+                                let fresh: Vec<String> = subscriptions[known..]
+                                    .iter()
+                                    .filter(|t| !subscriptions[..known].contains(t))
+                                    .cloned()
+                                    .collect();
+                                let catch_up = WsMessage::sync_complete(
+                                    generation(),
+                                    "local-server",
+                                    &user_id,
+                                );
                                 for packet in notification_publishes(&catch_up, &fresh, &user_id) {
                                     if sender.send(Message::Binary(packet.into())).await.is_err() {
                                         return;
@@ -487,47 +538,109 @@ impl NotificationMessage {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Duration;
+
     use tokio::sync::mpsc;
 
-    type Harness = (mpsc::UnboundedSender<Message>, mpsc::UnboundedReceiver<Vec<u8>>, broadcast::Sender<WsMessage>, tokio::task::JoinHandle<()>);
+    use super::*;
+
+    type Harness = (
+        mpsc::UnboundedSender<Message>,
+        mpsc::UnboundedReceiver<Vec<u8>>,
+        broadcast::Sender<WsMessage>,
+        tokio::task::JoinHandle<()>,
+    );
 
     /// In-process MQTT client: feed packets in, read what the server wrote back.
     /// Every CONNECT is accepted as user `u1`.
-    fn start() -> Harness { start_with(|_| Some("u1".into())) }
+    fn start() -> Harness {
+        start_with(|_| Some("u1".into()))
+    }
 
-    fn start_with(authenticate: impl Fn(Option<&str>) -> Option<String> + Send + 'static) -> Harness {
+    fn start_with(
+        authenticate: impl Fn(Option<&str>) -> Option<String> + Send + 'static,
+    ) -> Harness {
         let (in_tx, in_rx) = mpsc::unbounded_channel::<Message>();
         let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (notif_tx, notif_rx) = broadcast::channel(4);
-        let incoming = Box::pin(futures_util::stream::unfold(in_rx, |mut rx| async move { rx.recv().await.map(|m| (Ok(m), rx)) }));
-        let sink = Box::pin(futures_util::sink::unfold(out_tx, |tx, m: Message| async move {
-            if let Message::Binary(b) = m { let _ = tx.send(b.to_vec()); }
-            Ok::<_, std::convert::Infallible>(tx)
+        let incoming = Box::pin(futures_util::stream::unfold(in_rx, |mut rx| async move {
+            rx.recv().await.map(|m| (Ok(m), rx))
         }));
-        let task = tokio::spawn(run_mqtt_session(sink, incoming, notif_rx, || 42, authenticate));
+        let sink = Box::pin(futures_util::sink::unfold(
+            out_tx,
+            |tx, m: Message| async move {
+                if let Message::Binary(b) = m {
+                    let _ = tx.send(b.to_vec());
+                }
+                Ok::<_, std::convert::Infallible>(tx)
+            },
+        ));
+        let task = tokio::spawn(run_mqtt_session(
+            sink,
+            incoming,
+            notif_rx,
+            || 42,
+            authenticate,
+        ));
         (in_tx, out_rx, notif_tx, task)
     }
 
     async fn next(rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) -> Vec<u8> {
-        tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("timed out").expect("closed")
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out")
+            .expect("closed")
     }
 
     fn connect() -> Message {
         // CONNECT, MQTT 3.1.1, clean session, keepalive 60, client id "c"
-        Message::Binary(vec![0x10, 13, 0, 4, b'M', b'Q', b'T', b'T', 4, 2, 0, 60, 0, 1, b'c'].into())
+        Message::Binary(
+            vec![
+                0x10, 13, 0, 4, b'M', b'Q', b'T', b'T', 4, 2, 0, 60, 0, 1, b'c',
+            ]
+            .into(),
+        )
     }
 
     /// CONNECT with username "dev" and `password`.
     fn connect_with_password(password: &str) -> Message {
-        let mut p = vec![0x10, (10 + 3 + 5 + 2 + password.len()) as u8, 0, 4, b'M', b'Q', b'T', b'T', 4, 0xC2, 0, 60, 0, 1, b'c', 0, 3, b'd', b'e', b'v', 0, password.len() as u8];
+        let mut p = vec![
+            0x10,
+            (10 + 3 + 5 + 2 + password.len()) as u8,
+            0,
+            4,
+            b'M',
+            b'Q',
+            b'T',
+            b'T',
+            4,
+            0xC2,
+            0,
+            60,
+            0,
+            1,
+            b'c',
+            0,
+            3,
+            b'd',
+            b'e',
+            b'v',
+            0,
+            password.len() as u8,
+        ];
         p.extend_from_slice(password.as_bytes());
         Message::Binary(p.into())
     }
 
     fn subscribe(topic: &str) -> Message {
-        let mut p = vec![0x82, (2 + 2 + topic.len() + 1) as u8, 0, 1, 0, topic.len() as u8];
+        let mut p = vec![
+            0x82,
+            (2 + 2 + topic.len() + 1) as u8,
+            0,
+            1,
+            0,
+            topic.len() as u8,
+        ];
         p.extend_from_slice(topic.as_bytes());
         p.push(0);
         Message::Binary(p.into())
@@ -538,7 +651,10 @@ mod tests {
         assert_eq!(p[0], 0x30, "QoS 0 PUBLISH");
         let (_, n) = parse_remaining_length(&p[1..]).unwrap();
         let (topic, tl) = parse_mqtt_string(&p[1 + n..]).unwrap();
-        (topic.to_string(), serde_json::from_slice(&p[1 + n + tl..]).unwrap())
+        (
+            topic.to_string(),
+            serde_json::from_slice(&p[1 + n + tl..]).unwrap(),
+        )
     }
 
     #[tokio::test]
@@ -549,31 +665,54 @@ mod tests {
         in_tx.send(subscribe("user/u1/sync")).unwrap();
         assert_eq!(next(&mut out).await[0], 0x90);
         let (topic, body) = parse_publish(&next(&mut out).await);
-        assert_eq!((topic.as_str(), &body["message"]["attributes"]["event"]), ("user/u1/sync", &serde_json::json!("SyncComplete")), "catch-up after SUBACK");
+        assert_eq!(
+            (topic.as_str(), &body["message"]["attributes"]["event"]),
+            ("user/u1/sync", &serde_json::json!("SyncComplete")),
+            "catch-up after SUBACK"
+        );
         in_tx.send(subscribe("user/+/wild")).unwrap();
         in_tx.send(subscribe("user/u1/sync")).unwrap();
         assert_eq!(next(&mut out).await[0], 0x90);
-        assert_eq!(next(&mut out).await[0], 0x90, "wildcard or repeated subscription gets no catch-up");
+        assert_eq!(
+            next(&mut out).await[0],
+            0x90,
+            "wildcard or repeated subscription gets no catch-up"
+        );
 
-        notif.send(WsMessage::sync_complete(7, "local-server", "u1")).unwrap();
+        notif
+            .send(WsMessage::sync_complete(7, "local-server", "u1"))
+            .unwrap();
         let (topic, body) = parse_publish(&next(&mut out).await);
         assert_eq!(topic, "user/u1/sync");
         assert_eq!(body["message"]["attributes"]["event"], "SyncComplete");
 
         // Screenshare traffic is per account; this endpoint has no identity.
-        notif.send(WsMessage::screenshare_room_created("u1", "tablet", "r")).unwrap();
-        notif.send(WsMessage::sync_complete(8, "local-server", "u1")).unwrap();
+        notif
+            .send(WsMessage::screenshare_room_created("u1", "tablet", "r"))
+            .unwrap();
+        notif
+            .send(WsMessage::sync_complete(8, "local-server", "u1"))
+            .unwrap();
         let (_, body) = parse_publish(&next(&mut out).await);
-        assert_eq!(body["message"]["attributes"]["event"], "SyncComplete", "wildcard filter and screenshare event produced nothing");
+        assert_eq!(
+            body["message"]["attributes"]["event"], "SyncComplete",
+            "wildcard filter and screenshare event produced nothing"
+        );
         assert!(out.try_recv().is_err());
     }
 
     #[tokio::test]
     async fn nothing_is_pushed_before_connect() {
         let (in_tx, mut out, notif, _task) = start();
-        notif.send(WsMessage::sync_complete(1, "local-server", "u1")).unwrap();
+        notif
+            .send(WsMessage::sync_complete(1, "local-server", "u1"))
+            .unwrap();
         in_tx.send(connect()).unwrap();
-        assert_eq!(next(&mut out).await, build_connack(false, 0), "first packet must be CONNACK");
+        assert_eq!(
+            next(&mut out).await,
+            build_connack(false, 0),
+            "first packet must be CONNACK"
+        );
     }
 
     #[tokio::test]
@@ -585,71 +724,160 @@ mod tests {
         next(&mut out).await; // SUBACK
         next(&mut out).await; // catch-up SyncComplete
         // Overflow the capacity-4 channel before the session can drain it.
-        for i in 0..10 { let mut m = WsMessage::event("DocAdded", "x", "u1"); m.message.attributes.id = Some(i.to_string()); notif.send(m).unwrap(); }
+        for i in 0..10 {
+            let mut m = WsMessage::event("DocAdded", "x", "u1");
+            m.message.attributes.id = Some(i.to_string());
+            notif.send(m).unwrap();
+        }
         let (_, first) = parse_publish(&next(&mut out).await);
-        assert_eq!(first["message"]["attributes"]["event"], "SyncComplete", "lag is replaced by a catch-up SyncComplete");
-        for _ in 0..4 { next(&mut out).await; }
+        assert_eq!(
+            first["message"]["attributes"]["event"], "SyncComplete",
+            "lag is replaced by a catch-up SyncComplete"
+        );
+        for _ in 0..4 {
+            next(&mut out).await;
+        }
 
         drop(notif);
-        in_tx.send(Message::Binary(vec![0xC0, 0x00].into())).unwrap(); // PINGREQ
-        assert_eq!(next(&mut out).await, build_pingresp(), "session survives a closed broadcast channel");
-        in_tx.send(Message::Binary(vec![0xE0, 0x00].into())).unwrap(); // DISCONNECT
-        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        in_tx
+            .send(Message::Binary(vec![0xC0, 0x00].into()))
+            .unwrap(); // PINGREQ
+        assert_eq!(
+            next(&mut out).await,
+            build_pingresp(),
+            "session survives a closed broadcast channel"
+        );
+        in_tx
+            .send(Message::Binary(vec![0xE0, 0x00].into()))
+            .unwrap(); // DISCONNECT
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
     fn publish_topics_are_deduplicated_and_concrete() {
-        let subs = vec!["a".to_string(), "a".to_string(), "#".to_string(), "b/+".to_string(), String::new()];
+        let subs = vec![
+            "a".to_string(),
+            "a".to_string(),
+            "#".to_string(),
+            "b/+".to_string(),
+            String::new(),
+        ];
         let msg = WsMessage::sync_complete(1, "local-server", "u");
         let packets = notification_publishes(&msg, &subs, "u");
         assert_eq!(packets.len(), 1);
         assert_eq!(parse_publish(&packets[0]).0, "a");
-        assert!(notification_publishes(&msg, &subs, "someone-else").is_empty(), "another user's event");
-        assert_eq!(notification_publishes(&WsMessage::sync_complete(1, "local-server", SERVER_USER), &subs, "u").len(), 1, "server-wide event");
+        assert!(
+            notification_publishes(&msg, &subs, "someone-else").is_empty(),
+            "another user's event"
+        );
+        assert_eq!(
+            notification_publishes(
+                &WsMessage::sync_complete(1, "local-server", SERVER_USER),
+                &subs,
+                "u"
+            )
+            .len(),
+            1,
+            "server-wide event"
+        );
     }
 
     #[test]
     fn connect_token_reads_password_else_username() {
-        let body = |m: Message| { let Message::Binary(b) = m else { unreachable!() }; b[2..].to_vec() };
-        assert_eq!(connect_token(&body(connect_with_password("tok"))).as_deref(), Some("tok"));
-        assert_eq!(connect_token(&body(connect_with_password(""))).as_deref(), Some("dev"), "empty password falls back to username");
+        let body = |m: Message| {
+            let Message::Binary(b) = m else {
+                unreachable!()
+            };
+            b[2..].to_vec()
+        };
+        assert_eq!(
+            connect_token(&body(connect_with_password("tok"))).as_deref(),
+            Some("tok")
+        );
+        assert_eq!(
+            connect_token(&body(connect_with_password(""))).as_deref(),
+            Some("dev"),
+            "empty password falls back to username"
+        );
         assert_eq!(connect_token(&body(connect())), None, "no credentials");
         // Will flag set: will topic and message come before the username/password.
-        let will = [0, 4, b'M', b'Q', b'T', b'T', 4, 0xC6, 0, 60, 0, 1, b'c', 0, 1, b'w', 0, 2, 1, 2, 0, 1, b'u', 0, 2, b'p', b'w'];
+        let will = [
+            0, 4, b'M', b'Q', b'T', b'T', 4, 0xC6, 0, 60, 0, 1, b'c', 0, 1, b'w', 0, 2, 1, 2, 0, 1,
+            b'u', 0, 2, b'p', b'w',
+        ];
         assert_eq!(connect_token(&will).as_deref(), Some("pw"));
         assert_eq!(connect_token(&will[..will.len() - 1]), None, "truncated");
     }
 
     #[tokio::test]
     async fn unauthenticated_connect_is_refused_and_gets_nothing() {
-        let (in_tx, mut out, notif, task) = start_with(|t| (t == Some("good")).then(|| "u1".to_string()));
+        let (in_tx, mut out, notif, task) =
+            start_with(|t| (t == Some("good")).then(|| "u1".to_string()));
         in_tx.send(connect()).unwrap();
-        assert_eq!(next(&mut out).await, build_connack(false, 5), "not authorized");
-        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        assert_eq!(
+            next(&mut out).await,
+            build_connack(false, 5),
+            "not authorized"
+        );
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
         let _ = notif.send(WsMessage::sync_complete(1, "local-server", "u1"));
-        assert!(out.recv().await.is_none(), "session closed without publishing");
+        assert!(
+            out.recv().await.is_none(),
+            "session closed without publishing"
+        );
 
-        let (in_tx, mut out, _notif, task) = start_with(|t| (t == Some("good")).then(|| "u1".to_string()));
+        let (in_tx, mut out, _notif, task) =
+            start_with(|t| (t == Some("good")).then(|| "u1".to_string()));
         in_tx.send(connect_with_password("bad")).unwrap();
         assert_eq!(next(&mut out).await, build_connack(false, 5));
-        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
     async fn authenticated_client_only_gets_its_users_notifications() {
-        let (in_tx, mut out, notif, _task) = start_with(|t| (t == Some("good")).then(|| "u1".to_string()));
+        let (in_tx, mut out, notif, _task) =
+            start_with(|t| (t == Some("good")).then(|| "u1".to_string()));
         in_tx.send(connect_with_password("good")).unwrap();
         assert_eq!(next(&mut out).await, build_connack(false, 0));
         in_tx.send(subscribe("t")).unwrap();
         assert_eq!(next(&mut out).await[0], 0x90);
         let (_, body) = parse_publish(&next(&mut out).await);
-        assert_eq!(body["message"]["attributes"]["auth0UserID"], "u1", "catch-up carries the session's user");
+        assert_eq!(
+            body["message"]["attributes"]["auth0UserID"], "u1",
+            "catch-up carries the session's user"
+        );
 
-        notif.send(WsMessage::sync_complete(5, "dev", "u2")).unwrap();
-        notif.send(WsMessage::sync_complete(6, "dev", "u1")).unwrap();
+        notif
+            .send(WsMessage::sync_complete(5, "dev", "u2"))
+            .unwrap();
+        notif
+            .send(WsMessage::sync_complete(6, "dev", "u1"))
+            .unwrap();
         let (_, body) = parse_publish(&next(&mut out).await);
-        assert_eq!((&body["message"]["attributes"]["event"], &body["message"]["attributes"]["auth0UserID"]), (&serde_json::json!("SyncComplete"), &serde_json::json!("u1")), "u2's event was skipped");
-        in_tx.send(Message::Binary(vec![0xC0, 0x00].into())).unwrap(); // PINGREQ
-        assert_eq!(next(&mut out).await, build_pingresp(), "nothing else was queued");
+        assert_eq!(
+            (
+                &body["message"]["attributes"]["event"],
+                &body["message"]["attributes"]["auth0UserID"]
+            ),
+            (&serde_json::json!("SyncComplete"), &serde_json::json!("u1")),
+            "u2's event was skipped"
+        );
+        in_tx
+            .send(Message::Binary(vec![0xC0, 0x00].into()))
+            .unwrap(); // PINGREQ
+        assert_eq!(
+            next(&mut out).await,
+            build_pingresp(),
+            "nothing else was queued"
+        );
     }
 }

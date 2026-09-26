@@ -16,6 +16,9 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::error::{Result, ServerError};
+use crate::storage::Storage;
+
 /// Cap on extracted text stored per document, in bytes.
 const MAX_INDEXED_TEXT: usize = 100_000;
 
@@ -28,9 +31,13 @@ fn is_current(storage: &Storage, hash: &str, filename: &str) -> bool {
 
 /// Longest prefix of `text` of at most `max` bytes that ends on a char boundary.
 fn truncate_on_char_boundary(text: &str, max: usize) -> &str {
-    if text.len() <= max { return text; }
+    if text.len() <= max {
+        return text;
+    }
     let mut end = max;
-    while !text.is_char_boundary(end) { end -= 1; }
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
     &text[..end]
 }
 
@@ -221,17 +228,23 @@ impl SearchIndex {
         let content = Self::extract_pdf_text(hash, filename, pdf_data);
         self.index_document(hash, filename, content.as_deref())
     }
-    
+
     /// Extract a PDF's text with pdftotext (None if it fails or isn't installed).
     fn extract_pdf_text(hash: &str, filename: &str, pdf_data: &[u8]) -> Option<String> {
         // Stage the PDF in a unique temp file (removed on drop), so concurrent extractions of
         // the same hash can't clobber or delete each other's input.
-        let staged = tempfile::Builder::new().prefix(&format!("{hash}-")).suffix(".pdf").tempfile()
+        let staged = tempfile::Builder::new()
+            .prefix(&format!("{hash}-"))
+            .suffix(".pdf")
+            .tempfile()
             .and_then(|mut f| std::io::Write::write_all(&mut f, pdf_data).map(|_| f));
         let temp_pdf = match staged {
             Ok(f) => f,
             Err(e) => {
-                warn!("Failed to stage PDF {} for text extraction: {}", filename, e);
+                warn!(
+                    "Failed to stage PDF {} for text extraction: {}",
+                    filename, e
+                );
                 return None;
             }
         };
@@ -247,7 +260,13 @@ impl SearchIndex {
         match output {
             Ok(out) if out.status.success() => {
                 // Truncate to reasonable size for indexing
-                Some(truncate_on_char_boundary(&String::from_utf8_lossy(&out.stdout), MAX_INDEXED_TEXT).to_string())
+                Some(
+                    truncate_on_char_boundary(
+                        &String::from_utf8_lossy(&out.stdout),
+                        MAX_INDEXED_TEXT,
+                    )
+                    .to_string(),
+                )
             }
             Ok(out) => {
                 warn!(
@@ -416,7 +435,7 @@ impl SearchIndex {
             pdf_count: pdf_count as usize,
         })
     }
-    
+
     /// Rebuild entire index from storage. Rows are upserted one at a time as text is
     /// extracted (hashes are content addresses, so re-indexing one is idempotent and no
     /// library-wide batch of text is held in memory), then rows whose blob is gone from
@@ -426,17 +445,24 @@ impl SearchIndex {
     /// previous row, and rows written meanwhile by an overlapping (re)index survive.
     pub fn rebuild_from_storage(&self, storage: &Storage) -> Result<usize> {
         info!("Rebuilding search index from storage...");
-        
+
         let mut indexed = 0;
         for hash in storage.list_hashes()? {
-            let Some(filename) = storage.filename_for_hash(&hash) else { continue };
-            if !is_current(storage, &hash, &filename) { continue }
+            let Some(filename) = storage.filename_for_hash(&hash) else {
+                continue;
+            };
+            if !is_current(storage, &hash, &filename) {
+                continue;
+            }
             let content = match DocumentType::from_filename(&filename) {
                 DocumentType::Pdf => match storage.get(&hash) {
                     Ok(data) => Self::extract_pdf_text(&hash, &filename, &data),
                     Err(ServerError::NotFound(_)) => continue,
                     Err(e) => {
-                        warn!("Keeping previous index row for unreadable PDF {}: {}", filename, e);
+                        warn!(
+                            "Keeping previous index row for unreadable PDF {}: {}",
+                            filename, e
+                        );
                         continue;
                     }
                 },
@@ -446,11 +472,14 @@ impl SearchIndex {
             indexed += 1;
         }
         let pruned = self.prune_missing(storage)?;
-        
-        info!("Indexed {} documents, pruned {} stale rows", indexed, pruned);
+
+        info!(
+            "Indexed {} documents, pruned {} stale rows",
+            indexed, pruned
+        );
         Ok(indexed)
     }
-    
+
     /// Delete rows whose blob is no longer in storage or no longer mapped to a filename, and
     /// repoint rows whose own filename moved on to another blob while a different filename
     /// still currently maps their hash (so an unreadable blob can't keep a stale name). The
@@ -464,23 +493,41 @@ impl SearchIndex {
         let tx = conn.transaction().map_err(db)?;
         let (mut stale, mut renamed) = (Vec::new(), Vec::new());
         {
-            let mut stmt = tx.prepare("SELECT hash, filename FROM documents").map_err(db)?;
-            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).map_err(db)?
-                .collect::<rusqlite::Result<Vec<_>>>().map_err(db)?;
+            let mut stmt = tx
+                .prepare("SELECT hash, filename FROM documents")
+                .map_err(db)?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .map_err(db)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(db)?;
             for (h, f) in rows {
-                if live.contains(&h) && is_current(storage, &h, &f) { continue }
-                match storage.filename_for_hash(&h).filter(|g| live.contains(&h) && is_current(storage, &h, g)) {
+                if live.contains(&h) && is_current(storage, &h, &f) {
+                    continue;
+                }
+                match storage
+                    .filename_for_hash(&h)
+                    .filter(|g| live.contains(&h) && is_current(storage, &h, g))
+                {
                     Some(g) => renamed.push((h, g)),
                     None => stale.push(h),
                 }
             }
         }
         for hash in &stale {
-            tx.execute("DELETE FROM documents WHERE hash = ?1", params![hash]).map_err(db)?;
+            tx.execute("DELETE FROM documents WHERE hash = ?1", params![hash])
+                .map_err(db)?;
         }
         for (hash, filename) in &renamed {
-            tx.execute("UPDATE documents SET filename = ?2, doc_type = ?3 WHERE hash = ?1",
-                params![hash, filename, DocumentType::from_filename(filename).as_str()]).map_err(db)?;
+            tx.execute(
+                "UPDATE documents SET filename = ?2, doc_type = ?3 WHERE hash = ?1",
+                params![
+                    hash,
+                    filename,
+                    DocumentType::from_filename(filename).as_str()
+                ],
+            )
+            .map_err(db)?;
         }
         tx.commit().map_err(db)?;
         Ok(stale.len())
@@ -634,11 +681,27 @@ mod tests {
         let storage = Storage::new(tmp.path().join("store")).unwrap();
         let index = SearchIndex::new(tmp.path()).unwrap();
         let (keep, gone) = ("a".repeat(64), "b".repeat(64));
-        storage.put_with_hash(b"{}", &keep, "keepme.metadata").unwrap();
-        storage.put_with_hash(b"{}", &gone, "goneaway.metadata").unwrap();
+        storage
+            .put_with_hash(b"{}", &keep, "keepme.metadata")
+            .unwrap();
+        storage
+            .put_with_hash(b"{}", &gone, "goneaway.metadata")
+            .unwrap();
         // A stale row for a blob storage never had (e.g. left by an older rebuild).
-        index.index_document(&"c".repeat(64), "phantom.metadata", None).unwrap();
-        let q = |q: &str| index.search(&SearchQuery { q: q.into(), limit: 10, offset: 0, doc_type: None }).unwrap().len();
+        index
+            .index_document(&"c".repeat(64), "phantom.metadata", None)
+            .unwrap();
+        let q = |q: &str| {
+            index
+                .search(&SearchQuery {
+                    q: q.into(),
+                    limit: 10,
+                    offset: 0,
+                    doc_type: None,
+                })
+                .unwrap()
+                .len()
+        };
 
         assert_eq!(index.rebuild_from_storage(&storage).unwrap(), 2);
         assert_eq!((q("keepme"), q("goneaway"), q("phantom")), (1, 1, 0));
@@ -655,26 +718,48 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let storage = Storage::new(tmp.path().join("store")).unwrap();
         let index = SearchIndex::new(tmp.path()).unwrap();
-        let q = |q: &str| index.search(&SearchQuery { q: q.into(), limit: 10, offset: 0, doc_type: None }).unwrap().len();
+        let q = |q: &str| {
+            index
+                .search(&SearchQuery {
+                    q: q.into(),
+                    limit: 10,
+                    offset: 0,
+                    doc_type: None,
+                })
+                .unwrap()
+                .len()
+        };
         let book = "d".repeat(64);
-        storage.put_with_hash(b"%PDF-1.4", &book, "book.pdf").unwrap();
-        index.index_document(&book, "book.pdf", Some("zanzibar")).unwrap();
+        storage
+            .put_with_hash(b"%PDF-1.4", &book, "book.pdf")
+            .unwrap();
+        index
+            .index_document(&book, "book.pdf", Some("zanzibar"))
+            .unwrap();
         assert_eq!(index.rebuild_from_storage(&storage).unwrap(), 1);
 
         // A blob added and indexed after a rebuild listed storage (overlapping reindex) survives the prune.
         let late = "e".repeat(64);
-        storage.put_with_hash(b"{}", &late, "latecomer.metadata").unwrap();
-        index.index_document(&late, "latecomer.metadata", None).unwrap();
+        storage
+            .put_with_hash(b"{}", &late, "latecomer.metadata")
+            .unwrap();
+        index
+            .index_document(&late, "latecomer.metadata", None)
+            .unwrap();
         assert_eq!(index.prune_missing(&storage).unwrap(), 0);
         assert_eq!(q("latecomer"), 1);
 
         // An unreadable (not deleted) PDF keeps its previous row and extracted text.
-        #[cfg(unix)] {
+        #[cfg(unix)]
+        {
             use std::os::unix::fs::PermissionsExt;
-            index.index_document(&book, "book.pdf", Some("zanzibar")).unwrap();
+            index
+                .index_document(&book, "book.pdf", Some("zanzibar"))
+                .unwrap();
             let path = tmp.path().join("store").join(&book[..2]).join(&book);
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-            if std::fs::read(&path).is_err() { // not root
+            if std::fs::read(&path).is_err() {
+                // not root
                 index.rebuild_from_storage(&storage).unwrap();
                 assert_eq!(q("zanzibar"), 1, "read error must not erase the row");
             }
@@ -687,7 +772,16 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let storage = Storage::new(tmp.path().join("store")).unwrap();
         let index = SearchIndex::new(tmp.path()).unwrap();
-        let q = |q: &str| index.search(&SearchQuery { q: q.into(), limit: 10, offset: 0, doc_type: None }).unwrap();
+        let q = |q: &str| {
+            index
+                .search(&SearchQuery {
+                    q: q.into(),
+                    limit: 10,
+                    offset: 0,
+                    doc_type: None,
+                })
+                .unwrap()
+        };
         let old = storage.put(b"{\"v\":1}", "notes.metadata").unwrap();
         assert_eq!(index.rebuild_from_storage(&storage).unwrap(), 1);
         assert!(index.is_indexed(&old));
@@ -695,11 +789,23 @@ mod tests {
         // Same filename, new content: the mapping moves to the new hash, the old blob stays on disk.
         let new = storage.put(b"{\"v\":2}", "notes.metadata").unwrap();
         assert_ne!(old, new);
-        assert!(storage.exists(&old) && storage.hash_for_filename("notes.metadata").as_deref() == Some(new.as_str()));
+        assert!(
+            storage.exists(&old)
+                && storage.hash_for_filename("notes.metadata").as_deref() == Some(new.as_str())
+        );
         assert_eq!(index.rebuild_from_storage(&storage).unwrap(), 1);
-        assert!(!index.is_indexed(&old), "unmapped blob's row must be pruned");
+        assert!(
+            !index.is_indexed(&old),
+            "unmapped blob's row must be pruned"
+        );
         assert!(index.is_indexed(&new));
-        assert_eq!(q("notes").iter().map(|r| r.hash.clone()).collect::<Vec<_>>(), vec![new]);
+        assert_eq!(
+            q("notes")
+                .iter()
+                .map(|r| r.hash.clone())
+                .collect::<Vec<_>>(),
+            vec![new]
+        );
     }
 
     #[test]
@@ -707,20 +813,42 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let storage = Storage::new(tmp.path().join("store")).unwrap();
         let index = SearchIndex::new(tmp.path()).unwrap();
-        let q = |q: &str| index.search(&SearchQuery { q: q.into(), limit: 10, offset: 0, doc_type: None }).unwrap();
+        let q = |q: &str| {
+            index
+                .search(&SearchQuery {
+                    q: q.into(),
+                    limit: 10,
+                    offset: 0,
+                    doc_type: None,
+                })
+                .unwrap()
+        };
         // Two filenames share one blob; the row was written under alpha (e.g. its last readable indexing).
         let old = storage.put(b"{\"v\":1}", "alpha.metadata").unwrap();
         assert_eq!(storage.put(b"{\"v\":1}", "beta.metadata").unwrap(), old);
-        index.index_document(&old, "alpha.metadata", Some("zanzibar")).unwrap();
+        index
+            .index_document(&old, "alpha.metadata", Some("zanzibar"))
+            .unwrap();
 
         // alpha moves to new content; beta still maps the old blob, so its row is repointed, not kept stale.
         let new = storage.put(b"{\"v\":2}", "alpha.metadata").unwrap();
         index.index_document(&new, "alpha.metadata", None).unwrap();
         assert_eq!(index.prune_missing(&storage).unwrap(), 0);
         let hits = q("zanzibar");
-        assert_eq!(hits.iter().map(|r| (r.hash.clone(), r.filename.clone())).collect::<Vec<_>>(), vec![(old.clone(), "beta.metadata".into())]);
-        assert!(q("alpha").iter().all(|r| r.hash == new), "no row may keep alpha's stale name");
-        assert_eq!(q("beta").iter().map(|r| r.hash.clone()).collect::<Vec<_>>(), vec![old]);
+        assert_eq!(
+            hits.iter()
+                .map(|r| (r.hash.clone(), r.filename.clone()))
+                .collect::<Vec<_>>(),
+            vec![(old.clone(), "beta.metadata".into())]
+        );
+        assert!(
+            q("alpha").iter().all(|r| r.hash == new),
+            "no row may keep alpha's stale name"
+        );
+        assert_eq!(
+            q("beta").iter().map(|r| r.hash.clone()).collect::<Vec<_>>(),
+            vec![old]
+        );
     }
 
     #[test]

@@ -346,21 +346,38 @@ pub fn revoke_endpoint(provider: ProviderType) -> Option<&'static str> {
 }
 
 /// Revoke the grant at the provider. Ok(false) means the provider has no revoke endpoint.
-pub async fn revoke_token(provider: ProviderType, token: &OAuthToken, client: &reqwest::Client) -> Result<bool> {
-    let Some(url) = revoke_endpoint(provider) else { return Ok(false) };
+pub async fn revoke_token(
+    provider: ProviderType,
+    token: &OAuthToken,
+    client: &reqwest::Client,
+) -> Result<bool> {
+    let Some(url) = revoke_endpoint(provider) else {
+        return Ok(false);
+    };
     let req = match provider {
         // Revoking the refresh token revokes the whole grant (and its access tokens).
-        ProviderType::GoogleDrive => client.post(url)
-            .form(&[("token", token.refresh_token.as_deref().unwrap_or(&token.access_token))]),
+        ProviderType::GoogleDrive => client.post(url).form(&[(
+            "token",
+            token
+                .refresh_token
+                .as_deref()
+                .unwrap_or(&token.access_token),
+        )]),
         // Revokes the calling access token plus its refresh token and siblings.
         _ => client.post(url).bearer_auth(&token.access_token),
     };
-    let response = req.timeout(std::time::Duration::from_secs(10)).send().await
+    let response = req
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
         .map_err(|e| IntegrationError::Network(e.to_string()))?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(IntegrationError::OAuth(format!("revoke failed: {}: {}", status, body)));
+        return Err(IntegrationError::OAuth(format!(
+            "revoke failed: {}: {}",
+            status, body
+        )));
     }
     Ok(true)
 }

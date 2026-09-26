@@ -274,7 +274,12 @@ impl FirmwareManager {
                             checksum: None, // Could compute SHA256 on startup
                             release_type,
                             // rM1/rM2/Paper Pro images share version numbers; pin the model.
-                            download_url: format!("{}/firmware/v1/download/{}?device={}", base_url, version_str, device.as_str()),
+                            download_url: format!(
+                                "{}/firmware/v1/download/{}?device={}",
+                                base_url,
+                                version_str,
+                                device.as_str()
+                            ),
                         };
 
                         // Only keep production builds as primary, but track all
@@ -594,24 +599,55 @@ pub async fn download_firmware(
         Some(d) => DeviceType::from_str(d)
             .ok_or_else(|| ServerError::BadRequest(format!("Unknown device: {}", d)))?,
         None => {
-            let mut matches = ALL_DEVICES.into_iter().filter(|d| state.manager.get_version(*d, &version).is_some());
+            let mut matches = ALL_DEVICES
+                .into_iter()
+                .filter(|d| state.manager.get_version(*d, &version).is_some());
             match (matches.next(), matches.next()) {
                 (Some(d), None) => d,
-                (Some(_), Some(_)) => return Err(ServerError::BadRequest(format!(
-                    "Firmware {} exists for several devices; add ?device=<rm1|rm2|ferrari|chiappa|tatsu>", version))),
-                (None, _) => return Err(ServerError::NotFound(format!("Firmware version not found: {}", version))),
+                (Some(_), Some(_)) => {
+                    return Err(ServerError::BadRequest(format!(
+                        "Firmware {} exists for several devices; add ?device=<rm1|rm2|ferrari|chiappa|tatsu>",
+                        version
+                    )));
+                }
+                (None, _) => {
+                    return Err(ServerError::NotFound(format!(
+                        "Firmware version not found: {}",
+                        version
+                    )));
+                }
             }
         }
     };
 
-    let info = state.manager.get_version(device, &version)
-        .ok_or_else(|| ServerError::NotFound(format!("Firmware {} not found for {}", version, device.as_str())))?;
-    let path = state.manager.get_firmware_path(device, &version).filter(|p| p.exists())
-        .ok_or_else(|| ServerError::NotFound(format!("Firmware {} not found for {}", version, device.as_str())))?;
+    let info = state.manager.get_version(device, &version).ok_or_else(|| {
+        ServerError::NotFound(format!(
+            "Firmware {} not found for {}",
+            version,
+            device.as_str()
+        ))
+    })?;
+    let path = state
+        .manager
+        .get_firmware_path(device, &version)
+        .filter(|p| p.exists())
+        .ok_or_else(|| {
+            ServerError::NotFound(format!(
+                "Firmware {} not found for {}",
+                version,
+                device.as_str()
+            ))
+        })?;
     serve_file(&path, &info.filename, &headers).await
 }
 
-const ALL_DEVICES: [DeviceType; 5] = [DeviceType::Rm1, DeviceType::Rm2, DeviceType::Ferrari, DeviceType::Chiappa, DeviceType::Tatsu];
+const ALL_DEVICES: [DeviceType; 5] = [
+    DeviceType::Rm1,
+    DeviceType::Rm2,
+    DeviceType::Ferrari,
+    DeviceType::Chiappa,
+    DeviceType::Tatsu,
+];
 
 /// GET /firmware/v1/delta/{device}/{from}/{to} - download a delta update
 pub async fn download_delta(
@@ -909,42 +945,111 @@ mod tests {
 
     async fn fetch(router: axum::Router, uri: &str) -> (StatusCode, Vec<u8>) {
         use tower::ServiceExt;
-        let resp = router.oneshot(axum::http::Request::get(uri).body(Body::empty()).unwrap()).await.unwrap();
+        let resp = router
+            .oneshot(axum::http::Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
         let status = resp.status();
-        (status, axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec())
+        (
+            status,
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
     }
 
     #[tokio::test]
     async fn download_selects_image_by_device() {
         let dir = temp_archive("by-device");
-        fs::write(dir.join("remarkable-production-image-3.22.0.64-rm1-public.swu"), b"rm1 image").unwrap();
-        fs::write(dir.join("remarkable-production-image-3.22.0.64-rm2-public.swu"), b"rm2 image").unwrap();
-        fs::write(dir.join("remarkable-production-image-3.23.0.1-rm1-public.swu"), b"rm1 only").unwrap();
+        fs::write(
+            dir.join("remarkable-production-image-3.22.0.64-rm1-public.swu"),
+            b"rm1 image",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("remarkable-production-image-3.22.0.64-rm2-public.swu"),
+            b"rm2 image",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("remarkable-production-image-3.23.0.1-rm1-public.swu"),
+            b"rm1 only",
+        )
+        .unwrap();
         let mgr = FirmwareManager::new(&dir, "http://h").unwrap();
-        let url1 = mgr.get_version(DeviceType::Rm1, "3.22.0.64").unwrap().download_url.clone();
-        let url2 = mgr.get_version(DeviceType::Rm2, "3.22.0.64").unwrap().download_url.clone();
+        let url1 = mgr
+            .get_version(DeviceType::Rm1, "3.22.0.64")
+            .unwrap()
+            .download_url
+            .clone();
+        let url2 = mgr
+            .get_version(DeviceType::Rm2, "3.22.0.64")
+            .unwrap()
+            .download_url
+            .clone();
         assert_eq!(url1, "http://h/firmware/v1/download/3.22.0.64?device=rm1");
         assert_eq!(url2, "http://h/firmware/v1/download/3.22.0.64?device=rm2");
-        let router = axum::Router::new().nest("/firmware/v1", firmware_router(FirmwareState::new(mgr)));
+        let router =
+            axum::Router::new().nest("/firmware/v1", firmware_router(FirmwareState::new(mgr)));
         // each advertised URL serves its own model's image
-        assert_eq!(fetch(router.clone(), url1.strip_prefix("http://h").unwrap()).await, (StatusCode::OK, b"rm1 image".to_vec()));
-        assert_eq!(fetch(router.clone(), url2.strip_prefix("http://h").unwrap()).await, (StatusCode::OK, b"rm2 image".to_vec()));
+        assert_eq!(
+            fetch(router.clone(), url1.strip_prefix("http://h").unwrap()).await,
+            (StatusCode::OK, b"rm1 image".to_vec())
+        );
+        assert_eq!(
+            fetch(router.clone(), url2.strip_prefix("http://h").unwrap()).await,
+            (StatusCode::OK, b"rm2 image".to_vec())
+        );
         // legacy URL without device: ambiguous version rejected, unambiguous one still served
-        assert_eq!(fetch(router.clone(), "/firmware/v1/download/3.22.0.64").await.0, StatusCode::BAD_REQUEST);
-        assert_eq!(fetch(router.clone(), "/firmware/v1/download/3.23.0.1").await, (StatusCode::OK, b"rm1 only".to_vec()));
+        assert_eq!(
+            fetch(router.clone(), "/firmware/v1/download/3.22.0.64")
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            fetch(router.clone(), "/firmware/v1/download/3.23.0.1").await,
+            (StatusCode::OK, b"rm1 only".to_vec())
+        );
         // explicit device never falls back to another model's image
-        assert_eq!(fetch(router.clone(), "/firmware/v1/download/3.23.0.1?device=rm2").await.0, StatusCode::NOT_FOUND);
-        assert_eq!(fetch(router.clone(), "/firmware/v1/download/3.22.0.64?device=bogus").await.0, StatusCode::BAD_REQUEST);
-        assert_eq!(fetch(router, "/firmware/v1/download/9.9.9.9").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            fetch(router.clone(), "/firmware/v1/download/3.23.0.1?device=rm2")
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            fetch(
+                router.clone(),
+                "/firmware/v1/download/3.22.0.64?device=bogus"
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            fetch(router, "/firmware/v1/download/9.9.9.9").await.0,
+            StatusCode::NOT_FOUND
+        );
         fs::remove_dir_all(dir).ok();
     }
 
     #[test]
     fn trailing_slash_base_url_has_no_double_slash() {
         let dir = temp_archive("slash");
-        fs::write(dir.join("remarkable-production-image-3.22.0.64-rm2-public.swu"), b"rm2 image").unwrap();
+        fs::write(
+            dir.join("remarkable-production-image-3.22.0.64-rm2-public.swu"),
+            b"rm2 image",
+        )
+        .unwrap();
         let mgr = FirmwareManager::new(&dir, "http://h/").unwrap();
-        assert_eq!(mgr.get_version(DeviceType::Rm2, "3.22.0.64").unwrap().download_url, "http://h/firmware/v1/download/3.22.0.64?device=rm2");
+        assert_eq!(
+            mgr.get_version(DeviceType::Rm2, "3.22.0.64")
+                .unwrap()
+                .download_url,
+            "http://h/firmware/v1/download/3.22.0.64?device=rm2"
+        );
         fs::remove_dir_all(dir).ok();
     }
 

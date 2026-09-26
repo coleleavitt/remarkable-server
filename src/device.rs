@@ -1,9 +1,3 @@
-use crate::error::{Result, ServerError};
-use chrono::{DateTime, Duration, Utc};
-use jsonwebtoken::{encode, decode, Algorithm, Header, Validation};
-use rand::Rng;
-use rusqlite::{params, Connection, OptionalExtension};
-use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -11,7 +5,7 @@ use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{Algorithm, Header, Validation, decode, encode};
 use parking_lot::Mutex;
 use rand::Rng;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, ServerError};
@@ -49,11 +43,26 @@ pub struct Device {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct DeviceTokenClaims { sub: String, iss: String, iat: i64, nbf: i64, jti: String, #[serde(rename = "device-id")] device_id: String, #[serde(rename = "device-desc")] device_desc: String, #[serde(rename = "auth0-userid")] auth0_userid: String,
+struct DeviceTokenClaims {
+    sub: String,
+    iss: String,
+    iat: i64,
+    nbf: i64,
+    jti: String,
+    #[serde(rename = "device-id")]
+    device_id: String,
+    #[serde(rename = "device-desc")]
+    device_desc: String,
+    #[serde(rename = "auth0-userid")]
+    auth0_userid: String,
     /// Revocation generation (see `device_token_epochs`). Omitted when 0, so tokens minted before any
     /// revocation (e.g. the already-paired tablet's) are byte-for-byte what they always were.
-    #[serde(rename = "rms-epoch", default, skip_serializing_if = "is_zero")] epoch: i64 }
-fn is_zero(n: &i64) -> bool { *n == 0 }
+    #[serde(rename = "rms-epoch", default, skip_serializing_if = "is_zero")]
+    epoch: i64,
+}
+fn is_zero(n: &i64) -> bool {
+    *n == 0
+}
 const UPSERT_DEVICE: &str = "INSERT INTO devices (device_id, device_desc, registered_at, last_refresh, user_id) VALUES (?, ?, ?, ?, ?) ON CONFLICT(device_id) DO UPDATE SET device_desc=excluded.device_desc, last_refresh=excluded.last_refresh, user_id=excluded.user_id";
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -240,21 +249,40 @@ impl DeviceManager {
         device_desc: &str,
     ) -> Result<(String, String)> {
         let conn = self.inner.conn.lock();
-        let (user_id, expires_str): (String, String) = conn.query_row("SELECT user_id, expires_at FROM pending_codes WHERE code = ?", params![code], |r| Ok((r.get(0)?, r.get(1)?))).map_err(|_| ServerError::InvalidCode("Code not found".into()))?;
-        let expires = DateTime::parse_from_rfc3339(&expires_str).map_err(|_| ServerError::InvalidCode("Invalid expiry".into()))?.with_timezone(&Utc);
-        if Utc::now() > expires { conn.execute("DELETE FROM pending_codes WHERE code = ?", params![code]).ok(); return Err(ServerError::InvalidCode("Code expired".into())); }
-        conn.execute("DELETE FROM pending_codes WHERE code = ?", params![code]).ok();
+        let (user_id, expires_str): (String, String) = conn
+            .query_row(
+                "SELECT user_id, expires_at FROM pending_codes WHERE code = ?",
+                params![code],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|_| ServerError::InvalidCode("Code not found".into()))?;
+        let expires = DateTime::parse_from_rfc3339(&expires_str)
+            .map_err(|_| ServerError::InvalidCode("Invalid expiry".into()))?
+            .with_timezone(&Utc);
+        if Utc::now() > expires {
+            conn.execute("DELETE FROM pending_codes WHERE code = ?", params![code])
+                .ok();
+            return Err(ServerError::InvalidCode("Code expired".into()));
+        }
+        conn.execute("DELETE FROM pending_codes WHERE code = ?", params![code])
+            .ok();
         let epoch = Self::register(&conn, device_id, device_desc, &user_id)?;
         drop(conn);
-        let dt = self.gen_device_token(device_id, device_desc, &user_id, epoch)?; let ut = self.gen_user_token(device_id, device_desc, &user_id)?;
+        let dt = self.gen_device_token(device_id, device_desc, &user_id, epoch)?;
+        let ut = self.gen_user_token(device_id, device_desc, &user_id)?;
         Ok((dt, ut))
     }
     /// Unregister the device a (validly signed) device token names, scoped to the token's user.
     /// Idempotent: a token whose device is already gone is still accepted here and deletes nothing.
     /// A token from an earlier registration (older epoch) deletes nothing, so it can't knock out a re-pair.
     pub fn revoke_device_token(&self, device_token: &str) -> Result<bool> {
-        let c = self.decode_device_token_signature(device_token)?; let conn = self.inner.conn.lock();
-        match Self::check_registered(&conn, &c) { Ok(()) => {} Err(ServerError::InvalidToken) => return Ok(false), Err(e) => return Err(e) }
+        let c = self.decode_device_token_signature(device_token)?;
+        let conn = self.inner.conn.lock();
+        match Self::check_registered(&conn, &c) {
+            Ok(()) => {}
+            Err(ServerError::InvalidToken) => return Ok(false),
+            Err(e) => return Err(e),
+        }
         Self::unregister(&conn, &c.device_id, Some(&c.auth0_userid))
     }
     pub fn refresh_user_token(&self, device_token: &str) -> Result<String> {
@@ -265,7 +293,22 @@ impl DeviceManager {
     pub fn list_devices(&self, owner: Option<&str>) -> Result<Vec<Device>> {
         let conn = self.inner.conn.lock();
         let mut stmt = conn.prepare("SELECT device_id, device_desc, registered_at, last_refresh, user_id FROM devices WHERE ?1 IS NULL OR user_id = ?1")?;
-        let devices = stmt.query_map(params![owner], |row| Ok(Device { device_id: row.get(0)?, device_desc: row.get(1)?, registered_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(2)?).map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()), last_refresh: DateTime::parse_from_rfc3339(&row.get::<_, String>(3)?).map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()), user_id: row.get(4)? }))?.filter_map(|r| r.ok()).collect();
+        let devices = stmt
+            .query_map(params![owner], |row| {
+                Ok(Device {
+                    device_id: row.get(0)?,
+                    device_desc: row.get(1)?,
+                    registered_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(2)?)
+                        .map(|d| d.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now()),
+                    last_refresh: DateTime::parse_from_rfc3339(&row.get::<_, String>(3)?)
+                        .map(|d| d.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now()),
+                    user_id: row.get(4)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
         Ok(devices)
     }
     /// Unregister a device and revoke every device token issued for it so far.
@@ -278,26 +321,54 @@ impl DeviceManager {
     /// would let a later re-pair revive every token minted before it.
     fn unregister(conn: &Connection, device_id: &str, owner: Option<&str>) -> Result<bool> {
         let tx = conn.unchecked_transaction()?; // callers hold the connection mutex
-        let deleted = tx.execute("DELETE FROM devices WHERE device_id = ?1 AND (?2 IS NULL OR user_id = ?2)", params![device_id, owner])? > 0;
-        if deleted { Self::bump_epoch(&tx, device_id)?; }
-        tx.commit()?; Ok(deleted)
+        let deleted = tx.execute(
+            "DELETE FROM devices WHERE device_id = ?1 AND (?2 IS NULL OR user_id = ?2)",
+            params![device_id, owner],
+        )? > 0;
+        if deleted {
+            Self::bump_epoch(&tx, device_id)?;
+        }
+        tx.commit()?;
+        Ok(deleted)
     }
     /// Invalidate all device tokens minted for `device_id` so far, even if it is paired again later.
     fn bump_epoch(conn: &Connection, device_id: &str) -> Result<()> {
-        conn.execute("INSERT INTO device_token_epochs (device_id, epoch) VALUES (?, 1) ON CONFLICT(device_id) DO UPDATE SET epoch = epoch + 1", params![device_id])?; Ok(())
+        conn.execute("INSERT INTO device_token_epochs (device_id, epoch) VALUES (?, 1) ON CONFLICT(device_id) DO UPDATE SET epoch = epoch + 1", params![device_id])?;
+        Ok(())
     }
     /// Upsert a device registration; returns the epoch to mint its device token with.
     /// Moving a device to another user revokes the previous owner's tokens (they'd otherwise
     /// come back to life if the device were later paired back to that user).
     /// Bump + upsert run in one transaction so a failure can't hand the device over un-revoked.
-    fn register(conn: &Connection, device_id: &str, device_desc: &str, user_id: &str) -> Result<i64> {
+    fn register(
+        conn: &Connection,
+        device_id: &str,
+        device_desc: &str,
+        user_id: &str,
+    ) -> Result<i64> {
         let tx = conn.unchecked_transaction()?; // callers hold the connection mutex
-        let prev: Option<String> = tx.query_row("SELECT user_id FROM devices WHERE device_id = ?", params![device_id], |r| r.get(0)).optional()?;
-        if prev.is_some_and(|u| u != user_id) { Self::bump_epoch(&tx, device_id)?; }
+        let prev: Option<String> = tx
+            .query_row(
+                "SELECT user_id FROM devices WHERE device_id = ?",
+                params![device_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if prev.is_some_and(|u| u != user_id) {
+            Self::bump_epoch(&tx, device_id)?;
+        }
         let now = Utc::now().to_rfc3339();
-        tx.execute(UPSERT_DEVICE, params![device_id, device_desc, now, now, user_id])?;
-        let epoch = tx.query_row("SELECT COALESCE((SELECT epoch FROM device_token_epochs WHERE device_id = ?), 0)", params![device_id], |r| r.get(0))?;
-        tx.commit()?; Ok(epoch)
+        tx.execute(
+            UPSERT_DEVICE,
+            params![device_id, device_desc, now, now, user_id],
+        )?;
+        let epoch = tx.query_row(
+            "SELECT COALESCE((SELECT epoch FROM device_token_epochs WHERE device_id = ?), 0)",
+            params![device_id],
+            |r| r.get(0),
+        )?;
+        tx.commit()?;
+        Ok(epoch)
     }
 
     // ---- MDM instruction queue (enterprise device management, /mdm/v1) ----
@@ -334,9 +405,18 @@ impl DeviceManager {
 
     /// Record a device-reported status for an instruction.
     /// Only the owning user's instructions can be updated; another user's id is a no-op (false).
-    pub fn mdm_set_status(&self, user_id: &str, id: &str, status: &str, detail: Option<&str>) -> Result<bool> {
+    pub fn mdm_set_status(
+        &self,
+        user_id: &str,
+        id: &str,
+        status: &str,
+        detail: Option<&str>,
+    ) -> Result<bool> {
         let conn = self.inner.conn.lock();
-        Ok(conn.execute("UPDATE mdm_instructions SET status = ?, detail = ? WHERE id = ? AND user_id = ?", params![status, detail, id, user_id])? > 0)
+        Ok(conn.execute(
+            "UPDATE mdm_instructions SET status = ?, detail = ? WHERE id = ? AND user_id = ?",
+            params![status, detail, id, user_id],
+        )? > 0)
     }
 
     /// All instructions for the user: (id, name, status, detail).
@@ -351,9 +431,30 @@ impl DeviceManager {
             .collect();
         Ok(rows)
     }
-    fn gen_device_token(&self, device_id: &str, device_desc: &str, user_id: &str, epoch: i64) -> Result<String> {
+    fn gen_device_token(
+        &self,
+        device_id: &str,
+        device_desc: &str,
+        user_id: &str,
+        epoch: i64,
+    ) -> Result<String> {
         let now = Utc::now().timestamp();
-        encode(&Header::new(Algorithm::HS256), &DeviceTokenClaims { sub: "rM Device Token".into(), iss: self.inner.issuer.clone(), iat: now, nbf: now, jti: uuid::Uuid::new_v4().to_string(), device_id: device_id.into(), device_desc: device_desc.into(), auth0_userid: user_id.into(), epoch }, &self.inner.encoding_key).map_err(|e| ServerError::TokenError(e.to_string()))
+        encode(
+            &Header::new(Algorithm::HS256),
+            &DeviceTokenClaims {
+                sub: "rM Device Token".into(),
+                iss: self.inner.issuer.clone(),
+                iat: now,
+                nbf: now,
+                jti: uuid::Uuid::new_v4().to_string(),
+                device_id: device_id.into(),
+                device_desc: device_desc.into(),
+                auth0_userid: user_id.into(),
+                epoch,
+            },
+            &self.inner.encoding_key,
+        )
+        .map_err(|e| ServerError::TokenError(e.to_string()))
     }
     fn gen_user_token(&self, device_id: &str, device_desc: &str, user_id: &str) -> Result<String> {
         let now = Utc::now().timestamp();
@@ -394,26 +495,38 @@ impl DeviceManager {
     /// one. Deleting the row bumps the epoch, so re-pairing doesn't revive old tokens.
     fn decode_device_token(&self, token: &str) -> Result<DeviceTokenClaims> {
         let c = self.decode_device_token_signature(token)?;
-        Self::check_registered(&self.inner.conn.lock(), &c)?; Ok(c)
+        Self::check_registered(&self.inner.conn.lock(), &c)?;
+        Ok(c)
     }
     fn check_registered(conn: &Connection, c: &DeviceTokenClaims) -> Result<()> {
         // devices.device_id and device_token_epochs.device_id are PRIMARY KEYs: two index lookups.
         let epoch: Option<i64> = conn.query_row("SELECT COALESCE((SELECT epoch FROM device_token_epochs WHERE device_id = ?1), 0) FROM devices WHERE device_id = ?1 AND user_id = ?2", params![c.device_id, c.auth0_userid], |r| r.get(0)).optional()?;
-        if epoch != Some(c.epoch) { tracing::warn!(device_id = %c.device_id, "rejecting device token: device not registered to this user, or token revoked"); return Err(ServerError::InvalidToken); }
+        if epoch != Some(c.epoch) {
+            tracing::warn!(device_id = %c.device_id, "rejecting device token: device not registered to this user, or token revoked");
+            return Err(ServerError::InvalidToken);
+        }
         Ok(())
     }
     /// Validate a device token and record the refresh under one lock, so a delete/re-pair can't
     /// land between the registration check and the write (which would otherwise undo it).
     fn touch_device_token(&self, token: &str) -> Result<DeviceTokenClaims> {
-        let c = self.decode_device_token_signature(token)?; let conn = self.inner.conn.lock();
+        let c = self.decode_device_token_signature(token)?;
+        let conn = self.inner.conn.lock();
         Self::check_registered(&conn, &c)?;
-        conn.execute("UPDATE devices SET last_refresh = ? WHERE device_id = ? AND user_id = ?", params![Utc::now().to_rfc3339(), c.device_id, c.auth0_userid])?;
+        conn.execute(
+            "UPDATE devices SET last_refresh = ? WHERE device_id = ? AND user_id = ?",
+            params![Utc::now().to_rfc3339(), c.device_id, c.auth0_userid],
+        )?;
         Ok(c)
     }
     /// Signature/claims check only, no registration lookup. Use `decode_device_token` for auth.
     fn decode_device_token_signature(&self, token: &str) -> Result<DeviceTokenClaims> {
-        let mut val = Validation::new(Algorithm::HS256); val.validate_exp = false; val.set_required_spec_claims(&["sub", "iss", "iat"]);
-        decode::<DeviceTokenClaims>(token, &self.inner.decoding_key, &val).map(|d| d.claims).map_err(|_| ServerError::InvalidToken)
+        let mut val = Validation::new(Algorithm::HS256);
+        val.validate_exp = false;
+        val.set_required_spec_claims(&["sub", "iss", "iat"]);
+        decode::<DeviceTokenClaims>(token, &self.inner.decoding_key, &val)
+            .map(|d| d.claims)
+            .map_err(|_| ServerError::InvalidToken)
     }
     pub fn validate_token(&self, auth: &str) -> Result<String> {
         let token = auth
@@ -453,8 +566,14 @@ impl DeviceManager {
         let mut conn = self.inner.conn.lock();
         let tx = conn.transaction()?;
         let now = Utc::now().to_rfc3339();
-        tx.execute("DELETE FROM passcode_resets WHERE user_id = ? AND expires < ?", params![user_id, now])?;
-        tx.execute("DELETE FROM passcode_resets WHERE request_id = ? AND expires < ?", params![reset.request_id, now])?;
+        tx.execute(
+            "DELETE FROM passcode_resets WHERE user_id = ? AND expires < ?",
+            params![user_id, now],
+        )?;
+        tx.execute(
+            "DELETE FROM passcode_resets WHERE request_id = ? AND expires < ?",
+            params![reset.request_id, now],
+        )?;
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO passcode_resets (request_id, user_id, device_id, device_name, created, expires, approved) VALUES (?, ?, ?, ?, ?, ?, 0)",
             params![reset.request_id, user_id, reset.device_id, reset.device_name, reset.created.to_rfc3339(), reset.expires.to_rfc3339()],
@@ -467,7 +586,11 @@ impl DeviceManager {
     pub fn get_passcode_reset(&self, request_id: &str, user_id: &str) -> Result<PasscodeReset> {
         Self::read_passcode_reset(&self.inner.conn.lock(), request_id, user_id)
     }
-    fn read_passcode_reset(conn: &Connection, request_id: &str, user_id: &str) -> Result<PasscodeReset> {
+    fn read_passcode_reset(
+        conn: &Connection,
+        request_id: &str,
+        user_id: &str,
+    ) -> Result<PasscodeReset> {
         let row = conn.query_row(
             "SELECT device_id, device_name, created, expires, approved FROM passcode_resets WHERE request_id = ? AND user_id = ?",
             params![request_id, user_id],
@@ -494,11 +617,18 @@ impl DeviceManager {
 
     /// Why a guarded approve/deny touched no row: 403 if the (live) request is the caller's own,
     /// else 404. Only picks the status; the security decision is the guarded statement itself.
-    fn passcode_reset_miss(conn: &Connection, request_id: &str, user_id: &str, caller_device: Option<&str>) -> ServerError {
+    fn passcode_reset_miss(
+        conn: &Connection,
+        request_id: &str,
+        user_id: &str,
+        caller_device: Option<&str>,
+    ) -> ServerError {
         match Self::read_passcode_reset(conn, request_id, user_id) {
             Ok(r) if caller_device == Some(r.device_id.as_str()) => {
                 tracing::warn!(%request_id, device = %r.device_id, "passcode reset self-approval/denial rejected");
-                ServerError::Forbidden("a device cannot approve or deny its own passcode reset".into())
+                ServerError::Forbidden(
+                    "a device cannot approve or deny its own passcode reset".into(),
+                )
             }
             _ => ServerError::NotFound(request_id.into()),
         }
@@ -507,17 +637,35 @@ impl DeviceManager {
     /// Approve a pending reset; returns (user id, reset) so the caller can notify the device.
     /// `owner`/`caller_device` are the approving device's user and id (None for the admin endpoint):
     /// the UPDATE itself requires `device_id != caller_device`, so a device can never approve its own request.
-    pub fn approve_passcode_reset(&self, request_id: &str, owner: Option<&str>, caller_device: Option<&str>) -> Result<(String, PasscodeReset)> {
+    pub fn approve_passcode_reset(
+        &self,
+        request_id: &str,
+        owner: Option<&str>,
+        caller_device: Option<&str>,
+    ) -> Result<(String, PasscodeReset)> {
         let conn = self.inner.conn.lock();
         let user_id: String = conn
-            .query_row("SELECT user_id FROM passcode_resets WHERE request_id = ?", params![request_id], |r| r.get(0))
+            .query_row(
+                "SELECT user_id FROM passcode_resets WHERE request_id = ?",
+                params![request_id],
+                |r| r.get(0),
+            )
             .map_err(|_| ServerError::NotFound(request_id.into()))?;
-        if owner.is_some_and(|o| o != user_id) { return Err(ServerError::NotFound(request_id.into())); }
+        if owner.is_some_and(|o| o != user_id) {
+            return Err(ServerError::NotFound(request_id.into()));
+        }
         let updated = conn.execute(
             "UPDATE passcode_resets SET approved = 1 WHERE request_id = ?1 AND user_id = ?2 AND expires >= ?3 AND (?4 IS NULL OR device_id != ?4)",
             params![request_id, user_id, Utc::now().to_rfc3339(), caller_device],
         )?;
-        if updated == 0 { return Err(Self::passcode_reset_miss(&conn, request_id, &user_id, caller_device)); }
+        if updated == 0 {
+            return Err(Self::passcode_reset_miss(
+                &conn,
+                request_id,
+                &user_id,
+                caller_device,
+            ));
+        }
         let reset = Self::read_passcode_reset(&conn, request_id, &user_id)?;
         Ok((user_id, reset))
     }
@@ -525,15 +673,32 @@ impl DeviceManager {
     /// Drop `user_id`'s expired reset requests (lookups already treat them as missing).
     pub fn purge_expired_passcode_resets(&self, user_id: &str) -> Result<usize> {
         // rfc3339 strings from `to_rfc3339()` share one format/offset, so they compare chronologically.
-        Ok(self.inner.conn.lock().execute("DELETE FROM passcode_resets WHERE user_id = ? AND expires < ?", params![user_id, Utc::now().to_rfc3339()])?)
+        Ok(self.inner.conn.lock().execute(
+            "DELETE FROM passcode_resets WHERE user_id = ? AND expires < ?",
+            params![user_id, Utc::now().to_rfc3339()],
+        )?)
     }
 
     /// Deny: drop `user_id`'s reset request unless it is `caller_device`'s own (checked in the DELETE itself).
     /// 403 for the caller's own request, 404 if there is no such live request.
-    pub fn deny_passcode_reset(&self, request_id: &str, user_id: &str, caller_device: &str) -> Result<()> {
+    pub fn deny_passcode_reset(
+        &self,
+        request_id: &str,
+        user_id: &str,
+        caller_device: &str,
+    ) -> Result<()> {
         let conn = self.inner.conn.lock();
-        if conn.execute("DELETE FROM passcode_resets WHERE request_id = ? AND user_id = ? AND device_id != ?", params![request_id, user_id, caller_device])? == 0 {
-            return Err(Self::passcode_reset_miss(&conn, request_id, user_id, Some(caller_device)));
+        if conn.execute(
+            "DELETE FROM passcode_resets WHERE request_id = ? AND user_id = ? AND device_id != ?",
+            params![request_id, user_id, caller_device],
+        )? == 0
+        {
+            return Err(Self::passcode_reset_miss(
+                &conn,
+                request_id,
+                user_id,
+                Some(caller_device),
+            ));
         }
         Ok(())
     }
@@ -584,11 +749,22 @@ impl DeviceManager {
     /// Register/refresh a device and mint an OAuth bundle for software 3.28:
     /// access = the same user auth data our sync/gentree auth already accepts,
     /// refresh = a device auth data, id = an HS512 id auth data with auth.remarkable.com claims.
-    pub fn oauth_bundle(&self, user_id: &str, device_id: &str, device_desc: &str) -> Result<(String, String, String)> {
+    pub fn oauth_bundle(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        device_desc: &str,
+    ) -> Result<(String, String, String)> {
         let epoch = Self::register(&self.inner.conn.lock(), device_id, device_desc, user_id)?;
         self.mint_bundle(user_id, device_id, device_desc, epoch)
     }
-    fn mint_bundle(&self, user_id: &str, device_id: &str, device_desc: &str, epoch: i64) -> Result<(String, String, String)> {
+    fn mint_bundle(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        device_desc: &str,
+        epoch: i64,
+    ) -> Result<(String, String, String)> {
         Ok((
             self.gen_user_token(device_id, device_desc, user_id)?,
             self.gen_device_token(device_id, device_desc, user_id, epoch)?,
@@ -718,14 +894,19 @@ mod revocation_tests {
 
     fn setup() -> (DeviceManager, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
-        (DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap(), tmp)
+        (
+            DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap(),
+            tmp,
+        )
     }
     /// Pair `device` to `user` the way the tablet does (pairing code -> /token/json/2/device/new).
     fn pair(dm: &DeviceManager, user: &str, device: &str) -> String {
         let code = dm.create_pairing_code(user).unwrap();
         dm.exchange_code(&code, device, "remarkable").unwrap().0
     }
-    fn bearer(t: &str) -> String { format!("Bearer {t}") }
+    fn bearer(t: &str) -> String {
+        format!("Bearer {t}")
+    }
 
     #[test]
     fn registered_device_token_is_accepted() {
@@ -734,7 +915,10 @@ mod revocation_tests {
         assert_eq!(dm.validate_token(&bearer(&dt)).unwrap(), "local-user");
         assert_eq!(dm.caller(&bearer(&dt)).unwrap().1, "RM110-1");
         let ut = dm.refresh_user_token(&dt).unwrap();
-        assert_eq!(dm.caller(&bearer(&ut)).unwrap(), ("local-user".into(), "RM110-1".into(), "remarkable".into()));
+        assert_eq!(
+            dm.caller(&bearer(&ut)).unwrap(),
+            ("local-user".into(), "RM110-1".into(), "remarkable".into())
+        );
         assert!(dm.exchange_device_token(&dt).is_ok());
     }
 
@@ -743,7 +927,10 @@ mod revocation_tests {
         let (dm, _tmp) = setup();
         let dt = pair(&dm, "local-user", "RM110-1");
         assert!(dm.delete_device("RM110-1", None).unwrap());
-        assert!(matches!(dm.validate_token(&bearer(&dt)), Err(ServerError::InvalidToken)));
+        assert!(matches!(
+            dm.validate_token(&bearer(&dt)),
+            Err(ServerError::InvalidToken)
+        ));
         assert!(dm.caller(&bearer(&dt)).is_err());
         assert!(dm.refresh_user_token(&dt).is_err());
         // Refresh/exchange must not silently re-register the deleted device.
@@ -759,9 +946,15 @@ mod revocation_tests {
         let other = pair(&dm, "local-user", "RM110-2");
         assert!(dm.revoke_device_token(&dt).unwrap());
         assert!(dm.validate_token(&bearer(&dt)).is_err());
-        assert!(!dm.revoke_device_token(&dt).unwrap(), "second delete is a no-op, not an error");
+        assert!(
+            !dm.revoke_device_token(&dt).unwrap(),
+            "second delete is a no-op, not an error"
+        );
         assert!(dm.revoke_device_token("not-a-jwt").is_err());
-        assert!(dm.validate_token(&bearer(&other)).is_ok(), "other devices unaffected");
+        assert!(
+            dm.validate_token(&bearer(&other)).is_ok(),
+            "other devices unaffected"
+        );
     }
 
     #[test]
@@ -769,10 +962,15 @@ mod revocation_tests {
         let (dm, _tmp) = setup();
         let _b = pair(&dm, "user-b", "RM110-B");
         // Validly signed, but claims user A for a device registered to user B.
-        let forged = dm.gen_device_token("RM110-B", "remarkable", "user-a", 0).unwrap();
+        let forged = dm
+            .gen_device_token("RM110-B", "remarkable", "user-a", 0)
+            .unwrap();
         assert!(dm.validate_token(&bearer(&forged)).is_err());
         assert!(dm.caller(&bearer(&forged)).is_err());
-        assert!(!dm.revoke_device_token(&forged).unwrap(), "must not delete user B's device");
+        assert!(
+            !dm.revoke_device_token(&forged).unwrap(),
+            "must not delete user B's device"
+        );
         assert!(dm.get_device("RM110-B").unwrap().is_some());
         // A device re-paired to a new user drops the old user's token.
         let old = pair(&dm, "user-a", "RM110-X");
@@ -794,7 +992,10 @@ mod revocation_tests {
             assert!(dm.refresh_user_token(t).is_err());
             assert!(dm.refresh_oauth(t).is_err());
             assert!(dm.exchange_device_token(t).is_err());
-            assert!(!dm.revoke_device_token(t).unwrap(), "stale token must not unregister the new pairing");
+            assert!(
+                !dm.revoke_device_token(t).unwrap(),
+                "stale token must not unregister the new pairing"
+            );
         }
         assert!(dm.validate_token(&bearer(&new)).is_ok());
         // Self-revoke also bumps the epoch.
@@ -835,7 +1036,11 @@ mod revocation_tests {
         let (dm, _tmp) = setup();
         let dt = pair(&dm, "local-user", "RM110-1");
         let payload = dt.split('.').nth(1).unwrap();
-        let json = String::from_utf8(base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload).unwrap()).unwrap();
+        let json = String::from_utf8(
+            base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload)
+                .unwrap(),
+        )
+        .unwrap();
         assert!(!json.contains("rms-epoch"), "{json}");
         // A pre-existing token (minted before this column/claim existed) is still accepted.
         assert!(dm.validate_token(&bearer(&dt)).is_ok());
@@ -843,7 +1048,9 @@ mod revocation_tests {
     }
 
     /// A second connection to the same DB, to break things under the manager's feet.
-    fn side_conn(tmp: &tempfile::TempDir) -> Connection { Connection::open(tmp.path().join("devices.db")).unwrap() }
+    fn side_conn(tmp: &tempfile::TempDir) -> Connection {
+        Connection::open(tmp.path().join("devices.db")).unwrap()
+    }
     /// Make every epoch bump fail (both the insert and the ON CONFLICT update path).
     fn fail_epoch_bumps(tmp: &tempfile::TempDir) {
         side_conn(tmp).execute_batch("CREATE TRIGGER fail_ins BEFORE INSERT ON device_token_epochs BEGIN SELECT RAISE(ABORT, 'forced'); END; CREATE TRIGGER fail_upd BEFORE UPDATE ON device_token_epochs BEGIN SELECT RAISE(ABORT, 'forced'); END;").unwrap();
@@ -853,10 +1060,20 @@ mod revocation_tests {
     fn self_revoke_propagates_db_errors() {
         let (dm, tmp) = setup();
         let dt = pair(&dm, "local-user", "RM110-1");
-        side_conn(&tmp).execute_batch("ALTER TABLE devices RENAME TO devices_gone").unwrap();
-        assert!(matches!(dm.revoke_device_token(&dt), Err(ServerError::Database(_))), "a DB error is not 'already unregistered'");
-        side_conn(&tmp).execute_batch("ALTER TABLE devices_gone RENAME TO devices").unwrap();
-        assert!(dm.validate_token(&bearer(&dt)).is_ok(), "nothing was deleted");
+        side_conn(&tmp)
+            .execute_batch("ALTER TABLE devices RENAME TO devices_gone")
+            .unwrap();
+        assert!(
+            matches!(dm.revoke_device_token(&dt), Err(ServerError::Database(_))),
+            "a DB error is not 'already unregistered'"
+        );
+        side_conn(&tmp)
+            .execute_batch("ALTER TABLE devices_gone RENAME TO devices")
+            .unwrap();
+        assert!(
+            dm.validate_token(&bearer(&dt)).is_ok(),
+            "nothing was deleted"
+        );
         assert!(dm.revoke_device_token(&dt).unwrap());
     }
 
@@ -874,15 +1091,26 @@ mod revocation_tests {
         assert!(dm.revoke_device_token(&dt).is_err());
         assert!(dm.revoke_device_token(&other2).is_err());
         for (d, t) in [("RM110-1", &dt), ("RM110-2", &other2)] {
-            assert!(dm.get_device(d).unwrap().is_some(), "{d}: delete rolled back");
-            assert!(dm.validate_token(&bearer(t)).is_ok(), "{d}: token still valid, epoch unchanged");
+            assert!(
+                dm.get_device(d).unwrap().is_some(),
+                "{d}: delete rolled back"
+            );
+            assert!(
+                dm.validate_token(&bearer(t)).is_ok(),
+                "{d}: token still valid, epoch unchanged"
+            );
         }
         // Re-pairing to another user must not hand the device over un-revoked.
         let code = dm.create_pairing_code("user-b").unwrap();
         assert!(dm.exchange_code(&code, "RM110-1", "remarkable").is_err());
-        assert_eq!(dm.get_device("RM110-1").unwrap().unwrap().user_id, "local-user");
+        assert_eq!(
+            dm.get_device("RM110-1").unwrap().unwrap().user_id,
+            "local-user"
+        );
         assert!(dm.validate_token(&bearer(&dt)).is_ok());
-        side_conn(&tmp).execute_batch("DROP TRIGGER fail_ins; DROP TRIGGER fail_upd;").unwrap();
+        side_conn(&tmp)
+            .execute_batch("DROP TRIGGER fail_ins; DROP TRIGGER fail_upd;")
+            .unwrap();
         assert!(dm.delete_device("RM110-1", None).unwrap());
         assert!(dm.validate_token(&bearer(&dt)).is_err());
     }
@@ -905,7 +1133,36 @@ mod revocation_tests {
         let ut = dm.create_user_token("local-user").unwrap();
         assert_eq!(dm.validate_token(&bearer(&ut)).unwrap(), "local-user");
         let now = Utc::now().timestamp();
-        let expired = encode(&Header::new(Algorithm::HS256), &UserTokenClaims { sub: "local-user".into(), iss: "local.test".into(), iat: now - 7200, exp: now - 3600, nbf: now - 7200, jti: "x".into(), tectonic: "local".into(), scopes: USER_SCOPES.into(), auth0_profile: Auth0Profile { user_id: "local-user".into(), email: String::new(), name: String::new(), nickname: String::new(), level: String::new(), is_connected: true, is_beta: false }, device_id: "RM110-1".into(), device_desc: "remarkable".into(), subscription: SubscriptionClaim { status: "active".into(), plan: "connect".into() } }, &dm.inner.encoding_key).unwrap();
+        let expired = encode(
+            &Header::new(Algorithm::HS256),
+            &UserTokenClaims {
+                sub: "local-user".into(),
+                iss: "local.test".into(),
+                iat: now - 7200,
+                exp: now - 3600,
+                nbf: now - 7200,
+                jti: "x".into(),
+                tectonic: "local".into(),
+                scopes: USER_SCOPES.into(),
+                auth0_profile: Auth0Profile {
+                    user_id: "local-user".into(),
+                    email: String::new(),
+                    name: String::new(),
+                    nickname: String::new(),
+                    level: String::new(),
+                    is_connected: true,
+                    is_beta: false,
+                },
+                device_id: "RM110-1".into(),
+                device_desc: "remarkable".into(),
+                subscription: SubscriptionClaim {
+                    status: "active".into(),
+                    plan: "connect".into(),
+                },
+            },
+            &dm.inner.encoding_key,
+        )
+        .unwrap();
         assert!(dm.validate_token(&bearer(&expired)).is_err());
         assert!(dm.caller(&bearer(&expired)).is_err());
     }

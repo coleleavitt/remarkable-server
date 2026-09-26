@@ -151,17 +151,26 @@ pub async fn blob_get(
 /// tablet's first root upload may omit it), present = must be a u64 or the request is
 /// rejected. A garbled header must never degrade into an unguarded root overwrite.
 fn generation_precondition(headers: &HeaderMap) -> Result<Option<u64>> {
-    let Some(raw) = headers.get(GENERATION_MATCH_HEADER) else { return Ok(None) };
+    let Some(raw) = headers.get(GENERATION_MATCH_HEADER) else {
+        return Ok(None);
+    };
     match raw.to_str().ok().and_then(|v| v.trim().parse::<u64>().ok()) {
         Some(generation) => Ok(Some(generation)),
         None => {
             tracing::warn!(header = ?raw, "rejected malformed {GENERATION_MATCH_HEADER}");
-            Err(ServerError::InvalidHeader(format!("{GENERATION_MATCH_HEADER}: {raw:?}")))
+            Err(ServerError::InvalidHeader(format!(
+                "{GENERATION_MATCH_HEADER}: {raw:?}"
+            )))
         }
     }
 }
 
-pub async fn blob_put(State(state): State<AppState>, Query(q): Query<BlobQuery>, headers: HeaderMap, body: Bytes) -> Result<Response> {
+pub async fn blob_put(
+    State(state): State<AppState>,
+    Query(q): Query<BlobQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
     state.devices.verify_blob(&q.token, &q.blob, true)?;
     check_blob_id(&q.blob)?;
 
@@ -211,20 +220,38 @@ pub async fn sync_complete(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{device::DeviceManager, storage::Storage};
+    use crate::device::DeviceManager;
+    use crate::storage::Storage;
 
     fn setup() -> (AppState, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().unwrap();
         let storage = Storage::new(tmp.path()).unwrap();
-        let devices = DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        let devices =
+            DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
         (AppState::new(storage, devices), tmp)
     }
 
-    async fn put(state: &AppState, blob: &str, hdrs: &[(&'static str, &'static str)], body: &'static [u8]) -> Result<Response> {
+    async fn put(
+        state: &AppState,
+        blob: &str,
+        hdrs: &[(&'static str, &'static str)],
+        body: &'static [u8],
+    ) -> Result<Response> {
         let (token, _) = state.devices.sign_blob(blob, true).unwrap();
         let mut h = HeaderMap::new();
-        for (k, v) in hdrs { h.insert(*k, HeaderValue::from_static(v)); }
-        blob_put(State(state.clone()), Query(BlobQuery { blob: blob.into(), token }), h, Bytes::from_static(body)).await
+        for (k, v) in hdrs {
+            h.insert(*k, HeaderValue::from_static(v));
+        }
+        blob_put(
+            State(state.clone()),
+            Query(BlobQuery {
+                blob: blob.into(),
+                token,
+            }),
+            h,
+            Bytes::from_static(body),
+        )
+        .await
     }
 
     const H1: &[u8] = b"1111111111111111111111111111111111111111111111111111111111111111";
@@ -237,18 +264,27 @@ mod tests {
         put(&state, ROOT_BLOB, &[], H1).await.unwrap();
         assert_eq!(state.storage.get_root().generation, 1);
         // Stale generation: 412, root untouched.
-        let err = put(&state, ROOT_BLOB, &[(GENERATION_MATCH_HEADER, "0")], H2).await.unwrap_err();
-        assert!(matches!(err, ServerError::GenerationMismatch { current: 1 }));
+        let err = put(&state, ROOT_BLOB, &[(GENERATION_MATCH_HEADER, "0")], H2)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ServerError::GenerationMismatch { current: 1 }
+        ));
         // Present but malformed: 400, never an unguarded overwrite.
         for bad in ["", "abc", "-1", "1.0", "1,2"] {
-            let err = put(&state, ROOT_BLOB, &[(GENERATION_MATCH_HEADER, bad)], H2).await.unwrap_err();
+            let err = put(&state, ROOT_BLOB, &[(GENERATION_MATCH_HEADER, bad)], H2)
+                .await
+                .unwrap_err();
             assert!(matches!(err, ServerError::InvalidHeader(_)), "{bad:?}");
             assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
         }
         let root = state.storage.get_root();
         assert_eq!((root.hash.as_bytes(), root.generation), (H1, 1));
         // Matching generation: accepted.
-        let resp = put(&state, ROOT_BLOB, &[(GENERATION_MATCH_HEADER, "1")], H2).await.unwrap();
+        let resp = put(&state, ROOT_BLOB, &[(GENERATION_MATCH_HEADER, "1")], H2)
+            .await
+            .unwrap();
         assert_eq!(resp.headers()[GENERATION_HEADER], "2");
         assert_eq!(state.storage.get_root().hash.as_bytes(), H2);
     }
@@ -258,16 +294,37 @@ mod tests {
         let (state, _tmp) = setup();
         let blob = "a".repeat(64);
         // crc32c("123456789") = 4waSgw==; md5 alongside is fine.
-        put(&state, &blob, &[("x-goog-hash", "crc32c=4waSgw==,md5=JfnnlDI7RTiF9RgfG2JNCw==")], b"123456789").await.unwrap();
+        put(
+            &state,
+            &blob,
+            &[(
+                "x-goog-hash",
+                "crc32c=4waSgw==,md5=JfnnlDI7RTiF9RgfG2JNCw==",
+            )],
+            b"123456789",
+        )
+        .await
+        .unwrap();
         put(&state, &blob, &[], b"123456789").await.unwrap();
-        let err = put(&state, &blob, &[("x-goog-hash", "crc32c=4waSgw==")], b"12345678X").await.unwrap_err();
+        let err = put(
+            &state,
+            &blob,
+            &[("x-goog-hash", "crc32c=4waSgw==")],
+            b"12345678X",
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, ServerError::ChecksumMismatch { .. }));
         for bad in ["crc32c=nope", "garbage", "md5=JfnnlDI7RTiF9RgfG2JNCw=="] {
-            let err = put(&state, &blob, &[("x-goog-hash", bad)], b"123456789").await.unwrap_err();
+            let err = put(&state, &blob, &[("x-goog-hash", bad)], b"123456789")
+                .await
+                .unwrap_err();
             assert!(matches!(err, ServerError::InvalidHeader(_)), "{bad:?}");
         }
         // Root puts are checked too, before any root change.
-        let err = put(&state, ROOT_BLOB, &[("x-goog-hash", "crc32c=nope")], H1).await.unwrap_err();
+        let err = put(&state, ROOT_BLOB, &[("x-goog-hash", "crc32c=nope")], H1)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ServerError::InvalidHeader(_)));
         assert!(state.storage.get_root().hash.is_empty());
     }
