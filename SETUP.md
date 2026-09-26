@@ -167,7 +167,8 @@ Once paired, the tablet should sync automatically. You'll see:
 
 The tablet gets sync pushes over `/notifications/ws/json/1`. The MQTT-over-WebSocket `/mqtt` endpoint
 is off unless you set `MQTT_WS_NOTIFICATIONS=1`; the tablet does not use it (GAP_ANALYSIS.md, "MQTT:
-what the tablet actually uses"). Its MQTT traffic is screen share signalling on `SCREENSHARE_BIND`.
+what the tablet actually uses"). Its observed MQTT traffic is screen share signalling on `SCREENSHARE_BIND`;
+whether it also subscribes to sync topics there is unconfirmed.
 
 ## Troubleshooting
 

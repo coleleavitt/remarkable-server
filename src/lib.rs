@@ -698,9 +698,12 @@ mod router_tests {
         let devices =
             DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
         let state = AppState::new(storage, devices);
-        let _ = create_router(state.clone());
-        let _ = with_mqtt_ws(&state);
-        let _ = feature_routes(state, tmp.path(), None).unwrap();
+        // Everything main.rs merges with `MQTT_WS_NOTIFICATIONS=1`, in its order: `merge`
+        // panics on overlapping routes, so a `/mqtt` added elsewhere would only crash
+        // deployments that enabled the flag.
+        let _ = create_router(state.clone())
+            .merge(feature_routes(state.clone(), tmp.path(), None).unwrap())
+            .merge(mqtt_ws::router_if_enabled(state, Some("1")).expect("enabled"));
     }
 
     /// The API router with `/mqtt` enabled, as main.rs builds it when
@@ -716,50 +719,43 @@ mod router_tests {
     #[tokio::test]
     async fn mqtt_ws_route_is_off_by_default() {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path().join("storage")).unwrap();
+        let devices =
+            DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        let token = devices.create_user_token("u1@test").unwrap();
+        let state = AppState::new(storage, devices);
         for flag in [None, Some(""), Some("0"), Some("false"), Some("yes")] {
-            let tmp = tempfile::TempDir::new().unwrap();
-            let storage = Storage::new(tmp.path().join("storage")).unwrap();
-            let devices =
-                DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
-            let token = devices.create_user_token("u1@test").unwrap();
-            let state = AppState::new(storage, devices);
             assert!(
                 mqtt_ws::router_if_enabled(state.clone(), flag).is_none(),
                 "{flag:?}"
             );
-            // Built as main.rs builds it with the flag unset.
-            let app = create_router(state.clone())
-                .merge(feature_routes(state.clone(), tmp.path(), None).unwrap());
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let base = format!("ws://{}", listener.local_addr().unwrap());
-            tokio::spawn(async move { axum::serve(listener, app).await });
-            let connect = |path: &str| {
-                let mut req = format!("{base}{path}").into_client_request().unwrap();
-                req.headers_mut()
-                    .insert("authorization", format!("Bearer {token}").parse().unwrap());
-                tokio_tungstenite::connect_async(req)
-            };
-            match connect("/mqtt").await {
-                Err(tokio_tungstenite::tungstenite::Error::Http(r)) => {
-                    assert_eq!(r.status(), axum::http::StatusCode::NOT_FOUND, "{flag:?}")
-                }
-                other => panic!(
-                    "/mqtt must not be served for {flag:?}, got {:?}",
-                    other.map(|_| ())
-                ),
-            }
-            assert!(connect("/notifications/ws/json/1").await.is_ok());
         }
         for flag in ["1", "true", "on"] {
-            let tmp = tempfile::TempDir::new().unwrap();
-            let devices =
-                DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
-            let state = AppState::new(Storage::new(tmp.path()).unwrap(), devices);
             assert!(
-                mqtt_ws::router_if_enabled(state, Some(flag)).is_some(),
+                mqtt_ws::router_if_enabled(state.clone(), Some(flag)).is_some(),
                 "{flag}"
             );
         }
+        // Built as main.rs builds it when `router_if_enabled` returns `None`.
+        let app =
+            create_router(state.clone()).merge(feature_routes(state, tmp.path(), None).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("ws://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let connect = |path: &str| {
+            let mut req = format!("{base}{path}").into_client_request().unwrap();
+            req.headers_mut()
+                .insert("authorization", format!("Bearer {token}").parse().unwrap());
+            tokio_tungstenite::connect_async(req)
+        };
+        match connect("/mqtt").await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(r)) => {
+                assert_eq!(r.status(), axum::http::StatusCode::NOT_FOUND)
+            }
+            other => panic!("/mqtt must not be served, got {:?}", other.map(|_| ())),
+        }
+        assert!(connect("/notifications/ws/json/1").await.is_ok());
     }
 
     /// With `MQTT_WS_NOTIFICATIONS=1`, `/mqtt` is served, refuses clients without a valid

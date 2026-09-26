@@ -9,8 +9,11 @@
 //! (GAP_ANALYSIS.md, "MQTT: what the tablet actually uses"): xochitl 3.3.2 opened
 //! `/notifications/ws/json/1` for every notification session and, in 15 days of
 //! nginx logs, never requested any path containing `mqtt`, including after this
-//! route went live. Its only MQTT traffic is screen share signalling, raw MQTT over
-//! TLS to the `SCREENSHARE_BIND` broker (`crate::screenshare`), not WebSocket.
+//! route went live. Its observed MQTT traffic is screen share signalling, raw MQTT
+//! over TLS to the `SCREENSHARE_BIND` broker (`crate::screenshare`), not WebSocket.
+//! Whether it also subscribes to sync topics on that broker is unconfirmed (accepted
+//! SUBSCRIBE filters are logged at debug there); if it does, sync pushes belong on
+//! that broker, not on this endpoint.
 //!
 //! Path and topic are unverified guesses kept for other clients: nothing pins a
 //! path (`mqttbroker` in discovery is a bare host), so this uses the conventional

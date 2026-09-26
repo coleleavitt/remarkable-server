@@ -132,8 +132,8 @@ The community's top *concrete* pains. Small, bounded, high-value.
   and Office 365 calendars answer "not implemented".
 - ✅ **`/mqtt` topic** — checked against the production logs: the tablet
   (xochitl 3.3.2) never requests `/mqtt` and gets sync pushes over
-  `/notifications/ws/json/1`; its MQTT is screen share signalling on the
-  `SCREENSHARE_BIND` broker. `/mqtt` is now opt-in (`MQTT_WS_NOTIFICATIONS=1`),
+  `/notifications/ws/json/1`; its observed MQTT is screen share signalling on
+  the `SCREENSHARE_BIND` broker (sync subscriptions there: unconfirmed, below). `/mqtt` is now opt-in (`MQTT_WS_NOTIFICATIONS=1`),
   off by default (GAP_ANALYSIS.md, "MQTT: what the tablet actually uses").
 - 🧪 **Tablet's screenshare broker subscriptions** — all were inside the ACL (no
   denials logged), but the exact filters weren't logged; accepted filters now

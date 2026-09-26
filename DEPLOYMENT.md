@@ -234,7 +234,8 @@ Layout:
 - Sync push to the tablet is `/notifications/ws/json/1` (JSON over WebSocket). The MQTT-over-WebSocket
   `/mqtt` endpoint is **not** served unless `MQTT_WS_NOTIFICATIONS=1` is in the env file: the logs
   showed the tablet never requesting it (GAP_ANALYSIS.md, "MQTT: what the tablet actually uses"), so
-  leave it off. The tablet's MQTT is screen share only, on :8883 below.
+  leave it off. The tablet's observed MQTT is screen share signalling on :8883 below (whether it also
+  subscribes to sync topics there is unconfirmed).
 - The screenshare message queue broker listens directly on `0.0.0.0:8883` with TLS
   (`SCREENSHARE_CERT`/`SCREENSHARE_KEY` → a copy of the Let's Encrypt cert,
   refreshed by `contrib/linode/certbot-deploy-hook.sh`). nginx can't

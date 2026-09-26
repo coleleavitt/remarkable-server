@@ -121,7 +121,7 @@ Two MQTT endpoints exist:
 #### MQTT: what the tablet actually uses
 
 Checked on 2026-09-26 against the production Linode (read-only: `journalctl -u remarkable-server`,
-nginx `access.log*`), with the real tablet (RM110-218-95935, user `local-user`) connected through
+nginx `access.log*`), with the production tablet (user `local-user`) connected through
 rm-proxy (`127.0.0.1:443 → remarkable.unwrap.rs:443`, `127.0.0.2:443 → remarkable.unwrap.rs:8883`).
 No firmware was disassembled for this. Third-party IPs and all tokens are redacted.
 
@@ -130,9 +130,14 @@ Sources and windows:
   (`xochitl/3.3.2.1666 (codex 3.1.158-4)`) shows up on 2026-09-25/26: 282 requests.
 - Service journal at `RUST_LOG=remarkable_server=info`, retained 2026-09-25 01:37 → 2026-09-26 04:06
   UTC. `mqtt_ws` logs `MQTT WebSocket upgrade request for notifications` at info on every upgrade.
-- `/mqtt` was routed in 6ffa7bb and went live with the binary started 2026-09-26 04:05:39 UTC
-  (the deployed binary contains that log string). Before that, a request for it would have been a
-  404, which nginx still logs.
+- `/mqtt` was routed in 6ffa7bb (the only commit that adds the route; making it opt-in is the only change
+  that removes it) and was live at least from 2026-09-26 04:05:39 UTC. The running binary, started then,
+  contains two log strings that 6ffa7bb added (`MQTT CONNECT without a valid token, refusing`,
+  `second MQTT CONNECT, closing`) and not the opt-in change's `MQTT_WS_NOTIFICATIONS` (checked with
+  `grep -a -c -F` on `/proc/<pid>/exe`). `MQTT WebSocket upgrade request for notifications` proves
+  nothing here: it predates 6ffa7bb, in a handler nothing routed. Before the route existed, a request
+  for it would have been a 404, which nginx still logs, so the nginx count below does not depend on
+  when the route went live.
 
 Sync notifications: the tablet uses `/notifications/ws/json/1` only.
 - nginx: 16 tablet `GET /notifications/ws/json/1` (15 × `101`, 1 × `502` during a restart), e.g.
@@ -159,7 +164,8 @@ Sync notifications: the tablet uses `/notifications/ws/json/1` only.
   for `notifications` and `mqttbroker`; the tablet builds `wss://{notifications}/notifications/ws/json/1`
   from it and never used `mqttbroker` for a WebSocket.
 
-Screen share: the tablet's only MQTT traffic, raw MQTT 3.1.1 over TLS to the :8883 broker.
+Screen share: the tablet's only observed MQTT traffic, raw MQTT 3.1.1 over TLS to the :8883 broker.
+Whether it also subscribes to sync topics there is unconfirmed (see the SUBSCRIBE item below).
 - Client ids are `{user_id}-{uuid}`: 30 tablet CONNECTs, 19 distinct ids, all `user=local-user`, e.g.
   ```
   2026-09-26T02:39:28.581429Z  INFO remarkable_server::screenshare: mqtt client connected client=local-user-f08fe3ce-72ad-4fb9-a3a0-8862f4fe278a user=local-user
