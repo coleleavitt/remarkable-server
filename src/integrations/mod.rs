@@ -262,9 +262,10 @@ pub trait CloudProvider: Send + Sync {
     /// Changes since `cursor` under `folder_id` (default: the drive root), with paths relative
     /// to that folder like [`list_files`](Self::list_files); remote deletions come back with
     /// [`CloudFile::deleted`] set. With no cursor, providers return no changes and a cursor for
-    /// "now" (the caller is expected to have done a full listing). A cursor the provider no
-    /// longer accepts yields [`IntegrationError::ResyncRequired`]. Providers whose change feed
-    /// is already scoped and pathed that way can rely on the default, which ignores `folder_id`.
+    /// "now", so what already exists must come from a full listing taken after it (as
+    /// [`CloudSync::delta_sync`] does). A cursor the provider no longer accepts yields
+    /// [`IntegrationError::ResyncRequired`]. Providers whose change feed is already scoped and
+    /// pathed that way can rely on the default, which ignores `folder_id`.
     async fn get_changes_in(
         &self,
         folder_id: Option<&str>,

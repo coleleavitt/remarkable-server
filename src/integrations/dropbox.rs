@@ -2,7 +2,8 @@
 //!
 //! Full read/write access via Dropbox API v2.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Bound;
 
 use async_trait::async_trait;
 use reqwest::Client;
@@ -212,8 +213,9 @@ impl Dropbox {
 
 /// Map a non-success Dropbox response to an error. A missing path (409 `path/not_found`, or a
 /// plain 404) is [`IntegrationError::NotFound`] and content that can't be downloaded (409
-/// `unsupported_file`, e.g. Paper docs) is [`IntegrationError::NotDownloadable`], both
-/// permanent; auth, rate limits and 5xx stay retryable.
+/// `unsupported_file`, e.g. Paper docs, or `restricted_content`, e.g. a legal takedown) is
+/// [`IntegrationError::NotDownloadable`], both permanent; auth, rate limits and 5xx stay
+/// retryable.
 async fn response_error(response: reqwest::Response) -> IntegrationError {
     let status = response.status();
     match status.as_u16() {
@@ -231,7 +233,7 @@ async fn response_error(response: reqwest::Response) -> IntegrationError {
             let body = response.text().await.unwrap_or_default();
             if body.contains("path/not_found") {
                 IntegrationError::NotFound("Path not found".into())
-            } else if body.contains("unsupported_file") {
+            } else if body.contains("unsupported_file") || body.contains("restricted_content") {
                 IntegrationError::NotDownloadable(body)
             } else if body.contains("insufficient_space") {
                 IntegrationError::QuotaExceeded
@@ -316,8 +318,43 @@ impl DropboxEntry {
     }
 }
 
+/// Replay `list_folder` entries in order, as Dropbox asks clients to, into the state they
+/// describe: a later entry for a path replaces the earlier one, a file replaces anything that
+/// was below the path (it may have been a folder), and a `deleted` entry removes the path and
+/// everything below it. A listing is paged over time, so an item edited, moved or deleted while
+/// it pages shows up again in a later page. What remains comes back in the order it was last
+/// written; `deleted` entries remain (as deletions) only with `keep_deletions`, which a change
+/// feed needs because the caller may hold what they delete.
+fn replay(entries: &[DropboxEntry], keep_deletions: bool) -> Vec<&DropboxEntry> {
+    let mut state: BTreeMap<&str, (usize, &DropboxEntry)> = BTreeMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        let Some(lower) = e.path_lower.as_deref() else {
+            continue;
+        };
+        if e.tag != "folder" {
+            let below = format!("{}/", lower);
+            let gone: Vec<&str> = state
+                .range::<str, _>((Bound::Included(below.as_str()), Bound::Unbounded))
+                .map(|(k, _)| *k)
+                .take_while(|k| k.starts_with(&below))
+                .collect();
+            for k in gone {
+                state.remove(k);
+            }
+        }
+        if e.tag == "deleted" && !keep_deletions {
+            state.remove(lower);
+        } else {
+            state.insert(lower, (i, e));
+        }
+    }
+    let mut live: Vec<(usize, &DropboxEntry)> = state.into_values().collect();
+    live.sort_unstable_by_key(|(i, _)| *i);
+    live.into_iter().map(|(_, e)| e).collect()
+}
+
 /// `path_lower` → name of every folder in `entries`, for casing the folders on a path.
-fn folder_names(entries: &[DropboxEntry]) -> HashMap<&str, &str> {
+fn folder_names<'a>(entries: &[&'a DropboxEntry]) -> HashMap<&'a str, &'a str> {
     entries
         .iter()
         .filter(|e| e.tag == "folder")
@@ -454,8 +491,9 @@ impl CloudProvider for Dropbox {
     /// Everything under `folder_id` (a path or `id:`; default: the whole Dropbox) in one
     /// recursive `list_folder`, paged with `list_folder/continue`. Paths are relative to that
     /// folder (`/Sub/dir/file.pdf`), matching the local scan so nested files aren't seen as
-    /// missing and re-uploaded every sync. Entries that can't be given a safe relative path
-    /// (see [`relative_path`]) are skipped, and each item is listed once.
+    /// missing and re-uploaded every sync. The pages are [replayed](replay) in order, so an
+    /// item changed or deleted while they were fetched is listed as it ended up, once. Entries
+    /// that can't be given a safe relative path (see [`relative_path`]) are skipped.
     async fn list_files(&self, folder_id: Option<&str>) -> Result<Vec<CloudFile>> {
         let path = api_path(folder_id);
         let root = self.root_lower(path).await?;
@@ -463,21 +501,15 @@ impl CloudProvider for Dropbox {
             .api_request("files/list_folder", &ListFolderArg::recursive(path))
             .await?;
         let (entries, _) = self.drain(first).await?;
+        let entries = replay(&entries, false);
 
         let folders = folder_names(&entries);
-        let mut seen_items = HashSet::new();
         let mut seen_paths = HashSet::new();
         let mut out = Vec::new();
-        for e in &entries {
-            if e.tag == "deleted" {
-                continue;
-            }
+        for e in entries {
             let Some(rel) = relative_path(e, &root, &folders) else {
                 continue;
             };
-            if !seen_items.insert(e.path_lower.as_deref()) {
-                continue;
-            }
             if !seen_paths.insert(rel.clone()) {
                 tracing::warn!("dropbox: duplicate path {:?}, keeping the first", rel);
                 continue;
@@ -684,9 +716,10 @@ impl CloudProvider for Dropbox {
     /// Changes under `folder_id` since `cursor`, all pages of `list_folder/continue`, pathed like
     /// [`list_files`](CloudProvider::list_files). Without a cursor, returns no changes and
     /// `get_latest_cursor` for the folder (recursive, so the cursor itself is scoped to it).
-    /// The feed is a log, so only each path's last entry is kept (deleted then re-created
-    /// gives just the file), in feed order; `deleted` entries become deletions. An invalidated
-    /// cursor (409 `reset`) is [`IntegrationError::ResyncRequired`].
+    /// The feed is a log and is [replayed](replay): each path's last entry is kept (deleted
+    /// then re-created gives just the file), a deleted folder drops what was listed under it
+    /// earlier, and the result is in feed order; `deleted` entries become deletions. An
+    /// invalidated cursor (409 `reset`) is [`IntegrationError::ResyncRequired`].
     async fn get_changes_in(
         &self,
         folder_id: Option<&str>,
@@ -716,19 +749,11 @@ impl CloudProvider for Dropbox {
         }
 
         let root = self.root_lower(path).await?;
+        let entries = replay(&entries, true);
         let folders = folder_names(&entries);
-        let last: HashMap<&str, usize> = entries
-            .iter()
-            .enumerate()
-            .filter_map(|(i, e)| Some((e.path_lower.as_deref()?, i)))
-            .collect();
         let mut seen_paths = HashSet::new();
         let mut out = Vec::new();
-        for (i, e) in entries.iter().enumerate() {
-            match e.path_lower.as_deref() {
-                Some(lower) if last[lower] == i => {}
-                _ => continue, // superseded by a later entry for the same path
-            }
+        for e in entries {
             let Some(rel) = relative_path(e, &root, &folders) else {
                 tracing::debug!(
                     "dropbox: skipping change {:?}: not under the sync folder",
@@ -769,8 +794,8 @@ mod tests {
 
     use super::*;
 
-    /// Deleted paths (409 `path/not_found`) and Paper docs (409 `unsupported_file`) fail
-    /// permanently; auth and 5xx stay retryable.
+    /// Deleted paths (409 `path/not_found`), Paper docs (409 `unsupported_file`) and
+    /// restricted content fail permanently; auth and 5xx stay retryable.
     #[tokio::test]
     async fn download_error_mapping() {
         let app = axum::Router::new().route(
@@ -787,6 +812,11 @@ mod tests {
                     "/paper" => (
                         StatusCode::CONFLICT,
                         r#"{"error_summary":"unsupported_file/.."}"#,
+                    )
+                        .into_response(),
+                    "/restricted" => (
+                        StatusCode::CONFLICT,
+                        r#"{"error_summary":"path/restricted_content/.."}"#,
                     )
                         .into_response(),
                     "/flaky" => StatusCode::BAD_GATEWAY.into_response(),
@@ -810,8 +840,13 @@ mod tests {
 
         let err = d.download_file("/gone").await.unwrap_err();
         assert!(matches!(err, IntegrationError::NotFound(_)), "{err}");
-        let err = d.download_file("/paper").await.unwrap_err();
-        assert!(matches!(err, IntegrationError::NotDownloadable(_)), "{err}");
+        for path in ["/paper", "/restricted"] {
+            let err = d.download_file(path).await.unwrap_err();
+            assert!(
+                matches!(err, IntegrationError::NotDownloadable(_)),
+                "{path}: {err}"
+            );
+        }
         for path in ["/flaky", "/auth"] {
             let err = d.download_file(path).await.unwrap_err();
             assert!(!err.is_permanent(), "{path}: {err}");
@@ -857,6 +892,13 @@ mod tests {
         fn deleted(display: &str) -> Value {
             entry("deleted", display)
         }
+        /// `file(display)` after an edit: newer time and hash.
+        fn edited(display: &str) -> Value {
+            let mut e = file(display);
+            e["server_modified"] = json!("2024-05-06T07:08:09Z");
+            e["content_hash"] = json!("h2");
+            e
+        }
 
         fn page(entries: Vec<Value>, cursor: &str, has_more: bool) -> Value {
             json!({ "entries": entries, "cursor": cursor, "has_more": has_more })
@@ -892,6 +934,20 @@ mod tests {
                     )
                 }
                 "/stuck" => page(vec![file("/Stuck/s.pdf")], "stuck", true),
+                // Continued in `M1`, where the tree changes while the listing pages.
+                "/moving" => page(
+                    vec![
+                        folder("/Moving"),
+                        file("/Moving/x.pdf"),
+                        folder("/Moving/Sub"),
+                        file("/Moving/Sub/a.pdf"),
+                        file("/Moving/edit.pdf"),
+                        folder("/Moving/Was-a-folder"),
+                        file("/Moving/Was-a-folder/in.pdf"),
+                    ],
+                    "M1",
+                    true,
+                ),
                 _ => page(vec![], "none", false),
             }
         }
@@ -913,6 +969,30 @@ mod tests {
                     false,
                 ),
                 "stuck" => page(vec![], "stuck", true),
+                "M1" => page(
+                    vec![
+                        deleted("/Moving/x.pdf"),
+                        // Sub renamed to Sub2: its old entries go, the new ones come.
+                        deleted("/Moving/Sub"),
+                        folder("/Moving/Sub2"),
+                        file("/Moving/Sub2/a.pdf"),
+                        edited("/Moving/edit.pdf"),
+                        file("/Moving/Was-a-folder"), // a file now, where the folder was
+                    ],
+                    "M2",
+                    false,
+                ),
+                "CD" => page(
+                    vec![
+                        file("/Notes/Sub/a.pdf"),
+                        folder("/Notes/Dir"),
+                        file("/Notes/Dir/in.pdf"),
+                        deleted("/Notes/Sub"),
+                        file("/Notes/Dir"),
+                    ],
+                    "CD2",
+                    false,
+                ),
                 "C0" => page(
                     vec![
                         file("/Notes/new.pdf"),
@@ -960,7 +1040,7 @@ mod tests {
                         log(&l, "get_metadata", &b);
                         match b["path"].as_str().unwrap().to_lowercase().as_str() {
                             "/notes" | "id:notes" => Json(folder("/Notes")).into_response(),
-                            p @ ("/deep" | "/stuck") => {
+                            p @ ("/deep" | "/stuck" | "/moving") => {
                                 let display = format!("/{}{}", p[1..2].to_uppercase(), &p[2..]);
                                 Json(folder(&display)).into_response()
                             }
@@ -1008,6 +1088,23 @@ mod tests {
                             serde_json::from_str(headers["Dropbox-API-Arg"].to_str().unwrap())
                                 .unwrap();
                         arg["path"].as_str().unwrap().to_string()
+                    }),
+                )
+                .route(
+                    "/files/upload",
+                    post(|State(l): State<Log>, headers: HeaderMap| async move {
+                        let arg: Value =
+                            serde_json::from_str(headers["Dropbox-API-Arg"].to_str().unwrap())
+                                .unwrap();
+                        log(&l, "upload", &arg);
+                        Json(file(arg["path"].as_str().unwrap()))
+                    }),
+                )
+                .route(
+                    "/files/create_folder_v2",
+                    post(|State(l): State<Log>, Json(b): Json<Value>| async move {
+                        log(&l, "create_folder", &b);
+                        Json(json!({ "metadata": folder(b["path"].as_str().unwrap()) }))
                     }),
                 )
                 .with_state(state.clone());
@@ -1117,6 +1214,82 @@ mod tests {
             assert!(matches!(err, IntegrationError::NotFound(_)), "{err}");
         }
 
+        /// A listing that pages while the tree changes is replayed in order: deletions and
+        /// renames seen on a later page drop the earlier entries (children included), an edit
+        /// replaces the stale metadata, and a file replaces a folder and what was under it.
+        #[tokio::test]
+        async fn list_files_replays_changes_made_while_paging() {
+            let (base, _) = fake_dropbox().await;
+            let files = dropbox(&base).list_files(Some("/Moving")).await.unwrap();
+            assert_eq!(
+                paths(&files),
+                vec!["/Sub2", "/Sub2/a.pdf", "/Was-a-folder", "/edit.pdf"]
+            );
+            let edit = files.iter().find(|f| f.path == "/edit.pdf").unwrap();
+            assert_eq!(edit.content_hash.as_deref(), Some("h2"));
+            assert_eq!(edit.modified_at, 1714979289);
+            let was = files.iter().find(|f| f.path == "/Was-a-folder").unwrap();
+            assert!(!was.is_folder);
+        }
+
+        /// Within one batch of changes, a folder deleted after entries under it were listed
+        /// takes them with it, and a file replacing a folder does too.
+        #[tokio::test]
+        async fn changes_drop_entries_under_a_later_deletion() {
+            let (base, _) = fake_dropbox().await;
+            let (files, cursor) = dropbox(&base)
+                .get_changes_in(Some("/Notes"), Some("CD"))
+                .await
+                .unwrap();
+            assert_eq!(cursor.as_deref(), Some("CD2"));
+            let got: Vec<(&str, bool, bool)> = files
+                .iter()
+                .map(|f| (f.path.as_str(), f.deleted, f.is_folder))
+                .collect();
+            assert_eq!(got, vec![("/Sub", true, false), ("/Dir", false, false)]);
+        }
+
+        /// Uploads and new folders land under the sync folder however it is spelled: `/`, a
+        /// trailing slash or none never yields a `//` path, which Dropbox rejects.
+        #[tokio::test]
+        async fn upload_and_create_folder_join_the_folder_once() {
+            let (base, log) = fake_dropbox().await;
+            let d = dropbox(&base);
+            let folders = [None, Some("/"), Some("/Notes"), Some("/Notes/")];
+            for folder in folders {
+                let up = d
+                    .upload_file_at(folder, &["Sub", "a.pdf"], b"x", None)
+                    .await
+                    .unwrap();
+                assert_eq!(up.name, "a.pdf");
+                d.create_folder(folder, "New").await.unwrap();
+            }
+            let sent = |endpoint| -> Vec<Value> {
+                calls(&log, endpoint)
+                    .iter()
+                    .map(|b| b["path"].clone())
+                    .collect()
+            };
+            assert_eq!(
+                sent("upload"),
+                vec![
+                    json!("/Sub/a.pdf"),
+                    json!("/Sub/a.pdf"),
+                    json!("/Notes/Sub/a.pdf"),
+                    json!("/Notes/Sub/a.pdf"),
+                ]
+            );
+            assert_eq!(
+                sent("create_folder"),
+                vec![
+                    json!("/New"),
+                    json!("/New"),
+                    json!("/Notes/New"),
+                    json!("/Notes/New"),
+                ]
+            );
+        }
+
         #[tokio::test]
         async fn changes_start_with_a_cursor_scoped_to_the_folder() {
             let (base, log) = fake_dropbox().await;
@@ -1188,7 +1361,11 @@ mod tests {
             assert!(matches!(err, IntegrationError::ResyncRequired(_)), "{err}");
         }
 
-        fn sync_for(base: &str, root: &std::path::Path, cursor: &str) -> CloudSync<Dropbox> {
+        fn sync_for(
+            base: &str,
+            root: &std::path::Path,
+            cursor: Option<&str>,
+        ) -> CloudSync<Dropbox> {
             let config = SyncConfig {
                 local_path: root.to_path_buf(),
                 cloud_folder: Some("/Notes".into()),
@@ -1196,7 +1373,7 @@ mod tests {
                 ..Default::default()
             };
             let state = SyncState {
-                cursor: Some(cursor.into()),
+                cursor: cursor.map(Into::into),
                 ..Default::default()
             };
             CloudSync::with_state(dropbox(base), config, state)
@@ -1210,7 +1387,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             std::fs::create_dir(dir.path().join("Sub")).unwrap();
             std::fs::write(dir.path().join("Sub/old.pdf"), "mine").unwrap();
-            let mut sync = sync_for(&base, dir.path(), "C0");
+            let mut sync = sync_for(&base, dir.path(), Some("C0"));
             let r = sync.delta_sync().await.unwrap();
             assert!(r.errors.is_empty(), "{:?}", r.errors);
             assert_eq!((r.downloaded, r.deleted), (2, 0));
@@ -1226,23 +1403,27 @@ mod tests {
             assert_eq!(sync.state().cursor.as_deref(), Some("C2"));
         }
 
-        /// An invalidated cursor falls back to a full (recursive) sync and a fresh cursor.
+        /// An invalidated cursor, or none yet, falls back to a full (recursive) sync and a
+        /// fresh cursor.
         #[tokio::test]
-        async fn delta_sync_resyncs_after_reset() {
-            let (base, log) = fake_dropbox().await;
-            let dir = tempfile::tempdir().unwrap();
-            let mut sync = sync_for(&base, dir.path(), "expired");
-            let r = sync.delta_sync().await.unwrap();
-            assert!(r.errors.is_empty(), "{:?}", r.errors);
-            assert_eq!(r.downloaded, 3);
-            assert!(dir.path().join("Sub/Deeper/c.pdf").exists());
-            assert!(dir.path().join("Sub/b.pdf").exists());
-            assert_eq!(sync.state().cursor.as_deref(), Some("latest:/Notes"));
-            // The fresh cursor was taken before the full listing started.
-            let order: Vec<String> = log.lock().unwrap().iter().map(|(e, _)| e.clone()).collect();
-            let latest = order.iter().position(|e| e == "get_latest_cursor").unwrap();
-            let listed = order.iter().position(|e| e == "list_folder").unwrap();
-            assert!(latest < listed, "{order:?}");
+        async fn delta_sync_resyncs_after_reset_or_without_cursor() {
+            for cursor in [Some("expired"), None] {
+                let (base, log) = fake_dropbox().await;
+                let dir = tempfile::tempdir().unwrap();
+                let mut sync = sync_for(&base, dir.path(), cursor);
+                let r = sync.delta_sync().await.unwrap();
+                assert!(r.errors.is_empty(), "{:?}", r.errors);
+                assert_eq!(r.downloaded, 3);
+                assert!(dir.path().join("Sub/Deeper/c.pdf").exists());
+                assert!(dir.path().join("Sub/b.pdf").exists());
+                assert_eq!(sync.state().cursor.as_deref(), Some("latest:/Notes"));
+                // The fresh cursor was taken before the full listing started.
+                let order: Vec<String> =
+                    log.lock().unwrap().iter().map(|(e, _)| e.clone()).collect();
+                let latest = order.iter().position(|e| e == "get_latest_cursor").unwrap();
+                let listed = order.iter().position(|e| e == "list_folder").unwrap();
+                assert!(latest < listed, "{cursor:?}: {order:?}");
+            }
         }
     }
 

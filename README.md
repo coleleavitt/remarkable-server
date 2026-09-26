@@ -192,7 +192,7 @@ Prefix `/integrations/v2/cloud` (xochitl 3.29 uses the alias `/integrations/v2/s
 | `/providers/{provider}/disconnect` | DELETE | Disconnect (revokes the provider grant) |
 | `/sync` | POST | Trigger sync |
 
-Supported providers: Google Drive (listings and changes are paged), Dropbox, OneDrive. Dropbox and OneDrive full listings are not recursive, and their change feeds are not scoped to the configured folder.
+Supported providers: Google Drive, Dropbox, OneDrive. For all three, full listings are paged, recursive and pathed relative to the sync folder (`cloud_folder`, default: the whole drive), and change feeds are scoped to that folder. Remote files over the size limit (100 MB by default) are skipped. Remote deletions are reported but not applied (the local copy is kept). When a provider rejects the delta cursor (Dropbox `reset`, Graph `410`), or there is none yet, delta sync takes a fresh cursor and runs a full sync instead; that full sync does not upload files that exist only locally, since they may be remote deletions.
 
 ## Read-it-Later API
 

@@ -270,6 +270,18 @@ impl<P: CloudProvider> CloudSync<P> {
 
     /// Perform full sync
     pub async fn sync(&mut self) -> Result<SyncResult> {
+        Ok(self.reconcile(LocalOnly::Upload).await?.result)
+    }
+
+    /// Whether `f` is a file over `max_file_size`. Such remote files are never fetched: a
+    /// download is held in memory whole and lands on the server's own disk (the local scan
+    /// skips oversized files the same way).
+    fn too_large(&self, f: &CloudFile) -> bool {
+        !f.is_folder && self.config.max_file_size.is_some_and(|max| f.size > max)
+    }
+
+    /// Full sync: compare the whole listing with the local tree and transfer what differs.
+    async fn reconcile(&mut self, local_only: LocalOnly) -> Result<Reconciled> {
         let start = std::time::Instant::now();
         let mut result = SyncResult {
             status: SyncStatus::Success,
@@ -294,18 +306,21 @@ impl<P: CloudProvider> CloudSync<P> {
                     .errors
                     .push(format!("Failed to list cloud files: {}", e));
                 result.duration_ms = start.elapsed().as_millis() as u64;
-                return Ok(result);
+                return Ok(Reconciled {
+                    result,
+                    retry_needed: true,
+                });
             }
         };
 
         // Build cloud file map
-        let cloud_map: HashMap<String, CloudFile> = cloud_files
+        let mut cloud_map: HashMap<String, CloudFile> = cloud_files
             .into_iter()
             .map(|f| (f.path.clone(), f))
             .collect();
 
         // Get local files
-        let local_files = match self.list_local_files().await {
+        let mut local_files = match self.list_local_files().await {
             Ok(files) => files,
             Err(e) => {
                 result.status = SyncStatus::Failed;
@@ -313,9 +328,31 @@ impl<P: CloudProvider> CloudSync<P> {
                     .errors
                     .push(format!("Failed to list local files: {}", e));
                 result.duration_ms = start.elapsed().as_millis() as u64;
-                return Ok(result);
+                return Ok(Reconciled {
+                    result,
+                    retry_needed: true,
+                });
             }
         };
+
+        // A path whose remote file is too large is left alone in both directions: not
+        // downloaded, and a local file there isn't uploaded over it either.
+        cloud_map.retain(|path, f| {
+            let keep = !self.too_large(f);
+            if !keep {
+                tracing::warn!(
+                    "cloud sync: skipping {:?}: {} bytes is over the size limit",
+                    path,
+                    f.size
+                );
+                local_files.remove(path);
+            }
+            keep
+        });
+
+        // Set when a remote file wasn't fetched for a reason that may go away; a resync then
+        // keeps its old cursor so the fetch is retried (see `resync`).
+        let mut retry_needed = false;
 
         // Build sets for comparison
         let local_paths: HashSet<String> = local_files.keys().cloned().collect();
@@ -331,7 +368,9 @@ impl<P: CloudProvider> CloudSync<P> {
         let common_paths: Vec<&String> = local_paths.intersection(&cloud_paths).collect();
 
         match self.config.direction {
-            SyncDirection::Upload | SyncDirection::Bidirectional => {
+            SyncDirection::Upload | SyncDirection::Bidirectional
+                if local_only == LocalOnly::Upload =>
+            {
                 // Upload new local files
                 for path in &upload_paths {
                     let local_info = &local_files[*path];
@@ -343,7 +382,7 @@ impl<P: CloudProvider> CloudSync<P> {
                     }
                 }
             }
-            SyncDirection::Download => {}
+            _ => {}
         }
 
         match self.config.direction {
@@ -355,6 +394,7 @@ impl<P: CloudProvider> CloudSync<P> {
                         match self.download_file(cloud_file).await {
                             Ok(_) => result.downloaded += 1,
                             Err(e) => {
+                                retry_needed |= !e.is_permanent();
                                 result
                                     .errors
                                     .push(format!("Download {} failed: {}", path, e));
@@ -399,9 +439,12 @@ impl<P: CloudProvider> CloudSync<P> {
                         if self.config.direction != SyncDirection::Upload {
                             match self.download_file(cloud_file).await {
                                 Ok(_) => result.downloaded += 1,
-                                Err(e) => result
-                                    .errors
-                                    .push(format!("Download {} failed: {}", path, e)),
+                                Err(e) => {
+                                    retry_needed |= !e.is_permanent();
+                                    result
+                                        .errors
+                                        .push(format!("Download {} failed: {}", path, e));
+                                }
                             }
                         }
                     }
@@ -422,9 +465,12 @@ impl<P: CloudProvider> CloudSync<P> {
                         if self.config.direction != SyncDirection::Upload {
                             match self.download_file(&renamed_file).await {
                                 Ok(_) => result.downloaded += 1,
-                                Err(e) => result
-                                    .errors
-                                    .push(format!("Download conflict copy failed: {}", e)),
+                                Err(e) => {
+                                    retry_needed |= !e.is_permanent();
+                                    result
+                                        .errors
+                                        .push(format!("Download conflict copy failed: {}", e));
+                                }
                             }
                         }
                     }
@@ -449,9 +495,12 @@ impl<P: CloudProvider> CloudSync<P> {
                     // Cloud is newer
                     match self.download_file(cloud_file).await {
                         Ok(_) => result.downloaded += 1,
-                        Err(e) => result
-                            .errors
-                            .push(format!("Download {} failed: {}", path, e)),
+                        Err(e) => {
+                            retry_needed |= !e.is_permanent();
+                            result
+                                .errors
+                                .push(format!("Download {} failed: {}", path, e));
+                        }
                     }
                 }
             }
@@ -470,7 +519,10 @@ impl<P: CloudProvider> CloudSync<P> {
         }
 
         result.duration_ms = start.elapsed().as_millis() as u64;
-        Ok(result)
+        Ok(Reconciled {
+            result,
+            retry_needed,
+        })
     }
 
     /// List local files with metadata
@@ -689,8 +741,18 @@ impl<P: CloudProvider> CloudSync<P> {
         Ok(())
     }
 
-    /// Perform delta sync using provider's change API
+    /// Perform delta sync using provider's change API: download what changed remotely. Remote
+    /// deletions are reported by the provider but not applied, and local changes wait for a
+    /// full [`sync`](Self::sync). Without a usable cursor (none yet, or rejected by the
+    /// provider) it runs a [`resync`](Self::resync) instead.
     pub async fn delta_sync(&mut self) -> Result<SyncResult> {
+        let Some(cursor) = self.state.cursor.clone() else {
+            // A change feed only lists what changes after its cursor, so the files already
+            // there have to come from a full listing first.
+            tracing::info!("cloud sync: no delta cursor yet; running a full sync");
+            return self.resync().await;
+        };
+
         let start = std::time::Instant::now();
         let mut result = SyncResult {
             status: SyncStatus::Success,
@@ -705,14 +767,17 @@ impl<P: CloudProvider> CloudSync<P> {
         // Get changes since last cursor
         let (changes, new_cursor) = match self
             .provider
-            .get_changes_in(
-                self.config.cloud_folder.as_deref(),
-                self.state.cursor.as_deref(),
-            )
+            .get_changes_in(self.config.cloud_folder.as_deref(), Some(&cursor))
             .await
         {
             Ok(page) => page,
-            Err(IntegrationError::ResyncRequired(why)) => return self.resync(&why).await,
+            Err(IntegrationError::ResyncRequired(why)) => {
+                tracing::warn!(
+                    "cloud sync: delta cursor rejected ({}); running a full sync",
+                    why
+                );
+                return self.resync().await;
+            }
             Err(e) => return Err(e),
         };
 
@@ -738,6 +803,15 @@ impl<P: CloudProvider> CloudSync<P> {
                 continue;
             }
             if cloud_file.is_folder {
+                continue;
+            }
+            if self.too_large(&cloud_file) {
+                // Permanent until the limit changes, so it doesn't hold the cursor.
+                tracing::warn!(
+                    "cloud sync: skipping change {:?}: {} bytes is over the size limit",
+                    cloud_file.path,
+                    cloud_file.size
+                );
                 continue;
             }
 
@@ -824,26 +898,54 @@ impl<P: CloudProvider> CloudSync<P> {
         Ok(result)
     }
 
-    /// Recover from a delta cursor the provider rejected: take a fresh cursor, then do a full
-    /// sync. The cursor is taken first so changes made during the full sync are replayed by the
-    /// next delta rather than missed. Until both succeed the old cursor is kept, so the next
-    /// delta hits the same rejection and retries the resync instead of silently skipping the
-    /// gap (a fresh cursor alone would never list the changes made before it).
-    async fn resync(&mut self, why: &str) -> Result<SyncResult> {
-        tracing::warn!(
-            "cloud sync: delta cursor rejected ({}); running a full sync",
-            why
-        );
+    /// Catch up when there is no usable delta cursor (none yet, or the provider rejected it):
+    /// take a fresh cursor, then do a full sync. The cursor is taken first so changes made
+    /// during the full sync are replayed by the next delta rather than missed. It is only
+    /// stored once nothing remote is left to retry: if the listing failed or a download failed
+    /// for a reason that may go away, the old cursor is kept, so the next delta runs the resync
+    /// again instead of silently skipping those files (a fresh cursor never lists changes made
+    /// before it). Permanent failures (deleted, not downloadable, unsafe path) don't hold it,
+    /// and neither do failed uploads, which no cursor covers.
+    ///
+    /// Like the delta it stands in for, a resync never uploads files that exist only locally
+    /// (see [`LocalOnly::Keep`]).
+    async fn resync(&mut self) -> Result<SyncResult> {
         let (_, fresh) = self
             .provider
             .get_changes_in(self.config.cloud_folder.as_deref(), None)
             .await?;
-        let result = self.sync().await?;
-        if result.status != SyncStatus::Failed {
+        let Reconciled {
+            result,
+            retry_needed,
+        } = self.reconcile(LocalOnly::Keep).await?;
+        if retry_needed {
+            tracing::warn!(
+                "cloud sync: keeping the old delta cursor; the full sync will be retried"
+            );
+        } else {
             self.state.cursor = fresh;
         }
         Ok(result)
     }
+}
+
+/// What a full sync does with files that exist only locally, in an uploading direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalOnly {
+    /// Upload them: a requested full sync.
+    Upload,
+    /// Leave them. A resync stands in for a delta, which reports remote deletions but keeps
+    /// the local copies; a file missing from the listing may be one of those, and uploading it
+    /// would bring back what was deleted remotely. A later full sync uploads new local files.
+    Keep,
+}
+
+/// Outcome of a full sync ([`CloudSync::reconcile`]).
+struct Reconciled {
+    result: SyncResult,
+    /// Something remote wasn't fetched for a reason that may go away (a listing failed, or a
+    /// download failed with a non-permanent error).
+    retry_needed: bool,
 }
 
 #[cfg(test)]
@@ -855,15 +957,18 @@ mod tests {
     use super::*;
     use crate::integrations::{CloudFolder, OAuthToken, ProviderType, StorageQuota};
 
-    /// In-memory provider: serves `files` (content = id bytes) and records upload names.
-    /// Downloads of ids in `fail_ids` fail with a (transient) network error; `get_changes`
-    /// hands out `next_cursor`, except for `stale_cursor`, which it rejects as expired.
-    /// While `list_fails` is set, the full listing fails.
+    /// In-memory provider: serves `files` (content = id bytes) and records upload names and
+    /// downloaded ids. Downloads of ids in `fail_ids` fail with a (transient) network error,
+    /// of ids in `gone_ids` with a (permanent) not-found; `get_changes` hands out
+    /// `next_cursor`, except for `stale_cursor`, which it rejects as expired. While
+    /// `list_fails` is set, the full listing fails.
     #[derive(Default)]
     struct MockProvider {
         files: Vec<CloudFile>,
         uploads: Mutex<Vec<String>>,
+        downloads: Mutex<Vec<String>>,
         fail_ids: Mutex<HashSet<String>>,
+        gone_ids: HashSet<String>,
         next_cursor: Option<String>,
         stale_cursor: Option<String>,
         list_fails: std::sync::atomic::AtomicBool,
@@ -912,8 +1017,12 @@ mod tests {
             Err(IntegrationError::NotFound(id.into()))
         }
         async fn download_file(&self, id: &str) -> Result<Vec<u8>> {
+            self.downloads.lock().unwrap().push(id.into());
             if self.fail_ids.lock().unwrap().contains(id) {
                 return Err(IntegrationError::Network("connection reset".into()));
+            }
+            if self.gone_ids.contains(id) {
+                return Err(IntegrationError::NotFound(id.into()));
             }
             Ok(id.as_bytes().to_vec())
         }
@@ -1038,12 +1147,17 @@ mod tests {
         // Delta sync applies the same validation (fresh root so nothing conflicts).
         let root2 = outer.path().join("root2");
         std::fs::create_dir(&root2).unwrap();
-        let mut sync = CloudSync::new(
+        let state = SyncState {
+            cursor: Some("c1".into()),
+            ..Default::default()
+        };
+        let mut sync = CloudSync::with_state(
             MockProvider {
                 files,
                 ..Default::default()
             },
             cfg(&root2, SyncDirection::Download),
+            state,
         );
         let r = sync.delta_sync().await.unwrap();
         assert_eq!(r.downloaded, 1);
@@ -1241,6 +1355,172 @@ mod tests {
         assert_eq!(r.downloaded, 2);
         assert_eq!(std::fs::read(dir.path().join("sub/b.txt")).unwrap(), b"b");
         assert_eq!(sync.state().cursor.as_deref(), Some("fresh"));
+    }
+
+    fn stale(
+        provider: MockProvider,
+        dir: &Path,
+        direction: SyncDirection,
+    ) -> CloudSync<MockProvider> {
+        let state = SyncState {
+            cursor: Some("stale".into()),
+            ..Default::default()
+        };
+        let provider = MockProvider {
+            next_cursor: Some("fresh".into()),
+            stale_cursor: Some("stale".into()),
+            ..provider
+        };
+        CloudSync::with_state(provider, cfg(dir, direction), state)
+    }
+
+    /// A resync keeps the old cursor while a download failed transiently, whatever the
+    /// status (here PartialSuccess): the fresh cursor would never list that file again.
+    #[tokio::test]
+    async fn resync_holds_cursor_on_transient_download_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider {
+            files: vec![cf("ok", "/ok.txt"), cf("flaky", "/sub/flaky.txt")],
+            ..Default::default()
+        };
+        provider.fail_ids.lock().unwrap().insert("flaky".into());
+        let mut sync = stale(provider, dir.path(), SyncDirection::Download);
+
+        let r = sync.delta_sync().await.unwrap();
+        assert_eq!((r.status, r.downloaded), (SyncStatus::PartialSuccess, 1));
+        assert_eq!(sync.state().cursor.as_deref(), Some("stale"));
+
+        sync.provider.fail_ids.lock().unwrap().clear();
+        let r = sync.delta_sync().await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(sync.state().cursor.as_deref(), Some("fresh"));
+        assert_eq!(
+            std::fs::read(dir.path().join("sub/flaky.txt")).unwrap(),
+            b"flaky"
+        );
+    }
+
+    /// Only permanent failures and nothing else to transfer is status Failed, yet the resync
+    /// did all it ever can: the fresh cursor is stored instead of resyncing on every delta.
+    #[tokio::test]
+    async fn resync_advances_cursor_past_permanent_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider {
+            files: vec![cf("gone", "/gone.txt")],
+            gone_ids: HashSet::from(["gone".to_string()]),
+            ..Default::default()
+        };
+        let mut sync = stale(provider, dir.path(), SyncDirection::Download);
+        let r = sync.delta_sync().await.unwrap();
+        assert_eq!((r.status, r.errors.len()), (SyncStatus::Failed, 1));
+        assert_eq!(sync.state().cursor.as_deref(), Some("fresh"));
+    }
+
+    /// A resync (bidirectional here) never uploads files missing from the listing: they may be
+    /// remote deletions that delta sync reported and deliberately kept locally. A requested
+    /// full sync still uploads them.
+    #[tokio::test]
+    async fn resync_does_not_upload_local_only_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("deleted-remotely.txt"), "mine").unwrap();
+        let provider = MockProvider {
+            files: vec![cf("a", "/a.txt")],
+            ..Default::default()
+        };
+        let mut sync = stale(provider, dir.path(), SyncDirection::Bidirectional);
+        sync.state
+            .file_map
+            .insert("/deleted-remotely.txt".into(), "old-id".into());
+
+        let r = sync.delta_sync().await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!((r.downloaded, r.uploaded), (1, 0));
+        assert!(sync.provider.uploads.lock().unwrap().is_empty());
+        assert_eq!(
+            std::fs::read(dir.path().join("deleted-remotely.txt")).unwrap(),
+            b"mine"
+        );
+        assert_eq!(sync.state().cursor.as_deref(), Some("fresh"));
+
+        sync.sync().await.unwrap();
+        assert!(
+            sync.provider
+                .uploads
+                .lock()
+                .unwrap()
+                .contains(&"deleted-remotely.txt".to_string())
+        );
+    }
+
+    /// With no cursor yet, delta sync takes one and then runs a full sync, so files that
+    /// existed before the cursor aren't silently skipped.
+    #[tokio::test]
+    async fn delta_without_cursor_runs_a_full_sync_first() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("local-only.txt"), "mine").unwrap();
+        let provider = MockProvider {
+            files: vec![cf("a", "/a.txt"), cf("b", "/sub/b.txt")],
+            next_cursor: Some("c1".into()),
+            ..Default::default()
+        };
+        let mut sync = CloudSync::new(provider, cfg(dir.path(), SyncDirection::Bidirectional));
+        let r = sync.delta_sync().await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!((r.downloaded, r.uploaded), (2, 0));
+        assert_eq!(std::fs::read(dir.path().join("sub/b.txt")).unwrap(), b"b");
+        assert_eq!(sync.state().cursor.as_deref(), Some("c1"));
+    }
+
+    /// Remote files over `max_file_size` are never downloaded, by full or delta sync, and a
+    /// local file at such a path isn't uploaded over the remote one; neither is an error.
+    #[tokio::test]
+    async fn oversized_cloud_files_are_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("big.bin"), "small local").unwrap();
+        let mut big = cf("big", "/big.bin");
+        big.size = 1 << 20;
+        let mut huge = cf("huge", "/sub/huge.bin");
+        huge.size = u64::MAX;
+        let provider = MockProvider {
+            files: vec![big, huge, cf("ok", "/ok.txt")],
+            next_cursor: Some("c2".into()),
+            ..Default::default()
+        };
+        let config = SyncConfig {
+            max_file_size: Some(1024),
+            ..cfg(dir.path(), SyncDirection::Bidirectional)
+        };
+        let mut sync = CloudSync::new(provider, config);
+
+        let r = sync.sync().await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(
+            (r.status, r.downloaded, r.uploaded),
+            (SyncStatus::Success, 1, 0)
+        );
+        assert_eq!(*sync.provider.downloads.lock().unwrap(), vec!["ok"]);
+        assert_eq!(
+            std::fs::read(dir.path().join("big.bin")).unwrap(),
+            b"small local"
+        );
+        assert!(!dir.path().join("sub/huge.bin").exists());
+
+        sync.state.cursor = Some("c1".into());
+        sync.provider.downloads.lock().unwrap().clear();
+        let r = sync.delta_sync().await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(
+            !sync
+                .provider
+                .downloads
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|id| id != "ok"),
+            "{:?}",
+            sync.provider.downloads
+        );
+        assert_eq!(sync.state().cursor.as_deref(), Some("c2"));
     }
 
     #[test]
