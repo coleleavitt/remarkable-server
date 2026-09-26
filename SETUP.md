@@ -163,7 +163,11 @@ This prints a one-time code (or `POST /devices/v1` with `x-admin-token` returns 
 Once paired, the tablet should sync automatically. You'll see:
 - Generation numbers incrementing in server logs
 - Documents appearing in `remarkable-storage/`
-- WebSocket pings every ~30 seconds (notifications channel)
+- WebSocket pings every ~30 seconds (notifications channel, `/notifications/ws/json/1`)
+
+The tablet gets sync pushes over `/notifications/ws/json/1`. The MQTT-over-WebSocket `/mqtt` endpoint
+is off unless you set `MQTT_WS_NOTIFICATIONS=1`; the tablet does not use it (GAP_ANALYSIS.md, "MQTT:
+what the tablet actually uses"). Its MQTT traffic is screen share signalling on `SCREENSHARE_BIND`.
 
 ## Troubleshooting
 

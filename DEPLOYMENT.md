@@ -64,7 +64,7 @@ xochitl ──/etc/hosts──▶ 127.0.0.1:443 / 127.0.0.2:443  (rm-proxy on ta
   takes it **or** a paired device's device token. Unset = all of these are disabled (401).
 - Deleting a device (`DELETE /devices/v1/{id}` by its owner, or the tablet's own
   `/token/json/{2,3}/device/delete`) revokes every device and user token it minted, even across a
-  later re-pair, and closes its open `/notifications/ws` and `/mqtt` sessions. Open sessions on the
+  later re-pair, and closes its open `/notifications/ws` and (if enabled) `/mqtt` sessions. Open sessions on the
   screenshare broker (:8883) are **not** closed by a revocation.
 - Upstream TLS from the tablet relay is verified against webpki roots, so a
   MITM on the WiFi can't impersonate the Linode.
@@ -231,6 +231,10 @@ Layout:
   `CRASH_MAX_TOTAL_BYTES` (512 MiB) / `CRASH_MAX_REPORTS` (200).
 - systemd: `contrib/linode/remarkable-server.service` (runs as `remarkable` user).
 - The HTTP API listens on `127.0.0.1:3100` in plain HTTP; **nginx terminates TLS** on :443.
+- Sync push to the tablet is `/notifications/ws/json/1` (JSON over WebSocket). The MQTT-over-WebSocket
+  `/mqtt` endpoint is **not** served unless `MQTT_WS_NOTIFICATIONS=1` is in the env file: the logs
+  showed the tablet never requesting it (GAP_ANALYSIS.md, "MQTT: what the tablet actually uses"), so
+  leave it off. The tablet's MQTT is screen share only, on :8883 below.
 - The screenshare message queue broker listens directly on `0.0.0.0:8883` with TLS
   (`SCREENSHARE_CERT`/`SCREENSHARE_KEY` → a copy of the Let's Encrypt cert,
   refreshed by `contrib/linode/certbot-deploy-hook.sh`). nginx can't

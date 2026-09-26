@@ -1,26 +1,57 @@
 //! MQTT over WebSocket Handler
 //!
-//! Implements MQTT 3.1.1 protocol over WebSocket for device notifications.
-//! The device expects full MQTT protocol, not plain JSON.
+//! Implements MQTT 3.1.1 over WebSocket as an alternative framing of the
+//! `/notifications/ws/json/1` sync push.
 //!
-//! Served at `/mqtt`. Nothing in the firmware notes or discovery pins a path
-//! (`mqttbroker` in discovery is a bare host, and `/notifications/ws/json/1` is
-//! the JSON endpoint), so this uses the conventional MQTT-over-WebSocket path
-//! (VerneMQ's and Paho's default).
+//! **Off by default.** It is served at `/mqtt` only when [`ENABLE_ENV`]
+//! (`MQTT_WS_NOTIFICATIONS`) is `1`, `true` or `on` (see [`router_if_enabled`]),
+//! because the real tablet does not use it. Checked on the production server
+//! (GAP_ANALYSIS.md, "MQTT: what the tablet actually uses"): xochitl 3.3.2 opened
+//! `/notifications/ws/json/1` for every notification session and, in 15 days of
+//! nginx logs, never requested any path containing `mqtt`, including after this
+//! route went live. Its only MQTT traffic is screen share signalling, raw MQTT over
+//! TLS to the `SCREENSHARE_BIND` broker (`crate::screenshare`), not WebSocket.
+//!
+//! Path and topic are unverified guesses kept for other clients: nothing pins a
+//! path (`mqttbroker` in discovery is a bare host), so this uses the conventional
+//! MQTT-over-WebSocket path (VerneMQ's and Paho's default), and publishes on each
+//! concrete topic the client subscribed to.
 
+use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
 use axum::response::IntoResponse;
+use axum::routing::get;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use tokio::sync::broadcast;
+use tower_http::trace::TraceLayer;
 use tracing::{debug, info, warn};
 
 use crate::api::AppState;
 use crate::device::SessionIdentity;
 use crate::error::ServerError;
 use crate::notifications::WsMessage;
+
+/// Environment variable that serves [`PATH`] when set to `1`, `true` or `on`.
+pub const ENABLE_ENV: &str = "MQTT_WS_NOTIFICATIONS";
+
+/// Where the endpoint is served when enabled.
+pub const PATH: &str = "/mqtt";
+
+/// The [`PATH`] route, to merge into [`crate::create_router`]'s router, when `flag`
+/// (the value of [`ENABLE_ENV`]) is `1`, `true` or `on`; `None` otherwise, including
+/// when it is unset. No tablet uses it (see the module docs), so it stays off the
+/// public attack surface unless asked for.
+pub fn router_if_enabled(state: AppState, flag: Option<&str>) -> Option<Router> {
+    matches!(flag, Some("1" | "true" | "on")).then(|| {
+        Router::new()
+            .route(PATH, get(mqtt_notifications_ws))
+            .with_state(state)
+            .layer(TraceLayer::new_for_http())
+    })
+}
 
 /// An accepted CONNECT: the session's user, and a future that resolves when the device it
 /// authenticated as is revoked (the session is then closed).
@@ -217,7 +248,8 @@ fn build_publish(topic: &str, payload: &[u8], qos: u8, packet_id: Option<u16>) -
     packet
 }
 
-/// WebSocket upgrade handler for MQTT notifications endpoint (`/mqtt`).
+/// WebSocket upgrade handler for MQTT notifications endpoint (`/mqtt`, only routed
+/// when enabled; see [`router_if_enabled`]).
 ///
 /// Authenticated with the same tokens as `/notifications/ws/json/1`: a bearer
 /// `Authorization` header on the upgrade (an invalid one is rejected with 401),
@@ -285,8 +317,8 @@ const SERVER_USER: &str = "local-user";
 
 /// MQTT PUBLISH packets (QoS 0) carrying `msg` for the session of `user_id`.
 ///
-/// Assumption: nothing in this codebase pins the topic xochitl expects for
-/// sync pushes over MQTT-over-WebSocket, so the notification goes out on each
+/// Assumption: nothing pins a topic for sync pushes over MQTT-over-WebSocket
+/// (xochitl does not use this endpoint), so the notification goes out on each
 /// concrete (wildcard-free) topic the client SUBSCRIBEd to. Filters with `+`/`#`
 /// have no single concrete topic and are skipped. The payload is the same
 /// `WsMessage` JSON the `/notifications/ws/json/1` endpoint sends. Only events

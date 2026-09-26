@@ -16,7 +16,7 @@ A local sync server for reMarkable tablets, implementing **all sync protocol ver
 - **Calendar sync** (local ICS files; CalDAV/Google/Office 365 calendars can be added but their sync answers "not implemented")
 - **Cloud integrations** (Google Drive, Dropbox, OneDrive)
 - **Read-it-later** (Pocket, Instapaper, Wallabag accounts; credentials persisted server-side)
-- **Push notifications**: JSON WebSocket (`/notifications/ws/json/1`) and MQTT 3.1.1 over WebSocket (`/mqtt`)
+- **Push notifications**: JSON WebSocket (`/notifications/ws/json/1`, what the tablet uses), plus opt-in MQTT 3.1.1 over WebSocket (`/mqtt`, `MQTT_WS_NOTIFICATIONS=1`)
 - **OAuth2 device-code login** (software 3.28) with owner approval, and **gentree/v1** delta sync
 - **RSS/Newsletter ingestion**
 - **Document versions** with diff/restore
@@ -127,7 +127,7 @@ V4 root response includes capability flags:
 | `/token/json/3/device/delete` | POST | Unregister the calling device (self-revoke) |
 | `/discovery/v1/endpoints` | GET | Service discovery |
 
-Deleting a device (either route above) revokes every device token and every user token it has minted, even if it is paired again later, and closes its open `/notifications/ws` and `/mqtt` sessions (immediately, plus a 60 s re-check). Re-pairing a device to a different user revokes the previous owner's tokens the same way. Admin-minted user tokens (`/admin/create-user`) have no device and are not affected. The screenshare MQTT broker (`SCREENSHARE_BIND`) is not tied to this: its open sessions survive a revocation.
+Deleting a device (either route above) revokes every device token and every user token it has minted, even if it is paired again later, and closes its open `/notifications/ws` and (when enabled) `/mqtt` sessions (immediately, plus a 60 s re-check). Re-pairing a device to a different user revokes the previous owner's tokens the same way. Admin-minted user tokens (`/admin/create-user`) have no device and are not affected. The screenshare MQTT broker (`SCREENSHARE_BIND`) is not tied to this: its open sessions survive a revocation.
 
 ## Search API
 
@@ -309,6 +309,7 @@ No other route checks the admin token; `/debug/files`, for instance, takes an or
 |----------|---------|
 | `SMTP_HOST`, `SMTP_PORT` (587), `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM` | Tablet "Send by email" (`POST /share/v1/email`, STARTTLS) |
 | `SCREENSHARE_BIND` (e.g. `10.11.99.3:443`) | Screenshare signaling broker: MQTT 3.1.1 over TLS. Firmware dials `vernemq-prod.cloud.remarkable.engineering:443`, so give it its own address and point that name at it in the tablet's `/etc/hosts`. Screen data itself is peer-to-peer WebRTC. |
+| `MQTT_WS_NOTIFICATIONS=1` (`true`/`on`) | `/mqtt`: the sync push as MQTT 3.1.1 over WebSocket (same tokens as `/notifications/ws/json/1`). Off by default: the tablet (xochitl 3.3.2) only uses `/notifications/ws/json/1`, and its only MQTT is screen share signalling on the `SCREENSHARE_BIND` broker (evidence in GAP_ANALYSIS.md, "MQTT: what the tablet actually uses"). Path and topic are unverified; enable only for a client that wants it. |
 | `SCREENSHARE_ICE_SERVERS` | JSON list of ICE servers for `room-joined` (default `[]`; entries use a singular `url` key) |
 | `EMAIL_INBOUND_BIND` (e.g. `127.0.0.1:2525`) | Inbound SMTP: mail PDF/EPUB attachments to `send@{device-id}.remarkable.local` and they appear on the tablet |
 | `HWR_CAPTURE_DIR` | Save every handwriting request/response pair |

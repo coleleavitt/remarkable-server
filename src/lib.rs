@@ -235,13 +235,12 @@ pub fn create_router(state: AppState) -> Router {
         .route("/health", get(api::health))
         .route("/debug/files", get(api::list_files))
         .route("/debug/clear", delete(api::clear_storage))
-        // Notifications (MQTT over WebSocket)
+        // Sync push notifications (JSON over WebSocket; what the tablet uses). The MQTT-over-
+        // WebSocket variant (`/mqtt`) is opt-in: see `mqtt_ws::router_if_enabled`.
         .route(
             "/notifications/ws/json/1",
             get(notifications::notifications_ws),
         )
-        // Same notifications as MQTT 3.1.1 over WebSocket; path and auth: see mqtt_ws.rs.
-        .route("/mqtt", get(mqtt_ws::mqtt_notifications_ws))
         // Screenshare REST room broker (xochitl 3.27+/3.28)
         .route("/screenshare/v1/rooms", post(screenshare_rest::create_room))
         .route(
@@ -700,11 +699,72 @@ mod router_tests {
             DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
         let state = AppState::new(storage, devices);
         let _ = create_router(state.clone());
+        let _ = with_mqtt_ws(&state);
         let _ = feature_routes(state, tmp.path(), None).unwrap();
     }
 
-    /// `/mqtt` is served, refuses clients without a valid token, and pushes an
-    /// authenticated client its own user's SyncComplete but not another user's.
+    /// The API router with `/mqtt` enabled, as main.rs builds it when
+    /// `MQTT_WS_NOTIFICATIONS=1`.
+    fn with_mqtt_ws(state: &AppState) -> Router {
+        create_router(state.clone())
+            .merge(mqtt_ws::router_if_enabled(state.clone(), Some("1")).expect("enabled"))
+    }
+
+    /// `/mqtt` is off unless `MQTT_WS_NOTIFICATIONS` is `1`/`true`/`on`: no tablet uses it
+    /// (GAP_ANALYSIS.md), so by default it must not be reachable, not even with a valid
+    /// token, while `/notifications/ws/json/1` (what the tablet uses) still is.
+    #[tokio::test]
+    async fn mqtt_ws_route_is_off_by_default() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        for flag in [None, Some(""), Some("0"), Some("false"), Some("yes")] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let storage = Storage::new(tmp.path().join("storage")).unwrap();
+            let devices =
+                DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+            let token = devices.create_user_token("u1@test").unwrap();
+            let state = AppState::new(storage, devices);
+            assert!(
+                mqtt_ws::router_if_enabled(state.clone(), flag).is_none(),
+                "{flag:?}"
+            );
+            // Built as main.rs builds it with the flag unset.
+            let app = create_router(state.clone())
+                .merge(feature_routes(state.clone(), tmp.path(), None).unwrap());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("ws://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await });
+            let connect = |path: &str| {
+                let mut req = format!("{base}{path}").into_client_request().unwrap();
+                req.headers_mut()
+                    .insert("authorization", format!("Bearer {token}").parse().unwrap());
+                tokio_tungstenite::connect_async(req)
+            };
+            match connect("/mqtt").await {
+                Err(tokio_tungstenite::tungstenite::Error::Http(r)) => {
+                    assert_eq!(r.status(), axum::http::StatusCode::NOT_FOUND, "{flag:?}")
+                }
+                other => panic!(
+                    "/mqtt must not be served for {flag:?}, got {:?}",
+                    other.map(|_| ())
+                ),
+            }
+            assert!(connect("/notifications/ws/json/1").await.is_ok());
+        }
+        for flag in ["1", "true", "on"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let devices =
+                DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+            let state = AppState::new(Storage::new(tmp.path()).unwrap(), devices);
+            assert!(
+                mqtt_ws::router_if_enabled(state, Some(flag)).is_some(),
+                "{flag}"
+            );
+        }
+    }
+
+    /// With `MQTT_WS_NOTIFICATIONS=1`, `/mqtt` is served, refuses clients without a valid
+    /// token, and pushes an authenticated client its own user's SyncComplete but not
+    /// another user's.
     #[tokio::test]
     async fn mqtt_ws_route_requires_auth_and_filters_by_user() {
         use futures_util::{SinkExt, StreamExt};
@@ -717,7 +777,7 @@ mod router_tests {
         let state = AppState::new(Storage::new(tmp.path().join("storage")).unwrap(), devices);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}/mqtt", listener.local_addr().unwrap());
-        let router = create_router(state.clone());
+        let router = with_mqtt_ws(&state);
         tokio::spawn(async move { axum::serve(listener, router).await });
         let connect = |auth: Option<&str>| {
             let mut req = url.as_str().into_client_request().unwrap();
@@ -801,8 +861,9 @@ mod router_tests {
         assert_eq!(body["message"]["attributes"]["event"], "SyncComplete");
     }
 
-    /// Open notification sessions (JSON WebSocket and `/mqtt`, token in the header or in the
-    /// MQTT CONNECT) close when their device is deleted; another device's sessions stay open.
+    /// Open notification sessions (JSON WebSocket and, when enabled, `/mqtt`, token in the
+    /// header or in the MQTT CONNECT) close when their device is deleted; another device's
+    /// sessions stay open.
     #[tokio::test]
     async fn notification_sessions_close_when_their_device_is_revoked() {
         use futures_util::{SinkExt, StreamExt};
@@ -824,7 +885,7 @@ mod router_tests {
         let state = AppState::new(Storage::new(tmp.path().join("storage")).unwrap(), devices);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("ws://{}", listener.local_addr().unwrap());
-        let router = create_router(state.clone());
+        let router = with_mqtt_ws(&state);
         tokio::spawn(async move { axum::serve(listener, router).await });
         let open = |path: &str, token: Option<&str>| {
             let mut req = format!("{base}{path}").into_client_request().unwrap();
