@@ -1,11 +1,16 @@
 //! Calendar API endpoints
 
+use std::collections::HashMap;
+use std::future::Future;
+use std::hash::Hash;
 use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use chrono::Utc;
+use futures_util::future::{BoxFuture, FutureExt, Shared};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
@@ -22,12 +27,22 @@ use crate::calendar::{
     SyncConfig,
     parse_ics_file,
 };
+use crate::calendar_providers::{Fetched, ProviderEndpoints, RemoteSync, SyncWindow};
 use crate::error::{Result, ServerError};
 
 #[derive(Clone)]
 pub struct CalendarState {
     pub manager: Arc<Mutex<CalendarManager>>,
     pub sync_config: SyncConfig,
+    /// HTTP client and API endpoints for CalDAV / Google / Microsoft Graph calendars.
+    pub remote: RemoteSync,
+    /// The remote calendar syncs running, by calendar id. Two syncs of one calendar never
+    /// overlap (each would refresh the OAuth token from, and save back, its own copy of the
+    /// credentials), and a request for a calendar that is already syncing gets that sync's
+    /// result instead of queueing another full sync behind it.
+    syncs: SingleFlight<String, SyncResponse>,
+    /// The `/sync-all` run in progress, if any; later requests share its result.
+    sync_all: SingleFlight<(), Vec<SyncResponse>>,
 }
 
 impl CalendarState {
@@ -35,7 +50,89 @@ impl CalendarState {
         Self {
             manager: Arc::new(Mutex::new(manager)),
             sync_config: SyncConfig::default(),
+            remote: RemoteSync::default(),
+            syncs: SingleFlight::default(),
+            sync_all: SingleFlight::default(),
         }
+    }
+
+    /// Use other Google / Microsoft API endpoints (tests, sovereign clouds).
+    pub fn with_endpoints(mut self, endpoints: ProviderEndpoints) -> Self {
+        self.remote = RemoteSync::new(endpoints);
+        self
+    }
+}
+
+/// A running task's result, shared by everyone awaiting it; `Err` when the task panicked.
+type Flight<V> = Shared<BoxFuture<'static, std::result::Result<V, String>>>;
+
+/// Runs at most one task per key at a time: a caller arriving while one runs awaits that
+/// task's result instead of starting (or queueing) another. Each task runs on a task of its
+/// own, so it finishes, and saves what it fetched, even when every caller has gone away.
+struct SingleFlight<K, V> {
+    running: Arc<Mutex<HashMap<K, Flight<V>>>>,
+}
+
+impl<K, V> Clone for SingleFlight<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            running: self.running.clone(),
+        }
+    }
+}
+
+impl<K, V> Default for SingleFlight<K, V> {
+    fn default() -> Self {
+        Self {
+            running: Arc::default(),
+        }
+    }
+}
+
+/// Takes a finished task's entry out of the map, also when the task panics.
+struct Landed<K: Eq + Hash, V> {
+    running: Arc<Mutex<HashMap<K, Flight<V>>>>,
+    key: K,
+}
+
+impl<K: Eq + Hash, V> Drop for Landed<K, V> {
+    fn drop(&mut self) {
+        self.running.lock().remove(&self.key);
+    }
+}
+
+impl<K, V> SingleFlight<K, V>
+where
+    K: Eq + Hash + Clone + Send + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    /// The running task for `key`, or a new one running `task()`.
+    fn join_or_start<F>(&self, key: K, task: impl FnOnce() -> F) -> Flight<V>
+    where
+        F: Future<Output = V> + Send + 'static,
+    {
+        let mut running = self.running.lock();
+        if let Some(flight) = running.get(&key) {
+            return flight.clone();
+        }
+        let task = task();
+        let (map, landed_key) = (self.running.clone(), key.clone());
+        let handle = tokio::spawn(async move {
+            // Made inside the task, not captured by it: a future tokio drops unpolled (spawned
+            // during shutdown) must not take the map lock held below. Its drop waits for that
+            // lock, so the entry is in the map before it is removed; only this task removes
+            // it, and no other task for the key starts while it is there.
+            let _landed = Landed {
+                running: map,
+                key: landed_key,
+            };
+            task.await
+        });
+        let flight = async move { handle.await.map_err(|e| e.to_string()) }
+            .boxed()
+            .shared();
+        running.insert(key, flight.clone());
+        flight
     }
 }
 
@@ -147,16 +244,28 @@ pub enum CalendarConfigRequest {
         #[serde(default)]
         watch: bool,
     },
+    /// `url` is the calendar collection or a URL to discover it from (server root, principal
+    /// or calendar home). Basic auth with `username`/`password`, or `bearer_token`.
     Caldav {
         url: String,
+        #[serde(default)]
         username: String,
         password: Option<String>,
+        #[serde(default)]
+        bearer_token: Option<String>,
     },
+    /// Google Calendar API v3. `refresh_token` plus `client_id` (and usually `client_secret`)
+    /// let the server renew the access token by itself.
     Google {
         calendar_id: String,
         access_token: Option<String>,
         refresh_token: Option<String>,
+        #[serde(default)]
+        client_id: Option<String>,
+        #[serde(default)]
+        client_secret: Option<String>,
     },
+    /// On-premises Exchange (EWS); stored but not synced.
     Exchange {
         server: String,
         username: String,
@@ -164,10 +273,18 @@ pub enum CalendarConfigRequest {
         #[serde(default)]
         use_ews: bool,
     },
+    /// Microsoft Graph (Exchange Online / Microsoft 365). `calendar_id` defaults to the
+    /// user's default calendar.
     Office365 {
         tenant_id: String,
         access_token: Option<String>,
         refresh_token: Option<String>,
+        #[serde(default)]
+        client_id: Option<String>,
+        #[serde(default)]
+        client_secret: Option<String>,
+        #[serde(default)]
+        calendar_id: Option<String>,
     },
 }
 
@@ -182,19 +299,27 @@ impl From<CalendarConfigRequest> for CalendarConfig {
                 url,
                 username,
                 password,
+                bearer_token,
             } => CalendarConfig::Caldav {
                 url,
                 username,
                 password,
+                bearer_token,
+                collection_url: None,
             },
             CalendarConfigRequest::Google {
                 calendar_id,
                 access_token,
                 refresh_token,
+                client_id,
+                client_secret,
             } => CalendarConfig::Google {
                 calendar_id,
                 access_token,
                 refresh_token,
+                client_id,
+                client_secret,
+                token_expires_at: None,
             },
             CalendarConfigRequest::Exchange {
                 server,
@@ -211,10 +336,17 @@ impl From<CalendarConfigRequest> for CalendarConfig {
                 tenant_id,
                 access_token,
                 refresh_token,
+                client_id,
+                client_secret,
+                calendar_id,
             } => CalendarConfig::Office365 {
                 tenant_id,
                 access_token,
                 refresh_token,
+                client_id,
+                client_secret,
+                calendar_id,
+                token_expires_at: None,
             },
         }
     }
@@ -305,6 +437,16 @@ pub async fn add_calendar(
             )));
         }
     };
+    if let CalendarConfigRequest::Caldav { url, .. } = &request.config {
+        let valid = reqwest::Url::parse(url.trim())
+            .is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.has_host());
+        if !valid {
+            return Err(ServerError::BadRequest(format!(
+                "caldav url must be an http(s) URL: {:?}",
+                url
+            )));
+        }
+    }
     let calendar = Calendar {
         id: uuid::Uuid::new_v4().to_string(),
         name: request.name,
@@ -380,13 +522,33 @@ pub async fn list_meeting_notes(
     ))
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct SyncResponse {
     pub calendar_id: String,
     pub events_synced: usize,
+    /// Stored events in the sync window that the provider no longer returns (deleted or
+    /// moved upstream) and were removed. Omitted when zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub events_removed: usize,
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+impl SyncResponse {
+    fn new(calendar_id: String, events_synced: usize, error: Option<String>) -> Self {
+        Self {
+            calendar_id,
+            events_synced,
+            events_removed: 0,
+            success: error.is_none(),
+            error,
+        }
+    }
 }
 
 pub async fn sync_calendar_endpoint(
@@ -400,82 +562,204 @@ pub async fn sync_calendar_endpoint(
         .ok_or_else(|| ServerError::NotFound(id.clone()))?;
     let count = match &calendar.config {
         CalendarConfig::Ics { path, .. } => {
-            let events = parse_ics_file(path, &calendar.id).map_err(ServerError::from)?;
-            let count = events.len();
+            let parsed = parse_ics_file(path, &calendar.id).map_err(ServerError::from)?;
+            let count = parsed.events.len();
             let mut mgr = state.manager.lock();
-            for event in events {
-                mgr.upsert_event(&event)?;
+            for event in &parsed.events {
+                mgr.upsert_event(event)?;
             }
+            // Like an incomplete remote answer: what came is stored, the sync time is not.
+            if parsed.incomplete {
+                return Ok(Json(SyncResponse::new(
+                    id,
+                    count,
+                    Some(ICS_ZONES_TOO_COSTLY.to_string()),
+                )));
+            }
+            mgr.set_last_sync(&id, Utc::now())?;
             count
         }
         _ => {
-            return Ok(Json(SyncResponse {
-                calendar_id: id,
-                events_synced: 0,
-                success: false,
-                error: Some(unsupported_sync(&calendar.provider)),
-            }));
+            // Provider problems (including rejected credentials) are reported in the body, never
+            // as an HTTP error status of this server.
+            let result = sync_remote(&state, &id).await;
+            if let Some(err) = &result.error {
+                tracing::warn!("calendar {} sync failed: {}", result.calendar_id, err);
+            }
+            return Ok(Json(result));
         }
     };
-    Ok(Json(SyncResponse {
-        calendar_id: id,
-        events_synced: count,
-        success: true,
-        error: None,
-    }))
+    Ok(Json(SyncResponse::new(id, count, None)))
 }
 
-/// Only ICS calendars can be synced so far; other providers report that instead of a fake success.
-fn unsupported_sync(provider: &CalendarProvider) -> String {
-    format!("sync is not implemented for {} calendars", provider)
+/// Sync one remote calendar, or wait for the sync of it already running and share its result.
+///
+/// The sync runs on a task of its own that outlives the request: when the client (or nginx,
+/// after its read timeout) gives up, the handler's future is dropped, and tokens refreshed or
+/// rotated by then, a discovered collection and the fetched events must still be saved.
+/// Requests that keep coming while a slow provider holds one sync up join it rather than
+/// piling up full syncs to run one after another.
+async fn sync_remote(state: &CalendarState, id: &str) -> SyncResponse {
+    let flight = state.syncs.join_or_start(id.to_string(), || {
+        let state = state.clone();
+        let id = id.to_string();
+        async move { fetch_and_store(&state, &id).await }
+    });
+    flight.await.unwrap_or_else(|e| {
+        SyncResponse::new(id.to_string(), 0, Some(format!("sync task failed: {}", e)))
+    })
+}
+
+/// Fetch a remote (CalDAV / Google / Microsoft Graph) calendar and store what it returned in
+/// the sync window. Every failure is reported in the response rather than returned.
+async fn fetch_and_store(state: &CalendarState, id: &str) -> SyncResponse {
+    // The stored calendar, not a copy taken before the request joined or started this sync:
+    // a sync that just finished may have refreshed its tokens or found its collection.
+    let Some(calendar) = state.manager.lock().get_calendar(id) else {
+        return SyncResponse::new(
+            id.to_string(),
+            0,
+            Some(format!("calendar {} no longer exists", id)),
+        );
+    };
+    let window = SyncWindow::around(Utc::now());
+    let mut config = calendar.config.clone();
+    let fetched = state
+        .remote
+        .fetch_events(&calendar, &mut config, window)
+        .await;
+    let mut errors = Vec::new();
+    let mut mgr = state.manager.lock();
+    // Refreshed/rotated tokens and discovered URLs are saved even when the fetch failed later.
+    if config != calendar.config {
+        if let Err(e) = mgr.update_config(&calendar.id, config) {
+            errors.push(format!("saving updated credentials failed: {}", e));
+        }
+    }
+    let (stored, removed) = match fetched {
+        Ok(Fetched {
+            events,
+            incomplete: None,
+        }) => mgr
+            .replace_events_in_range(&calendar.id, window.start, window.end, &events)
+            .unwrap_or_else(|e| {
+                errors.push(format!("saving events failed: {}", e));
+                (0, 0)
+            }),
+        // Store what came, but an event missing from a partial answer was not deleted.
+        Ok(Fetched {
+            events,
+            incomplete: Some(reason),
+        }) => {
+            errors.insert(0, reason);
+            match mgr.upsert_events(&calendar.id, &events) {
+                Ok(stored) => (stored, 0),
+                Err(e) => {
+                    errors.push(format!("saving events failed: {}", e));
+                    (0, 0)
+                }
+            }
+        }
+        Err(e) => {
+            errors.insert(0, e.to_string());
+            (0, 0)
+        }
+    };
+    if errors.is_empty() {
+        if let Err(e) = mgr.set_last_sync(&calendar.id, Utc::now()) {
+            errors.push(format!("saving sync time failed: {}", e));
+        }
+    }
+    drop(mgr);
+    let error = (!errors.is_empty()).then(|| errors.join("; "));
+    SyncResponse {
+        events_removed: removed,
+        ..SyncResponse::new(calendar.id, stored, error)
+    }
+}
+
+/// Why an ICS sync is incomplete, see [`IcsEvents::incomplete`](crate::calendar::IcsEvents).
+const ICS_ZONES_TOO_COSTLY: &str = "too many time zone rules to go through: events whose \
+                                    times could not be converted were not stored";
+
+/// Load an ICS calendar's file; failures are reported in the result.
+fn sync_ics(state: &CalendarState, calendar: &Calendar, path: &std::path::Path) -> SyncResponse {
+    let parsed = match parse_ics_file(path, &calendar.id) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            return SyncResponse::new(
+                calendar.id.clone(),
+                0,
+                Some(format!("ICS load failed: {}", e)),
+            );
+        }
+    };
+    let total = parsed.events.len();
+    let mut mgr = state.manager.lock();
+    let failures: Vec<String> = parsed
+        .events
+        .iter()
+        .filter_map(|e| {
+            mgr.upsert_event(e)
+                .err()
+                .map(|err| format!("{}: {}", e.uid, err))
+        })
+        .collect();
+    let mut errors = Vec::new();
+    if parsed.incomplete {
+        errors.push(ICS_ZONES_TOO_COSTLY.to_string());
+    }
+    if !failures.is_empty() {
+        errors.push(format!(
+            "{} of {} events failed to save: {}",
+            failures.len(),
+            total,
+            failures.join("; ")
+        ));
+    }
+    // Reported like a remote sync's: a sync that missed events, or whose time was not saved,
+    // did not fully succeed.
+    if errors.is_empty() {
+        if let Err(e) = mgr.set_last_sync(&calendar.id, Utc::now()) {
+            errors.push(format!("saving sync time failed: {}", e));
+        }
+    }
+    let error = (!errors.is_empty()).then(|| errors.join("; "));
+    SyncResponse::new(calendar.id.clone(), total - failures.len(), error)
 }
 
 pub async fn sync_all_calendars(
     State(state): State<CalendarState>,
 ) -> Result<Json<Vec<SyncResponse>>> {
+    // On a task of its own, like a single remote sync: the remaining calendars still sync (and
+    // save refreshed tokens) when the client stops waiting. At most one runs; a request made
+    // while it does gets its results.
+    let flight = state.sync_all.join_or_start((), {
+        let state = state.clone();
+        move || sync_all(state)
+    });
+    let results = flight
+        .await
+        .map_err(|e| ServerError::Internal(format!("calendar sync task failed: {}", e)))?;
+    Ok(Json(results))
+}
+
+async fn sync_all(state: CalendarState) -> Vec<SyncResponse> {
     let calendars = state.manager.lock().list_calendars();
     let mut results = Vec::new();
     for calendar in calendars {
         // Per-calendar failures are reported in that calendar's entry (success=false + error)
         // instead of being swallowed; the rest still sync.
-        let (count, error) = match &calendar.config {
-            CalendarConfig::Ics { path, .. } => match parse_ics_file(path, &calendar.id) {
-                Ok(events) => {
-                    let total = events.len();
-                    let mut mgr = state.manager.lock();
-                    let failures: Vec<String> = events
-                        .iter()
-                        .filter_map(|e| {
-                            mgr.upsert_event(e)
-                                .err()
-                                .map(|err| format!("{}: {}", e.uid, err))
-                        })
-                        .collect();
-                    let error = (!failures.is_empty()).then(|| {
-                        format!(
-                            "{} of {} events failed to save: {}",
-                            failures.len(),
-                            total,
-                            failures.join("; ")
-                        )
-                    });
-                    (total - failures.len(), error)
-                }
-                Err(e) => (0, Some(format!("ICS load failed: {}", e))),
-            },
-            _ => (0, Some(unsupported_sync(&calendar.provider))),
+        let result = match &calendar.config {
+            CalendarConfig::Ics { path, .. } => sync_ics(&state, &calendar, path),
+            _ => sync_remote(&state, &calendar.id).await,
         };
-        if let Some(err) = &error {
-            tracing::warn!("calendar {} sync failed: {}", calendar.id, err);
+        if let Some(err) = &result.error {
+            tracing::warn!("calendar {} sync failed: {}", result.calendar_id, err);
         }
-        results.push(SyncResponse {
-            calendar_id: calendar.id,
-            events_synced: count,
-            success: error.is_none(),
-            error,
-        });
+        results.push(result);
     }
-    Ok(Json(results))
+    results
 }
 
 pub async fn get_upcoming_events(
@@ -515,7 +799,47 @@ pub async fn calendar_webhook(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    #[tokio::test]
+    async fn single_flight_shares_a_run_and_forgets_it_when_it_lands() {
+        let flights = SingleFlight::<&'static str, usize>::default();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let run = || {
+            let (runs, gate) = (runs.clone(), gate.clone());
+            move || async move {
+                gate.acquire().await.unwrap().forget();
+                runs.fetch_add(1, Ordering::SeqCst) + 1
+            }
+        };
+        let a = flights.join_or_start("k", run());
+        let b = flights.join_or_start("k", run());
+        let other = flights.join_or_start("j", run());
+        gate.add_permits(3);
+        let (a, b, other) = (a.await.unwrap(), b.await.unwrap(), other.await.unwrap());
+        assert_eq!(a, b);
+        assert_ne!(a, other);
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        // Removed before the result was handed out: the next call runs again.
+        assert!(flights.running.lock().is_empty());
+        gate.add_permits(1);
+        assert_eq!(flights.join_or_start("k", run()).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn single_flight_recovers_from_a_panicking_run() {
+        let flights = SingleFlight::<(), u8>::default();
+        let err = flights
+            .join_or_start((), || async { panic!("provider exploded") })
+            .await
+            .unwrap_err();
+        assert!(err.contains("panic"), "{}", err);
+        assert!(flights.running.lock().is_empty());
+        assert_eq!(flights.join_or_start((), || async { 7 }).await, Ok(7));
+    }
 
     fn ics_calendar(id: &str, path: std::path::PathBuf) -> Calendar {
         Calendar {
@@ -529,6 +853,121 @@ mod tests {
             last_sync: None,
             config: CalendarConfig::Ics { path, watch: false },
         }
+    }
+
+    #[tokio::test]
+    async fn sync_all_reports_an_ics_sync_time_that_was_not_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let ics = dir.path().join("good.ics");
+        std::fs::write(
+            &ics,
+            "BEGIN:VEVENT\nUID:1\nDTSTART:20250101T100000Z\nEND:VEVENT\n",
+        )
+        .unwrap();
+        let db = dir.path().join("cal.db");
+        let mut mgr = CalendarManager::new(&db).unwrap();
+        mgr.add_calendar(ics_calendar("ics", ics)).unwrap();
+        // The database refuses to record sync times from now on.
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER no_sync_time BEFORE UPDATE OF last_sync ON calendars \
+                 BEGIN SELECT RAISE(ABORT, 'disk is full'); END;",
+            )
+            .unwrap();
+        let state = CalendarState::new(mgr);
+        let Json(results) = sync_all_calendars(State(state.clone())).await.unwrap();
+        let result = &results[0];
+        assert!(!result.success);
+        assert_eq!(result.events_synced, 1);
+        let error = result.error.as_deref().unwrap();
+        assert!(
+            error.contains("saving sync time failed") && error.contains("disk is full"),
+            "{}",
+            error
+        );
+        assert!(
+            state
+                .manager
+                .lock()
+                .get_calendar("ics")
+                .unwrap()
+                .last_sync
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ics_file_too_costly_to_convert_keeps_the_stored_times() {
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zones.ics");
+        let fixed = "BEGIN:VTIMEZONE\nTZID:Fixed\nBEGIN:STANDARD\nTZOFFSETFROM:+0100\nTZOFFSETTO:+0100\nDTSTART:19700101T000000\nEND:STANDARD\nEND:VTIMEZONE\n";
+        let late = "BEGIN:VEVENT\nUID:late\nDTSTART;TZID=Fixed:20260105T090000\nEND:VEVENT\n";
+        std::fs::write(&path, format!("{}{}", fixed, late)).unwrap();
+        let mut mgr = CalendarManager::new(&dir.path().join("cal.db")).unwrap();
+        mgr.add_calendar(ics_calendar("ics", path.clone())).unwrap();
+        let state = CalendarState::new(mgr);
+        let Json(first) = sync_calendar_endpoint(State(state.clone()), Path("ics".into()))
+            .await
+            .unwrap();
+        assert!(first.success, "{:?}", first.error);
+        let synced_at = state.manager.lock().get_calendar("ics").unwrap().last_sync;
+        assert!(synced_at.is_some());
+        // Now an event in a zone whose rules cost more than the whole budget comes first:
+        // observances with yearly COUNT rules, walked from year 1 on every lookup, whose long
+        // BYMONTHDAY and BYDAY lists never agree on a day.
+        let weekdays: Vec<String> = [2, 3, 4, -2, -3, -4]
+            .iter()
+            .flat_map(|n| ["MO", "TU", "WE", "TH", "FR", "SA", "SU"].map(|d| format!("{}{}", n, d)))
+            .collect();
+        let observance = format!(
+            "BEGIN:STANDARD\nTZOFFSETFROM:+0100\nTZOFFSETTO:+0100\nDTSTART:00010101T000000\nRRULE:FREQ=YEARLY;COUNT=4000000000;BYMONTH=1,2,3,4,5,6,7,8,9,10,11,12;BYMONTHDAY=29,30,31,-29,-30,-31;BYDAY={}\nEND:STANDARD\n",
+            weekdays.join(",")
+        );
+        let costly = format!(
+            "BEGIN:VTIMEZONE\nTZID:Costly\n{}END:VTIMEZONE\nBEGIN:VEVENT\nUID:costly\nDTSTART;TZID=Costly:20260105T090000\nEND:VEVENT\n",
+            observance.repeat(12)
+        );
+        let utc_event = "BEGIN:VEVENT\nUID:utc\nDTSTART:20260107T090000Z\nEND:VEVENT\n";
+        std::fs::write(&path, format!("{}{}{}{}", fixed, costly, late, utc_event)).unwrap();
+        let Json(single) = sync_calendar_endpoint(State(state.clone()), Path("ics".into()))
+            .await
+            .unwrap();
+        let Json(all) = sync_all_calendars(State(state.clone())).await.unwrap();
+        for result in [&single, &all[0]] {
+            assert!(!result.success);
+            // Only the UTC event could be stored.
+            assert_eq!(result.events_synced, 1);
+            let error = result.error.as_deref().unwrap();
+            assert!(error.contains("too many time zone rules"), "{}", error);
+        }
+        let mgr = state.manager.lock();
+        let stored = mgr
+            .get_events(
+                "ics",
+                &EventQuery {
+                    start: Some(at("2026-01-01T00:00:00Z")),
+                    end: Some(at("2026-02-01T00:00:00Z")),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // Still at 08:00 UTC, not moved to 09:00 by a time read as UTC; the costly event is
+        // not stored at a guessed time; the sync time is the complete sync's.
+        let starts: Vec<_> = stored.iter().map(|e| (e.uid.as_str(), e.start)).collect();
+        assert_eq!(
+            starts,
+            [
+                ("late", at("2026-01-05T08:00:00Z")),
+                ("utc", at("2026-01-07T09:00:00Z"))
+            ]
+        );
+        assert_eq!(mgr.get_calendar("ics").unwrap().last_sync, synced_at);
     }
 
     #[tokio::test]
@@ -553,6 +992,10 @@ mod tests {
                 tenant_id: "t".into(),
                 access_token: None,
                 refresh_token: None,
+                client_id: None,
+                client_secret: None,
+                calendar_id: None,
+                token_expires_at: None,
             },
         })
         .unwrap();
@@ -577,7 +1020,7 @@ mod tests {
             o365.error
                 .as_deref()
                 .unwrap()
-                .contains("not implemented for office365"),
+                .contains("no usable access token"),
             "{:?}",
             o365.error
         );
