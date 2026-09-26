@@ -49,14 +49,17 @@ tempfile = "3"
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 rustls = { version = "0.23.45", features = ["aws-lc-rs"] }
 tiny-skia = "0.11"
-rumqttc = { version = "0.24", default-features = false }
+# Only the mqttbytes v4 codec is used (src/screenshare.rs), so no features are needed here.
+# Keep rumqttc's rustls features off everywhere (they pull rustls-webpki 0.102): in the
+# resolved build remarkable-mqtt enables only `use-native-tls` (feature unification).
+rumqttc = { version = "0.25.1", default-features = false }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 bytes = "1"
-remarkable-lines = { version = "0.1.0", git = "https://github.com/coleleavitt/remarkable-rs", rev = "9fe198ac95f84d70161236b04234e6c1f13864f7" }
-remarkable-core = { version = "0.1.0", git = "https://github.com/coleleavitt/remarkable-rs", rev = "9fe198ac95f84d70161236b04234e6c1f13864f7" }
+remarkable-lines = { version = "0.1.0", git = "https://github.com/coleleavitt/remarkable-rs", rev = "0eb11cf5ce2cfd0414f6273a486b1fa0e87e3476" }
+remarkable-core = { version = "0.1.0", git = "https://github.com/coleleavitt/remarkable-rs", rev = "0eb11cf5ce2cfd0414f6273a486b1fa0e87e3476" }
 # Screen share viewer: protocol/transport core and signaling message types
-remarkable-screenshare = { git = "https://github.com/coleleavitt/remarkable-rs", rev = "9fe198ac95f84d70161236b04234e6c1f13864f7" }
-remarkable-mqtt = { git = "https://github.com/coleleavitt/remarkable-rs", rev = "9fe198ac95f84d70161236b04234e6c1f13864f7" }
+remarkable-screenshare = { git = "https://github.com/coleleavitt/remarkable-rs", rev = "0eb11cf5ce2cfd0414f6273a486b1fa0e87e3476" }
+remarkable-mqtt = { git = "https://github.com/coleleavitt/remarkable-rs", rev = "0eb11cf5ce2cfd0414f6273a486b1fa0e87e3476" }
 png = "0.17"
 regex = "1.13.1"
 tokio-util = { version = "0.7.19", features = ["io"] }
@@ -70,8 +73,15 @@ tokio = { version = "1", features = ["test-util"] }
 tokio-test = "0.4"
 # WebSocket client for the /mqtt route test (same version axum's ws uses)
 tokio-tungstenite = "0.29"
-# Fake tablet peer for the screen share viewer test
-webrtc = { git = "https://github.com/coleleavitt/webrtc", branch = "fix/datachannel-max-message-size" }
+# Fake tablet peer for the screen share viewer test. Needs
+# SettingEngine::set_sctp_max_message_size_can_receive (the tablet's frames are
+# >64 KiB): webrtc-rs/webrtc#908, merged into upstream's v0.17.x branch as this
+# rev but not yet released (crates.io has 0.17.2). Pinned to the same rev as
+# remarkable-screenshare so the tree has one webrtc; a `branch = "v0.17.x"`
+# spec is a different git source to cargo and would duplicate every webrtc
+# crate. Switch both to crates.io webrtc = "0.17.3" (or later 0.17.x) once
+# published.
+webrtc = { git = "https://github.com/webrtc-rs/webrtc", rev = "98d0a140d2f0a49d7ebd10feabaee18931941630" }
 flate2 = "1"
 proptest = "1.11.0"
 

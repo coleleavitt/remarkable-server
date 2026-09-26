@@ -23,7 +23,6 @@ use std::time::{Duration, Instant};
 use bytes::BytesMut;
 use parking_lot::Mutex;
 use rumqttc::mqttbytes::v4::{
-    self,
     ConnAck,
     ConnectReturnCode,
     Packet,
@@ -516,7 +515,7 @@ impl Broker {
 
         // CONNECT (must be first)
         let connect = loop {
-            match v4::read(&mut buf, MAX_PACKET) {
+            match Packet::read(&mut buf, MAX_PACKET) {
                 Ok(Packet::Connect(c)) => break c,
                 Ok(other) => anyhow::bail!("expected CONNECT, got {other:?}"),
                 Err(rumqttc::mqttbytes::Error::InsufficientBytes(_)) => {
@@ -591,7 +590,7 @@ impl Broker {
             loop {
                 // Answer every complete packet already buffered (the answers go out below).
                 loop {
-                    let packet = match v4::read(&mut buf, MAX_PACKET) {
+                    let packet = match Packet::read(&mut buf, MAX_PACKET) {
                         Ok(p) => p,
                         Err(rumqttc::mqttbytes::Error::InsufficientBytes(_)) => break,
                         Err(e) => anyhow::bail!("bad packet: {e:?}"),
@@ -735,6 +734,7 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll, ready};
 
+    use rumqttc::mqttbytes::v4;
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
     use super::*;
@@ -903,7 +903,7 @@ mod tests {
         async fn next(&mut self) -> Option<Packet> {
             tokio::time::timeout(WAIT, async {
                 loop {
-                    match v4::read(&mut self.buf, MAX_PACKET) {
+                    match Packet::read(&mut self.buf, MAX_PACKET) {
                         Ok(p) => return Some(p),
                         Err(rumqttc::mqttbytes::Error::InsufficientBytes(_)) => {}
                         Err(e) => panic!("bad packet from broker: {e:?}"),
