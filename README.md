@@ -189,7 +189,7 @@ Supported providers: Google Drive, Dropbox, OneDrive
 | `/readlater/v1/articles` | POST | Add article |
 | `/readlater/v1/accounts` | GET | List connected services |
 
-Supported services: Pocket, Instapaper, Wallabag, Omnivore
+Supported services: Pocket, Instapaper, Wallabag (Omnivore was removed after the service shut down in November 2024)
 
 ## Versions API
 
@@ -269,6 +269,7 @@ Admin endpoints are disabled unless `ADMIN_TOKEN` is set; requests must send it 
 | `POST /devices/v1[?user=<id>]` | Mint a one-time pairing code for `local-user` (same as `--pair`), or for `<id>` |
 | `POST /admin/passcode/resets/{id}/approve` | Approve a tablet's passcode (PIN) reset request; the id is logged when the tablet asks |
 | `GET /admin/storage/unreachable?grace_secs=86400` | Read-only JSON list of blobs not reachable from the current root and older than the grace period (default 24 h). Never deletes; returns 500 with a reason if part of the tree couldn't be parsed |
+| `POST /admin/storage/gc?grace_secs=604800&dry_run=true` | Delete the blobs the unreachable report lists (default grace 7 days). A dry run unless `dry_run=false`; refuses (500) if the tree isn't fully parsed; stops with 409 if a sync commits mid-run. See DEPLOYMENT.md before using |
 
 `JWT_SECRET` sets the token signing key (default is a built-in constant; changing it invalidates paired devices).
 
@@ -281,6 +282,7 @@ Admin endpoints are disabled unless `ADMIN_TOKEN` is set; requests must send it 
 | `SCREENSHARE_ICE_SERVERS` | JSON list of ICE servers for `room-joined` (default `[]`; entries use a singular `url` key) |
 | `EMAIL_INBOUND_BIND` (e.g. `127.0.0.1:2525`) | Inbound SMTP: mail PDF/EPUB attachments to `send@{device-id}.remarkable.local` and they appear on the tablet |
 | `HWR_CAPTURE_DIR` | Save every handwriting request/response pair |
+| `PUBLIC_URL` (e.g. `https://remarkable.unwrap.rs`) | Public base URL for links a person opens: the OAuth `verification_uri`/`verification_uri_complete` (default `https://<--host>`) and firmware archive downloads |
 
 Handwriting conversion (`POST /convert/v1/handwriting`) runs the local `tesseract` binary: fine for neat print, poor for cursive/maths.
 
@@ -331,12 +333,21 @@ accepts, so no other change is needed; the id access data is an HS512 auth data 
 `https://auth.remarkable.com/{tectonic,subscription,mdm,created_at}` claims.
 
 Device codes are **not** auto-approved (RFC 8628): `/oauth/token` answers
-`authorization_pending` until the owner approves the `user_code` the client shows, and
-`expired_token` after `expires_in` (600 s). Pending codes are held in memory, expired ones are
-evicted, and at most 256 are kept (unapproved codes are dropped first). To approve (the first
-two need `ADMIN_TOKEN` set; the third does not):
+`authorization_pending` until the owner approves the `user_code` the client shows,
+`expired_token` after `expires_in` (600 s), and `invalid_grant` for a `device_code` that was
+never issued or was already redeemed. Polling again before `interval` (5 s) has passed gets
+`slow_down` and a 5 s longer interval. Pending codes are held in memory, expired ones are
+evicted, and at most 256 are kept (unapproved codes are dropped first).
 
-- open the advertised `verification_uri` (`https://<host>/oauth/verify?user_code=1234-5678`)
+`POST /oauth/device/code` is unauthenticated, so it is rate limited in process: 5 codes per
+client IP (an IPv6 /64 counts as one client) per 10 minutes and 20 codes per minute in total;
+past either limit it answers `429` with `{"error":"slow_down"}` and `Retry-After`. The client
+IP is the socket peer; only when the peer is loopback (a local reverse proxy such as nginx) is
+the rightmost `X-Forwarded-For` entry (else `X-Real-IP`) used instead.
+
+To approve (the first two need `ADMIN_TOKEN` set; the third does not):
+
+- open the advertised `verification_uri` (`<PUBLIC_URL or https://<host>>/oauth/verify?user_code=1234-5678`)
   and submit the code with the admin token, or
 - `curl -X POST https://<host>/admin/oauth/approve -H "x-admin-token: $ADMIN_TOKEN"
   -H 'content-type: application/json' -d '{"user_code":"1234-5678"}'`, or
