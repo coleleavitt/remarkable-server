@@ -25,6 +25,7 @@ const DOC_TYPE: &str = "80000000";
 /// Retries when another client moves the root while we're inserting.
 const ROOT_RETRIES: usize = 5;
 
+#[derive(Clone)]
 struct Entry {
     hash: String,
     kind: String,
@@ -200,6 +201,25 @@ pub(crate) fn create_document_from(
     parent: &str,
 ) -> Result<(String, u64)> {
     let id = uuid::Uuid::new_v4().to_string();
+    // Refuse up front, before writing any blobs, so a root we won't rewrite doesn't leave
+    // an orphaned document behind on every rejected upload. (Re-checked on each attempt below.)
+    current_root_entries(storage)?;
+    let entry = put_document(storage, &id, name, ext, file, parent)?;
+    let generation = commit_to_root(storage, std::slice::from_ref(&entry))?;
+    Ok((id, generation))
+}
+
+/// Store a new document's blobs (`<id>.metadata`, `<id>.content`, `<id>.<ext>`) and its index,
+/// inside the collection `parent` ("" = top level); returns its root entry. Nothing refers to
+/// the blobs until [`commit_to_root`] adds the entry.
+fn put_document(
+    storage: &Storage,
+    id: &str,
+    name: &str,
+    ext: &str,
+    file: DocFile<'_>,
+    parent: &str,
+) -> Result<Entry> {
     let now = chrono::Utc::now().timestamp_millis().to_string();
     let metadata = serde_json::json!({
         "createdTime": now, "lastModified": now, "lastOpened": "", "lastOpenedPage": 0,
@@ -210,10 +230,6 @@ pub(crate) fn create_document_from(
         "lineHeight": -1, "margins": 125, "orientation": "portrait", "pageCount": 0,
         "pages": [], "textScale": 1,
     });
-
-    // Refuse up front, before writing any blobs, so a root we won't rewrite doesn't leave
-    // an orphaned document behind on every rejected upload. (Re-checked on each attempt below.)
-    current_root_entries(storage)?;
     let mut files = vec![
         put_leaf(
             storage,
@@ -229,28 +245,101 @@ pub(crate) fn create_document_from(
     ];
     let doc_hash = index_hash(&mut files)?;
     storage.put_with_hash(&render_index(&files), &doc_hash, &format!("{id}.docSchema"))?;
-    let doc_entry = || Entry {
-        hash: doc_hash.clone(),
+    Ok(Entry {
+        hash: doc_hash,
         kind: DOC_TYPE.into(),
-        name: id.clone(),
+        name: id.to_owned(),
         subfiles: files.len() as u64,
         size: files.iter().map(|f| f.size).sum(),
-    };
+    })
+}
 
+/// Add `new` (document entries whose blobs are stored) to the current root in one commit and
+/// return the new generation. Each attempt re-reads and strictly re-parses the root, so a
+/// root that became one we won't rewrite is refused, and a root another client moved meanwhile
+/// (generation mismatch) is retried on top of its new entries, up to [`ROOT_RETRIES`] times.
+fn commit_to_root(storage: &Storage, new: &[Entry]) -> Result<u64> {
     for _ in 0..ROOT_RETRIES {
         let (root, mut entries) = current_root_entries(storage)?;
-        entries.push(doc_entry());
+        entries.extend(new.iter().cloned());
         let root_hash = index_hash(&mut entries)?;
         storage.put_with_hash(&render_index(&entries), &root_hash, "root.docSchema")?;
         match storage.set_root_if(root_hash, Some(root.generation)) {
-            Ok(new_root) => return Ok((id, new_root.generation)),
+            Ok(new_root) => return Ok(new_root.generation),
             Err(ServerError::GenerationMismatch { .. }) => continue,
             Err(e) => return Err(e),
         }
     }
-    Err(ServerError::Internal(
-        "root kept changing while adding document".into(),
-    ))
+    Err(ServerError::Internal(match new.len() {
+        1 => "root kept changing while adding document".into(),
+        n => format!("root kept changing while adding {n} documents"),
+    }))
+}
+
+/// A new PDF/EPUB document for [`stage_documents`]: its visible name, file extension (`pdf`
+/// or `epub`, also its `fileType`) and file.
+pub struct NewDocument<'a> {
+    pub name: &'a str,
+    pub ext: &'a str,
+    pub data: &'a [u8],
+}
+
+/// New documents whose blobs are stored, to be added to the root together by
+/// [`commit`](Self::commit). Their ids are known before the commit, so a caller can record where
+/// each is going first.
+pub struct DocumentBatch {
+    entries: Vec<Entry>,
+}
+
+impl DocumentBatch {
+    /// The documents' ids, in the order they were staged.
+    pub fn ids(&self) -> Vec<String> {
+        self.entries.iter().map(|e| e.name.clone()).collect()
+    }
+
+    /// Add every document to the root in one commit (one generation bump, whatever the number
+    /// of documents), with the same strict parsing and retries as [`create_document_in`], and
+    /// return the new generation. A root not fully understood is refused and left as it is.
+    /// An empty batch commits nothing and returns the current generation.
+    pub fn commit(self, storage: &Storage) -> Result<u64> {
+        if self.entries.is_empty() {
+            return Ok(storage.get_root().generation);
+        }
+        commit_to_root(storage, &self.entries)
+    }
+}
+
+/// Store the blobs of `docs`, each a new document inside the collection `parent` ("" = top
+/// level), for [`DocumentBatch::commit`] to add in one root commit. Like [`create_document_in`],
+/// refuses a root it doesn't fully understand before writing any blob.
+pub fn stage_documents(
+    storage: &Storage,
+    docs: &[NewDocument<'_>],
+    parent: &str,
+) -> Result<DocumentBatch> {
+    current_root_entries(storage)?;
+    let entries = docs
+        .iter()
+        .map(|doc| {
+            let id = uuid::Uuid::new_v4().to_string();
+            put_document(
+                storage,
+                &id,
+                doc.name,
+                doc.ext,
+                DocFile::Bytes(doc.data),
+                parent,
+            )
+        })
+        .collect::<Result<_>>()?;
+    Ok(DocumentBatch { entries })
+}
+
+/// The ids of the nodes (documents and collections) listed in the current root, read with the
+/// same strict parsing as the document writers; an error for a root they would refuse.
+pub fn root_node_ids(storage: &Storage) -> Result<std::collections::HashSet<String>> {
+    let (_, entries) = current_root_entries(storage)?;
+    Ok(entries.iter().map(|e| e.id().to_owned()).collect())
 }
 
 /// Resolve `folder` to a collection id: "" is the top level; otherwise a live
@@ -637,6 +726,106 @@ mod tests {
         );
         let text = String::from_utf8(storage.get(&storage.get_root().hash).unwrap()).unwrap();
         assert!(text.contains(&a) && text.contains(&b));
+    }
+
+    fn new_docs(names: &[&'static str]) -> Vec<NewDocument<'static>> {
+        names
+            .iter()
+            .map(|&name| NewDocument {
+                name,
+                ext: "epub",
+                data: b"PK",
+            })
+            .collect()
+    }
+
+    /// A batch of documents lands in one root commit (one generation bump), inside the folder,
+    /// next to the entries already there, under the ids it was staged with.
+    #[test]
+    fn a_batch_is_added_in_one_commit() {
+        let (a, b) = (entry_line('a', "doc-a"), entry_line('b', "doc-b"));
+        let (storage, _, _tmp) = storage_with_root(&format!("3\n{a}\n{b}\n"));
+        let folder = ensure_folder(&storage, "News").unwrap();
+        let generation = storage.get_root().generation;
+
+        let batch =
+            stage_documents(&storage, &new_docs(&["One", "Two", "Three"]), &folder).unwrap();
+        let ids = batch.ids();
+        assert_eq!(
+            storage.get_root().generation,
+            generation,
+            "staging commits nothing"
+        );
+        assert_eq!(batch.commit(&storage).unwrap(), generation + 1);
+
+        assert_eq!(storage.get_root().generation, generation + 1);
+        let listed = root_node_ids(&storage).unwrap();
+        assert_eq!(listed.len(), 3 + 3, "{listed:?}");
+        assert!(
+            ["doc-a", "doc-b", folder.as_str()]
+                .iter()
+                .all(|id| listed.contains(*id))
+        );
+        for (id, name) in ids.iter().zip(["One", "Two", "Three"]) {
+            assert!(listed.contains(id));
+            let m = meta(&storage, id);
+            assert_eq!(
+                (m["visibleName"].as_str(), m["parent"].as_str()),
+                (Some(name), Some(folder.as_str()))
+            );
+        }
+        let text = String::from_utf8(storage.get(&storage.get_root().hash).unwrap()).unwrap();
+        assert!(text.contains(&a) && text.contains(&b));
+
+        let empty = stage_documents(&storage, &[], "").unwrap();
+        assert_eq!(empty.commit(&storage).unwrap(), generation + 1);
+        assert_eq!(storage.get_root().generation, generation + 1);
+    }
+
+    /// A batch is refused, before any blob is written, by a root the writers don't fully
+    /// understand; and one that becomes such a root before the commit is refused then, and left
+    /// as it is.
+    #[test]
+    fn a_batch_never_rewrites_a_root_it_does_not_understand() {
+        let bad = format!("3\n{}\nnot-an-entry\n", entry_line('a', "doc-a"));
+        let (storage, root_hash, _tmp) = storage_with_root(&bad);
+        let (before, blobs) = (storage.get_root(), storage.list_hashes().unwrap().len());
+        assert!(stage_documents(&storage, &new_docs(&["One", "Two"]), "").is_err());
+        assert_eq!(
+            storage.list_hashes().unwrap().len(),
+            blobs,
+            "no orphan blobs"
+        );
+        assert_eq!(storage.get_root().generation, before.generation);
+        assert!(root_node_ids(&storage).is_err());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        let batch = stage_documents(&storage, &new_docs(&["One", "Two"]), "").unwrap();
+        storage
+            .put_with_hash(bad.as_bytes(), &root_hash, "root.docSchema")
+            .unwrap();
+        let before = storage.set_root(root_hash.clone()).unwrap();
+        assert!(batch.commit(&storage).is_err());
+        let after = storage.get_root();
+        assert_eq!(
+            (after.hash, after.generation),
+            (root_hash, before.generation)
+        );
+    }
+
+    /// A root another client moved between staging and the commit is re-read: the commit lands
+    /// on top of it, keeping what it added.
+    #[test]
+    fn a_batch_commit_keeps_what_landed_meanwhile() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        let batch = stage_documents(&storage, &new_docs(&["One", "Two"]), "").unwrap();
+        let (other, generation) = create_document(&storage, "Upload", "pdf", b"%PDF").unwrap();
+        assert_eq!(batch.commit(&storage).unwrap(), generation + 1);
+        let listed = root_node_ids(&storage).unwrap();
+        assert_eq!(listed.len(), 3);
+        assert!(listed.contains(&other));
     }
 
     #[test]

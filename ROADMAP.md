@@ -48,7 +48,10 @@ These are done and, in several cases, ahead of rmfakecloud:
   scaffolding; sync confined to `<storage>/integrations`, path-traversal and
   symlink-safe, provider grants revoked on disconnect (#16). Google Drive
   listings are paged and recursive, its delta is scoped to the sync folder, and
-  a delta cursor only advances once every change applied (#26).
+  a delta cursor only advances once every change applied (#26). Dropbox and
+  OneDrive got the same (recursive listings relative to the sync folder, deltas
+  scoped to it, a rejected cursor falls back to a full resync), and remote files
+  over the size limit are skipped (#34).
 - ✅ **Read-later credentials persist** — provider tokens (and the optional
   Wallabag password) are stored in `readlater.db` apart from the config, survive
   restarts, refreshed tokens are saved at once, never returned by the API;
@@ -61,6 +64,16 @@ These are done and, in several cases, ahead of rmfakecloud:
   responses; OAuth tokens refresh on expiry or 401 and are saved even when the
   sync fails or the client disconnects. On-premises Exchange (EWS) is not
   supported and says so.
+- ✅ **Read-later sync runs** — a scheduler (per-account interval, backoff on
+  account-wide failures, one sync per account at a time) and the `/sync`
+  endpoints put new articles on the tablet as EPUB/PDF documents through the
+  strict document path, push SyncComplete only when the root changed, and never
+  add an article twice. Provider requests time out, PDF converters are confined
+  and killed after a deadline, and status changes go back once, to the account
+  that recorded the article. Articles go on the tablet in batches of up to 20
+  per root commit (a first import no longer bumps the generation once per
+  article), are keyed by account (two Wallabag instances can both hold an id;
+  old databases are re-keyed once), and `readlater.db` is owner-only (#33).
 - ✅ **Security hardening (Sept 2026 review)** — OAuth device-code sign-ins need
   owner approval (#18); deleting or re-pairing a device revokes its tokens, and
   users only see and delete their own devices (#17); pairing codes are
@@ -101,7 +114,8 @@ The community's top *concrete* pains. Small, bounded, high-value.
 - ✅ **Large-file upload robustness** *(#29)* — upload bodies are streamed to
   `<storage>/.uploads/` with the checksum computed on the fly (sync v3
   `put_file`, sync15 `blob_put`, the v2/v4 blob PUTs, document uploads, share
-  links; gentree `PutFile` decodes its base64 straight to disk), instead of
+  links; gentree `PutFile` reads its JSON incrementally and decodes the base64
+  blob straight to disk), instead of
   holding whole files in RAM. The official cloud's `302 → Google-upload`
   redirect that resets progress to 0% does **not** apply here (we accept the
   PUT directly). Resumable/chunked upload only if a client needs it.
@@ -124,20 +138,29 @@ The community's top *concrete* pains. Small, bounded, high-value.
 
 ### Known follow-ups (from the #23–#29 reviews)
 
-- ⬜ **Read-later sync never runs** — `/integrations/v2/readlater/sync` and
-  `/accounts/{id}/sync` only answer `queued` / zero counts, and the manager's
-  scheduler is never started; wire them to an actual sync.
-- ⬜ **Dropbox / OneDrive listings** — full listings are non-recursive, and
-  their delta (change feed) ignores the configured sync folder (Drive got both
-  fixes in #26).
-- ⬜ **Screenshare MQTT broker vs revocation** — sessions on the `SCREENSHARE_BIND`
-  broker are not closed when their device is revoked (the `/notifications/ws`
-  and `/mqtt` sessions are).
-- ⬜ **Remaining buffered bodies** — gentree `PutFile` (base64 inside JSON),
-  handwriting convert and share-by-email still read the whole request into
-  memory.
-- 🧪 **`/mqtt` topic** — MQTT-over-WebSocket push publishes on whatever concrete
-  topics the client subscribes to; not yet verified against a real tablet.
+- ✅ **Dropbox / OneDrive listings** — full listings are recursive and relative
+  to the sync folder, and their deltas are scoped to it (#34).
+- ⬜ **Cloud full sync keeps no state** — `POST /integrations/v2/cloud/sync`
+  runs a fresh full sync every time, so a file deleted remotely is uploaded again
+  from its local copy, and Google Drive files present on both sides go through
+  the conflict strategy on every run (Dropbox and OneDrive skip files whose
+  content hash matches, #34). Needs per-folder sync state kept between runs.
+- ✅ **Screenshare MQTT broker vs revocation** *(#31)* — sessions on the
+  `SCREENSHARE_BIND` broker now close when their device is revoked, like the
+  `/notifications/ws` and (when enabled) `/mqtt` ones, and a revoked device leaves its REST
+  screenshare rooms.
+- ✅ **Remaining buffered bodies** — gentree `PutFile` streams its JSON body
+  (the base64 blob is decoded to disk as it arrives); handwriting convert (64
+  MiB, read after auth) and share-by-email (25 MiB, 413 over it) still read the
+  request into memory, but with limits sized to what they carry instead of 1 GiB.
+- ✅ **`/mqtt` topic** — checked against the production logs: the tablet
+  (xochitl 3.3.2) never requests `/mqtt` and gets sync pushes over
+  `/notifications/ws/json/1`; its observed MQTT is screen share signalling on
+  the `SCREENSHARE_BIND` broker (sync subscriptions there: unconfirmed, below). `/mqtt` is now opt-in (`MQTT_WS_NOTIFICATIONS=1`),
+  off by default (GAP_ANALYSIS.md, "MQTT: what the tablet actually uses").
+- 🧪 **Tablet's screenshare broker subscriptions** — all were inside the ACL (no
+  denials logged), but the exact filters weren't logged; accepted filters now
+  log at debug (`remarkable_server::screenshare=debug`).
 
 ---
 

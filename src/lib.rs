@@ -15,6 +15,7 @@ pub mod gentree;
 pub mod handwriting;
 pub mod hw_search;
 pub mod integrations;
+mod json_scan;
 pub mod mdm;
 pub mod mqtt_ws;
 pub mod notifications;
@@ -23,6 +24,7 @@ pub mod passcode;
 pub mod protocol;
 pub mod readlater;
 pub mod readlater_api;
+pub mod readlater_sync;
 pub mod reports;
 pub mod screenshare;
 pub mod screenshare_rest;
@@ -139,61 +141,46 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/v1/signed-urls/uploads", post(sync15::signed_upload))
         .route("/api/v1/sync-complete", post(sync15::sync_complete))
-        // Handwriting conversion (local tesseract; see handwriting.rs)
-        .route(
-            "/convert/v1/handwriting",
-            post(handwriting::convert).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
-        )
+        // Handwriting conversion (local tesseract; see handwriting.rs). The handler reads
+        // the body itself after auth, limited to `handwriting::MAX_BODY` (a `Body`
+        // extractor ignores `DefaultBodyLimit`, so no layer here).
+        .route("/convert/v1/handwriting", post(handwriting::convert))
         .route("/handwriting/v1/search", get(hw_search::search))
-        .route(
-            "/api/v1/page",
-            post(handwriting::convert).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
-        )
+        .route("/api/v1/page", post(handwriting::convert))
         // Share a page as a link (3.27+)
         .route(
             "/share/v1/link",
             post(share_link::create).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
         )
         .route("/share/v1/link/{name}", get(share_link::get))
-        // Send by email (SMTP via env)
-        .route(
-            "/share/v1/email",
-            post(share_email::send).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
-        )
+        // Send by email (SMTP via env); limited to `share_email::MAX_BODY`.
+        .route("/share/v1/email", share_email::route())
         // Read on reMarkable / desktop uploads (PDF, EPUB)
         .route(
             "/doc/v1/files",
             post(documents::upload_v1).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
         )
-        .route(
-            "/doc/v2/files",
-            post(documents::upload_v2).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
-        )
-        .route(
-            "/blobstorage",
-            get(sync15::blob_get)
-                .put(sync15::blob_put)
-                .layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
-        )
+        // The raw-body uploads below (`/doc/v2/files`, `/blobstorage` PUT and
+        // `/sync/v3/files/{hash}` PUT) stream to disk through `upload::stage_body`, which
+        // enforces MAX_BLOB_BYTES. They take a `Body` extractor, which ignores
+        // `DefaultBodyLimit`, so they carry no such layer.
+        .route("/doc/v2/files", post(documents::upload_v2))
+        .route("/blobstorage", get(sync15::blob_get).put(sync15::blob_put))
         // V3 Protocol (hash-based CRDT - current production)
         .route("/sync/v3/root", get(api::get_root).put(api::put_root))
         .route("/sync/v3/check-files", post(api::check_files))
         .route("/sync/v3/missing", get(api::missing_blobs))
         .route("/sync/v3/files-list", get(api::files_list))
         .route("/sync/v3/files/{hash}", get(api::get_file))
-        .route(
-            "/sync/v3/files/{hash}",
-            put(api::put_file).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
-        )
+        .route("/sync/v3/files/{hash}", put(api::put_file))
         // V4 Protocol (extended metadata - future)
         // gentree/v1 delta sync (rm-sync, software 3.28+); /sync/v3/{missing,check-files} are reused above.
         .route("/gentree/v1/GetEntries", post(gentree::get_entries))
         .route("/gentree/v1/GetFiles", post(gentree::get_files))
         .route("/gentree/v1/GetFile", post(gentree::get_file))
-        .route(
-            "/gentree/v1/PutFile",
-            post(gentree::put_file).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
-        )
+        // PutFile streams its body and enforces MAX_BLOB_BYTES itself (a `Body` extractor
+        // ignores `DefaultBodyLimit`, so a layer here would be a no-op).
+        .route("/gentree/v1/PutFile", post(gentree::put_file))
         .route("/gentree/v1/DeleteEntry", post(gentree::delete_entry))
         .route("/gentree/v1/EntrySession", post(gentree::entry_session))
         .route("/sync/v4/root", get(protocol::v4_get_root))
@@ -236,13 +223,12 @@ pub fn create_router(state: AppState) -> Router {
         .route("/health", get(api::health))
         .route("/debug/files", get(api::list_files))
         .route("/debug/clear", delete(api::clear_storage))
-        // Notifications (MQTT over WebSocket)
+        // Sync push notifications (JSON over WebSocket; what the tablet uses). The MQTT-over-
+        // WebSocket variant (`/mqtt`) is opt-in: see `mqtt_ws::router_if_enabled`.
         .route(
             "/notifications/ws/json/1",
             get(notifications::notifications_ws),
         )
-        // Same notifications as MQTT 3.1.1 over WebSocket; path and auth: see mqtt_ws.rs.
-        .route("/mqtt", get(mqtt_ws::mqtt_notifications_ws))
         // Screenshare REST room broker (xochitl 3.27+/3.28)
         .route("/screenshare/v1/rooms", post(screenshare_rest::create_room))
         .route(
@@ -376,10 +362,8 @@ pub fn create_router_with_all(
     let sync_router = Router::new()
         .route("/sync/v3/root", get(api::get_root))
         .route("/sync/v3/files/{hash}", get(api::get_file))
-        .route(
-            "/sync/v3/files/{hash}",
-            put(api::put_file).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
-        )
+        // `api::put_file` enforces MAX_BLOB_BYTES itself (see `create_router`).
+        .route("/sync/v3/files/{hash}", put(api::put_file))
         .route("/devices/v1", post(api::create_pairing_code))
         .route("/devices/v1", get(api::list_devices))
         .route("/devices/v1/{id}", delete(api::delete_device))
@@ -413,10 +397,8 @@ pub fn create_router_with_calendar(state: AppState, calendar_state: CalendarStat
     let sync_router = Router::new()
         .route("/sync/v3/root", get(api::get_root))
         .route("/sync/v3/files/{hash}", get(api::get_file))
-        .route(
-            "/sync/v3/files/{hash}",
-            put(api::put_file).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
-        )
+        // `api::put_file` enforces MAX_BLOB_BYTES itself (see `create_router`).
+        .route("/sync/v3/files/{hash}", put(api::put_file))
         .route("/devices/v1", post(api::create_pairing_code))
         .route("/devices/v1", get(api::list_devices))
         .route("/devices/v1/{id}", delete(api::delete_device))
@@ -450,10 +432,8 @@ pub fn create_router_with_integrations(
     Router::new()
         .route("/sync/v3/root", get(api::get_root))
         .route("/sync/v3/files/{hash}", get(api::get_file))
-        .route(
-            "/sync/v3/files/{hash}",
-            put(api::put_file).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
-        )
+        // `api::put_file` enforces MAX_BLOB_BYTES itself (see `create_router`).
+        .route("/sync/v3/files/{hash}", put(api::put_file))
         .route("/devices/v1", post(api::create_pairing_code))
         .route("/devices/v1", get(api::list_devices))
         .route("/devices/v1/{id}", delete(api::delete_device))
@@ -490,10 +470,8 @@ pub fn create_full_router(
     Router::new()
         .route("/sync/v3/root", get(api::get_root))
         .route("/sync/v3/files/{hash}", get(api::get_file))
-        .route(
-            "/sync/v3/files/{hash}",
-            put(api::put_file).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
-        )
+        // `api::put_file` enforces MAX_BLOB_BYTES itself (see `create_router`).
+        .route("/sync/v3/files/{hash}", put(api::put_file))
         .route("/devices/v1", post(api::create_pairing_code))
         .route("/devices/v1", get(api::list_devices))
         .route("/devices/v1/{id}", delete(api::delete_device))
@@ -561,9 +539,7 @@ impl Default for ServerConfig {
 }
 
 pub fn init_readlater_manager(storage_path: &Path) -> anyhow::Result<ReadLaterManager> {
-    let db_path = storage_path.join("readlater.db");
-    std::fs::create_dir_all(storage_path.join("articles"))?;
-    Ok(ReadLaterManager::new(&db_path, storage_path)?)
+    Ok(ReadLaterManager::new(&storage_path.join("readlater.db"))?)
 }
 
 /// Reject requests without a valid device/user token. Applied to every feature API
@@ -614,6 +590,16 @@ pub fn feature_routes(
         .is_ok()
         .then(|| feeds.clone().start_scheduler(FEED_CHECK_SECS));
 
+    // Read-later articles go into the device's sync tree. Scheduled syncs run only inside a
+    // Tokio runtime (not in unit tests) and unless READLATER_AUTO_SYNC turns them off; a pass
+    // with no accounts does nothing.
+    let readlater = ReadLaterState::new(
+        init_readlater_manager(storage_path)?,
+        state.storage.clone(),
+        state.notification_tx.clone(),
+    )
+    .with_scheduler(readlater_sync::SchedulerConfig::from_env());
+
     // Cloud syncs may only touch directories under <storage>/integrations.
     let cloud = IntegrationState::with_sync_base(storage_path.join("integrations"));
     let mut router = Router::new()
@@ -631,10 +617,7 @@ pub fn feature_routes(
             "/integrations/v2/calendars",
             calendar_router(CalendarState::new(init_calendar_manager(storage_path)?)),
         )
-        .nest(
-            "/integrations/v2/readlater",
-            readlater_router(ReadLaterState::new(init_readlater_manager(storage_path)?)),
-        )
+        .nest("/integrations/v2/readlater", readlater_router(readlater))
         // xochitl 3.29 uses /storage/; older builds use /cloud. Share one state so both see the same accounts.
         .nest(
             "/integrations/v2/cloud",
@@ -700,12 +683,69 @@ mod router_tests {
         let devices =
             DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
         let state = AppState::new(storage, devices);
-        let _ = create_router(state.clone());
-        let _ = feature_routes(state, tmp.path(), None).unwrap();
+        // Everything main.rs merges with `MQTT_WS_NOTIFICATIONS=1`, in its order: `merge`
+        // panics on overlapping routes, so a `/mqtt` added elsewhere would only crash
+        // deployments that enabled the flag.
+        let _ = create_router(state.clone())
+            .merge(feature_routes(state.clone(), tmp.path(), None).unwrap())
+            .merge(mqtt_ws::router_if_enabled(state, Some("1")).expect("enabled"));
     }
 
-    /// `/mqtt` is served, refuses clients without a valid token, and pushes an
-    /// authenticated client its own user's SyncComplete but not another user's.
+    /// The API router with `/mqtt` enabled, as main.rs builds it when
+    /// `MQTT_WS_NOTIFICATIONS=1`.
+    fn with_mqtt_ws(state: &AppState) -> Router {
+        create_router(state.clone())
+            .merge(mqtt_ws::router_if_enabled(state.clone(), Some("1")).expect("enabled"))
+    }
+
+    /// `/mqtt` is off unless `MQTT_WS_NOTIFICATIONS` is `1`/`true`/`on`: no tablet uses it
+    /// (GAP_ANALYSIS.md), so by default it must not be reachable, not even with a valid
+    /// token, while `/notifications/ws/json/1` (what the tablet uses) still is.
+    #[tokio::test]
+    async fn mqtt_ws_route_is_off_by_default() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path().join("storage")).unwrap();
+        let devices =
+            DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        let token = devices.create_user_token("u1@test").unwrap();
+        let state = AppState::new(storage, devices);
+        for flag in [None, Some(""), Some("0"), Some("false"), Some("yes")] {
+            assert!(
+                mqtt_ws::router_if_enabled(state.clone(), flag).is_none(),
+                "{flag:?}"
+            );
+        }
+        for flag in ["1", "true", "on"] {
+            assert!(
+                mqtt_ws::router_if_enabled(state.clone(), Some(flag)).is_some(),
+                "{flag}"
+            );
+        }
+        // Built as main.rs builds it when `router_if_enabled` returns `None`.
+        let app =
+            create_router(state.clone()).merge(feature_routes(state, tmp.path(), None).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("ws://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let connect = |path: &str| {
+            let mut req = format!("{base}{path}").into_client_request().unwrap();
+            req.headers_mut()
+                .insert("authorization", format!("Bearer {token}").parse().unwrap());
+            tokio_tungstenite::connect_async(req)
+        };
+        match connect("/mqtt").await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(r)) => {
+                assert_eq!(r.status(), axum::http::StatusCode::NOT_FOUND)
+            }
+            other => panic!("/mqtt must not be served, got {:?}", other.map(|_| ())),
+        }
+        assert!(connect("/notifications/ws/json/1").await.is_ok());
+    }
+
+    /// With `MQTT_WS_NOTIFICATIONS=1`, `/mqtt` is served, refuses clients without a valid
+    /// token, and pushes an authenticated client its own user's SyncComplete but not
+    /// another user's.
     #[tokio::test]
     async fn mqtt_ws_route_requires_auth_and_filters_by_user() {
         use futures_util::{SinkExt, StreamExt};
@@ -718,7 +758,7 @@ mod router_tests {
         let state = AppState::new(Storage::new(tmp.path().join("storage")).unwrap(), devices);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}/mqtt", listener.local_addr().unwrap());
-        let router = create_router(state.clone());
+        let router = with_mqtt_ws(&state);
         tokio::spawn(async move { axum::serve(listener, router).await });
         let connect = |auth: Option<&str>| {
             let mut req = url.as_str().into_client_request().unwrap();
@@ -765,6 +805,13 @@ mod router_tests {
             .send(notifications::WsMessage::sync_complete(1, "d", "u1@test"));
         assert_eq!(recv(&mut anon).await, None, "closed, nothing published");
 
+        // A valid header token does not excuse a malformed CONNECT (here an empty body).
+        let (mut bad, _) = connect(Some(&format!("Bearer {token}"))).await.unwrap();
+        bad.send(Message::Binary(vec![0x10, 0].into()))
+            .await
+            .unwrap();
+        assert_eq!(recv(&mut bad).await, None, "closed without a CONNACK");
+
         let (mut ws, _) = connect(Some(&format!("Bearer {token}"))).await.unwrap();
         ws.send(Message::Binary(CONNECT.to_vec().into()))
             .await
@@ -802,8 +849,112 @@ mod router_tests {
         assert_eq!(body["message"]["attributes"]["event"], "SyncComplete");
     }
 
-    /// Open notification sessions (JSON WebSocket and `/mqtt`, token in the header or in the
-    /// MQTT CONNECT) close when their device is deleted; another device's sessions stay open.
+    /// On the real upgrade: a text frame, even from a client that has sent no token, is
+    /// answered with close code 1003 (MQTT is binary only, [MQTT-6.0.0-1]); and a message
+    /// of `MAX_MESSAGE_SIZE` bytes is read, one a byte longer closes the socket.
+    #[tokio::test]
+    async fn mqtt_ws_closes_on_text_frames_and_oversized_messages() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+        type Ws = tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >;
+        const FIVE_S: std::time::Duration = std::time::Duration::from_secs(5);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let devices =
+            DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        let token = devices.create_user_token("u1@test").unwrap();
+        let state = AppState::new(Storage::new(tmp.path().join("storage")).unwrap(), devices);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/mqtt", listener.local_addr().unwrap());
+        let router = with_mqtt_ws(&state);
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let open = |auth: Option<String>| {
+            let mut req = url.as_str().into_client_request().unwrap();
+            if let Some(a) = auth {
+                req.headers_mut()
+                    .insert("authorization", a.parse().unwrap());
+            }
+            async move { tokio_tungstenite::connect_async(req).await.unwrap().0 }
+        };
+        async fn next(ws: &mut Ws) -> Option<Message> {
+            match tokio::time::timeout(FIVE_S, ws.next())
+                .await
+                .expect("timed out")
+            {
+                Some(Ok(m)) => Some(m),
+                _ => None,
+            }
+        }
+        /// A QoS 0 PUBLISH on "t", `len` bytes long in all (a 3-byte remaining length).
+        fn publish_of_len(len: usize) -> Message {
+            let remaining = len - 4;
+            assert!((16_384..2_097_152).contains(&remaining), "3-byte length");
+            let mut p = vec![
+                0x30,
+                (remaining % 128) as u8 | 0x80,
+                (remaining / 128 % 128) as u8 | 0x80,
+                (remaining / 16_384) as u8,
+                0,
+                1,
+                b't',
+            ];
+            p.resize(len, 0);
+            Message::Binary(p.into())
+        }
+
+        let mut anon = open(None).await;
+        anon.send(Message::Text("x".repeat(4096).into()))
+            .await
+            .unwrap();
+        match next(&mut anon).await {
+            Some(Message::Close(Some(f))) => assert_eq!(f.code, CloseCode::Unsupported),
+            other => panic!("text frame must close with 1003, got {other:?}"),
+        }
+
+        let mut ws = open(Some(format!("Bearer {token}"))).await;
+        ws.send(Message::Binary(
+            vec![
+                0x10, 13, 0, 4, b'M', b'Q', b'T', b'T', 4, 2, 0, 60, 0, 1, b'c',
+            ]
+            .into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            next(&mut ws).await,
+            Some(Message::Binary(vec![0x20, 2, 0, 0].into())),
+            "CONNACK accepted"
+        );
+        ws.send(publish_of_len(mqtt_ws::MAX_MESSAGE_SIZE))
+            .await
+            .unwrap();
+        ws.send(Message::Binary(vec![0xC0, 0].into()))
+            .await
+            .unwrap(); // PINGREQ
+        assert_eq!(
+            next(&mut ws).await,
+            Some(Message::Binary(vec![0xD0, 0].into())),
+            "a message at the cap is read"
+        );
+        // The server stops reading at the frame header, so this send may fail midway.
+        let _ = tokio::time::timeout(
+            FIVE_S,
+            ws.send(publish_of_len(mqtt_ws::MAX_MESSAGE_SIZE + 1)),
+        )
+        .await;
+        let _ = ws.send(Message::Binary(vec![0xC0, 0].into())).await; // PINGREQ
+        match next(&mut ws).await {
+            None | Some(Message::Close(_)) => {}
+            other => panic!("one byte over the cap must close the socket, got {other:?}"),
+        }
+    }
+
+    /// Open notification sessions (JSON WebSocket and, when enabled, `/mqtt`, token in the
+    /// header or in the MQTT CONNECT) close when their device is deleted; another device's
+    /// sessions stay open.
     #[tokio::test]
     async fn notification_sessions_close_when_their_device_is_revoked() {
         use futures_util::{SinkExt, StreamExt};
@@ -825,7 +976,7 @@ mod router_tests {
         let state = AppState::new(Storage::new(tmp.path().join("storage")).unwrap(), devices);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("ws://{}", listener.local_addr().unwrap());
-        let router = create_router(state.clone());
+        let router = with_mqtt_ws(&state);
         tokio::spawn(async move { axum::serve(listener, router).await });
         let open = |path: &str, token: Option<&str>| {
             let mut req = format!("{base}{path}").into_client_request().unwrap();
