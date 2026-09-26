@@ -385,8 +385,9 @@ impl SearchIndex {
     /// Rebuild entire index from storage. Rows are upserted one at a time as text is
     /// extracted (hashes are content addresses, so re-indexing one is idempotent and no
     /// library-wide batch of text is held in memory), then rows whose blob is gone from
-    /// storage are pruned, so deleted documents drop out of search. Rows are only ever
-    /// removed for blobs that no longer exist: a blob that can't be read this time keeps its
+    /// storage or no longer mapped to any filename are pruned, so deleted and superseded
+    /// documents (e.g. the old blob left behind when a filename is re-uploaded with new
+    /// content) drop out of search. A live, mapped blob that can't be read this time keeps its
     /// previous row, and rows written meanwhile by an overlapping (re)index survive.
     pub fn rebuild_from_storage(&self, storage: &Storage) -> Result<usize> {
         info!("Rebuilding search index from storage...");
@@ -414,18 +415,21 @@ impl SearchIndex {
         Ok(indexed)
     }
     
-    /// Delete rows whose blob is no longer in storage. The listing is taken while holding the
-    /// DB lock, so every row already written refers to a blob that listing can see.
+    /// Delete rows whose blob is no longer in storage or no longer mapped to a filename. The
+    /// listing and mapping lookups happen while holding the DB lock, so every row already
+    /// written refers to a blob and mapping they can see. The row's own filename is checked
+    /// first (O(1)); only on a mismatch is the hash reverse-looked-up.
     fn prune_missing(&self, storage: &Storage) -> Result<usize> {
         let db = |e: rusqlite::Error| ServerError::Database(e.to_string());
         let mut conn = self.inner.conn.lock();
         let live: std::collections::HashSet<String> = storage.list_hashes()?.into_iter().collect();
+        let mapped = |h: &str, f: &str| storage.hash_for_filename(f).as_deref() == Some(h) || storage.filename_for_hash(h).is_some();
         let tx = conn.transaction().map_err(db)?;
         let stale: Vec<String> = {
-            let mut stmt = tx.prepare("SELECT hash FROM documents").map_err(db)?;
-            let hashes = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(db)?
+            let mut stmt = tx.prepare("SELECT hash, filename FROM documents").map_err(db)?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).map_err(db)?
                 .collect::<rusqlite::Result<Vec<_>>>().map_err(db)?;
-            hashes.into_iter().filter(|h| !live.contains(h)).collect()
+            rows.into_iter().filter(|(h, f)| !live.contains(h) || !mapped(h, f)).map(|(h, _)| h).collect()
         };
         for hash in &stale {
             tx.execute("DELETE FROM documents WHERE hash = ?1", params![hash]).map_err(db)?;
@@ -598,6 +602,26 @@ mod tests {
             }
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
+    }
+
+    #[test]
+    fn test_rebuild_prunes_blobs_whose_filename_was_repointed() {
+        let tmp = TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path().join("store")).unwrap();
+        let index = SearchIndex::new(tmp.path()).unwrap();
+        let q = |q: &str| index.search(&SearchQuery { q: q.into(), limit: 10, offset: 0, doc_type: None }).unwrap();
+        let old = storage.put(b"{\"v\":1}", "notes.metadata").unwrap();
+        assert_eq!(index.rebuild_from_storage(&storage).unwrap(), 1);
+        assert!(index.is_indexed(&old));
+
+        // Same filename, new content: the mapping moves to the new hash, the old blob stays on disk.
+        let new = storage.put(b"{\"v\":2}", "notes.metadata").unwrap();
+        assert_ne!(old, new);
+        assert!(storage.exists(&old) && storage.filename_for_hash(&old).is_none());
+        assert_eq!(index.rebuild_from_storage(&storage).unwrap(), 1);
+        assert!(!index.is_indexed(&old), "unmapped blob's row must be pruned");
+        assert!(index.is_indexed(&new));
+        assert_eq!(q("notes").iter().map(|r| r.hash.clone()).collect::<Vec<_>>(), vec![new]);
     }
 
     #[test]
