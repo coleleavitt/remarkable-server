@@ -14,18 +14,20 @@
 //! tablet reads. A format the parser doesn't know is recorded as unparsed and sync
 //! carries on unaffected.
 
-use crate::error::{Result, ServerError};
-use crate::types::SyncRoot;
-use parking_lot::{Mutex, RwLock};
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use parking_lot::{Mutex, RwLock};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use sha2::{Digest, Sha256};
+
+use crate::error::{Result, ServerError};
+use crate::types::SyncRoot;
 
 /// Monotonic counter for unique temp-file names within this process.
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -110,7 +112,9 @@ pub fn is_valid_hash(hash: &str) -> bool {
 }
 
 fn unix_now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// One line of a sync index: `hash:type:name:subfiles:size`.
@@ -131,8 +135,8 @@ impl IndexEntry {
 }
 
 /// Parse an index blob strictly: schema `3` or `4`, then `hash:type:name:subfiles:size`
-/// lines. Schema 4's summary line (a field that is just `.`, e.g. `0:.:<count>:<size>`)
-/// is skipped. Any other shape is an error, so the projection is never partially wrong.
+/// lines. Schema 4's summary line `0:.:<count>:<size>` is skipped. Any other shape is an
+/// error, so the projection is never partially wrong.
 pub fn parse_index(bytes: &[u8]) -> std::result::Result<(String, Vec<IndexEntry>), String> {
     let text = std::str::from_utf8(bytes).map_err(|_| "index is not UTF-8".to_string())?;
     let mut lines = text.lines();
@@ -143,8 +147,8 @@ pub fn parse_index(bytes: &[u8]) -> std::result::Result<(String, Vec<IndexEntry>
     let mut entries = Vec::new();
     for line in lines.filter(|l| !l.trim().is_empty()) {
         let fields: Vec<&str> = line.split(':').collect();
-        if schema == "4" && fields.contains(&".") {
-            continue;
+        if schema == "4" && matches!(fields[..], ["0", ".", _, _]) {
+            continue; // summary line; four fields, so never confused with an entry
         }
         let [hash, kind, name, subfiles, size] = fields[..] else {
             return Err(format!("malformed index line {line:?}"));
@@ -152,7 +156,10 @@ pub fn parse_index(bytes: &[u8]) -> std::result::Result<(String, Vec<IndexEntry>
         if !is_valid_hash(hash) {
             return Err(format!("invalid hash in index line {line:?}"));
         }
-        let number = |s: &str| s.parse::<u64>().map_err(|_| format!("bad number in index line {line:?}"));
+        let number = |s: &str| {
+            s.parse::<u64>()
+                .map_err(|_| format!("bad number in index line {line:?}"))
+        };
         entries.push(IndexEntry {
             hash: hash.to_string(),
             kind: kind.to_string(),
@@ -207,7 +214,11 @@ impl Storage {
         let root = Self::load_or_import_root(&conn, &base_path)?;
         let root = Self::adopt_newer_root_json(&conn, &base_path, root)?;
         let storage = Self {
-            inner: Arc::new(StorageInner { base_path, db: Mutex::new(conn), root: RwLock::new(root.clone()) }),
+            inner: Arc::new(StorageInner {
+                base_path,
+                db: Mutex::new(conn),
+                root: RwLock::new(root.clone()),
+            }),
         };
         storage.reconcile_blobs()?;
         if let Err(e) = storage.index_tree(&root.hash) {
@@ -218,7 +229,9 @@ impl Storage {
 
     /// The root row, created from `root.json` (or empty) the first time.
     fn load_or_import_root(conn: &Connection, base_path: &Path) -> Result<SyncRoot> {
-        let exists: Option<i64> = conn.query_row("SELECT id FROM root WHERE id = 1", [], |r| r.get(0)).optional()?;
+        let exists: Option<i64> = conn
+            .query_row("SELECT id FROM root WHERE id = 1", [], |r| r.get(0))
+            .optional()?;
         if exists.is_some() {
             return Self::select_root(conn);
         }
@@ -229,15 +242,26 @@ impl Storage {
             params![root.hash, root.generation as i64, root.schema_version],
         )?;
         if inserted == 1 && !root.hash.is_empty() {
-            tracing::info!(generation = root.generation, "imported root.json into sync.db");
+            tracing::info!(
+                generation = root.generation,
+                "imported root.json into sync.db"
+            );
         }
         Self::select_root(conn)
     }
 
     fn select_root(conn: &Connection) -> Result<SyncRoot> {
-        Ok(conn.query_row("SELECT hash, generation, schema_version FROM root WHERE id = 1", [], |r| {
-            Ok(SyncRoot { hash: r.get(0)?, generation: r.get::<_, i64>(1)? as u64, schema_version: r.get(2)? })
-        })?)
+        Ok(conn.query_row(
+            "SELECT hash, generation, schema_version FROM root WHERE id = 1",
+            [],
+            |r| {
+                Ok(SyncRoot {
+                    hash: r.get(0)?,
+                    generation: r.get::<_, i64>(1)? as u64,
+                    schema_version: r.get(2)?,
+                })
+            },
+        )?)
     }
 
     fn read_root_json(base_path: &Path) -> Result<Option<SyncRoot>> {
@@ -245,17 +269,26 @@ impl Storage {
         if !root_path.exists() {
             return Ok(None);
         }
-        Ok(Some(serde_json::from_str(&fs::read_to_string(&root_path)?)?))
+        Ok(Some(serde_json::from_str(&fs::read_to_string(
+            &root_path,
+        )?)?))
     }
 
     /// `root.json` is only a mirror, so it can't be *ahead* of `sync.db` unless a build
     /// without `sync.db` committed roots here (a rollback). Adopt that root rather than
     /// serve an older tree, which would make the tablet drop what it synced meanwhile.
-    fn adopt_newer_root_json(conn: &Connection, base_path: &Path, db_root: SyncRoot) -> Result<SyncRoot> {
-        let Some(mirror) = Self::read_root_json(base_path)? else { return Ok(db_root) };
+    fn adopt_newer_root_json(
+        conn: &Connection,
+        base_path: &Path,
+        db_root: SyncRoot,
+    ) -> Result<SyncRoot> {
+        let Some(mirror) = Self::read_root_json(base_path)? else {
+            return Ok(db_root);
+        };
         if mirror.generation > db_root.generation {
             tracing::warn!(
-                db_generation = db_root.generation, json_generation = mirror.generation,
+                db_generation = db_root.generation,
+                json_generation = mirror.generation,
                 "root.json is ahead of sync.db (rolled back to an older build?); adopting root.json"
             );
             conn.execute(
@@ -264,7 +297,10 @@ impl Storage {
             )?;
             return Self::select_root(conn);
         }
-        if mirror.generation == db_root.generation && mirror.hash != db_root.hash && !mirror.hash.is_empty() {
+        if mirror.generation == db_root.generation
+            && mirror.hash != db_root.hash
+            && !mirror.hash.is_empty()
+        {
             return Err(ServerError::Config(format!(
                 "root.json and sync.db disagree at generation {} ({} vs {}); fix one by hand before starting",
                 db_root.generation, mirror.hash, db_root.hash
@@ -301,13 +337,20 @@ impl Storage {
             added += 1;
         }
         // Re-check: another process may have written the file after our scan.
-        for hash in known.iter().filter(|h| !on_disk.contains_key(*h) && !self.hash_path(h).exists()) {
+        for hash in known
+            .iter()
+            .filter(|h| !on_disk.contains_key(*h) && !self.hash_path(h).exists())
+        {
             tx.execute("DELETE FROM blobs WHERE hash = ?1", [hash])?;
             dropped += 1;
         }
         tx.commit()?;
         if added + dropped > 0 {
-            tracing::info!(added, dropped, "reconciled blob table with storage directory");
+            tracing::info!(
+                added,
+                dropped,
+                "reconciled blob table with storage directory"
+            );
         }
         Ok(())
     }
@@ -323,12 +366,18 @@ impl Storage {
             }
             for file in fs::read_dir(entry.path())? {
                 let file = file?;
-                let Some(hash) = file.file_name().to_str().map(str::to_owned) else { continue };
+                let Some(hash) = file.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
                 if !is_valid_hash(&hash) || !hash.starts_with(&*name.to_string_lossy()) {
                     continue; // a temp file left by a crash mid-write, or a misplaced file get() can't serve
                 }
                 let meta = file.metadata()?;
-                let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or_else(unix_now, |d| d.as_secs() as i64);
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map_or_else(unix_now, |d| d.as_secs() as i64);
                 blobs.insert(hash, (meta.len(), mtime));
             }
         }
@@ -345,7 +394,13 @@ impl Storage {
         let row = self.inner.db.lock().query_row(
             "SELECT hash, generation, schema_version FROM root WHERE id = 1",
             [],
-            |r| Ok(SyncRoot { hash: r.get(0)?, generation: r.get::<_, i64>(1)? as u64, schema_version: r.get(2)? }),
+            |r| {
+                Ok(SyncRoot {
+                    hash: r.get(0)?,
+                    generation: r.get::<_, i64>(1)? as u64,
+                    schema_version: r.get(2)?,
+                })
+            },
         );
         match row {
             Ok(root) => {
@@ -373,13 +428,22 @@ impl Storage {
         let root = {
             let mut db = self.inner.db.lock();
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let (generation, schema_version): (i64, u32) =
-                tx.query_row("SELECT generation, schema_version FROM root WHERE id = 1", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let (generation, schema_version): (i64, u32) = tx.query_row(
+                "SELECT generation, schema_version FROM root WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
             let generation = generation as u64;
             if expected.is_some_and(|expected| expected != generation) {
-                return Err(ServerError::GenerationMismatch { current: generation });
+                return Err(ServerError::GenerationMismatch {
+                    current: generation,
+                });
             }
-            let root = SyncRoot { hash, generation: generation + 1, schema_version };
+            let root = SyncRoot {
+                hash,
+                generation: generation + 1,
+                schema_version,
+            };
             tx.execute(
                 "UPDATE root SET previous_hash = hash, hash = ?1, generation = ?2 WHERE id = 1",
                 params![root.hash, root.generation as i64],
@@ -401,10 +465,16 @@ impl Storage {
     /// process already mirrored.
     fn write_mirror(&self, root: &SyncRoot) {
         let path = self.inner.base_path.join("root.json");
-        if Self::read_root_json(&self.inner.base_path).ok().flatten().is_some_and(|m| m.generation > root.generation) {
+        if Self::read_root_json(&self.inner.base_path)
+            .ok()
+            .flatten()
+            .is_some_and(|m| m.generation > root.generation)
+        {
             return;
         }
-        let written = serde_json::to_string_pretty(root).map_err(std::io::Error::other).and_then(|m| atomic_write(&path, m.as_bytes()));
+        let written = serde_json::to_string_pretty(root)
+            .map_err(std::io::Error::other)
+            .and_then(|m| atomic_write(&path, m.as_bytes()));
         if let Err(e) = written {
             tracing::warn!(error = %e, "root committed but root.json mirror not updated");
         }
@@ -438,7 +508,9 @@ impl Storage {
 
     /// Get file by filename (the most recently stored blob with that name)
     pub fn get_by_filename(&self, filename: &str) -> Result<Vec<u8>> {
-        let hash = self.hash_for_filename(filename).ok_or_else(|| ServerError::NotFound(filename.to_string()))?;
+        let hash = self
+            .hash_for_filename(filename)
+            .ok_or_else(|| ServerError::NotFound(filename.to_string()))?;
         self.get(&hash)
     }
 
@@ -464,7 +536,11 @@ impl Storage {
         self.inner
             .db
             .lock()
-            .query_row("SELECT filename FROM blobs WHERE hash = ?1 AND filename != ''", [hash], |r| r.get(0))
+            .query_row(
+                "SELECT filename FROM blobs WHERE hash = ?1 AND filename != ''",
+                [hash],
+                |r| r.get(0),
+            )
             .optional()
             .unwrap_or_else(|e| {
                 tracing::error!(error = %e, "blob lookup by hash failed");
@@ -503,7 +579,10 @@ impl Storage {
             params![hash, filename, data.len() as i64, unix_now()],
         )?;
         // New bytes under this hash: forget any earlier parse of it.
-        self.inner.db.lock().execute("DELETE FROM indexes WHERE hash = ?1", [hash])?;
+        self.inner
+            .db
+            .lock()
+            .execute("DELETE FROM indexes WHERE hash = ?1", [hash])?;
         Ok(())
     }
 
@@ -533,7 +612,11 @@ impl Storage {
         if path.exists() {
             fs::remove_file(path)?;
         }
-        let meta_path = self.inner.base_path.join("meta").join(format!("{hash}.meta"));
+        let meta_path = self
+            .inner
+            .base_path
+            .join("meta")
+            .join(format!("{hash}.meta"));
         if meta_path.exists() {
             fs::remove_file(meta_path)?;
         }
@@ -549,7 +632,12 @@ impl Storage {
         if !self.ensure_indexed(root_hash)? {
             return Ok(());
         }
-        for doc in self.index_entries(root_hash)?.unwrap_or_default().iter().filter(|e| e.is_index()) {
+        for doc in self
+            .index_entries(root_hash)?
+            .unwrap_or_default()
+            .iter()
+            .filter(|e| e.is_index())
+        {
             self.ensure_indexed(&doc.hash)?;
         }
         Ok(())
@@ -565,7 +653,11 @@ impl Storage {
             .inner
             .db
             .lock()
-            .query_row("SELECT ok FROM indexes WHERE hash = ?1 AND parser_version >= ?2", params![hash, PARSER_VERSION], |r| r.get(0))
+            .query_row(
+                "SELECT ok FROM indexes WHERE hash = ?1 AND parser_version >= ?2",
+                params![hash, PARSER_VERSION],
+                |r| r.get(0),
+            )
             .optional()?;
         if let Some(ok) = seen {
             return Ok(ok);
@@ -589,7 +681,14 @@ impl Storage {
                     "INSERT OR REPLACE INTO entries (index_hash, name, hash, kind, subfiles, size) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 )?;
                 for e in entries {
-                    insert.execute(params![hash, e.name, e.hash, e.kind, e.subfiles as i64, e.size as i64])?;
+                    insert.execute(params![
+                        hash,
+                        e.name,
+                        e.hash,
+                        e.kind,
+                        e.subfiles as i64,
+                        e.size as i64
+                    ])?;
                 }
                 true
             }
@@ -610,7 +709,11 @@ impl Storage {
     /// The parsed entries of index blob `hash`, or `None` if it isn't (successfully) parsed.
     pub fn index_entries(&self, hash: &str) -> Result<Option<Vec<IndexEntry>>> {
         let db = self.inner.db.lock();
-        let ok: Option<bool> = db.query_row("SELECT ok FROM indexes WHERE hash = ?1", [hash], |r| r.get(0)).optional()?;
+        let ok: Option<bool> = db
+            .query_row("SELECT ok FROM indexes WHERE hash = ?1", [hash], |r| {
+                r.get(0)
+            })
+            .optional()?;
         if ok != Some(true) {
             return Ok(None);
         }
@@ -668,8 +771,11 @@ impl Storage {
     /// would otherwise look unreachable.
     pub fn unreachable_blobs(&self, grace: Duration) -> Result<Vec<String>> {
         let root = self.get_root();
-        let previous: String =
-            self.inner.db.lock().query_row("SELECT previous_hash FROM root WHERE id = 1", [], |r| r.get(0))?;
+        let previous: String = self.inner.db.lock().query_row(
+            "SELECT previous_hash FROM root WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )?;
         let mut live = self.version_hashes()?;
         self.add_tree(&root.hash, true, &mut live)?;
         // The previous root is best effort: it may predate this server or be gone.
@@ -699,7 +805,9 @@ impl Storage {
         live.insert(root_hash.to_string());
         self.index_tree(root_hash)?;
         let unparsed = |hash: &str| {
-            ServerError::Internal(format!("index {hash} is missing or unparsed; refusing to report unreachable blobs"))
+            ServerError::Internal(format!(
+                "index {hash} is missing or unparsed; refusing to report unreachable blobs"
+            ))
         };
         let docs = match self.index_entries(root_hash)? {
             Some(docs) => docs,
@@ -737,14 +845,16 @@ impl Storage {
     /// when the tree can't be read, so callers deleting on `false` stay safe.
     pub fn is_referenced(&self, hash: &str) -> bool {
         let root = self.get_root();
-        let previous = self.inner.db.lock().query_row("SELECT previous_hash FROM root WHERE id = 1", [], |r| r.get::<_, String>(0));
+        let previous = self.inner.db.lock().query_row(
+            "SELECT previous_hash FROM root WHERE id = 1",
+            [],
+            |r| r.get::<_, String>(0),
+        );
         let mut live = HashSet::new();
-        let walked = previous
-            .map_err(ServerError::from)
-            .and_then(|previous| {
-                self.add_tree(&root.hash, true, &mut live)?;
-                self.add_tree(&previous, false, &mut live)
-            });
+        let walked = previous.map_err(ServerError::from).and_then(|previous| {
+            self.add_tree(&root.hash, true, &mut live)?;
+            self.add_tree(&previous, false, &mut live)
+        });
         match walked {
             Ok(()) => live.contains(hash),
             Err(e) => {
@@ -780,7 +890,11 @@ impl Storage {
             .inner
             .db
             .lock()
-            .query_row("SELECT COUNT(*), COALESCE(SUM(size), 0) FROM blobs", [], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM blobs",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
             .unwrap_or_else(|e| {
                 tracing::error!(error = %e, "reading storage stats failed");
                 (0, 0)
@@ -829,10 +943,14 @@ impl Storage {
     /// List all stored files with hash, filename, and size
     pub fn list(&self) -> Vec<(String, String, usize)> {
         let db = self.inner.db.lock();
-        let rows = db.prepare("SELECT hash, filename, size FROM blobs ORDER BY filename").and_then(|mut stmt| {
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as usize)))?
+        let rows = db
+            .prepare("SELECT hash, filename, size FROM blobs ORDER BY filename")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as usize))
+                })?
                 .collect::<rusqlite::Result<Vec<_>>>()
-        });
+            });
         rows.unwrap_or_else(|e| {
             tracing::error!(error = %e, "listing blobs failed");
             Vec::new()
@@ -851,8 +969,9 @@ pub struct StorageStats {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
+
+    use super::*;
 
     #[test]
     fn test_storage_put_get() {
@@ -888,7 +1007,10 @@ mod tests {
         // Overwrite with different-length content: never truncated, fully replaced.
         atomic_write(&path, b"second-and-longer").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"second-and-longer");
-        assert!(temp_residue(tmp.path()).is_empty(), "temp files left behind");
+        assert!(
+            temp_residue(tmp.path()).is_empty(),
+            "temp files left behind"
+        );
     }
 
     #[test]
@@ -900,9 +1022,14 @@ mod tests {
         // A fresh Storage over the same dir reads the persisted root back.
         let reloaded = Storage::new(tmp.path()).unwrap();
         assert_eq!(reloaded.get_root().hash, h);
-        assert!(temp_residue(tmp.path()).is_empty(), "temp files left behind");
+        assert!(
+            temp_residue(tmp.path()).is_empty(),
+            "temp files left behind"
+        );
         // root.json is kept as a mirror of the committed root.
-        let mirror: SyncRoot = serde_json::from_str(&fs::read_to_string(tmp.path().join("root.json")).unwrap()).unwrap();
+        let mirror: SyncRoot =
+            serde_json::from_str(&fs::read_to_string(tmp.path().join("root.json")).unwrap())
+                .unwrap();
         assert_eq!((mirror.hash, mirror.generation), (h, 1));
     }
 
@@ -947,7 +1074,10 @@ mod tests {
         storage.delete(&hash).unwrap();
         assert!(!storage.exists(&hash));
         assert!(storage.filename_for_hash(&hash).is_none());
-        assert!(matches!(storage.delete("../../etc"), Err(ServerError::InvalidHash(_))));
+        assert!(matches!(
+            storage.delete("../../etc"),
+            Err(ServerError::InvalidHash(_))
+        ));
     }
 
     #[test]
@@ -959,7 +1089,10 @@ mod tests {
 
         let mut listed = storage.list();
         listed.sort();
-        let mut expected = vec![(a.clone(), "a.pdf".to_string(), 4), (b.clone(), "b.content".to_string(), 2)];
+        let mut expected = vec![
+            (a.clone(), "a.pdf".to_string(), 4),
+            (b.clone(), "b.content".to_string(), 2),
+        ];
         expected.sort();
         assert_eq!(listed, expected);
 
@@ -989,13 +1122,20 @@ mod tests {
         let storage = Storage::new(tmp.path()).unwrap();
         assert!(tmp.path().join("sync.db").exists());
         let root = storage.get_root();
-        assert_eq!((root.hash.as_str(), root.generation), ("c".repeat(64).as_str(), 21));
+        assert_eq!(
+            (root.hash.as_str(), root.generation),
+            ("c".repeat(64).as_str(), 21)
+        );
         assert_eq!(storage.filename_for_hash(&hash).as_deref(), Some("doc.pdf"));
         assert_eq!(storage.get_by_filename("doc.pdf").unwrap(), b"legacy blob");
         assert_eq!(storage.list_hashes().unwrap(), vec![hash.clone()]);
 
         // Once imported, sync.db wins over a stale root.json.
-        fs::write(tmp.path().join("root.json"), serde_json::to_string(&SyncRoot::new("d".repeat(64), 3)).unwrap()).unwrap();
+        fs::write(
+            tmp.path().join("root.json"),
+            serde_json::to_string(&SyncRoot::new("d".repeat(64), 3)).unwrap(),
+        )
+        .unwrap();
         assert_eq!(Storage::new(tmp.path()).unwrap().get_root().generation, 21);
     }
 
@@ -1013,7 +1153,11 @@ mod tests {
         fs::create_dir_all(tmp.path().join(&orphan[..2])).unwrap();
         fs::write(tmp.path().join(&orphan[..2]).join(&orphan), b"orphan").unwrap();
         // Crash residue is not a blob.
-        fs::write(tmp.path().join(&kept[..2]).join(format!(".{kept}.tmp.1.0")), b"x").unwrap();
+        fs::write(
+            tmp.path().join(&kept[..2]).join(format!(".{kept}.tmp.1.0")),
+            b"x",
+        )
+        .unwrap();
 
         let storage = Storage::new(tmp.path()).unwrap();
         let mut expected = vec![kept, orphan];
@@ -1030,7 +1174,10 @@ mod tests {
 
         first.set_root_if("a".repeat(64), Some(0)).unwrap();
         let lost = second.set_root_if("b".repeat(64), Some(0));
-        assert!(matches!(lost, Err(ServerError::GenerationMismatch { current: 1 })));
+        assert!(matches!(
+            lost,
+            Err(ServerError::GenerationMismatch { current: 1 })
+        ));
         assert_eq!(second.get_root().hash, "a".repeat(64));
 
         second.set_root_if("b".repeat(64), Some(1)).unwrap();
@@ -1040,11 +1187,22 @@ mod tests {
     #[test]
     fn parses_schema_3_and_4_and_rejects_unknown() {
         let h = "e".repeat(64);
-        let (schema, entries) = parse_index(format!("3\n{h}:0:doc.content:0:12\n").as_bytes()).unwrap();
+        let (schema, entries) =
+            parse_index(format!("3\n{h}:0:doc.content:0:12\n").as_bytes()).unwrap();
         assert_eq!(schema, "3");
-        assert_eq!(entries, vec![IndexEntry { hash: h.clone(), kind: "0".into(), name: "doc.content".into(), subfiles: 0, size: 12 }]);
+        assert_eq!(
+            entries,
+            vec![IndexEntry {
+                hash: h.clone(),
+                kind: "0".into(),
+                name: "doc.content".into(),
+                subfiles: 0,
+                size: 12
+            }]
+        );
 
-        let (schema, entries) = parse_index(format!("4\n0:.:1:12\n{h}:0:doc.content:0:12\n").as_bytes()).unwrap();
+        let (schema, entries) =
+            parse_index(format!("4\n0:.:1:12\n{h}:0:doc.content:0:12\n").as_bytes()).unwrap();
         assert_eq!((schema.as_str(), entries.len()), ("4", 1));
 
         assert!(parse_index(b"9\nwhatever").is_err());
@@ -1056,16 +1214,30 @@ mod tests {
     fn projects_committed_tree_and_serves_index_verbatim() {
         let tmp = TempDir::new().unwrap();
         let storage = Storage::new(tmp.path()).unwrap();
-        let (id, _) = crate::documents::create_document(&storage, "Paper", "pdf", b"%PDF-1.4 test").unwrap();
+        let (id, _) =
+            crate::documents::create_document(&storage, "Paper", "pdf", b"%PDF-1.4 test").unwrap();
         let first_root = storage.get_root().hash;
 
-        let docs = storage.index_entries(&first_root).unwrap().expect("root parsed");
+        let docs = storage
+            .index_entries(&first_root)
+            .unwrap()
+            .expect("root parsed");
         assert_eq!(docs.len(), 1);
         assert_eq!(docs[0].name, id);
         assert!(docs[0].is_index());
-        let files = storage.index_entries(&docs[0].hash).unwrap().expect("doc index parsed");
+        let files = storage
+            .index_entries(&docs[0].hash)
+            .unwrap()
+            .expect("doc index parsed");
         let names: Vec<_> = files.iter().map(|f| f.name.clone()).collect();
-        assert_eq!(names, vec![format!("{id}.content"), format!("{id}.metadata"), format!("{id}.pdf")]);
+        assert_eq!(
+            names,
+            vec![
+                format!("{id}.content"),
+                format!("{id}.metadata"),
+                format!("{id}.pdf")
+            ]
+        );
         assert!(storage.missing_from_root().unwrap().is_empty());
 
         // The index bytes the tablet fetches are exactly what was stored.
@@ -1076,7 +1248,14 @@ mod tests {
         crate::documents::create_document(&storage, "Second", "pdf", b"%PDF-1.4 two").unwrap();
         assert_ne!(storage.get_root().hash, first_root);
         assert_eq!(storage.get(&first_root).unwrap(), stored);
-        assert_eq!(storage.index_entries(&storage.get_root().hash).unwrap().unwrap().len(), 2);
+        assert_eq!(
+            storage
+                .index_entries(&storage.get_root().hash)
+                .unwrap()
+                .unwrap()
+                .len(),
+            2
+        );
 
         // Deleting a leaf shows up as missing.
         let pdf = files.iter().find(|f| f.name.ends_with(".pdf")).unwrap();
@@ -1091,7 +1270,9 @@ mod tests {
         let leaf = storage.put(b"leaf", "leaf.rm").unwrap();
         let index = format!("7\n{leaf}:future:field:layout\n");
         let index_hash = "f".repeat(64);
-        storage.put_with_hash(index.as_bytes(), &index_hash, "root.docSchema").unwrap();
+        storage
+            .put_with_hash(index.as_bytes(), &index_hash, "root.docSchema")
+            .unwrap();
 
         let root = storage.set_root_if(index_hash.clone(), Some(0)).unwrap();
         assert_eq!(root.generation, 1);
@@ -1106,15 +1287,29 @@ mod tests {
     #[test]
     fn rollback_then_upgrade_adopts_newer_root_json() {
         let tmp = TempDir::new().unwrap();
-        Storage::new(tmp.path()).unwrap().set_root("a".repeat(64)).unwrap();
+        Storage::new(tmp.path())
+            .unwrap()
+            .set_root("a".repeat(64))
+            .unwrap();
         // An older build (no sync.db) commits two more roots, updating only root.json.
-        fs::write(tmp.path().join("root.json"), serde_json::to_string(&SyncRoot::new("b".repeat(64), 3)).unwrap()).unwrap();
+        fs::write(
+            tmp.path().join("root.json"),
+            serde_json::to_string(&SyncRoot::new("b".repeat(64), 3)).unwrap(),
+        )
+        .unwrap();
         let root = Storage::new(tmp.path()).unwrap().get_root();
         assert_eq!((root.hash, root.generation), ("b".repeat(64), 3));
 
         // Same generation, different hash: ambiguous, refuse to start.
-        fs::write(tmp.path().join("root.json"), serde_json::to_string(&SyncRoot::new("c".repeat(64), 3)).unwrap()).unwrap();
-        assert!(matches!(Storage::new(tmp.path()), Err(ServerError::Config(_))));
+        fs::write(
+            tmp.path().join("root.json"),
+            serde_json::to_string(&SyncRoot::new("c".repeat(64), 3)).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            Storage::new(tmp.path()),
+            Err(ServerError::Config(_))
+        ));
     }
 
     #[test]
@@ -1125,7 +1320,11 @@ mod tests {
         let root = storage.get_root().hash;
         let doc = &storage.index_entries(&root).unwrap().unwrap()[0];
         let leaf = &storage.index_entries(&doc.hash).unwrap().unwrap()[0];
-        assert!(storage.is_referenced(&root) && storage.is_referenced(&doc.hash) && storage.is_referenced(&leaf.hash));
+        assert!(
+            storage.is_referenced(&root)
+                && storage.is_referenced(&doc.hash)
+                && storage.is_referenced(&leaf.hash)
+        );
         let orphan = storage.put(b"orphan", "o.rm").unwrap();
         assert!(!storage.is_referenced(&orphan));
     }
@@ -1136,7 +1335,13 @@ mod tests {
         let storage = Storage::new(tmp.path()).unwrap();
         storage.write_mirror(&SyncRoot::new("a".repeat(64), 5));
         storage.write_mirror(&SyncRoot::new("b".repeat(64), 4));
-        assert_eq!(Storage::read_root_json(tmp.path()).unwrap().unwrap().generation, 5);
+        assert_eq!(
+            Storage::read_root_json(tmp.path())
+                .unwrap()
+                .unwrap()
+                .generation,
+            5
+        );
     }
 
     #[test]
@@ -1144,7 +1349,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let storage = Storage::new(tmp.path()).unwrap();
         let h = "f".repeat(64);
-        storage.put_with_hash(b"7\nunknown", &h, "root.docSchema").unwrap();
+        storage
+            .put_with_hash(b"7\nunknown", &h, "root.docSchema")
+            .unwrap();
         storage.set_root(h.clone()).unwrap();
         assert!(storage.index_entries(&h).unwrap().is_none());
         storage.put_with_hash(b"3\n", &h, "root.docSchema").unwrap();
@@ -1161,26 +1368,56 @@ mod tests {
         crate::documents::create_document(&storage, "Two", "pdf", b"%PDF-1.4 two").unwrap();
         // Root one is now the previous root: its tree is still live.
         let unreachable = storage.unreachable_blobs(Duration::ZERO).unwrap();
-        assert!(first_tree.iter().all(|h| !unreachable.contains(h)), "{unreachable:?}");
+        assert!(
+            first_tree.iter().all(|h| !unreachable.contains(h)),
+            "{unreachable:?}"
+        );
 
         // A version-history blob is live.
         let kept = storage.put(b"old content", "doc.content").unwrap();
         let versions = tmp.path().join("versions");
         fs::create_dir_all(&versions).unwrap();
         let db = Connection::open(versions.join("versions.db")).unwrap();
-        db.execute_batch("CREATE TABLE versions (content_hash TEXT NOT NULL)").unwrap();
-        db.execute("INSERT INTO versions VALUES (?1)", [&kept]).unwrap();
-        assert!(!storage.unreachable_blobs(Duration::ZERO).unwrap().contains(&kept));
+        db.execute_batch("CREATE TABLE versions (content_hash TEXT NOT NULL)")
+            .unwrap();
+        db.execute("INSERT INTO versions VALUES (?1)", [&kept])
+            .unwrap();
+        assert!(
+            !storage
+                .unreachable_blobs(Duration::ZERO)
+                .unwrap()
+                .contains(&kept)
+        );
 
         // Huge grace saturates instead of wrapping into "report everything".
-        assert!(storage.unreachable_blobs(Duration::from_secs(u64::MAX)).unwrap().is_empty());
+        assert!(
+            storage
+                .unreachable_blobs(Duration::from_secs(u64::MAX))
+                .unwrap()
+                .is_empty()
+        );
 
         // Touching resets the clock.
         let orphan = storage.put(b"orphan", "x.rm").unwrap();
-        storage.inner.db.lock().execute("UPDATE blobs SET updated_at = 0 WHERE hash = ?1", [&orphan]).unwrap();
-        assert!(storage.unreachable_blobs(Duration::from_secs(60)).unwrap().contains(&orphan));
+        storage
+            .inner
+            .db
+            .lock()
+            .execute("UPDATE blobs SET updated_at = 0 WHERE hash = ?1", [&orphan])
+            .unwrap();
+        assert!(
+            storage
+                .unreachable_blobs(Duration::from_secs(60))
+                .unwrap()
+                .contains(&orphan)
+        );
         storage.touch(&[orphan.clone()]).unwrap();
-        assert!(!storage.unreachable_blobs(Duration::from_secs(60)).unwrap().contains(&orphan));
+        assert!(
+            !storage
+                .unreachable_blobs(Duration::from_secs(60))
+                .unwrap()
+                .contains(&orphan)
+        );
     }
 
     #[test]
@@ -1190,9 +1427,93 @@ mod tests {
         crate::documents::create_document(&storage, "Live", "pdf", b"%PDF-1.4 live").unwrap();
         let orphan = storage.put(b"superseded page", "old.rm").unwrap();
 
-        assert_eq!(storage.unreachable_blobs(Duration::ZERO).unwrap(), vec![orphan.clone()]);
-        assert!(storage.unreachable_blobs(Duration::from_secs(3600)).unwrap().is_empty());
+        assert_eq!(
+            storage.unreachable_blobs(Duration::ZERO).unwrap(),
+            vec![orphan.clone()]
+        );
+        assert!(
+            storage
+                .unreachable_blobs(Duration::from_secs(3600))
+                .unwrap()
+                .is_empty()
+        );
         // Report only: nothing was deleted.
         assert!(storage.exists(&orphan));
+    }
+
+    mod props {
+        use proptest::prelude::*;
+
+        use super::super::*;
+
+        fn entry() -> impl Strategy<Value = IndexEntry> {
+            (
+                "[0-9a-f]{64}",
+                prop_oneof!["0", "80000000"],
+                "[A-Za-z0-9._/-]{1,40}",
+                any::<u32>(),
+                any::<u64>(),
+            )
+                .prop_map(|(hash, kind, name, subfiles, size)| IndexEntry {
+                    hash,
+                    kind: kind.into(),
+                    name,
+                    subfiles: subfiles.into(),
+                    size,
+                })
+        }
+
+        fn render(schema: &str, summary: bool, entries: &[IndexEntry]) -> String {
+            let mut out = format!("{schema}\n");
+            if summary {
+                out.push_str(&format!(
+                    "0:.:{}:{}\n",
+                    entries.len(),
+                    entries.iter().map(|e| e.size as u128).sum::<u128>()
+                ));
+            }
+            for e in entries {
+                out.push_str(&format!(
+                    "{}:{}:{}:{}:{}\n",
+                    e.hash, e.kind, e.name, e.subfiles, e.size
+                ));
+            }
+            out
+        }
+
+        proptest! {
+            #[test]
+            fn never_panics_on_arbitrary_bytes(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
+                let _ = parse_index(&bytes);
+                let _ = lenient_children(&bytes);
+            }
+
+            #[test]
+            fn schema_3_round_trips(entries in proptest::collection::vec(entry(), 0..20)) {
+                let (schema, parsed) = parse_index(render("3", false, &entries).as_bytes()).unwrap();
+                prop_assert_eq!(schema, "3");
+                prop_assert_eq!(parsed, entries);
+            }
+
+            #[test]
+            fn schema_4_summary_line_is_skipped(entries in proptest::collection::vec(entry(), 0..20)) {
+                let (schema, parsed) = parse_index(render("4", true, &entries).as_bytes()).unwrap();
+                prop_assert_eq!(schema, "4");
+                prop_assert_eq!(parsed, entries);
+            }
+
+            #[test]
+            fn lenient_reader_agrees_on_valid_indexes(entries in proptest::collection::vec(entry(), 0..20)) {
+                let text = render("3", false, &entries);
+                let strict: Vec<String> = parse_index(text.as_bytes()).unwrap().1.into_iter().map(|e| e.hash).collect();
+                prop_assert_eq!(lenient_children(text.as_bytes()), strict);
+            }
+
+            #[test]
+            fn other_schemas_are_rejected(schema in "[0-9a-z]{1,3}", entries in proptest::collection::vec(entry(), 0..5)) {
+                prop_assume!(schema != "3" && schema != "4");
+                prop_assert!(parse_index(render(&schema, false, &entries).as_bytes()).is_err());
+            }
+        }
     }
 }

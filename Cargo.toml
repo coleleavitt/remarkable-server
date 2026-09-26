@@ -65,6 +65,7 @@ tokio-test = "0.4"
 # Fake tablet peer for the screen share viewer test
 webrtc = { git = "https://github.com/coleleavitt/webrtc", branch = "fix/datachannel-max-message-size" }
 flate2 = "1"
+proptest = "1.11.0"
 
 # MQTT broker for device notifications
 
