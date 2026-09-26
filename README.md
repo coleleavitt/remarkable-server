@@ -313,14 +313,16 @@ accepts, so no other change is needed; the id access data is an HS512 auth data 
 Device codes are **not** auto-approved (RFC 8628): `/oauth/token` answers
 `authorization_pending` until the owner approves the `user_code` the client shows, and
 `expired_token` after `expires_in` (600 s). Pending codes are held in memory, expired ones are
-evicted, and at most 256 are kept. To approve (`ADMIN_TOKEN` must be set):
+evicted, and at most 256 are kept (unapproved codes are dropped first). To approve (the first
+two need `ADMIN_TOKEN` set; the third does not):
 
 - open the advertised `verification_uri` (`https://<host>/oauth/verify?user_code=1234-5678`)
   and submit the code with the admin token, or
 - `curl -X POST https://<host>/admin/oauth/approve -H "x-admin-token: $ADMIN_TOKEN"
   -H 'content-type: application/json' -d '{"user_code":"1234-5678"}'`, or
 - the same request with `Authorization: Bearer <device credential>` of an already-paired
-  device instead of the admin token (short-lived access credentials are refused).
+  device instead of the admin token (short-lived access credentials and credentials of
+  deleted devices are refused).
 
 The server also logs `OAuth device code requested` with the `user_code` at WARN. Legacy
 pairing (`--pair` + `/token/json/2/device/new`) and `/token/json/4/device/exchange` are

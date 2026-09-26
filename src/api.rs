@@ -194,8 +194,15 @@ pub struct CreateUserRequest { pub email: String }
 
 /// Admin-only endpoints are disabled unless `ADMIN_TOKEN` is set; callers must send it
 /// in `x-admin-token`.
-pub(crate) fn require_admin(headers: &HeaderMap) -> Result<()> {
-    let expected = std::env::var("ADMIN_TOKEN").ok().filter(|t| !t.is_empty()).ok_or(ServerError::Unauthorized)?;
+pub(crate) fn require_admin(headers: &HeaderMap) -> Result<()> { check_admin(admin_token().as_deref(), headers) }
+
+/// The configured `ADMIN_TOKEN`, if set and non-empty.
+pub(crate) fn admin_token() -> Option<String> { std::env::var("ADMIN_TOKEN").ok().filter(|t| !t.is_empty()) }
+
+/// `require_admin` against an explicit expected token (`None` = admin disabled), so callers
+/// can be tested without touching the process environment.
+pub(crate) fn check_admin(expected: Option<&str>, headers: &HeaderMap) -> Result<()> {
+    let expected = expected.filter(|t| !t.is_empty()).ok_or(ServerError::Unauthorized)?;
     let given = headers.get("x-admin-token").and_then(|v| v.to_str().ok()).ok_or(ServerError::Unauthorized)?;
     if given.as_bytes() != expected.as_bytes() { return Err(ServerError::Unauthorized); }
     Ok(())

@@ -43,13 +43,17 @@ struct PendingCodes { map: HashMap<String, Pending>, cap: usize }
 impl PendingCodes {
     fn new(cap: usize) -> Self { Self { map: HashMap::new(), cap } }
     fn evict(&mut self, now: Instant) { self.map.retain(|_, p| now.saturating_duration_since(p.at) <= DEVICE_CODE_TTL); }
+    /// Past the cap the oldest *unapproved* code goes first, so unauthenticated `/oauth/device/code`
+    /// floods can't push out a code the owner already approved (only approvers create those).
     fn insert(&mut self, device_code: String, user_code: String, now: Instant) {
         self.evict(now);
         while self.map.len() >= self.cap {
-            let Some(oldest) = self.map.iter().min_by_key(|(_, p)| p.at).map(|(k, _)| k.clone()) else { break };
-            self.map.remove(&oldest);
+            let oldest = |approved: bool| self.map.iter().filter(|(_, p)| approved || p.approved_by.is_none()).min_by_key(|(_, p)| p.at).map(|(k, _)| k.clone());
+            let Some(victim) = oldest(false).or_else(|| oldest(true)) else { break };
+            self.map.remove(&victim);
         }
-        let device_id = format!("oauth-{}", &device_code[..8.min(device_code.len())]);
+        // Own random id (not a device_code prefix): no collisions between tablets, and the code never leaks into tokens.
+        let device_id = format!("oauth-{}", uuid::Uuid::new_v4().simple());
         self.map.insert(device_code, Pending { device_id, user_code, at: now, approved_by: None });
     }
     fn has_user_code(&self, user_code: &str) -> bool { self.map.values().any(|p| p.user_code == user_code) }
@@ -61,15 +65,18 @@ impl PendingCodes {
             None => false,
         }
     }
-    /// Poll a device_code; an approved code is consumed (single use).
-    fn poll(&mut self, device_code: &str, now: Instant) -> Poll {
+    /// Poll a device_code; an approved code is taken out (single use). Hand it back with `restore`
+    /// if issuing the tokens fails, so the tablet's next poll can retry.
+    fn poll(&mut self, device_code: &str, now: Instant) -> (Poll, Option<Pending>) {
         let expired = match self.map.get(device_code) { Some(p) => now.saturating_duration_since(p.at) > DEVICE_CODE_TTL, None => true };
         self.evict(now);
-        if expired { return Poll::Expired; }
-        if self.map[device_code].approved_by.is_none() { return Poll::Pending; }
+        if expired { return (Poll::Expired, None); }
+        if self.map[device_code].approved_by.is_none() { return (Poll::Pending, None); }
         let p = self.map.remove(device_code).expect("checked above");
-        Poll::Approved { user_id: p.approved_by.unwrap_or_default(), device_id: p.device_id }
+        (Poll::Approved { user_id: p.approved_by.clone().unwrap_or_default(), device_id: p.device_id.clone() }, Some(p))
     }
+    /// Put back an approved code whose token issuance failed (it keeps its original expiry).
+    fn restore(&mut self, device_code: String, p: Pending) { self.map.insert(device_code, p); }
 }
 
 static PENDING: LazyLock<Mutex<PendingCodes>> = LazyLock::new(|| Mutex::new(PendingCodes::new(MAX_PENDING)));
@@ -122,13 +129,16 @@ pub async fn token(State(state): State<AppState>, Form(f): Form<HashMap<String, 
     let grant = f.get("grant_type").map(String::as_str).unwrap_or("");
     if grant == DEVICE_CODE_GRANT {
         let Some(dc) = f.get("device_code") else { return oauth_err("invalid_request"); };
-        let polled = pending().poll(dc, Instant::now());
+        let (polled, taken) = pending().poll(dc, Instant::now());
         match polled {
             Poll::Pending => oauth_err("authorization_pending"),
             Poll::Expired => oauth_err("expired_token"),
             Poll::Approved { user_id, device_id } => match state.devices.oauth_bundle(&user_id, &device_id, "remarkable") {
                 Ok((a, r, i)) => (StatusCode::OK, Json(bundle_value(a, r, i))).into_response(),
-                Err(e) => e.into_response(),
+                Err(e) => {
+                    if let Some(p) = taken { pending().restore(dc.clone(), p); }
+                    e.into_response()
+                }
             },
         }
     } else if grant == "refresh_token" {
@@ -146,17 +156,18 @@ pub async fn token(State(state): State<AppState>, Form(f): Form<HashMap<String, 
 /// like the other `/admin` endpoints), or an already-paired device via its device (refresh)
 /// credential, which can mint the same bundle through `/token/json/4/device/exchange` anyway.
 /// Short-lived access credentials are not accepted, so they can't be upgraded to a long-lived one.
-fn approver(state: &AppState, headers: &HeaderMap) -> Result<String> {
+/// `admin` is the configured `ADMIN_TOKEN` (passed in so tests don't mutate the process env).
+fn approver(state: &AppState, headers: &HeaderMap, admin: Option<&str>) -> Result<String> {
     if headers.contains_key("x-admin-token") {
-        crate::api::require_admin(headers)?;
+        crate::api::check_admin(admin, headers)?;
         return Ok(LOCAL_USER.to_owned());
     }
     let auth = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).ok_or(ServerError::Unauthorized)?;
     state.devices.device_token_user(auth.strip_prefix("Bearer ").ok_or(ServerError::Unauthorized)?)
 }
 
-fn approve_code(state: &AppState, headers: &HeaderMap, user_code: &str) -> Result<Json<Value>> {
-    let user = approver(state, headers)?;
+fn approve_code(state: &AppState, headers: &HeaderMap, user_code: &str, admin: Option<&str>) -> Result<Json<Value>> {
+    let user = approver(state, headers, admin)?;
     let user_code = user_code.trim();
     if !pending().approve(user_code, &user, Instant::now()) {
         return Err(ServerError::NotFound("unknown or expired user_code".into()));
@@ -170,16 +181,20 @@ pub struct ApproveRequest { user_code: String, #[serde(default)] admin_token: Op
 
 /// `POST /admin/oauth/approve {"user_code": "1234-5678"}` (`x-admin-token` or device Bearer).
 pub async fn admin_approve(State(state): State<AppState>, headers: HeaderMap, Json(req): Json<ApproveRequest>) -> Result<Json<Value>> {
-    approve_code(&state, &headers, &req.user_code)
+    approve_code(&state, &headers, &req.user_code, crate::api::admin_token().as_deref())
 }
 
 /// `POST /oauth/verify` (form `user_code`, credential as `x-admin-token`/Bearer header or the
 /// `admin_token` form field used by the page below).
-pub async fn verify(State(state): State<AppState>, mut headers: HeaderMap, Form(req): Form<ApproveRequest>) -> Result<Json<Value>> {
+pub async fn verify(State(state): State<AppState>, headers: HeaderMap, Form(req): Form<ApproveRequest>) -> Result<Json<Value>> {
+    verify_with(&state, headers, &req, crate::api::admin_token().as_deref())
+}
+
+fn verify_with(state: &AppState, mut headers: HeaderMap, req: &ApproveRequest, admin: Option<&str>) -> Result<Json<Value>> {
     if let Some(t) = req.admin_token.as_deref().filter(|t| !t.is_empty()) {
         headers.insert("x-admin-token", HeaderValue::from_str(t).map_err(|_| ServerError::Unauthorized)?);
     }
-    approve_code(&state, &headers, &req.user_code)
+    approve_code(state, &headers, &req.user_code, admin)
 }
 
 #[derive(Deserialize)]
@@ -218,6 +233,8 @@ mod tests {
     use super::*;
     use crate::{device::DeviceManager, storage::Storage};
     use axum::http::HeaderValue;
+
+    const ADMIN: &str = "oauth-test-admin-token";
 
     fn setup() -> (AppState, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -262,7 +279,7 @@ mod tests {
         assert_eq!((st, v["error"].as_str()), (StatusCode::BAD_REQUEST, Some("authorization_pending")));
 
         // 3. owner approves with a paired device credential, then the grant -> access/refresh/id
-        approve_code(&state, &bearer(&paired_device_token(&state)), &user_code).unwrap();
+        assert!(approve_code(&state, &bearer(&paired_device_token(&state)), &user_code, None).is_ok());
         let (st, v) = body_json(token(State(state.clone()), grant(&code)).await).await;
         assert_eq!(st, StatusCode::OK);
         let access = v["access_token"].as_str().unwrap().to_string();
@@ -301,44 +318,70 @@ mod tests {
         let (state, _tmp) = setup();
         let (code, user_code) = mint(&state).await;
         // no credential, wrong admin token, a short-lived access credential, garbage bearer
-        assert!(matches!(approve_code(&state, &HeaderMap::new(), &user_code), Err(ServerError::Unauthorized)));
+        assert!(matches!(approve_code(&state, &HeaderMap::new(), &user_code, None), Err(ServerError::Unauthorized)));
         let mut bad = HeaderMap::new();
         bad.insert("x-admin-token", HeaderValue::from_static("definitely-not-the-admin-token"));
-        assert!(approve_code(&state, &bad, &user_code).is_err());
+        assert!(approve_code(&state, &bad, &user_code, Some(ADMIN)).is_err());
+        assert!(approve_code(&state, &bad, &user_code, None).is_err(), "admin disabled when ADMIN_TOKEN unset");
         let access = state.devices.oauth_bundle(LOCAL_USER, "paired-tablet", "remarkable").unwrap().0;
-        assert!(approve_code(&state, &bearer(&access), &user_code).is_err());
-        assert!(approve_code(&state, &bearer("nope"), &user_code).is_err());
+        assert!(approve_code(&state, &bearer(&access), &user_code, None).is_err());
+        assert!(approve_code(&state, &bearer("nope"), &user_code, None).is_err());
         // form field admin_token is checked the same way
-        let r = verify(State(state.clone()), HeaderMap::new(), Form(ApproveRequest { user_code: user_code.clone(), admin_token: Some("wrong".into()) })).await;
-        assert!(r.is_err());
+        assert!(verify_with(&state, HeaderMap::new(), &ApproveRequest { user_code: user_code.clone(), admin_token: Some("wrong".into()) }, Some(ADMIN)).is_err());
         let (_, v) = body_json(token(State(state.clone()), grant(&code)).await).await;
         assert_eq!(v["error"], "authorization_pending");
         // unknown user_code with a valid credential
-        assert!(matches!(approve_code(&state, &bearer(&paired_device_token(&state)), "0000-000x"), Err(ServerError::NotFound(_))));
+        assert!(matches!(approve_code(&state, &bearer(&paired_device_token(&state)), "0000-000x", None), Err(ServerError::NotFound(_))));
     }
 
     #[tokio::test]
     async fn admin_token_approves_via_json_and_verify_form() {
-        std::env::set_var("ADMIN_TOKEN", "oauth-test-admin-token");
         let (state, _tmp) = setup();
         let mut h = HeaderMap::new();
-        h.insert("x-admin-token", HeaderValue::from_static("oauth-test-admin-token"));
+        h.insert("x-admin-token", HeaderValue::from_static(ADMIN));
         let (code, user_code) = mint(&state).await;
-        admin_approve(State(state.clone()), h, Json(ApproveRequest { user_code, admin_token: None })).await.unwrap();
+        assert!(approve_code(&state, &h, &user_code, Some(ADMIN)).is_ok());
         assert_eq!(token(State(state.clone()), grant(&code)).await.status(), StatusCode::OK);
 
         let (code, user_code) = mint(&state).await;
-        verify(State(state.clone()), HeaderMap::new(), Form(ApproveRequest { user_code, admin_token: Some("oauth-test-admin-token".into()) })).await.unwrap();
+        assert!(verify_with(&state, HeaderMap::new(), &ApproveRequest { user_code, admin_token: Some(ADMIN.into()) }, Some(ADMIN)).is_ok());
         let (st, v) = body_json(token(State(state.clone()), grant(&code)).await).await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(state.devices.caller(&format!("Bearer {}", v["access_token"].as_str().unwrap())).unwrap().0, LOCAL_USER);
     }
 
     #[tokio::test]
+    async fn deleted_device_cannot_approve() {
+        let (state, _tmp) = setup();
+        let (_, user_code) = mint(&state).await;
+        let dev = paired_device_token(&state);
+        assert!(state.devices.delete_device("paired-tablet").unwrap());
+        assert!(matches!(approve_code(&state, &bearer(&dev), &user_code, None), Err(ServerError::Unauthorized)));
+        // signature alone is not enough: the device row must still exist
+        assert!(state.devices.device_token_user(&dev).is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_issuance_keeps_approval_for_retry() {
+        let (state, tmp) = setup();
+        let (code, user_code) = mint(&state).await;
+        assert!(approve_code(&state, &bearer(&paired_device_token(&state)), &user_code, None).is_ok());
+        // make oauth_bundle's device write fail
+        let db = rusqlite::Connection::open(tmp.path().join("devices.db")).unwrap();
+        db.execute_batch("ALTER TABLE devices RENAME TO devices_away").unwrap();
+        assert!(token(State(state.clone()), grant(&code)).await.status().is_server_error());
+        db.execute_batch("ALTER TABLE devices_away RENAME TO devices").unwrap();
+        // the approval survived: the retry gets tokens, and only once
+        assert_eq!(token(State(state.clone()), grant(&code)).await.status(), StatusCode::OK);
+        let (_, v) = body_json(token(State(state.clone()), grant(&code)).await).await;
+        assert_eq!(v["error"], "expired_token");
+    }
+
+    #[tokio::test]
     async fn expired_code_is_rejected_even_if_approved() {
         let (state, _tmp) = setup();
         let (code, user_code) = mint(&state).await;
-        approve_code(&state, &bearer(&paired_device_token(&state)), &user_code).unwrap();
+        assert!(approve_code(&state, &bearer(&paired_device_token(&state)), &user_code, None).is_ok());
         // age the entry past expires_in
         pending().map.get_mut(&code).unwrap().at = Instant::now().checked_sub(DEVICE_CODE_TTL + Duration::from_secs(1)).unwrap();
         let (st, v) = body_json(token(State(state.clone()), grant(&code)).await).await;
@@ -347,7 +390,7 @@ mod tests {
         // and it can no longer be approved
         let (code2, user_code2) = mint(&state).await;
         pending().map.get_mut(&code2).unwrap().at = Instant::now().checked_sub(DEVICE_CODE_TTL + Duration::from_secs(1)).unwrap();
-        assert!(approve_code(&state, &bearer(&paired_device_token(&state)), &user_code2).is_err());
+        assert!(approve_code(&state, &bearer(&paired_device_token(&state)), &user_code2, None).is_err());
     }
 
     #[test]
@@ -357,20 +400,42 @@ mod tests {
         for i in 0..5 { p.insert(format!("code{i:04}xxxx"), format!("0000-000{i}"), t0 + Duration::from_secs(i)); }
         assert_eq!(p.map.len(), 3, "capped");
         assert!(!p.map.contains_key("code0000xxxx") && !p.map.contains_key("code0001xxxx"), "oldest dropped first");
-        assert_eq!(p.poll("code0004xxxx", t0 + Duration::from_secs(5)), Poll::Pending);
+        assert_eq!(p.poll("code0004xxxx", t0 + Duration::from_secs(5)).0, Poll::Pending);
         assert!(p.approve("0000-0004", "u", t0 + Duration::from_secs(5)));
-        assert_eq!(p.poll("code0004xxxx", t0 + Duration::from_secs(6)), Poll::Approved { user_id: "u".into(), device_id: "oauth-code0004".into() });
+        let dev = p.map["code0004xxxx"].device_id.clone();
+        assert!(dev.starts_with("oauth-") && dev.len() == 6 + 32 && !dev.contains("code0004"), "{dev}");
+        let (polled, taken) = p.poll("code0004xxxx", t0 + Duration::from_secs(6));
+        assert_eq!(polled, Poll::Approved { user_id: "u".into(), device_id: dev.clone() });
+        assert_eq!(p.poll("code0004xxxx", t0 + Duration::from_secs(6)).0, Poll::Expired, "single use");
+        p.restore("code0004xxxx".into(), taken.unwrap());
+        assert_eq!(p.poll("code0004xxxx", t0 + Duration::from_secs(7)).0, Poll::Approved { user_id: "u".into(), device_id: dev }, "restored after a failed issue");
         // everything left expires; a later insert evicts it without any poll
         p.insert("fresh000xxxx".into(), "1111-1111".into(), t0 + DEVICE_CODE_TTL + Duration::from_secs(10));
         assert_eq!(p.map.keys().collect::<Vec<_>>(), vec!["fresh000xxxx"]);
-        assert_eq!(p.poll("missing", t0), Poll::Expired);
+        assert_eq!(p.poll("missing", t0).0, Poll::Expired);
+    }
+
+    #[test]
+    fn cap_eviction_spares_approved_codes() {
+        let t0 = Instant::now();
+        let mut p = PendingCodes::new(3);
+        p.insert("approved".into(), "0000-0000".into(), t0);
+        assert!(p.approve("0000-0000", "u", t0));
+        // an unauthenticated flood of new codes never pushes out the (oldest) approved one
+        for i in 1..50 { p.insert(format!("flood{i}"), format!("1111-{i:04}"), t0 + Duration::from_secs(i)); }
+        assert_eq!(p.map.len(), 3);
+        assert!(matches!(p.poll("approved", t0 + Duration::from_secs(60)).0, Poll::Approved { .. }));
+        // with only approved codes left, the oldest approved one goes
+        let mut p = PendingCodes::new(2);
+        for i in 0..3u64 { p.insert(format!("a{i}"), format!("2222-000{i}"), t0 + Duration::from_secs(i)); assert!(p.approve(&format!("2222-000{i}"), "u", t0 + Duration::from_secs(i))); }
+        assert!(!p.map.contains_key("a0") && p.map.contains_key("a1") && p.map.contains_key("a2"));
     }
 
     #[tokio::test]
     async fn device_code_grant_type_must_match_exactly() {
         let (state, _tmp) = setup();
         let (code, user_code) = mint(&state).await;
-        approve_code(&state, &bearer(&paired_device_token(&state)), &user_code).unwrap();
+        assert!(approve_code(&state, &bearer(&paired_device_token(&state)), &user_code, None).is_ok());
         for g in ["device_code", "evil:device_code", "urn:ietf:params:oauth:grant-type:device_code "] {
             let f = Form(HashMap::from([("grant_type".to_string(), g.to_string()), ("device_code".to_string(), code.clone())]));
             let (_, v) = body_json(token(State(state.clone()), f).await).await;
