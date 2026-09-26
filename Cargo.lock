@@ -2811,6 +2811,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac",
+ "html5ever",
  "imap",
  "jsonwebtoken",
  "lettre",
