@@ -380,6 +380,12 @@ impl DeviceManager {
             device_id: device_id.into(),
         });
     }
+    /// Send a revocation event without changing any registration: lets a test overflow the
+    /// channel without a DB round-trip per event.
+    #[cfg(test)]
+    pub(crate) fn announce_revoked_for_test(&self, user_id: &str, device_id: &str) {
+        self.announce_revoked(user_id.into(), device_id);
+    }
     /// Revocation events for open sessions. Subscribe before checking a session's registration,
     /// so a revocation landing in between is not missed.
     pub fn subscribe_revocations(&self) -> tokio::sync::broadcast::Receiver<DeviceRevoked> {

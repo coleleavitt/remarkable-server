@@ -20,7 +20,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::api::AppState;
-use crate::device::{DeviceManager, DeviceRevoked};
+use crate::device::{DeviceManager, DeviceRevoked, SESSION_RECHECK, SessionIdentity};
 use crate::error::{Result, ServerError};
 use crate::notifications::WsMessage;
 
@@ -37,6 +37,22 @@ pub struct RoomClient {
     pub user_id: String,
     #[serde(rename = "isOwner")]
     pub is_owner: bool,
+    /// The device registration the client joined under; `None` for an in-process client (the
+    /// server's own viewer), which no revocation concerns.
+    #[serde(skip)]
+    registration: Option<SessionIdentity>,
+}
+
+impl RoomClient {
+    /// A device, as the registration its token was minted under.
+    fn device(who: &SessionIdentity, is_owner: bool) -> Self {
+        Self {
+            client_id: who.device_id.clone(),
+            user_id: who.user_id.clone(),
+            is_owner,
+            registration: Some(who.clone()),
+        }
+    }
 }
 
 struct Room {
@@ -61,27 +77,20 @@ impl RoomManager {
         rooms.retain(|_, r| r.last_activity.elapsed() <= ROOM_TIMEOUT);
     }
 
-    /// Create a room owned by `user_id`, with `device_id` as the owner client.
-    fn create(&self, user_id: &str, device_id: &str) -> (String, String) {
+    /// Create a room owned by `owner`'s account, with its device as the owner client.
+    fn create(&self, owner: &SessionIdentity) -> (String, String) {
         let mut rooms = self.rooms.lock();
         Self::sweep(&mut rooms);
         let room_id = uuid::Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now();
-        let mut participants = HashMap::new();
-        participants.insert(
-            device_id.to_string(),
-            RoomClient {
-                client_id: device_id.to_string(),
-                user_id: user_id.to_string(),
-                is_owner: true,
-            },
-        );
+        let participants =
+            HashMap::from([(owner.device_id.clone(), RoomClient::device(owner, true))]);
         rooms.insert(
             room_id.clone(),
             Room {
                 created_at,
                 last_activity: Instant::now(),
-                owner_user_id: user_id.to_string(),
+                owner_user_id: owner.user_id.clone(),
                 participants,
             },
         );
@@ -99,15 +108,11 @@ impl RoomManager {
             .map(|(id, _)| id.clone())
     }
 
-    fn add_participant(&self, room_id: &str, client_id: &str, user_id: &str) {
+    fn add_participant(&self, room_id: &str, who: &SessionIdentity) {
         if let Some(r) = self.rooms.lock().get_mut(room_id) {
             r.participants
-                .entry(client_id.to_string())
-                .or_insert(RoomClient {
-                    client_id: client_id.to_string(),
-                    user_id: user_id.to_string(),
-                    is_owner: false,
-                });
+                .entry(who.device_id.clone())
+                .or_insert_with(|| RoomClient::device(who, false));
         }
     }
 
@@ -158,25 +163,44 @@ impl RoomManager {
         }
     }
 
-    /// Take a revoked device out of its account's rooms: rooms it owns close (it can no longer
-    /// share into them), rooms it only joined lose it as a participant.
-    fn drop_device(&self, user_id: &str, device_id: &str) {
-        self.rooms.lock().retain(|room_id, r| {
-            if r.owner_user_id != user_id {
-                return true;
+    /// Every device participant, as (room, the registration it joined under).
+    fn registrations(&self) -> Vec<(String, SessionIdentity)> {
+        let rooms = self.rooms.lock();
+        rooms
+            .iter()
+            .flat_map(|(room_id, r)| {
+                r.participants
+                    .values()
+                    .filter_map(|c| Some((room_id.clone(), c.registration.clone()?)))
+            })
+            .collect()
+    }
+
+    /// Take each (room, registration) participant out of its room: a room it owns closes (it can
+    /// no longer share into it), one it only joined loses it. Only that very registration goes:
+    /// the device joined under a later one (paired again) is another participant and stays.
+    fn drop_registrations(&self, ended: &[(String, SessionIdentity)]) {
+        let mut rooms = self.rooms.lock();
+        for (room_id, reg) in ended {
+            let Some(r) = rooms.get_mut(room_id) else {
+                continue;
+            };
+            let Some(c) = r
+                .participants
+                .get(&reg.device_id)
+                .filter(|c| c.registration.as_ref() == Some(reg))
+            else {
+                continue;
+            };
+            let device_id = &reg.device_id;
+            if c.is_owner {
+                tracing::info!(%room_id, %device_id, "screenshare room closed: owner device revoked");
+                rooms.remove(room_id);
+            } else {
+                tracing::info!(%room_id, %device_id, "revoked device left screenshare room");
+                r.participants.remove(device_id);
             }
-            match r.participants.get(device_id) {
-                Some(c) if c.is_owner => {
-                    tracing::info!(%room_id, %device_id, "screenshare room closed: owner device revoked");
-                    false
-                }
-                Some(_) => {
-                    r.participants.remove(device_id);
-                    true
-                }
-                None => true,
-            }
-        });
+        }
     }
 
     fn exists(&self, room_id: &str) -> bool {
@@ -214,24 +238,34 @@ impl RoomManager {
         ))
     }
 
-    /// Join `room_id` of `user_id`'s account; false if the room is gone or
-    /// belongs to another account. Checked and joined under one lock.
+    /// Join `room_id` of `user_id`'s account as an in-process client, such as the server's
+    /// viewer, which holds no device registration. See [`join_as`](Self::join_as).
     pub fn join(&self, room_id: &str, client_id: &str, user_id: &str) -> bool {
+        self.join_as(
+            room_id,
+            RoomClient {
+                client_id: client_id.to_string(),
+                user_id: user_id.to_string(),
+                is_owner: false,
+                registration: None,
+            },
+        )
+    }
+
+    /// Join `room_id` as `client`; false if the room is gone or belongs to another account.
+    /// Checked and joined under one lock.
+    fn join_as(&self, room_id: &str, client: RoomClient) -> bool {
         let mut rooms = self.rooms.lock();
         Self::sweep(&mut rooms);
         let Some(r) = rooms
             .get_mut(room_id)
-            .filter(|r| r.owner_user_id == user_id)
+            .filter(|r| r.owner_user_id == client.user_id)
         else {
             return false;
         };
         r.participants
-            .entry(client_id.to_string())
-            .or_insert(RoomClient {
-                client_id: client_id.to_string(),
-                user_id: user_id.to_string(),
-                is_owner: false,
-            });
+            .entry(client.client_id.clone())
+            .or_insert(client);
         r.last_activity = Instant::now();
         true
     }
@@ -244,10 +278,11 @@ impl RoomManager {
     }
 }
 
-/// Drop revoked devices from REST rooms as their revocation events arrive (see
-/// [`DeviceManager::subscribe_revocations`]). Every REST call authenticates afresh, so a revoked
-/// device can't act in a room anyway; this closes the rooms it owned, which a viewer's keepalives
-/// would otherwise keep alive.
+/// Take revoked devices out of REST rooms: on each revocation event (see
+/// [`DeviceManager::subscribe_revocations`]), and for every room after missed events and every
+/// [`SESSION_RECHECK`], which also catches an event whose check hit a DB error. Every REST call
+/// authenticates afresh, so a revoked device can't act in a room anyway; this closes the rooms it
+/// owned, which a viewer's keepalives would otherwise keep alive.
 pub fn spawn_revocation_cleanup(
     devices: DeviceManager,
     rooms: RoomManager,
@@ -255,30 +290,49 @@ pub fn spawn_revocation_cleanup(
     use tokio::sync::broadcast::error::RecvError;
     let mut events = devices.subscribe_revocations();
     tokio::spawn(async move {
+        let mut recheck = tokio::time::interval_at(
+            tokio::time::Instant::now() + SESSION_RECHECK,
+            SESSION_RECHECK,
+        );
+        recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            match events.recv().await {
-                Ok(ev) => on_revoked(&devices, &rooms, &ev),
-                // Missed rooms still expire after ROOM_TIMEOUT once nobody keeps them alive.
-                Err(RecvError::Lagged(n)) => {
-                    tracing::warn!("screenshare room cleanup missed {n} revocation events")
-                }
-                Err(RecvError::Closed) => return,
-            }
+            let device = tokio::select! {
+                ev = events.recv() => match ev {
+                    Ok(ev) => Some(ev),
+                    Err(RecvError::Lagged(n)) => {
+                        tracing::warn!("screenshare room cleanup missed {n} revocation events; re-checking every room");
+                        None
+                    }
+                    Err(RecvError::Closed) => return,
+                },
+                _ = recheck.tick() => None,
+            };
+            let ended = ended_registrations(&devices, &rooms, device.as_ref());
+            rooms.drop_registrations(&ended);
         }
     })
 }
 
-fn on_revoked(devices: &DeviceManager, rooms: &RoomManager, ev: &DeviceRevoked) {
-    // Deleted and at once paired again to the same account: rooms it has now may belong to the
-    // new registration, so leave them be. The id must match exactly, as in the token checks
-    // (`get_device` ignores case, so it could find another device of the account).
-    let re_paired = devices
-        .list_devices(Some(&ev.user_id))
-        .is_ok_and(|ds| ds.iter().any(|d| d.device_id == ev.device_id));
-    if re_paired {
-        return;
-    }
-    rooms.drop_device(&ev.user_id, &ev.device_id);
+/// The device participants whose registration has ended: in every room, or only `device`'s (on
+/// its revocation event). Only a definite "not registered / revoked" counts; on a DB error the
+/// participant stays until a later check gets an answer (the periodic one at the latest).
+///
+/// Checked outside the room lock (a DB lookup each), yet dropping them afterwards stays exact: an
+/// ended registration never comes back (a re-pair gets a new epoch), and whatever the device
+/// makes or joins under the new one holds that one instead.
+fn ended_registrations(
+    devices: &DeviceManager,
+    rooms: &RoomManager,
+    device: Option<&DeviceRevoked>,
+) -> Vec<(String, SessionIdentity)> {
+    rooms
+        .registrations()
+        .into_iter()
+        .filter(|(_, reg)| {
+            device.is_none_or(|d| d.user_id == reg.user_id && d.device_id == reg.device_id)
+        })
+        .filter(|(_, reg)| !devices.session_still_valid(reg))
+        .collect()
 }
 
 fn authz(headers: &HeaderMap) -> Result<&str> {
@@ -293,13 +347,15 @@ pub async fn create_room(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<Value>)> {
-    let (user_id, device_id, _) = state.devices.caller(authz(&headers)?)?;
-    let (room_id, created_at) = state.screenshare.create(&user_id, &device_id);
+    let who = state.devices.session_identity(authz(&headers)?)?;
+    let (room_id, created_at) = state.screenshare.create(&who);
     // Tell the user's other clients to join. sourceDeviceID = creator, so the creator drops it.
     let _ = state
         .notification_tx
         .send(WsMessage::screenshare_room_created(
-            &user_id, &device_id, &room_id,
+            &who.user_id,
+            &who.device_id,
+            &room_id,
         ));
     Ok((
         StatusCode::CREATED,
@@ -314,16 +370,14 @@ pub async fn join_active(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<Value>)> {
-    let (user_id, device_id, _) = state.devices.caller(authz(&headers)?)?;
-    let Some(room_id) = state.screenshare.find_active(&user_id) else {
+    let who = state.devices.session_identity(authz(&headers)?)?;
+    let Some(room_id) = state.screenshare.find_active(&who.user_id) else {
         return Ok((
             StatusCode::NOT_FOUND,
             Json(json!({"error": "no active room"})),
         ));
     };
-    state
-        .screenshare
-        .add_participant(&room_id, &device_id, &user_id);
+    state.screenshare.add_participant(&room_id, &who);
     Ok((
         StatusCode::OK,
         Json(json!({
@@ -382,8 +436,11 @@ pub async fn join_room(
     headers: HeaderMap,
     Path(room_id): Path<String>,
 ) -> Result<(StatusCode, Json<Value>)> {
-    let (user_id, device_id, _) = state.devices.caller(authz(&headers)?)?;
-    if !state.screenshare.join(&room_id, &device_id, &user_id) {
+    let who = state.devices.session_identity(authz(&headers)?)?;
+    if !state
+        .screenshare
+        .join_as(&room_id, RoomClient::device(&who, false))
+    {
         return Ok((
             StatusCode::NOT_FOUND,
             Json(json!({"error": "room not found"})),
@@ -572,16 +629,38 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    /// Pair `device` to `user` and return its device token.
+    fn pair(dm: &DeviceManager, user: &str, device: &str) -> String {
+        let code = dm.create_pairing_code(user).unwrap();
+        dm.exchange_code(&code, device, "remarkable").unwrap().0
+    }
+
+    fn identity(dm: &DeviceManager, token: &str) -> SessionIdentity {
+        dm.session_identity(&format!("Bearer {token}")).unwrap()
+    }
+
+    fn client_ids(rooms: &RoomManager, room_id: &str) -> Vec<String> {
+        let mut ids: Vec<_> = rooms
+            .clients(room_id)
+            .into_iter()
+            .map(|c| c.client_id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Let the cleanup task handle what is pending. The clock is paused, and it only moves once
+    /// every task is idle, so by the end of this sleep the task has done all it can.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn revoked_devices_leave_their_rooms() {
         let (state, _tk, _tmp) = state_and_auth();
         let dm = &state.devices;
-        let pair = |user: &str, device: &str| {
-            let code = dm.create_pairing_code(user).unwrap();
-            dm.exchange_code(&code, device, "remarkable").unwrap().0
-        };
-        let tablet = pair("local-user", "RM110-1");
-        let other = pair("local-user", "RM110-2");
+        let tablet = pair(dm, "local-user", "RM110-1");
+        let other = pair(dm, "local-user", "RM110-2");
         let rooms = &state.screenshare;
         let cleanup = spawn_revocation_cleanup(dm.clone(), rooms.clone());
 
@@ -592,28 +671,21 @@ mod tests {
         assert_eq!(code, StatusCode::CREATED);
         let shared = body["roomId"].as_str().unwrap().to_string();
         assert!(rooms.join(&shared, "viewer", "local-user"));
-        rooms.add_participant(&shared, "RM110-2", "local-user");
+        rooms.add_participant(&shared, &identity(dm, &other));
         // The second tablet's own room, which the first one joined.
-        let (other_room, _) = rooms.create("local-user", "RM110-2");
-        rooms.add_participant(&other_room, "RM110-1", "local-user");
+        let (other_room, _) = rooms.create(&identity(dm, &other));
+        rooms.add_participant(&other_room, &identity(dm, &tablet));
 
         assert!(dm.delete_device("RM110-1", None).unwrap());
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while rooms.exists(&shared) {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "owner revoked, room kept"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        settle().await;
+        assert!(!rooms.exists(&shared), "owner revoked, room kept");
         // The viewer's keepalive now fails, so it stops watching a room nobody shares into.
         assert!(!rooms.keepalive(&shared, "local-user"));
-        let ids: Vec<_> = rooms
-            .clients(&other_room)
-            .into_iter()
-            .map(|c| c.client_id)
-            .collect();
-        assert_eq!(ids, ["RM110-2"], "revoked member left, owner stays");
+        assert_eq!(
+            client_ids(rooms, &other_room),
+            ["RM110-2"],
+            "revoked member left, owner stays"
+        );
         assert!(rooms.keepalive(&other_room, "local-user"));
         let (code, _) = join_active(State(state.clone()), hdrs(&other))
             .await
@@ -625,24 +697,99 @@ mod tests {
     #[tokio::test]
     async fn late_revocation_event_spares_a_same_account_re_pair() {
         let (state, _tk, _tmp) = state_and_auth();
-        let dm = &state.devices;
-        let code = dm.create_pairing_code("local-user").unwrap();
-        dm.exchange_code(&code, "RM110-1", "remarkable").unwrap();
-        let (room, _) = state.screenshare.create("local-user", "RM110-1");
-        // The event of an earlier delete, handled after the device was paired back.
+        let (dm, rooms) = (&state.devices, &state.screenshare);
+        let old = identity(dm, &pair(dm, "local-user", "RM110-1"));
+        let (old_room, _) = rooms.create(&old);
+        // A device of the same account whose id differs only in case (ids are case-sensitive, as
+        // in the token checks) has a room too, which the tablet joined.
+        let twin = identity(dm, &pair(dm, "local-user", "rm110-1"));
+        let (twin_room, _) = rooms.create(&twin);
+        rooms.add_participant(&twin_room, &old);
+
+        // Deleted and paired straight back, and the event is handled only now. Its registrations
+        // are checked before the re-paired tablet shares again and rejoins the twin's room, and
+        // dropped after: the widest window between the two.
+        assert!(dm.delete_device("RM110-1", None).unwrap());
+        let new = identity(dm, &pair(dm, "local-user", "RM110-1"));
         let ev = DeviceRevoked {
             user_id: "local-user".into(),
             device_id: "RM110-1".into(),
         };
-        on_revoked(dm, &state.screenshare, &ev);
-        assert!(state.screenshare.exists(&room));
-        // Handled while it is gone, the event does close the room, even with a device of the
-        // same account whose id differs only in case (ids are case-sensitive, as in token checks).
-        let code = dm.create_pairing_code("local-user").unwrap();
-        dm.exchange_code(&code, "rm110-1", "remarkable").unwrap();
+        let ended = ended_registrations(dm, rooms, Some(&ev));
+        let (new_room, _) = rooms.create(&new);
+        rooms.leave_or_close(&twin_room, "RM110-1");
+        rooms.add_participant(&twin_room, &new);
+        rooms.drop_registrations(&ended);
+
+        assert!(
+            !rooms.exists(&old_room),
+            "the revoked registration's room closed"
+        );
+        assert!(rooms.exists(&new_room), "the re-pair's room was closed");
+        assert_eq!(client_ids(rooms, &twin_room), ["RM110-1", "rm110-1"]);
+        // Handling the event again finds nothing more to drop.
+        rooms.drop_registrations(&ended_registrations(dm, rooms, Some(&ev)));
+        assert!(rooms.exists(&new_room));
+        assert_eq!(client_ids(rooms, &twin_room), ["RM110-1", "rm110-1"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn event_checked_during_a_db_error_is_caught_by_the_recheck() {
+        let (state, _tk, tmp) = state_and_auth();
+        let (dm, rooms) = (&state.devices, &state.screenshare);
+        let tablet = identity(dm, &pair(dm, "local-user", "RM110-1"));
+        let (room, _) = rooms.create(&tablet);
+        let cleanup = spawn_revocation_cleanup(dm.clone(), rooms.clone());
+        let side = rusqlite::Connection::open(tmp.path().join("devices.db")).unwrap();
+
+        // The event arrives while every lookup fails: the room is not closed on a guess.
         assert!(dm.delete_device("RM110-1", None).unwrap());
-        on_revoked(dm, &state.screenshare, &ev);
-        assert!(!state.screenshare.exists(&room));
+        side.execute_batch("ALTER TABLE devices RENAME TO devices_gone")
+            .unwrap();
+        settle().await;
+        assert!(rooms.exists(&room), "closed on a failed lookup");
+        // Nor by a periodic re-check that fails too.
+        tokio::time::sleep(SESSION_RECHECK).await;
+        assert!(rooms.exists(&room));
+
+        // The next re-check that gets an answer closes it.
+        side.execute_batch("ALTER TABLE devices_gone RENAME TO devices")
+            .unwrap();
+        tokio::time::sleep(SESSION_RECHECK).await;
+        assert!(
+            !rooms.exists(&room),
+            "revoked owner's room kept after the DB came back"
+        );
+        cleanup.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missed_revocation_events_are_caught_up_at_once() {
+        let (state, _tk, _tmp) = state_and_auth();
+        let (dm, rooms) = (&state.devices, &state.screenshare);
+        let revoked = identity(dm, &pair(dm, "local-user", "RM110-1"));
+        let (revoked_room, _) = rooms.create(&revoked);
+        let other = identity(dm, &pair(dm, "local-user", "RM110-2"));
+        let (other_room, _) = rooms.create(&other);
+        assert!(rooms.join(&other_room, "viewer", "local-user"));
+        let cleanup = spawn_revocation_cleanup(dm.clone(), rooms.clone());
+
+        // The tablet's event, then more than the channel holds (64) before the task runs: its
+        // event is lost and the task only hears that it lagged.
+        assert!(dm.delete_device("RM110-1", None).unwrap());
+        for i in 0..70 {
+            dm.announce_revoked_for_test("local-user", &format!("spare-{i}"));
+        }
+        let start = tokio::time::Instant::now();
+        settle().await;
+        assert!(start.elapsed() < SESSION_RECHECK);
+        assert!(
+            !rooms.exists(&revoked_room),
+            "room of a missed revocation kept"
+        );
+        // In-process clients hold no registration: the re-check leaves them be.
+        assert_eq!(client_ids(rooms, &other_room), ["RM110-2", "viewer"]);
+        cleanup.abort();
     }
 
     #[tokio::test]

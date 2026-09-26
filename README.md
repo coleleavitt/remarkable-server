@@ -360,7 +360,9 @@ verified against a real 3.28 device. They are additive and do not affect 3.3.2 s
 user's other clients as `ScreenshareMessage` / `ScreenshareRoomCreated` events on the
 notifications channel (data = base64 inner JSON). ICE servers come from
 `SCREENSHARE_ICE_SERVERS`. Rooms expire 60 s after the last keepalive. When a device is
-revoked, rooms it owns close and it is dropped from rooms it joined.
+revoked, rooms it created or joined under that registration are cleaned up (immediately, plus a
+60 s re-check): rooms it owns close and it is dropped from rooms it joined. Rooms it makes after
+being paired again to the same account are not affected.
 
 ### gentree/v1 delta sync (rm-sync)
 `POST /gentree/v1/{GetEntries,GetFiles,GetFile,PutFile,DeleteEntry,EntrySession}`
