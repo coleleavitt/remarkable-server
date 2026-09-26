@@ -1,16 +1,18 @@
 //! RFC 5545 recurrence rules (RRULE), for the subset calendars use in practice: `FREQ` of
 //! `DAILY`, `WEEKLY`, `MONTHLY` or `YEARLY` with `INTERVAL`, `COUNT`, `UNTIL`, `BYMONTH`,
-//! `BYMONTHDAY`, `BYDAY` and `WKST`.
+//! `BYMONTHDAY`, `BYDAY`, `BYSETPOS` (Outlook's and Apple's "last weekday of the month") and
+//! `WKST`.
 //!
-//! A rule with any other part (`BYSETPOS`, `BYWEEKNO`, `BYYEARDAY`, `BYHOUR`, ...), a
-//! sub-daily frequency or a `BYDAY` ordinal beyond 5 (no month has a sixth Monday) does not
-//! parse, and callers keep the event as its first occurrence. The same engine walks the onsets
-//! of VTIMEZONE observances.
+//! A rule with any other part (`BYWEEKNO`, `BYYEARDAY`, `BYHOUR`, ...), a sub-daily frequency
+//! or a `BYDAY` ordinal beyond 5 (no month has a sixth Monday) does not parse, and callers
+//! keep the event as its first occurrence. The same engine walks the onsets of VTIMEZONE
+//! observances.
 //!
 //! Walks are paid for in steps of a budget: each period costs one step plus one per `BY` list
-//! entry it goes through, and each date it yields one more. The lists are deduplicated when
-//! parsed (at most 12 months, 62 month days and 77 weekdays), so a step is a bounded amount of
-//! work whatever the rule says.
+//! entry it goes through, and each date its `BYMONTH`, `BYMONTHDAY` and `BYDAY` parts select
+//! one more. The lists are deduplicated when parsed (at most 12 months, 62 month days, 77
+//! weekdays and 732 set positions), so a step is a bounded amount of work whatever the rule
+//! says.
 
 use chrono::{Datelike, Days, Months, NaiveDate, NaiveDateTime, Weekday};
 
@@ -41,6 +43,10 @@ pub(super) struct Rule {
     by_month_day: Vec<i32>,
     /// `(ordinal, weekday)`; ordinal 0 means every such weekday of the period.
     by_day: Vec<(i32, Weekday)>,
+    /// `BYSETPOS`: which of the dates a period's other `BY` parts select it keeps, counted
+    /// from the end when negative. Each date is one instance, as `BYHOUR` and the like are
+    /// not supported.
+    by_set_pos: Vec<i32>,
     wkst: Weekday,
 }
 
@@ -181,6 +187,7 @@ impl Rule {
             by_month: Vec::new(),
             by_month_day: Vec::new(),
             by_day: Vec::new(),
+            by_set_pos: Vec::new(),
             wkst: Weekday::Mon,
         };
         for part in rule.trim().split(';').filter(|p| !p.trim().is_empty()) {
@@ -238,6 +245,18 @@ impl Rule {
                         |(n, wd)| (*n, wd.num_days_from_monday()),
                     )?
                 }
+                "BYSETPOS" => {
+                    parsed.by_set_pos = list(
+                        &value,
+                        |p| {
+                            p.trim_start_matches('+')
+                                .parse::<i32>()
+                                .ok()
+                                .filter(|p| *p != 0 && (-366..=366).contains(p))
+                        },
+                        |p| *p,
+                    )?
+                }
                 "WKST" => parsed.wkst = weekday(&value)?,
                 _ => return None,
             }
@@ -252,7 +271,12 @@ impl Rule {
             // Weekdays counted across the whole year (`BYDAY=20MO`) are not implemented.
             Freq::Yearly => parsed.by_day.is_empty() || !parsed.by_month.is_empty(),
         };
-        supported.then_some(parsed)
+        // BYSETPOS picks from what another BY part selects (RFC 5545 section 3.3.10).
+        let selects = !(parsed.by_month.is_empty()
+            && parsed.by_month_day.is_empty()
+            && parsed.by_day.is_empty());
+        let set_pos_ok = parsed.by_set_pos.is_empty() || selects;
+        (supported && set_pos_ok).then_some(parsed)
     }
 
     pub(super) fn has_count(&self) -> bool {
@@ -312,7 +336,7 @@ impl Rule {
         month_days & weekdays
     }
 
-    /// Steps one period costs besides the dates it yields: one, plus each `BY` list entry it
+    /// Steps one period costs besides the dates it selects: one, plus each `BY` list entry it
     /// goes through (in every month it looks at, for a yearly rule).
     fn period_cost(&self) -> usize {
         let months = match self.freq {
@@ -320,7 +344,33 @@ impl Rule {
             Freq::Yearly if !self.by_month_day.is_empty() => 12,
             _ => 1,
         };
-        1 + self.by_month.len() + months * (self.by_month_day.len() + self.by_day.len())
+        1 + self.by_month.len()
+            + months * (self.by_month_day.len() + self.by_day.len())
+            + self.by_set_pos.len()
+    }
+
+    /// The dates at the `BYSETPOS` positions of a period's `dates` (in order), in order; all
+    /// of them without `BYSETPOS`.
+    fn at_set_positions(&self, dates: Vec<NaiveDate>) -> Vec<NaiveDate> {
+        if self.by_set_pos.is_empty() {
+            return dates;
+        }
+        let mut kept: Vec<NaiveDate> = self
+            .by_set_pos
+            .iter()
+            .filter_map(|&pos| {
+                let index = match usize::try_from(pos) {
+                    Ok(from_start) => from_start.checked_sub(1)?,
+                    Err(_) => dates
+                        .len()
+                        .checked_sub(pos.unsigned_abs().try_into().ok()?)?,
+                };
+                dates.get(index).copied()
+            })
+            .collect();
+        kept.sort_unstable();
+        kept.dedup();
+        kept
     }
 
     /// The first day of period `k` and the dates the rule selects in it, in order. `None` once
@@ -412,7 +462,7 @@ impl Rule {
     /// `end`. `UNTIL` is left to `visit` (see [`Rule::until_allows`]), as it may need the
     /// occurrence in UTC. Without `COUNT`, periods that end before `from` are skipped (and
     /// `start` with them). Each period walked costs [`Rule::period_cost`] steps of `budget`,
-    /// and each date it yields one more.
+    /// and each date it selects (before `BYSETPOS` picks from them) one more.
     pub(super) fn walk(
         &self,
         start: NaiveDateTime,
@@ -447,7 +497,8 @@ impl Rule {
                 return Ok(());
             }
             charge(budget, dates.len())?;
-            for date in dates {
+            // Positions count every date of the period, those before DTSTART included.
+            for date in self.at_set_positions(dates) {
                 let at = date.and_time(time);
                 if at <= start {
                     continue;
@@ -718,6 +769,105 @@ mod tests {
     }
 
     #[test]
+    fn set_positions_pick_from_each_period() {
+        // RFC 5545 section 3.8.5.3's examples: the third Tuesday, Wednesday or Thursday of the
+        // month for three months...
+        assert_eq!(
+            occurrences(
+                "FREQ=MONTHLY;COUNT=3;BYDAY=TU,WE,TH;BYSETPOS=3",
+                "19970904T090000",
+                "19980101T000000"
+            ),
+            ["19970904T090000", "19971007T090000", "19971106T090000"]
+        );
+        // ... and the second-to-last weekday of the month.
+        assert_eq!(
+            occurrences(
+                "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-2",
+                "19970929T090000",
+                "19980331T235959"
+            ),
+            [
+                "19970929T090000",
+                "19971030T090000",
+                "19971127T090000",
+                "19971230T090000",
+                "19980129T090000",
+                "19980226T090000",
+                "19980330T090000"
+            ]
+        );
+        // The last weekday of the month, as Outlook writes it, from a DTSTART that is one.
+        assert_eq!(
+            occurrences(
+                "FREQ=MONTHLY;INTERVAL=1;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1;WKST=SU",
+                "20260130T160000",
+                "20260601T000000"
+            ),
+            [
+                "20260130T160000",
+                "20260227T160000",
+                "20260331T160000",
+                "20260430T160000",
+                "20260529T160000"
+            ]
+        );
+        // First and last of the set, the same date named twice kept once, and positions past
+        // the set's end ignored.
+        assert_eq!(
+            occurrences(
+                "FREQ=MONTHLY;BYMONTHDAY=1,15,-1;BYSETPOS=1,-1,-3,9;COUNT=4",
+                "20260101T080000",
+                "20270101T000000"
+            ),
+            [
+                "20260101T080000",
+                "20260131T080000",
+                "20260201T080000",
+                "20260228T080000"
+            ]
+        );
+        // Yearly: the last Sunday of March or October, whichever is later (October).
+        assert_eq!(
+            occurrences(
+                "FREQ=YEARLY;BYMONTH=3,10;BYDAY=-1SU;BYSETPOS=-1;COUNT=2",
+                "20251026T020000",
+                "20300101T000000"
+            ),
+            ["20251026T020000", "20261025T020000"]
+        );
+        // Weekly: the first working day of each week.
+        assert_eq!(
+            occurrences(
+                "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=1;COUNT=3",
+                "20260105T090000",
+                "20270101T000000"
+            ),
+            ["20260105T090000", "20260112T090000", "20260119T090000"]
+        );
+        // Skipping ahead to the window keeps the same occurrences.
+        let rule = Rule::parse("FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1").unwrap();
+        let walk = |from: Option<NaiveDate>| {
+            let mut out = Vec::new();
+            rule.walk(
+                at("20200131T160000"),
+                from,
+                at("20260801T000000"),
+                &mut 100_000,
+                |t| {
+                    out.push(t);
+                    true
+                },
+            )
+            .unwrap();
+            out.retain(|t| t.date() >= NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
+            out
+        };
+        assert_eq!(walk(None), walk(NaiveDate::from_ymd_opt(2026, 1, 1)));
+        assert_eq!(walk(None).len(), 7);
+    }
+
+    #[test]
     fn skipping_ahead_keeps_the_same_occurrences() {
         let rule = Rule::parse("FREQ=WEEKLY;INTERVAL=3;BYDAY=TU,TH").unwrap();
         let start = at("20200107T093000");
@@ -791,8 +941,13 @@ mod tests {
     fn unsupported_rules_do_not_parse() {
         for rule in [
             "FREQ=HOURLY",
-            "FREQ=MONTHLY;BYSETPOS=-1;BYDAY=MO,TU,WE,TH,FR",
             "FREQ=YEARLY;BYWEEKNO=20",
+            "FREQ=YEARLY;BYYEARDAY=100",
+            // BYSETPOS needs another BY part to pick from, and a position within a year.
+            "FREQ=MONTHLY;BYSETPOS=1",
+            "FREQ=MONTHLY;BYDAY=MO;BYSETPOS=0",
+            "FREQ=MONTHLY;BYDAY=MO;BYSETPOS=367",
+            "FREQ=MONTHLY;BYDAY=MO;BYSETPOS=last",
             "FREQ=YEARLY;BYDAY=20MO",
             "FREQ=WEEKLY;BYDAY=1MO",
             "FREQ=MONTHLY;BYDAY=6MO",
@@ -806,12 +961,13 @@ mod tests {
             assert_eq!(Rule::parse(rule), None, "{}", rule);
         }
         assert!(Rule::parse("freq=weekly;byday=mo;").is_some());
+        assert!(Rule::parse("FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1").is_some());
     }
 
     proptest::proptest! {
         #[test]
         fn walks_are_ordered_bounded_and_never_panic(
-            rule in "FREQ=(DAILY|WEEKLY|MONTHLY|YEARLY)(;INTERVAL=[1-9]{1,3})?(;COUNT=[0-9]{1,4})?(;BYMONTH=(1[0-2]|[1-9]))?(;BYMONTHDAY=-?[1-9]{1,2})?(;BYDAY=(-?[1-5])?(MO|TU|WE|TH|FR|SA|SU))?(;WKST=(MO|SU))?",
+            rule in "FREQ=(DAILY|WEEKLY|MONTHLY|YEARLY)(;INTERVAL=[1-9]{1,3})?(;COUNT=[0-9]{1,4})?(;BYMONTH=(1[0-2]|[1-9]))?(;BYMONTHDAY=-?[1-9]{1,2})?(;BYDAY=(-?[1-5])?(MO|TU|WE|TH|FR|SA|SU)(,(MO|TU|WE|TH|FR|SA|SU))?)?(;BYSETPOS=-?[1-9]{1,2})?(;WKST=(MO|SU))?",
             year in 1i32..9999,
         ) {
             if let Some(rule) = Rule::parse(&rule) {

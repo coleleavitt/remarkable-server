@@ -93,6 +93,11 @@ pub struct Fetched {
     /// Why the answer may be missing events (a CalDAV server truncating its results, say).
     /// Stored events it does not list are then kept rather than removed as deleted upstream.
     pub incomplete: Option<String>,
+    /// Events the answer holds only in part, which the user should hear about although the
+    /// answer is complete otherwise (a recurring event whose rule could be expanded neither by
+    /// the server nor here, so only its first occurrence came). Stored events the answer does
+    /// not list are still removed.
+    pub warnings: Vec<String>,
 }
 
 impl Fetched {
@@ -100,6 +105,7 @@ impl Fetched {
         Self {
             events,
             incomplete: None,
+            warnings: Vec::new(),
         }
     }
 }

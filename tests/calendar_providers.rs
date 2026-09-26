@@ -14,7 +14,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Timelike, Utc};
 use parking_lot::Mutex;
 use remarkable_server::calendar::{
     Calendar,
@@ -977,6 +977,139 @@ async fn caldav_fallback_expands_recurring_events_in_their_time_zone() {
     assert!(second.success, "{:?}", second.error);
     assert_eq!((second.events_synced, second.events_removed), (3, 1));
     assert_eq!(all_events(&state, "w").len(), 3);
+}
+
+#[tokio::test]
+async fn caldav_fallback_reports_rules_it_cannot_expand_and_still_prunes() {
+    // A server without `expand` sends the masters: Outlook's "last weekday of the month" at
+    // 16:00 Berlin time (BYSETPOS), a rule no calendar engine here expands (BYWEEKNO), and a
+    // one-off event that is later deleted upstream.
+    let today = Utc::now().date_naive();
+    let deleted = Arc::new(Mutex::new(false));
+    let base = serve({
+        let deleted = deleted.clone();
+        move |_| {
+            Router::new().fallback(move |method: Method, body: String| async move {
+                match method.as_str() {
+                    "PROPFIND" => multistatus(
+                        r#"<d:response><d:href>/cal/</d:href><d:propstat><d:prop>
+                            <d:resourcetype><d:collection/><cal:calendar/></d:resourcetype>
+                           </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"#,
+                    ),
+                    "REPORT" if body.contains("expand") => {
+                        (StatusCode::NOT_IMPLEMENTED, "expand unsupported").into_response()
+                    }
+                    "REPORT" => {
+                        let d = |n: i64| (today + Duration::days(n)).format("%Y%m%d").to_string();
+                        let one_off = if *deleted.lock() {
+                            String::new()
+                        } else {
+                            format!(
+                                "BEGIN:VEVENT\r\nUID:one-off@dav\r\nSUMMARY:Review\r\nDTSTART:{}T120000Z\r\nEND:VEVENT\r\n",
+                                d(5)
+                            )
+                        };
+                        let ics = format!(
+                            "BEGIN:VCALENDAR\r\nBEGIN:VTIMEZONE\r\nTZID:W. Europe Standard Time\r\nBEGIN:STANDARD\r\nDTSTART:16010101T030000\r\nTZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100\r\nRRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=-1SU;BYMONTH=10\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nDTSTART:16010101T020000\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0200\r\nRRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=-1SU;BYMONTH=3\r\nEND:DAYLIGHT\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:close@dav\r\nSUMMARY:Month-end close\r\nDTSTART;TZID=W. Europe Standard Time:20250131T160000\r\nDTEND;TZID=W. Europe Standard Time:20250131T170000\r\nRRULE:FREQ=MONTHLY;INTERVAL=1;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1;WKST=SU\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:rota@dav\r\nSUMMARY:Week rota\r\nDTSTART:{}T090000Z\r\nRRULE:FREQ=YEARLY;BYWEEKNO=1,20,40\r\nEND:VEVENT\r\n{}END:VCALENDAR\r\n",
+                            d(2),
+                            one_off
+                        );
+                        multistatus(&format!(
+                            r#"<d:response><d:href>/cal/all.ics</d:href><d:propstat><d:prop>
+                                <d:getetag>"a1"</d:getetag>
+                                <cal:calendar-data>{}</cal:calendar-data>
+                               </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"#,
+                            ics_escape_xml(&ics)
+                        ))
+                    }
+                    _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+                }
+            })
+        }
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut mgr = CalendarManager::new(&dir.path().join("calendars.db")).unwrap();
+    mgr.add_calendar(calendar(
+        "o",
+        "Office",
+        CalendarProvider::Caldav,
+        CalendarConfig::Caldav {
+            url: format!("{}/cal/", base),
+            username: String::new(),
+            password: None,
+            bearer_token: None,
+            collection_url: None,
+        },
+    ))
+    .unwrap();
+    let state = CalendarState::new(mgr);
+    let sync = || {
+        let state = state.clone();
+        async move {
+            let axum::Json(r) = sync_calendar_endpoint(State(state), Path("o".into()))
+                .await
+                .unwrap();
+            r
+        }
+    };
+
+    let first = sync().await;
+    // The rule that could not be expanded is named...
+    assert!(!first.success);
+    let error = first.error.as_deref().unwrap();
+    assert!(
+        error.contains("1 recurring event(s) (\"Week rota\")")
+            && error.contains("only their first occurrence was stored"),
+        "{}",
+        error
+    );
+    // ... but the rest of the answer was complete, so its sync time is saved.
+    assert!(
+        state
+            .manager
+            .lock()
+            .get_calendar("o")
+            .unwrap()
+            .last_sync
+            .is_some()
+    );
+    let events = all_events(&state, "o");
+    let rota: Vec<_> = events.iter().filter(|e| e.uid == "rota@dav").collect();
+    assert_eq!(rota.len(), 1);
+    assert_eq!(rota[0].id, "o:rota@dav");
+    // Every last weekday of the month in the window, at 16:00 in Berlin (15:00 UTC in
+    // winter, 14:00 UTC in summer).
+    let closes: Vec<_> = events.iter().filter(|e| e.uid == "close@dav").collect();
+    assert!((12..=14).contains(&closes.len()), "{}", closes.len());
+    for close in &closes {
+        let day = close.start.date_naive();
+        assert!(day.weekday().num_days_from_monday() < 5, "{}", day);
+        let later_weekday = (1..=3)
+            .map(|n| day + Duration::days(n))
+            .take_while(|later| later.month() == day.month())
+            .any(|later| later.weekday().num_days_from_monday() < 5);
+        assert!(!later_weekday, "{} is not the month's last weekday", day);
+        assert!([14, 15].contains(&close.start.hour()), "{}", close.start);
+        assert_eq!(close.end - close.start, Duration::hours(1));
+        assert_eq!(close.etag.as_deref(), Some("\"a1\""));
+    }
+    assert_eq!(
+        first.events_synced,
+        closes.len() + 2,
+        "the closes, the rota's first occurrence and the one-off"
+    );
+
+    // Stored events the answer no longer lists are still removed.
+    *deleted.lock() = true;
+    let second = sync().await;
+    assert_eq!(second.events_removed, 1);
+    assert!(
+        all_events(&state, "o")
+            .iter()
+            .all(|e| e.uid != "one-off@dav")
+    );
+    assert!(second.error.as_deref().unwrap().contains("Week rota"));
 }
 
 // ---------------------------------------------------------------------------------------

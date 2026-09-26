@@ -40,6 +40,12 @@ use crate::calendar::{Calendar, CalendarError, Expansion, Result, parse_ics_expa
 
 /// Redirect hops followed per request (e.g. `/.well-known/caldav` to the DAV root).
 const MAX_REDIRECTS: usize = 5;
+/// Longest `getetag` kept. Real ones are short quoted hashes or version numbers; every event
+/// of a resource carries a copy of its etag, which is only stored, never sent back, so a
+/// longer one is dropped rather than copied.
+const MAX_ETAG_BYTES: usize = 1024;
+/// Recurring events [`read_report`] names when their rules cannot be expanded.
+const NAMED_UNEXPANDED: usize = 3;
 
 /// Connection settings from a `caldav` calendar config.
 pub(super) struct Account<'a> {
@@ -381,7 +387,11 @@ fn parse_resources(base: &Url, body: &str) -> Result<Vec<Resource>> {
                         resource.display_name = Some(p.text.trim().to_string());
                     }
                     (DAV, "current-user-principal") => resource.principal = href_in(Some(p), base),
-                    (DAV, "getetag") => resource.etag = Some(p.text.trim().to_string()),
+                    (DAV, "getetag") => {
+                        resource.etag = Some(p.text.trim())
+                            .filter(|etag| etag.len() <= MAX_ETAG_BYTES)
+                            .map(str::to_string);
+                    }
                     (CALDAV, "calendar-home-set") => {
                         resource.calendar_home = href_in(Some(p), base)
                     }
@@ -634,10 +644,12 @@ fn read_report(response: &DavResponse, calendar_id: &str, window: SyncWindow) ->
         let Some(data) = resource.calendar_data else {
             continue;
         };
-        for mut event in parse_ics_expanded(&data, calendar_id, &mut expansion) {
-            event.etag = resource.etag.clone();
-            events.push(event);
-        }
+        events.extend(parse_ics_expanded(
+            &data,
+            calendar_id,
+            resource.etag.as_deref(),
+            &mut expansion,
+        ));
     }
     let unknown: Vec<&str> = expansion.unknown_zones().collect();
     if !unknown.is_empty() {
@@ -657,7 +669,34 @@ fn read_report(response: &DavResponse, calendar_id: &str, window: SyncWindow) ->
             )
         })
     });
-    Ok(Fetched { events, incomplete })
+    // Series stored as their first occurrence only: reported, but the answer is complete
+    // otherwise, so stored events it does not list are still removed.
+    let unexpanded = expansion.unexpanded();
+    let warnings = match unexpanded.len() {
+        0 => Vec::new(),
+        count => {
+            let mut named: Vec<String> = unexpanded
+                .take(NAMED_UNEXPANDED)
+                .map(|summary| format!("{:?}", summary))
+                .collect();
+            if count > NAMED_UNEXPANDED {
+                named.push(format!("{} more", count - NAMED_UNEXPANDED));
+            }
+            vec![format!(
+                "caldav: REPORT {}: {} recurring event(s) ({}) use a recurrence rule that \
+                 the CalDAV server did not expand and this server cannot, so only their first \
+                 occurrence was stored",
+                redact(&response.url),
+                count,
+                named.join(", ")
+            )]
+        }
+    };
+    Ok(Fetched {
+        events,
+        incomplete,
+        warnings,
+    })
 }
 
 pub(super) async fn fetch(
@@ -947,6 +986,83 @@ mod tests {
             .collect();
         // An unreadable (403) resource is skipped, not a sign of a partial answer.
         assert_eq!(failures, [None, Some(503), Some(507), None]);
+    }
+
+    #[test]
+    fn report_events_carry_short_etags_and_name_unexpanded_series() {
+        let resource = |href: &str, etag: &str, ics: &str| {
+            format!(
+                "<d:response><d:href>{}</d:href><d:propstat><d:prop><d:getetag>{}</d:getetag>\
+                 <c:calendar-data>{}</c:calendar-data></d:prop>\
+                 <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>",
+                href, etag, ics
+            )
+        };
+        let daily = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:d\nDTSTART:20260101T090000Z\nRRULE:FREQ=DAILY;COUNT=3\nEND:VEVENT\nEND:VCALENDAR\n";
+        let unexpandable = |uid: &str| {
+            format!(
+                "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:{uid}\nSUMMARY:Rota {uid}\nDTSTART:20260105T090000Z\nRRULE:FREQ=YEARLY;BYWEEKNO=2\nEND:VEVENT\nEND:VCALENDAR\n"
+            )
+        };
+        let mut body = resource("/cal/d.ics", "\"d1\"", daily);
+        // An etag no real server sends is not copied into every event.
+        body.push_str(&resource(
+            "/cal/long.ics",
+            &"x".repeat(MAX_ETAG_BYTES + 1),
+            &unexpandable("a"),
+        ));
+        for uid in ["b", "c", "e"] {
+            body.push_str(&resource(
+                &format!("/cal/{}.ics", uid),
+                "\"r\"",
+                &unexpandable(uid),
+            ));
+        }
+        let response = DavResponse {
+            url: Url::parse("https://dav.example/cal/").unwrap(),
+            status: StatusCode::MULTI_STATUS,
+            body: format!(
+                r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">{}</d:multistatus>"#,
+                body
+            ),
+        };
+        let window = SyncWindow {
+            start: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            end: Utc.with_ymd_and_hms(2027, 1, 1, 0, 0, 0).unwrap(),
+        };
+        let fetched = read_report(&response, "c", window).unwrap();
+        let etags: Vec<_> = fetched
+            .events
+            .iter()
+            .map(|e| (e.uid.as_str(), e.etag.as_deref()))
+            .collect();
+        assert_eq!(
+            etags,
+            [
+                ("d", Some("\"d1\"")),
+                ("d", Some("\"d1\"")),
+                ("d", Some("\"d1\"")),
+                ("a", None),
+                ("b", Some("\"r\"")),
+                ("c", Some("\"r\"")),
+                ("e", Some("\"r\"")),
+            ]
+        );
+        // The answer is complete (stored events it does not list are removed), but the
+        // series kept as their first occurrence are named.
+        assert_eq!(fetched.incomplete, None);
+        assert_eq!(fetched.warnings.len(), 1);
+        let warning = &fetched.warnings[0];
+        assert!(
+            warning.contains("4 recurring event(s) (\"Rota a\", \"Rota b\", \"Rota c\", 1 more)"),
+            "{}",
+            warning
+        );
+        assert!(
+            warning.contains("only their first occurrence"),
+            "{}",
+            warning
+        );
     }
 
     #[test]

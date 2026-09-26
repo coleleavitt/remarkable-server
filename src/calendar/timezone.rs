@@ -114,22 +114,36 @@ impl Zone {
     /// before it, or the offset the earliest onset changes from when `local` precedes them
     /// all. `None` when the zone has no usable observance. Each observance costs one step of
     /// `budget`, and walking its RRULE the steps [`Rule::walk`] charges.
+    ///
+    /// Times that occur twice (clocks going back) are the first of the two, as RFC 5545
+    /// section 3.3.5 requires: the onset is in the local time before it, so they precede it.
+    /// Times that do not occur (skipped when clocks go forward) take the offset before the
+    /// gap, as that section also requires: 02:30 on a day New York skips from 02:00 to 03:00
+    /// is 07:30 UTC (03:30 EDT).
     pub(super) fn offset_at(
         &self,
         local: NaiveDateTime,
         budget: &mut usize,
     ) -> Result<Option<i32>, Exhausted> {
-        let mut latest: Option<(NaiveDateTime, i32)> = None;
+        // The latest onset, with the offsets it changes from and to.
+        let mut latest: Option<(NaiveDateTime, Option<i32>, i32)> = None;
         for o in &self.observances {
             charge(budget, 1)?;
-            if let (Some(onset), Some(offset)) = (o.last_onset(local, budget)?, o.offset_to) {
-                if latest.is_none_or(|(at, _)| onset > at) {
-                    latest = Some((onset, offset));
+            if let (Some(onset), Some(to)) = (o.last_onset(local, budget)?, o.offset_to) {
+                if latest.is_none_or(|(at, ..)| onset > at) {
+                    latest = Some((onset, o.offset_from, to));
                 }
             }
         }
+        let skipped = |onset: NaiveDateTime, from: i32, to: i32| {
+            to > from
+                && onset
+                    .checked_add_signed(Duration::seconds((to - from).into()))
+                    .is_some_and(|gap_end| local < gap_end)
+        };
         Ok(match latest {
-            Some((_, offset)) => Some(offset),
+            Some((onset, Some(from), to)) if skipped(onset, from, to) => Some(from),
+            Some((_, _, to)) => Some(to),
             None => self
                 .observances
                 .iter()
@@ -315,6 +329,125 @@ mod tests {
         assert_eq!(listed.offset(at("20210101T000000")), Some(3 * 3600));
         assert_eq!(listed.offset(at("20230101T000000")), Some(3600));
         assert_eq!(listed.offset(at("20250101T000000")), Some(3 * 3600));
+    }
+
+    /// A zone of yearly observances `(TZOFFSETFROM, TZOFFSETTO, DTSTART, RRULE)`.
+    fn yearly(observances: &[(&str, &str, &str, &str)]) -> Zone {
+        let mut zone = Zone::default();
+        for (from, to, start, rule) in observances {
+            zone.add(observance(&[
+                ("TZOFFSETFROM", from),
+                ("TZOFFSETTO", to),
+                ("DTSTART", start),
+                ("RRULE", rule),
+            ]));
+        }
+        zone
+    }
+
+    #[test]
+    fn skipped_times_take_the_offset_before_the_gap_and_repeated_ones_the_first() {
+        // RFC 5545 section 3.3.5's own examples.
+        let new_york = yearly(&[
+            (
+                "-0500",
+                "-0400",
+                "20070311T020000",
+                "FREQ=YEARLY;BYMONTH=3;BYDAY=2SU",
+            ),
+            (
+                "-0400",
+                "-0500",
+                "20071104T020000",
+                "FREQ=YEARLY;BYMONTH=11;BYDAY=1SU",
+            ),
+        ]);
+        // 02:30 does not exist on 11 March 2007: it is 03:30 EDT, an hour after 01:30 EST.
+        assert_eq!(
+            new_york.utc(at("20070311T023000")),
+            Some(at("20070311T073000"))
+        );
+        assert_eq!(
+            new_york.utc(at("20070311T013000")),
+            Some(at("20070311T063000"))
+        );
+        assert_eq!(
+            new_york.utc(at("20070311T030000")),
+            Some(at("20070311T070000"))
+        );
+        // 01:30 happens twice on 4 November 2007: the first time, in EDT.
+        assert_eq!(
+            new_york.utc(at("20071104T013000")),
+            Some(at("20071104T053000"))
+        );
+        assert_eq!(
+            new_york.utc(at("20071104T020000")),
+            Some(at("20071104T070000"))
+        );
+
+        // Berlin skips 02:00-03:00 on 29 March 2026 (the onset itself included) and repeats
+        // 02:00-03:00 on 25 October.
+        let berlin = berlin();
+        for (local, utc) in [
+            ("20260329T015959", "20260329T005959"),
+            ("20260329T020000", "20260329T010000"),
+            ("20260329T023000", "20260329T013000"),
+            ("20260329T025959", "20260329T015959"),
+            ("20260329T030000", "20260329T010000"),
+            ("20261025T023000", "20261025T003000"),
+            ("20261025T030000", "20261025T020000"),
+        ] {
+            assert_eq!(berlin.utc(at(local)), Some(at(utc)), "{}", local);
+        }
+
+        // Havana skips midnight to 01:00 on 8 March 2026: an event from 00:00 to 02:00 local
+        // is 05:00-06:00 UTC, not a start the evening before.
+        let havana = yearly(&[
+            (
+                "-0500",
+                "-0400",
+                "20130310T000000",
+                "FREQ=YEARLY;BYMONTH=3;BYDAY=2SU",
+            ),
+            (
+                "-0400",
+                "-0500",
+                "20121104T010000",
+                "FREQ=YEARLY;BYMONTH=11;BYDAY=1SU",
+            ),
+        ]);
+        assert_eq!(
+            havana.utc(at("20260308T000000")),
+            Some(at("20260308T050000"))
+        );
+        assert_eq!(
+            havana.utc(at("20260308T020000")),
+            Some(at("20260308T060000"))
+        );
+
+        // Lord Howe Island moves its clocks by half an hour: 02:00 to 02:30 is skipped.
+        let lord_howe = yearly(&[
+            (
+                "+1030",
+                "+1100",
+                "20081005T020000",
+                "FREQ=YEARLY;BYMONTH=10;BYDAY=1SU",
+            ),
+            (
+                "+1100",
+                "+1030",
+                "20080406T020000",
+                "FREQ=YEARLY;BYMONTH=4;BYDAY=1SU",
+            ),
+        ]);
+        assert_eq!(
+            lord_howe.utc(at("20261004T021500")),
+            Some(at("20261003T154500"))
+        );
+        assert_eq!(
+            lord_howe.utc(at("20261004T023000")),
+            Some(at("20261003T153000"))
+        );
     }
 
     #[test]

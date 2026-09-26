@@ -12,8 +12,9 @@
 //! VTIMEZONE rules are too costly to go through is never guessed: its event is left out, and
 //! the caller learns that the result is incomplete.
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Utc};
@@ -31,13 +32,14 @@ pub const UNTITLED_EVENT: &str = "(no title)";
 /// they have a COUNT, so this is only reached by thousands of long-running COUNT rules, or by
 /// a hostile server.
 const MAX_RULE_STEPS: usize = 6_000_000;
-/// Occurrences one CalDAV answer may expand into in all: some 250 daily series over the
-/// sync window. Each costs a few hundred bytes besides its text, which
-/// [`MAX_EXPANDED_BYTES`] bounds.
+/// Events one CalDAV answer may hold in all, expanded occurrences and events sent as they are
+/// alike: some 250 daily series over the sync window. Each costs a few hundred bytes besides
+/// its text, which [`MAX_EXPANDED_BYTES`] bounds.
 const MAX_INSTANCES: usize = 100_000;
-/// Bytes of text (ids, summaries, descriptions, locations) the expanded occurrences of one
-/// CalDAV answer may hold in all. Every occurrence carries a copy of its series' text, so
-/// without this a long DESCRIPTION would be multiplied by the number of occurrences.
+/// Bytes of text (ids, summaries, descriptions, locations, etags) the events of one CalDAV
+/// answer may hold in all. Every occurrence carries a copy of its series' text (and of its
+/// resource's etag), so without this a long DESCRIPTION would be multiplied by the number of
+/// occurrences.
 const MAX_EXPANDED_BYTES: usize = 64 << 20;
 /// Steps the VTIMEZONE lookups of one CalDAV answer (or one ICS file) may take in all: one
 /// per observance, plus the steps of walking its rule. A lookup in a usual zone costs about
@@ -77,7 +79,7 @@ pub fn parse_ics_file(path: &Path, calendar_id: &str) -> Result<IcsEvents> {
 /// Parse VEVENTs from ICS text: one event per VEVENT, a recurring event as its first
 /// occurrence.
 pub fn parse_ics_str(content: &str, calendar_id: &str) -> IcsEvents {
-    let doc = Document::parse(content);
+    let doc = Document::parse(content, usize::MAX);
     let events = doc
         .events
         .iter()
@@ -114,6 +116,9 @@ pub struct Expansion {
     zone_steps_left: usize,
     truncated: bool,
     unknown_zones: BTreeSet<String>,
+    /// Summaries of the recurring events whose RRULE is outside the supported subset, by
+    /// UID.
+    unexpanded: BTreeMap<String, String>,
 }
 
 impl Expansion {
@@ -128,6 +133,7 @@ impl Expansion {
             zone_steps_left: MAX_ZONE_STEPS,
             truncated: false,
             unknown_zones: BTreeSet::new(),
+            unexpanded: BTreeMap::new(),
         }
     }
 
@@ -140,18 +146,45 @@ impl Expansion {
     pub fn unknown_zones(&self) -> impl Iterator<Item = &str> {
         self.unknown_zones.iter().map(String::as_str)
     }
+
+    /// Summaries of the recurring events whose RRULE is outside the supported subset (see
+    /// [`super::recurrence`]), one per series: only their first occurrence is in the result,
+    /// so later ones in the window are missing. The rest of the answer is complete.
+    pub fn unexpanded(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.unexpanded.values().map(String::as_str)
+    }
+
+    /// Pay for one more event holding `bytes` of text; `false`, and the answer truncated,
+    /// once either budget cannot.
+    fn take(&mut self, bytes: usize) -> bool {
+        if self.instances_left == 0 || self.bytes_left < bytes {
+            self.truncated = true;
+            return false;
+        }
+        self.instances_left -= 1;
+        self.bytes_left -= bytes;
+        true
+    }
 }
 
 /// Parse CalDAV calendar data, expanding each recurring event (RRULE, RDATE, EXDATE and the
 /// VEVENTs overriding single occurrences) into its occurrences that overlap the expansion
 /// window. An RRULE outside the supported subset (see [`super::recurrence`]) leaves the event
-/// as its first occurrence. Data a server already expanded has no RRULE and is unaffected.
+/// as its first occurrence, and is listed in [`Expansion::unexpanded`]. Data a server already
+/// expanded has no RRULE and is unaffected. Every event gets `etag`, the etag of the resource
+/// the data came from, and is paid for from the expansion's budgets.
 pub fn parse_ics_expanded(
     content: &str,
     calendar_id: &str,
+    etag: Option<&str>,
     expansion: &mut Expansion,
 ) -> Vec<CalendarEvent> {
-    let doc = Document::parse(content);
+    // Each VEVENT is an event, a moved occurrence (one event too) or a series (at least one
+    // occurrence, unless each is moved or cancelled): an object with more than twice the
+    // events still allowed would run out of them anyway. Its VEVENTs past that are not kept,
+    // so a server cannot make the parsed components ten times larger than its answer.
+    let doc = Document::parse(content, expansion.instances_left.saturating_mul(2));
+    expansion.truncated |= doc.events_dropped;
     doc.zones.steps_left.set(expansion.zone_steps_left);
     // Occurrences with a VEVENT of their own, by UID, and the series with one whose
     // RECURRENCE-ID could not be converted: which occurrence it replaces is unknown, so the
@@ -173,16 +206,33 @@ pub fn parse_ics_expanded(
     let mut events = Vec::new();
     for e in &doc.events {
         let rule = match (&e.recurrence_id, &e.rrule, &e.uid) {
-            (None, Some(rule), Some(_)) => Rule::parse(rule),
+            (None, Some(text), Some(uid)) => {
+                let rule = Rule::parse(text);
+                if rule.is_none() {
+                    expansion
+                        .unexpanded
+                        .entry(uid.clone())
+                        .or_insert_with(|| e.label());
+                }
+                rule
+            }
             _ => None,
         };
         match rule {
             Some(_) if e.uid.as_deref().is_some_and(|uid| unresolved.contains(uid)) => {}
             Some(rule) => {
                 let skip = e.uid.as_deref().and_then(|uid| overridden.get(uid));
-                events.extend(e.expand(&rule, calendar_id, &doc.zones, skip, expansion));
+                events.extend(e.expand(&rule, calendar_id, etag, &doc.zones, skip, expansion));
             }
-            None => events.extend(e.event(calendar_id, &doc.zones)),
+            None => {
+                let Some(mut event) = e.event(calendar_id, &doc.zones) else {
+                    continue;
+                };
+                event.etag = etag.map(str::to_string);
+                if expansion.take(text_bytes(&event)) {
+                    events.push(event);
+                }
+            }
         }
     }
     expansion.zone_steps_left = doc.zones.steps_left.get();
@@ -237,6 +287,18 @@ impl IcsTime {
             other => occurrence_key(false, zones.utc(other)?),
         })
     }
+}
+
+/// Bytes of text `event` holds, as the expansion's byte budget counts them.
+fn text_bytes(event: &CalendarEvent) -> usize {
+    let text = |t: &Option<String>| t.as_ref().map_or(0, String::len);
+    event.id.len()
+        + event.calendar_id.len()
+        + event.uid.len()
+        + event.summary.len()
+        + text(&event.description)
+        + text(&event.location)
+        + text(&event.etag)
 }
 
 fn occurrence_key(all_day: bool, start: DateTime<Utc>) -> String {
@@ -383,15 +445,29 @@ impl VEventFields {
         Some((start, end, all_day))
     }
 
-    /// Bytes of text each occurrence of this event holds: its id (`calendar:uid:key`),
-    /// calendar id, UID, summary, description and location.
-    fn occurrence_bytes(&self, uid: &str, calendar_id: &str) -> usize {
+    /// Bytes of text each occurrence of this event holds (see [`text_bytes`]): its id
+    /// (`calendar:uid:key`), calendar id, UID, summary, description, location and `etag`.
+    fn occurrence_bytes(&self, uid: &str, calendar_id: &str, etag: Option<&str>) -> usize {
         let text = |t: &Option<String>| t.as_ref().map_or(0, String::len);
         2 * (calendar_id.len() + uid.len())
             + 18
             + self.summary.as_deref().unwrap_or(UNTITLED_EVENT).len()
             + text(&self.description)
             + text(&self.location)
+            + etag.map_or(0, str::len)
+    }
+
+    /// How the event is named in reports: the start of its summary, or its UID.
+    fn label(&self) -> String {
+        let name = self
+            .summary
+            .as_deref()
+            .or(self.uid.as_deref())
+            .unwrap_or(UNTITLED_EVENT);
+        match name.char_indices().nth(60) {
+            Some((end, _)) => format!("{}...", &name[..end]),
+            None => name.to_string(),
+        }
     }
 
     fn occurrence(
@@ -399,6 +475,7 @@ impl VEventFields {
         id: String,
         uid: &str,
         calendar_id: &str,
+        etag: Option<&str>,
         (start, end, all_day): (DateTime<Utc>, DateTime<Utc>, bool),
     ) -> CalendarEvent {
         let now = Utc::now();
@@ -421,7 +498,7 @@ impl VEventFields {
             status: self.status,
             created: now,
             updated: now,
-            etag: None,
+            etag: etag.map(str::to_string),
         }
     }
 
@@ -439,7 +516,7 @@ impl VEventFields {
             Some(rid) => format!("{}:{}:{}", calendar_id, uid, rid),
             None => format!("{}:{}", calendar_id, uid),
         };
-        Some(self.occurrence(id, uid, calendar_id, times))
+        Some(self.occurrence(id, uid, calendar_id, None, times))
     }
 
     /// The occurrences of this recurring event that overlap the expansion window, except
@@ -450,6 +527,7 @@ impl VEventFields {
         &self,
         rule: &Rule,
         calendar_id: &str,
+        etag: Option<&str>,
         zones: &Zones,
         overridden: Option<&HashSet<String>>,
         expansion: &mut Expansion,
@@ -485,9 +563,7 @@ impl VEventFields {
                 && (end_of(at) > window_start || (length.is_zero() && at >= window_start))
         };
         let mut starts = Vec::new();
-        let bytes = self.occurrence_bytes(uid, calendar_id);
-        let (mut instances_left, mut bytes_left) = (expansion.instances_left, expansion.bytes_left);
-        let mut truncated = false;
+        let bytes = self.occurrence_bytes(uid, calendar_id, etag);
         // Local times run up to 14 hours ahead of UTC, and occurrences starting before the
         // window may still overlap it.
         let margin = Duration::days(2);
@@ -499,15 +575,6 @@ impl VEventFields {
             .checked_add_signed(margin)
             .unwrap_or(window_end)
             .naive_utc();
-        // Both budgets must allow one more occurrence.
-        let take = |instances_left: &mut usize, bytes_left: &mut usize| {
-            if *instances_left == 0 || *bytes_left < bytes {
-                return false;
-            }
-            *instances_left -= 1;
-            *bytes_left -= bytes;
-            true
-        };
         let mut budget = expansion.rule_steps_left;
         let walked = rule.walk(
             anchor,
@@ -533,8 +600,7 @@ impl VEventFields {
                     return false;
                 }
                 if overlaps(at) && !skip(at) {
-                    if !take(&mut instances_left, &mut bytes_left) {
-                        truncated = true;
+                    if !expansion.take(bytes) {
                         return false;
                     }
                     starts.push(at);
@@ -542,27 +608,23 @@ impl VEventFields {
                 true
             },
         );
-        truncated |= walked.is_err();
+        expansion.rule_steps_left = budget;
+        expansion.truncated |= walked.is_err();
         let mut seen: HashSet<DateTime<Utc>> = starts.iter().copied().collect();
         for extra in self.rdates.iter().filter_map(|t| zones.utc(t)) {
             if !overlaps(extra) || skip(extra) || !seen.insert(extra) {
                 continue;
             }
-            if !take(&mut instances_left, &mut bytes_left) {
-                truncated = true;
+            if !expansion.take(bytes) {
                 break;
             }
             starts.push(extra);
         }
-        expansion.rule_steps_left = budget;
-        expansion.instances_left = instances_left;
-        expansion.bytes_left = bytes_left;
-        expansion.truncated |= truncated;
         starts
             .into_iter()
             .map(|at| {
                 let id = format!("{}:{}:{}", calendar_id, uid, occurrence_key(all_day, at));
-                self.occurrence(id, uid, calendar_id, (at, end_of(at), all_day))
+                self.occurrence(id, uid, calendar_id, etag, (at, end_of(at), all_day))
             })
             .collect()
     }
@@ -571,6 +633,8 @@ impl VEventFields {
 /// The VEVENTs and VTIMEZONEs of an iCalendar text.
 struct Document {
     events: Vec<VEventFields>,
+    /// Whether VEVENTs past the most [`Document::parse`] was to keep were left out.
+    events_dropped: bool,
     zones: Zones,
 }
 
@@ -591,9 +655,11 @@ enum State {
 }
 
 impl Document {
-    fn parse(content: &str) -> Document {
+    /// Parse `content`, keeping its first `max_events` VEVENTs.
+    fn parse(content: &str, max_events: usize) -> Document {
         let mut doc = Document {
             events: Vec::new(),
+            events_dropped: false,
             zones: Zones::default(),
         };
         let mut state = State::Outside;
@@ -625,7 +691,11 @@ impl Document {
                     if let State::Event { fields, .. } =
                         std::mem::replace(&mut state, State::Outside)
                     {
-                        doc.events.push(fields);
+                        if doc.events.len() < max_events {
+                            doc.events.push(fields);
+                        } else {
+                            doc.events_dropped = true;
+                        }
                     }
                 }
                 ("BEGIN", "VTIMEZONE") if matches!(state, State::Outside) => {
@@ -737,18 +807,23 @@ fn param<'a>(params: &'a [(String, String)], name: &str) -> Option<&'a str> {
 
 /// Undo RFC 5545 section 3.1 line folding: a line starting with a space or tab continues the
 /// previous line, minus that one leading whitespace character.
-fn unfold_ics_lines(content: &str) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
-    for raw in content.lines() {
-        match (
-            raw.strip_prefix(' ').or_else(|| raw.strip_prefix('\t')),
-            lines.last_mut(),
-        ) {
-            (Some(rest), Some(prev)) => prev.push_str(rest),
-            _ => lines.push(raw.to_string()),
-        }
+///
+/// Lines are unfolded one at a time as the parser asks for them, and only folded ones are
+/// copied: a list of every line up front would cost some 30 times the text for text of short
+/// lines (a gigabyte for a 32 MiB answer).
+fn unfold_ics_lines(content: &str) -> impl Iterator<Item = Cow<'_, str>> {
+    fn continuation(raw: &str) -> Option<&str> {
+        raw.strip_prefix(' ').or_else(|| raw.strip_prefix('\t'))
     }
-    lines
+    let mut raw = content.lines().peekable();
+    std::iter::from_fn(move || {
+        let mut line = Cow::Borrowed(raw.next()?);
+        while let Some(rest) = raw.peek().copied().and_then(continuation) {
+            line.to_mut().push_str(rest);
+            raw.next();
+        }
+        Some(line)
+    })
 }
 
 /// Split a content line into `(name;params, value)` at the first colon outside a quoted
@@ -933,7 +1008,7 @@ mod tests {
     fn recurring_events_expand_within_the_window() {
         let mut expansion =
             Expansion::new(utc("2026-03-01T00:00:00Z"), utc("2026-04-07T00:00:00Z"));
-        let events = parse_ics_expanded(&weekly_series(), "cal", &mut expansion);
+        let events = parse_ics_expanded(&weekly_series(), "cal", None, &mut expansion);
         assert!(!expansion.truncated());
         let mut starts: Vec<_> = events
             .iter()
@@ -989,10 +1064,10 @@ mod tests {
 
     #[test]
     fn expansion_honours_count_until_and_all_day_series() {
-        let ics = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:count\nDTSTART:20260301T120000Z\nRRULE:FREQ=DAILY;COUNT=3\nEND:VEVENT\nBEGIN:VEVENT\nUID:until\nDTSTART:20260301T120000Z\nDURATION:PT1H\nRRULE:FREQ=WEEKLY;UNTIL=20260315T120000Z\nEND:VEVENT\nBEGIN:VEVENT\nUID:birthday\nSUMMARY:Birthday\nDTSTART;VALUE=DATE:20000310\nDTEND;VALUE=DATE:20000311\nRRULE:FREQ=YEARLY\nEND:VEVENT\nBEGIN:VEVENT\nUID:odd\nDTSTART:20260302T120000Z\nRRULE:FREQ=MONTHLY;BYSETPOS=1;BYDAY=MO\nEND:VEVENT\nEND:VCALENDAR\n";
+        let ics = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:count\nDTSTART:20260301T120000Z\nRRULE:FREQ=DAILY;COUNT=3\nEND:VEVENT\nBEGIN:VEVENT\nUID:until\nDTSTART:20260301T120000Z\nDURATION:PT1H\nRRULE:FREQ=WEEKLY;UNTIL=20260315T120000Z\nEND:VEVENT\nBEGIN:VEVENT\nUID:birthday\nSUMMARY:Birthday\nDTSTART;VALUE=DATE:20000310\nDTEND;VALUE=DATE:20000311\nRRULE:FREQ=YEARLY\nEND:VEVENT\nBEGIN:VEVENT\nUID:odd\nDTSTART:20260302T120000Z\nRRULE:FREQ=YEARLY;BYWEEKNO=10\nEND:VEVENT\nBEGIN:VEVENT\nUID:close\nSUMMARY:Month-end close\nDTSTART:20250131T150000Z\nRRULE:FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1;WKST=SU\nEND:VEVENT\nEND:VCALENDAR\n";
         let mut expansion =
             Expansion::new(utc("2026-03-02T00:00:00Z"), utc("2026-04-01T00:00:00Z"));
-        let events = parse_ics_expanded(ics, "cal", &mut expansion);
+        let events = parse_ics_expanded(ics, "cal", None, &mut expansion);
         let ids = |uid: &str| {
             let mut ids: Vec<_> = events
                 .iter()
@@ -1016,8 +1091,13 @@ mod tests {
         assert!(birthday.all_day);
         assert_eq!(birthday.start, utc("2026-03-10T00:00:00Z"));
         assert_eq!(birthday.end, utc("2026-03-11T00:00:00Z"));
-        // A rule outside the supported subset stays its first occurrence.
+        // The last weekday of the month, as Outlook writes it.
+        assert_eq!(ids("close"), ["cal:close:20260331T150000Z"]);
+        // A rule outside the supported subset stays its first occurrence, and is reported
+        // (by UID, as it has no summary) without making the answer incomplete.
         assert_eq!(ids("odd"), ["cal:odd"]);
+        assert_eq!(expansion.unexpanded().collect::<Vec<_>>(), ["odd"]);
+        assert!(!expansion.truncated());
     }
 
     #[test]
@@ -1025,13 +1105,13 @@ mod tests {
         let daily = "BEGIN:VEVENT\nUID:d\nDTSTART:20260101T090000Z\nRRULE:FREQ=DAILY\nEND:VEVENT\n";
         let window = (utc("2026-01-01T00:00:00Z"), utc("2027-01-01T00:00:00Z"));
         let mut roomy = Expansion::new(window.0, window.1);
-        assert_eq!(parse_ics_expanded(daily, "c", &mut roomy).len(), 365);
+        assert_eq!(parse_ics_expanded(daily, "c", None, &mut roomy).len(), 365);
         assert!(!roomy.truncated());
         let mut few = Expansion {
             instances_left: 10,
             ..Expansion::new(window.0, window.1)
         };
-        assert_eq!(parse_ics_expanded(daily, "c", &mut few).len(), 10);
+        assert_eq!(parse_ics_expanded(daily, "c", None, &mut few).len(), 10);
         assert!(few.truncated());
         // COUNT rules walk from DTSTART, so an old one costs periods, not occurrences.
         let old = "BEGIN:VEVENT\nUID:o\nDTSTART:19000101T090000Z\nRRULE:FREQ=DAILY;COUNT=100000\nEND:VEVENT\n";
@@ -1039,15 +1119,15 @@ mod tests {
             rule_steps_left: 2_000,
             ..Expansion::new(window.0, window.1)
         };
-        assert!(parse_ics_expanded(old, "c", &mut short).is_empty());
+        assert!(parse_ics_expanded(old, "c", None, &mut short).is_empty());
         assert!(short.truncated());
         // The budgets are shared by every object of one answer.
         let mut shared = Expansion {
             instances_left: 400,
             ..Expansion::new(window.0, window.1)
         };
-        assert_eq!(parse_ics_expanded(daily, "c", &mut shared).len(), 365);
-        assert_eq!(parse_ics_expanded(daily, "c", &mut shared).len(), 35);
+        assert_eq!(parse_ics_expanded(daily, "c", None, &mut shared).len(), 365);
+        assert_eq!(parse_ics_expanded(daily, "c", None, &mut shared).len(), 35);
         assert!(shared.truncated());
     }
 
@@ -1077,7 +1157,7 @@ mod tests {
         );
         let window = (utc("2026-01-01T00:00:00Z"), utc("2027-01-01T00:00:00Z"));
         let mut expansion = Expansion::new(window.0, window.1);
-        let parsed = parse_ics_expanded(&ics, "c", &mut expansion);
+        let parsed = parse_ics_expanded(&ics, "c", None, &mut expansion);
         assert!(expansion.truncated());
         // The events converted before the budget ran out are there, at the right time. The
         // rest are left out rather than read as UTC, an hour off. A UTC event after them is
@@ -1106,7 +1186,7 @@ mod tests {
     fn a_series_cut_short_by_the_zone_budget_keeps_only_correct_occurrences() {
         let window = (utc("2026-03-01T00:00:00Z"), utc("2026-04-07T00:00:00Z"));
         let mut full = Expansion::new(window.0, window.1);
-        let all = parse_ics_expanded(&weekly_series(), "cal", &mut full);
+        let all = parse_ics_expanded(&weekly_series(), "cal", None, &mut full);
         assert!(!full.truncated());
         let key = |e: &CalendarEvent| (e.id.clone(), e.start, e.end, e.summary.clone());
         let all: HashSet<_> = all.iter().map(key).collect();
@@ -1120,7 +1200,7 @@ mod tests {
                 zone_steps_left: budget,
                 ..Expansion::new(window.0, window.1)
             };
-            let events = parse_ics_expanded(&weekly_series(), "cal", &mut expansion);
+            let events = parse_ics_expanded(&weekly_series(), "cal", None, &mut expansion);
             let got: HashSet<_> = events.iter().map(key).collect();
             assert_eq!(got.len(), events.len(), "budget {}", budget);
             assert!(got.is_subset(&all), "budget {}: {:?}", budget, got);
@@ -1137,7 +1217,7 @@ mod tests {
                 BERLIN, start
             );
             let mut expansion = Expansion::new(window.0, window.1);
-            let ids: Vec<String> = parse_ics_expanded(&ics, "c", &mut expansion)
+            let ids: Vec<String> = parse_ics_expanded(&ics, "c", None, &mut expansion)
                 .into_iter()
                 .map(|e| e.id)
                 .collect();
@@ -1169,7 +1249,7 @@ mod tests {
         );
         let window = (utc("2026-01-01T00:00:00Z"), utc("2027-01-01T00:00:00Z"));
         let mut expansion = Expansion::new(window.0, window.1);
-        let events = parse_ics_expanded(&ics, "c", &mut expansion);
+        let events = parse_ics_expanded(&ics, "c", None, &mut expansion);
         assert!(expansion.truncated());
         let held: usize = events
             .iter()
@@ -1190,9 +1270,9 @@ mod tests {
             bytes_left: 400 * each,
             ..Expansion::new(window.0, window.1)
         };
-        assert_eq!(parse_ics_expanded(short, "c", &mut shared).len(), 365);
+        assert_eq!(parse_ics_expanded(short, "c", None, &mut shared).len(), 365);
         assert!(!shared.truncated());
-        assert_eq!(parse_ics_expanded(short, "c", &mut shared).len(), 35);
+        assert_eq!(parse_ics_expanded(short, "c", None, &mut shared).len(), 35);
         assert!(shared.truncated());
     }
 
@@ -1201,8 +1281,199 @@ mod tests {
         let ics = "BEGIN:VEVENT\nUID:a\nDTSTART;TZID=Nowhere:20260105T090000\nEND:VEVENT\nBEGIN:VEVENT\nUID:b\nDTSTART;TZID=Nowhere:20260106T090000\nEND:VEVENT\n";
         let mut expansion =
             Expansion::new(utc("2026-01-01T00:00:00Z"), utc("2027-01-01T00:00:00Z"));
-        assert_eq!(parse_ics_expanded(ics, "c", &mut expansion).len(), 2);
+        assert_eq!(parse_ics_expanded(ics, "c", None, &mut expansion).len(), 2);
         assert_eq!(expansion.unknown_zones().collect::<Vec<_>>(), ["Nowhere"]);
+    }
+
+    #[test]
+    fn times_the_clocks_skip_take_the_offset_before_the_gap() {
+        // Berlin skips 02:00-03:00 on 29 March 2026. RFC 5545 section 3.3.5 reads 02:30 with
+        // the offset before the gap: 01:30 UTC, which is 03:30 CEST.
+        let single = format!(
+            "{}BEGIN:VEVENT\r\nUID:gap\r\nDTSTART;TZID=Europe/Berlin:20260329T023000\r\nEND:VEVENT\r\n",
+            BERLIN
+        );
+        let events = parse_ics_str(&single, "c").events;
+        assert_eq!(events[0].start, utc("2026-03-29T01:30:00Z"));
+        assert_eq!(events[0].end, utc("2026-03-29T02:30:00Z"));
+
+        // A nightly 02:30 series across the change, with the gap night cancelled or moved by
+        // UTC times, which is how servers write EXDATE and RECURRENCE-ID.
+        let series = |exdate: &str, moved: &str| {
+            format!(
+                "BEGIN:VCALENDAR\r\n{}BEGIN:VEVENT\r\nUID:nightly\r\nSUMMARY:Backup\r\nDTSTART;TZID=Europe/Berlin:20260325T023000\r\nDURATION:PT30M\r\nRRULE:FREQ=DAILY;COUNT=7\r\n{}END:VEVENT\r\n{}END:VCALENDAR\r\n",
+                BERLIN, exdate, moved
+            )
+        };
+        let expand = |ics: &str| {
+            let mut expansion =
+                Expansion::new(utc("2026-03-20T00:00:00Z"), utc("2026-04-10T00:00:00Z"));
+            let mut events: Vec<_> = parse_ics_expanded(ics, "c", None, &mut expansion)
+                .into_iter()
+                .map(|e| (e.id, e.start.format("%dT%H%M").to_string()))
+                .collect();
+            events.sort();
+            assert!(!expansion.truncated());
+            events
+        };
+        let occurrence = |day: &str, utc: &str| (format!("c:nightly:202603{}Z", utc), day.into());
+        let all = expand(&series("", ""));
+        assert_eq!(
+            all,
+            [
+                occurrence("25T0130", "25T013000"),
+                occurrence("26T0130", "26T013000"),
+                occurrence("27T0130", "27T013000"),
+                occurrence("28T0130", "28T013000"),
+                // The night of the change: 03:30 CEST.
+                occurrence("29T0130", "29T013000"),
+                // Then 02:30 CEST.
+                occurrence("30T0030", "30T003000"),
+                occurrence("31T0030", "31T003000"),
+            ]
+        );
+        let cancelled = expand(&series("EXDATE:20260329T013000Z\r\n", ""));
+        assert_eq!(cancelled.len(), 6);
+        assert!(cancelled.iter().all(|(_, day)| !day.starts_with("29")));
+        let moved = expand(&series(
+            "",
+            "BEGIN:VEVENT\r\nUID:nightly\r\nRECURRENCE-ID:20260329T013000Z\r\nSUMMARY:Backup (late)\r\nDTSTART:20260329T060000Z\r\nDURATION:PT30M\r\nEND:VEVENT\r\n",
+        ));
+        assert_eq!(moved.len(), 7);
+        let gap_night: Vec<_> = moved
+            .iter()
+            .filter(|(_, day)| day.starts_with("29"))
+            .collect();
+        assert_eq!(gap_night, [&occurrence("29T0600", "29T013000")]);
+        // The same cancellation written in local time matches too.
+        let local = expand(&series("EXDATE;TZID=Europe/Berlin:20260329T023000\r\n", ""));
+        assert_eq!(local, cancelled);
+    }
+
+    #[test]
+    fn every_event_of_an_answer_is_paid_for() {
+        let window = (utc("2026-01-01T00:00:00Z"), utc("2027-01-01T00:00:00Z"));
+        // Events sent as they are (what a server's `expand` answers with) count against the
+        // instance budget like expanded occurrences.
+        let plain: String = (0..5)
+            .map(|i| {
+                format!(
+                    "BEGIN:VEVENT\nUID:p{}\nRECURRENCE-ID:2026010{}T090000Z\nDTSTART:2026010{}T090000Z\nEND:VEVENT\n",
+                    i,
+                    i + 1,
+                    i + 1
+                )
+            })
+            .collect();
+        let mut few = Expansion {
+            instances_left: 3,
+            ..Expansion::new(window.0, window.1)
+        };
+        assert_eq!(parse_ics_expanded(&plain, "c", None, &mut few).len(), 3);
+        assert!(few.truncated());
+        let mut roomy = Expansion::new(window.0, window.1);
+        assert_eq!(parse_ics_expanded(&plain, "c", None, &mut roomy).len(), 5);
+        assert!(!roomy.truncated());
+        // And against the byte budget: id `c:p0:20260101T090000Z`, calendar id, UID and
+        // "(no title)".
+        let each = 21 + 1 + 2 + UNTITLED_EVENT.len();
+        let mut short = Expansion {
+            bytes_left: 4 * each,
+            ..Expansion::new(window.0, window.1)
+        };
+        assert_eq!(parse_ics_expanded(&plain, "c", None, &mut short).len(), 4);
+        assert!(short.truncated());
+
+        // Every event carries its resource's etag, and every copy of it is paid for: a daily
+        // series with a 1 MiB etag cannot hold a year of copies (365 MiB).
+        let etag = "e".repeat(1 << 20);
+        let daily = "BEGIN:VEVENT\nUID:d\nDTSTART:20260101T090000Z\nRRULE:FREQ=DAILY\nEND:VEVENT\n";
+        let mut expansion = Expansion::new(window.0, window.1);
+        let events = parse_ics_expanded(daily, "c", Some(&etag), &mut expansion);
+        assert!(expansion.truncated());
+        // Id `c:d:20260101T090000Z`, calendar id, UID and "(no title)", then the etag.
+        let each = 20 + 1 + 1 + UNTITLED_EVENT.len() + etag.len();
+        assert_eq!(events.len(), MAX_EXPANDED_BYTES / each);
+        let held: usize = events.iter().map(text_bytes).sum();
+        assert!(held <= MAX_EXPANDED_BYTES, "{}", held);
+        assert!(
+            events
+                .iter()
+                .all(|e| e.etag.as_deref() == Some(etag.as_str()))
+        );
+        // Plain events carry it too.
+        let mut expansion = Expansion::new(window.0, window.1);
+        let events = parse_ics_expanded(&plain, "c", Some("\"v1\""), &mut expansion);
+        assert!(events.iter().all(|e| e.etag.as_deref() == Some("\"v1\"")));
+
+        // VEVENTs that could never all become events are not all parsed: past twice the
+        // events still allowed, they are left out (and the answer is incomplete).
+        let broken = "BEGIN:VEVENT\nSUMMARY:no UID\nEND:VEVENT\n".repeat(7);
+        let mut expansion = Expansion {
+            instances_left: 3,
+            ..Expansion::new(window.0, window.1)
+        };
+        let events = parse_ics_expanded(&format!("{}{}", broken, plain), "c", None, &mut expansion);
+        assert!(events.is_empty());
+        assert!(expansion.truncated());
+        assert_eq!(Document::parse(&broken, 6).events.len(), 6);
+        assert!(Document::parse(&broken, 6).events_dropped);
+        assert!(!Document::parse(&broken, 7).events_dropped);
+        // A series whose occurrences are all moved yields none itself, which the margin
+        // allows for.
+        let moved = "BEGIN:VEVENT\nUID:m\nDTSTART:20260105T090000Z\nRRULE:FREQ=DAILY;COUNT=2\nEND:VEVENT\nBEGIN:VEVENT\nUID:m\nRECURRENCE-ID:20260105T090000Z\nDTSTART:20260105T100000Z\nEND:VEVENT\nBEGIN:VEVENT\nUID:m\nRECURRENCE-ID:20260106T090000Z\nDTSTART:20260106T100000Z\nEND:VEVENT\n";
+        let mut expansion = Expansion {
+            instances_left: 2,
+            ..Expansion::new(window.0, window.1)
+        };
+        assert_eq!(
+            parse_ics_expanded(moved, "c", None, &mut expansion).len(),
+            2
+        );
+        assert!(!expansion.truncated());
+    }
+
+    #[test]
+    fn unexpanded_series_are_named_once() {
+        let long = "A very long meeting title that goes on and on well past sixty characters";
+        let ics = format!(
+            "BEGIN:VEVENT\nUID:hourly\nSUMMARY:{}\nDTSTART:20260105T090000Z\nRRULE:FREQ=HOURLY\nEND:VEVENT\nBEGIN:VEVENT\nUID:hourly\nRECURRENCE-ID:20260105T100000Z\nSUMMARY:Moved\nDTSTART:20260105T103000Z\nEND:VEVENT\nBEGIN:VEVENT\nUID:weekno\nSUMMARY:Week 10\nDTSTART:20260302T090000Z\nRRULE:FREQ=YEARLY;BYWEEKNO=10\nEND:VEVENT\nBEGIN:VEVENT\nUID:fine\nDTSTART:20260105T090000Z\nRRULE:FREQ=WEEKLY;COUNT=2\nEND:VEVENT\n",
+            long
+        );
+        let mut expansion =
+            Expansion::new(utc("2026-01-01T00:00:00Z"), utc("2027-01-01T00:00:00Z"));
+        let events = parse_ics_expanded(&ics, "c", None, &mut expansion);
+        // First occurrences, the moved one and the supported series.
+        assert_eq!(events.len(), 5);
+        assert!(!expansion.truncated());
+        let named: Vec<_> = expansion.unexpanded().collect();
+        assert_eq!(named.len(), 2);
+        assert_eq!(named[0], format!("{}...", &long[..60]));
+        assert_eq!(named[1], "Week 10");
+    }
+
+    /// Line unfolding as it was done before it became lazy: every line up front.
+    fn unfold_eagerly(content: &str) -> Vec<String> {
+        let mut lines: Vec<String> = Vec::new();
+        for raw in content.lines() {
+            match (
+                raw.strip_prefix(' ').or_else(|| raw.strip_prefix('\t')),
+                lines.last_mut(),
+            ) {
+                (Some(rest), Some(prev)) => prev.push_str(rest),
+                _ => lines.push(raw.to_string()),
+            }
+        }
+        lines
+    }
+
+    #[test]
+    fn unfolding_copies_only_folded_lines() {
+        let content = " leading\r\n continued\r\nA:1\r\nB:2\r\n \r\n\tthree\r\n\r\nC:3";
+        let lines: Vec<Cow<'_, str>> = unfold_ics_lines(content).collect();
+        assert_eq!(lines, [" leadingcontinued", "A:1", "B:2three", "", "C:3"]);
+        let copied: Vec<bool> = lines.iter().map(|l| matches!(l, Cow::Owned(_))).collect();
+        assert_eq!(copied, [true, false, true, false, false]);
     }
 
     #[test]
@@ -1229,6 +1500,12 @@ mod tests {
 
     proptest::proptest! {
         #[test]
+        fn unfolding_lazily_matches_unfolding_everything(s in "([ \t]?[A-Z:]{0,3}(\r?\n)?){0,12}") {
+            let lazy: Vec<String> = unfold_ics_lines(&s).map(Cow::into_owned).collect();
+            proptest::prop_assert_eq!(lazy, unfold_eagerly(&s));
+        }
+
+        #[test]
         fn ics_parser_never_panics(s in "(BEGIN:VEVENT|END:VEVENT|BEGIN:VALARM|END:VALARM|BEGIN:VTIMEZONE|END:VTIMEZONE|BEGIN:STANDARD|END:STANDARD|TZID:Z1|TZOFFSETTO:[-+][0-9]{4}|UID:x|DTSTART(;TZID=Z1)?:[0-9TZ]{0,16}|DTEND:[0-9TZ]{0,16}|DURATION:[-+PTWDHMS0-9]{0,12}|RECURRENCE-ID:[0-9]{0,8}|RRULE:FREQ=(DAILY|WEEKLY|MONTHLY|YEARLY)(;COUNT=[0-9]{1,3})?|EXDATE:[0-9TZ]{0,16}|[ -~]{0,20}|\r?\n){0,40}") {
             for e in parse_ics_str(&s, "c").events {
                 proptest::prop_assert!(e.end >= e.start);
@@ -1238,7 +1515,7 @@ mod tests {
                 instances_left: 2_000,
                 ..Expansion::new(utc("2000-01-01T00:00:00Z"), utc("2001-01-01T00:00:00Z"))
             };
-            for e in parse_ics_expanded(&s, "c", &mut expansion) {
+            for e in parse_ics_expanded(&s, "c", None, &mut expansion) {
                 proptest::prop_assert!(e.end >= e.start);
             }
         }

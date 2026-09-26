@@ -560,24 +560,13 @@ pub async fn sync_calendar_endpoint(
         .lock()
         .get_calendar(&id)
         .ok_or_else(|| ServerError::NotFound(id.clone()))?;
-    let count = match &calendar.config {
+    match &calendar.config {
         CalendarConfig::Ics { path, .. } => {
-            let parsed = parse_ics_file(path, &calendar.id).map_err(ServerError::from)?;
-            let count = parsed.events.len();
-            let mut mgr = state.manager.lock();
-            for event in &parsed.events {
-                mgr.upsert_event(event)?;
-            }
-            // Like an incomplete remote answer: what came is stored, the sync time is not.
-            if parsed.incomplete {
-                return Ok(Json(SyncResponse::new(
-                    id,
-                    count,
-                    Some(ICS_ZONES_TOO_COSTLY.to_string()),
-                )));
-            }
-            mgr.set_last_sync(&id, Utc::now())?;
-            count
+            let (manager, path) = (state.manager.clone(), path.clone());
+            let result = run_blocking(move || load_ics(&manager, &id, &path))
+                .await
+                .map_err(ServerError::Internal)??;
+            Ok(Json(result))
         }
         _ => {
             // Provider problems (including rejected credentials) are reported in the body, never
@@ -586,10 +575,45 @@ pub async fn sync_calendar_endpoint(
             if let Some(err) = &result.error {
                 tracing::warn!("calendar {} sync failed: {}", result.calendar_id, err);
             }
-            return Ok(Json(result));
+            Ok(Json(result))
         }
-    };
-    Ok(Json(SyncResponse::new(id, count, None)))
+    }
+}
+
+/// Run `work` on a blocking thread. Parsing calendar data (with its time zone and recurrence
+/// rules) and writing many events is CPU and disk work that must not hold up the async
+/// workers, which also serve the tablets.
+async fn run_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> std::result::Result<T, String> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| format!("calendar sync task failed: {}", e))
+}
+
+/// Parse and store the file of ICS calendar `id` for [`sync_calendar_endpoint`]; a file that
+/// cannot be read, or an event that cannot be saved, fails the request.
+fn load_ics(
+    manager: &Mutex<CalendarManager>,
+    id: &str,
+    path: &std::path::Path,
+) -> Result<SyncResponse> {
+    let parsed = parse_ics_file(path, id).map_err(ServerError::from)?;
+    let count = parsed.events.len();
+    let mut mgr = manager.lock();
+    for event in &parsed.events {
+        mgr.upsert_event(event)?;
+    }
+    // Like an incomplete remote answer: what came is stored, the sync time is not.
+    if parsed.incomplete {
+        return Ok(SyncResponse::new(
+            id.to_string(),
+            count,
+            Some(ICS_ZONES_TOO_COSTLY.to_string()),
+        ));
+    }
+    mgr.set_last_sync(id, Utc::now())?;
+    Ok(SyncResponse::new(id.to_string(), count, None))
 }
 
 /// Sync one remote calendar, or wait for the sync of it already running and share its result.
@@ -628,8 +652,24 @@ async fn fetch_and_store(state: &CalendarState, id: &str) -> SyncResponse {
         .remote
         .fetch_events(&calendar, &mut config, window)
         .await;
+    let manager = state.manager.clone();
+    run_blocking(move || store_fetched(&manager, calendar, config, window, fetched))
+        .await
+        .unwrap_or_else(|e| SyncResponse::new(id.to_string(), 0, Some(e)))
+}
+
+/// Save what a fetch of `calendar` brought: its updated `config`, and the events it returned
+/// in `window`.
+fn store_fetched(
+    manager: &Mutex<CalendarManager>,
+    calendar: Calendar,
+    config: CalendarConfig,
+    window: SyncWindow,
+    fetched: std::result::Result<Fetched, CalendarError>,
+) -> SyncResponse {
     let mut errors = Vec::new();
-    let mut mgr = state.manager.lock();
+    let mut warnings = Vec::new();
+    let mut mgr = manager.lock();
     // Refreshed/rotated tokens and discovered URLs are saved even when the fetch failed later.
     if config != calendar.config {
         if let Err(e) = mgr.update_config(&calendar.id, config) {
@@ -640,17 +680,22 @@ async fn fetch_and_store(state: &CalendarState, id: &str) -> SyncResponse {
         Ok(Fetched {
             events,
             incomplete: None,
-        }) => mgr
-            .replace_events_in_range(&calendar.id, window.start, window.end, &events)
-            .unwrap_or_else(|e| {
-                errors.push(format!("saving events failed: {}", e));
-                (0, 0)
-            }),
+            warnings: partial,
+        }) => {
+            warnings = partial;
+            mgr.replace_events_in_range(&calendar.id, window.start, window.end, &events)
+                .unwrap_or_else(|e| {
+                    errors.push(format!("saving events failed: {}", e));
+                    (0, 0)
+                })
+        }
         // Store what came, but an event missing from a partial answer was not deleted.
         Ok(Fetched {
             events,
             incomplete: Some(reason),
+            warnings: partial,
         }) => {
+            warnings = partial;
             errors.insert(0, reason);
             match mgr.upsert_events(&calendar.id, &events) {
                 Ok(stored) => (stored, 0),
@@ -671,6 +716,9 @@ async fn fetch_and_store(state: &CalendarState, id: &str) -> SyncResponse {
         }
     }
     drop(mgr);
+    // Events the answer holds only in part are reported as well, although the sync was
+    // complete otherwise: what the answer did not list was removed, and its time saved.
+    errors.extend(warnings);
     let error = (!errors.is_empty()).then(|| errors.join("; "));
     SyncResponse {
         events_removed: removed,
@@ -682,20 +730,16 @@ async fn fetch_and_store(state: &CalendarState, id: &str) -> SyncResponse {
 const ICS_ZONES_TOO_COSTLY: &str = "too many time zone rules to go through: events whose \
                                     times could not be converted were not stored";
 
-/// Load an ICS calendar's file; failures are reported in the result.
-fn sync_ics(state: &CalendarState, calendar: &Calendar, path: &std::path::Path) -> SyncResponse {
-    let parsed = match parse_ics_file(path, &calendar.id) {
+/// Load the file of ICS calendar `id`; failures are reported in the result.
+fn sync_ics(manager: &Mutex<CalendarManager>, id: &str, path: &std::path::Path) -> SyncResponse {
+    let parsed = match parse_ics_file(path, id) {
         Ok(parsed) => parsed,
         Err(e) => {
-            return SyncResponse::new(
-                calendar.id.clone(),
-                0,
-                Some(format!("ICS load failed: {}", e)),
-            );
+            return SyncResponse::new(id.to_string(), 0, Some(format!("ICS load failed: {}", e)));
         }
     };
     let total = parsed.events.len();
-    let mut mgr = state.manager.lock();
+    let mut mgr = manager.lock();
     let failures: Vec<String> = parsed
         .events
         .iter()
@@ -720,12 +764,12 @@ fn sync_ics(state: &CalendarState, calendar: &Calendar, path: &std::path::Path) 
     // Reported like a remote sync's: a sync that missed events, or whose time was not saved,
     // did not fully succeed.
     if errors.is_empty() {
-        if let Err(e) = mgr.set_last_sync(&calendar.id, Utc::now()) {
+        if let Err(e) = mgr.set_last_sync(id, Utc::now()) {
             errors.push(format!("saving sync time failed: {}", e));
         }
     }
     let error = (!errors.is_empty()).then(|| errors.join("; "));
-    SyncResponse::new(calendar.id.clone(), total - failures.len(), error)
+    SyncResponse::new(id.to_string(), total - failures.len(), error)
 }
 
 pub async fn sync_all_calendars(
@@ -751,7 +795,13 @@ async fn sync_all(state: CalendarState) -> Vec<SyncResponse> {
         // Per-calendar failures are reported in that calendar's entry (success=false + error)
         // instead of being swallowed; the rest still sync.
         let result = match &calendar.config {
-            CalendarConfig::Ics { path, .. } => sync_ics(&state, &calendar, path),
+            CalendarConfig::Ics { path, .. } => {
+                let (manager, id, path) =
+                    (state.manager.clone(), calendar.id.clone(), path.clone());
+                run_blocking(move || sync_ics(&manager, &id, &path))
+                    .await
+                    .unwrap_or_else(|e| SyncResponse::new(calendar.id.clone(), 0, Some(e)))
+            }
             _ => sync_remote(&state, &calendar.id).await,
         };
         if let Some(err) = &result.error {
