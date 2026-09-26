@@ -20,6 +20,13 @@ use tracing::{debug, info, warn};
 /// Cap on extracted text stored per document, in bytes.
 const MAX_INDEXED_TEXT: usize = 100_000;
 
+/// Whether `hash` is the blob `filename` currently resolves to. A superseded version (the
+/// same filename re-uploaded with new content) is not, whether or not the storage layer still
+/// remembers a name for the old hash.
+fn is_current(storage: &Storage, hash: &str, filename: &str) -> bool {
+    storage.hash_for_filename(filename).as_deref() == Some(hash)
+}
+
 /// Longest prefix of `text` of at most `max` bytes that ends on a char boundary.
 fn truncate_on_char_boundary(text: &str, max: usize) -> &str {
     if text.len() <= max { return text; }
@@ -395,6 +402,7 @@ impl SearchIndex {
         let mut indexed = 0;
         for hash in storage.list_hashes()? {
             let Some(filename) = storage.filename_for_hash(&hash) else { continue };
+            if !is_current(storage, &hash, &filename) { continue }
             let content = match DocumentType::from_filename(&filename) {
                 DocumentType::Pdf => match storage.get(&hash) {
                     Ok(data) => Self::extract_pdf_text(&hash, &filename, &data),
@@ -423,7 +431,7 @@ impl SearchIndex {
         let db = |e: rusqlite::Error| ServerError::Database(e.to_string());
         let mut conn = self.inner.conn.lock();
         let live: std::collections::HashSet<String> = storage.list_hashes()?.into_iter().collect();
-        let mapped = |h: &str, f: &str| storage.hash_for_filename(f).as_deref() == Some(h) || storage.filename_for_hash(h).is_some();
+        let mapped = |h: &str, f: &str| is_current(storage, h, f) || storage.filename_for_hash(h).is_some_and(|g| is_current(storage, h, &g));
         let tx = conn.transaction().map_err(db)?;
         let stale: Vec<String> = {
             let mut stmt = tx.prepare("SELECT hash, filename FROM documents").map_err(db)?;
@@ -617,7 +625,7 @@ mod tests {
         // Same filename, new content: the mapping moves to the new hash, the old blob stays on disk.
         let new = storage.put(b"{\"v\":2}", "notes.metadata").unwrap();
         assert_ne!(old, new);
-        assert!(storage.exists(&old) && storage.filename_for_hash(&old).is_none());
+        assert!(storage.exists(&old) && storage.hash_for_filename("notes.metadata").as_deref() == Some(new.as_str()));
         assert_eq!(index.rebuild_from_storage(&storage).unwrap(), 1);
         assert!(!index.is_indexed(&old), "unmapped blob's row must be pruned");
         assert!(index.is_indexed(&new));
