@@ -133,11 +133,22 @@ impl OneDrive {
         self.handle_response(response).await
     }
 
-    fn children_url(&self, root: &SyncRoot<'_>) -> String {
+    /// The item `root` is: `.../me/drive/root` or `.../me/drive/items/{id}`.
+    fn root_url(&self, root: &SyncRoot<'_>) -> String {
         match root {
-            SyncRoot::Folder(id) => format!("{}/me/drive/items/{}/children", self.graph_base, id),
-            SyncRoot::Drive => format!("{}/me/drive/root/children", self.graph_base),
+            SyncRoot::Folder(id) => format!("{}/me/drive/items/{}", self.graph_base, id),
+            SyncRoot::Drive => format!("{}/me/drive/root", self.graph_base),
         }
+    }
+
+    fn children_url(&self, root: &SyncRoot<'_>) -> String {
+        format!("{}/children", self.root_url(root))
+    }
+
+    /// `action` (`content`, `createUploadSession`) on the item at `path`, a `/`-separated
+    /// path below `root`: `root:/{path}:/{action}` or `items/{id}:/{path}:/{action}`.
+    fn path_url(&self, root: &SyncRoot<'_>, path: &str, action: &str) -> String {
+        format!("{}:/{}:/{}", self.root_url(root), encode_path(path), action)
     }
 
     /// Every item of the collection at `url`, following `@odata.nextLink`.
@@ -280,8 +291,9 @@ impl OneDrive {
     }
 }
 
-/// The folder listings and change paths are relative to: the whole drive, or a folder by item
-/// id. `root` is Graph's alias for the drive root.
+/// The folder listings, change paths, uploads and new folders are relative to: the whole
+/// drive, or a folder by item id. `root` is Graph's alias for the drive root, and `""` means
+/// it too, so every call agrees on what a sync folder is.
 enum SyncRoot<'a> {
     Drive,
     Folder(&'a str),
@@ -580,6 +592,12 @@ impl CloudProvider for OneDrive {
         Ok(out)
     }
 
+    /// Before #34 a folder's listing pathed each item by its `parentReference.path`, its path
+    /// from the drive root. `root` was listed the same way it is now, and `""` not at all.
+    fn had_drive_rooted_layout(&self, folder_id: Option<&str>) -> bool {
+        matches!(SyncRoot::of(folder_id), SyncRoot::Folder(_))
+    }
+
     async fn list_folders(&self) -> Result<Vec<CloudFolder>> {
         // Use search to find all folders
         let url = format!(
@@ -666,20 +684,8 @@ impl CloudProvider for OneDrive {
         // For larger files, use upload session
         const SIMPLE_UPLOAD_LIMIT: usize = 4 * 1024 * 1024;
 
-        let url = if let Some(id) = parent_id {
-            format!(
-                "{}/me/drive/items/{}:/{}:/content",
-                self.graph_base,
-                id,
-                encode_path(name)
-            )
-        } else {
-            format!(
-                "{}/me/drive/root:/{}:/content",
-                self.graph_base,
-                encode_path(name)
-            )
-        };
+        // The same root as the listing, so `""` uploads to the drive root it listed.
+        let url = self.path_url(&SyncRoot::of(parent_id), name, "content");
 
         if content.len() <= SIMPLE_UPLOAD_LIMIT {
             // Simple upload
@@ -701,11 +707,7 @@ impl CloudProvider for OneDrive {
     }
 
     async fn create_folder(&self, parent_id: Option<&str>, name: &str) -> Result<CloudFolder> {
-        let url = if let Some(id) = parent_id {
-            format!("{}/me/drive/items/{}/children", self.graph_base, id)
-        } else {
-            format!("{}/me/drive/root/children", self.graph_base)
-        };
+        let url = self.children_url(&SyncRoot::of(parent_id));
 
         #[derive(Serialize)]
         struct CreateFolder<'a> {
@@ -929,20 +931,7 @@ impl OneDrive {
         content: &[u8],
     ) -> Result<CloudFile> {
         // Create upload session
-        let session_url = if let Some(id) = parent_id {
-            format!(
-                "{}/me/drive/items/{}:/{}:/createUploadSession",
-                self.graph_base,
-                id,
-                encode_path(name)
-            )
-        } else {
-            format!(
-                "{}/me/drive/root:/{}:/createUploadSession",
-                self.graph_base,
-                encode_path(name)
-            )
-        };
+        let session_url = self.path_url(&SyncRoot::of(parent_id), name, "createUploadSession");
 
         #[derive(Serialize)]
         struct CreateSessionBody {
@@ -1099,7 +1088,13 @@ mod tests {
         use serde_json::{Value, json};
 
         use super::*;
-        use crate::integrations::sync::{CloudSync, SyncConfig, SyncDirection, SyncState};
+        use crate::integrations::sync::{
+            CloudSync,
+            SyncConfig,
+            SyncDirection,
+            SyncState,
+            SyncStatus,
+        };
 
         fn file(id: &str, name: &str, parent: &str) -> Value {
             json!({
@@ -1550,6 +1545,121 @@ mod tests {
                 .collect();
             assert_eq!(at_root.len(), 3, "{children:?}");
             assert!(!children.iter().any(|c| c.starts_with("children root")));
+        }
+
+        /// A Graph stand-in that records `METHOD path` of every request, after reading its
+        /// body. Listings are empty, `createUploadSession` hands out `{base}/session`, and any
+        /// other write answers with an item.
+        async fn recording_graph() -> (String, Arc<Mutex<Vec<String>>>) {
+            use axum::http::{Method, Uri};
+
+            #[derive(Clone, Default)]
+            struct Rec {
+                base: Arc<Mutex<String>>,
+                seen: Arc<Mutex<Vec<String>>>,
+            }
+            let rec = Rec::default();
+            let app =
+                axum::Router::new()
+                    .fallback(
+                        |State(rec): State<Rec>,
+                         method: Method,
+                         uri: Uri,
+                         body: axum::body::Body| async move {
+                            axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                            let path = uri.path().to_string();
+                            rec.seen
+                                .lock()
+                                .unwrap()
+                                .push(format!("{} {}", method, path));
+                            if method == Method::GET {
+                                Json(json!({ "value": [] })).into_response()
+                            } else if path.ends_with(":/createUploadSession") {
+                                let base = rec.base.lock().unwrap().clone();
+                                Json(json!({
+                                    "uploadUrl": format!("{}/session", base),
+                                    "expirationDateTime": "2030-01-01T00:00:00Z",
+                                }))
+                                .into_response()
+                            } else {
+                                (StatusCode::CREATED, Json(file("NEW", "new", "P"))).into_response()
+                            }
+                        },
+                    )
+                    .with_state(rec.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            *rec.base.lock().unwrap() = base.clone();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            (base, rec.seen)
+        }
+
+        /// Uploads (simple and resumable) and new folders go where the listing looked: `""`
+        /// and `root` are the drive root for writes too (`root:/…`, `root/children`), never
+        /// `items/:/…` or `items//children`, so a sync of `""` can upload what it lists.
+        #[tokio::test]
+        async fn writes_treat_root_aliases_as_the_drive_root() {
+            let (base, seen) = recording_graph().await;
+            let d = onedrive(&base);
+            let big = vec![0u8; 4 * 1024 * 1024 + 1]; // over the simple-upload limit
+            for folder in [None, Some(""), Some("root"), Some("F")] {
+                seen.lock().unwrap().clear();
+                d.list_files(folder).await.unwrap();
+                d.upload_file_at(folder, &["dir", "x.pdf"], b"x", None)
+                    .await
+                    .unwrap();
+                d.upload_file_at(folder, &["big.bin"], &big, None)
+                    .await
+                    .unwrap();
+                d.create_folder(folder, "New").await.unwrap();
+                let at = if folder == Some("F") {
+                    "items/F"
+                } else {
+                    "root"
+                };
+                assert_eq!(
+                    *seen.lock().unwrap(),
+                    vec![
+                        format!("GET /me/drive/{at}/children"),
+                        format!("PUT /me/drive/{at}:/dir/x.pdf:/content"),
+                        format!("POST /me/drive/{at}:/big.bin:/createUploadSession"),
+                        "PUT /session".to_string(),
+                        format!("POST /me/drive/{at}/children"),
+                    ],
+                    "{folder:?}"
+                );
+            }
+
+            // A full sync of `""` lists the drive root and uploads into it.
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("x.pdf"), "x").unwrap();
+            seen.lock().unwrap().clear();
+            let config = SyncConfig {
+                local_path: dir.path().to_path_buf(),
+                cloud_folder: Some(String::new()),
+                ..Default::default()
+            };
+            let r = CloudSync::new(d, config).sync().await.unwrap();
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+            assert_eq!((r.status, r.uploaded), (SyncStatus::Success, 1));
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![
+                    "GET /me/drive/root/children",
+                    "PUT /me/drive/root:/x.pdf:/content"
+                ]
+            );
+        }
+
+        /// Only a folder other than the drive root had its files laid out by their path from
+        /// the drive root before #34.
+        #[test]
+        fn drive_rooted_layout_only_for_folders() {
+            let d = onedrive(GRAPH_BASE);
+            for root in [None, Some(""), Some("root")] {
+                assert!(!d.had_drive_rooted_layout(root), "{root:?}");
+            }
+            assert!(d.had_drive_rooted_layout(Some("F")));
         }
 
         /// Neither the sync folder nor the drive root is in the delta, so the parent chains are

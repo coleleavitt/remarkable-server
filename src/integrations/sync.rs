@@ -168,6 +168,38 @@ fn local_write_error(cloud_path: &str, e: IntegrationError) -> IntegrationError 
     }
 }
 
+/// The remote file that the local-only file at `path` looks like a leftover copy of, from the
+/// layout a Dropbox or OneDrive folder sync had before #34 (see
+/// [`CloudProvider::had_drive_rooted_layout`]): `/Notes/a.pdf` for the folder's `/a.pdf`, or
+/// `/Documents/Notes/a.pdf` for a folder further down the drive. Those listings weren't
+/// recursive, so a leftover is a top-level remote file inside local directories none of which
+/// exists remotely. A file under a directory the folder does have is an ordinary new file.
+fn leftover_of<'a>(path: &str, cloud: &'a HashMap<String, CloudFile>) -> Option<&'a str> {
+    let (dirs, name) = path.rsplit_once('/')?;
+    if dirs.is_empty() {
+        return None; // top level: the same in both layouts
+    }
+    let (remote, file) = cloud.get_key_value(&format!("/{}", name))?;
+    if file.is_folder {
+        return None;
+    }
+    let exists_remotely = |dir: &str| {
+        cloud.keys().any(|p| {
+            p.strip_prefix(dir)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        })
+    };
+    let mut dir = String::new();
+    for part in dirs.split('/').skip(1) {
+        dir.push('/');
+        dir.push_str(part);
+        if exists_remotely(&dir) {
+            return None;
+        }
+    }
+    Some(remote)
+}
+
 /// Sync direction
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyncDirection {
@@ -296,7 +328,9 @@ impl<P: CloudProvider> CloudSync<P> {
         &self.state
     }
 
-    /// Perform full sync
+    /// Perform full sync. Files only present locally are uploaded, except where the provider
+    /// [had a drive-rooted layout](CloudProvider::had_drive_rooted_layout) for this folder: a
+    /// local file that looks like a leftover of it is reported as an error and left alone.
     pub async fn sync(&mut self) -> Result<SyncResult> {
         Ok(self.reconcile(LocalOnly::Upload).await?.result)
     }
@@ -399,8 +433,24 @@ impl<P: CloudProvider> CloudSync<P> {
             SyncDirection::Upload | SyncDirection::Bidirectional
                 if local_only == LocalOnly::Upload =>
             {
+                // Local files left by the layout an older version kept this folder in aren't
+                // uploaded: they'd land one level down (`/Notes/Notes/a.pdf`) for good.
+                let drive_rooted = self
+                    .provider
+                    .had_drive_rooted_layout(self.config.cloud_folder.as_deref());
                 // Upload new local files
                 for path in &upload_paths {
+                    if drive_rooted {
+                        if let Some(remote) = leftover_of(path, &cloud_map) {
+                            result.errors.push(format!(
+                                "Not uploading {}: it looks like a copy of {} left by an older \
+                                 version, which kept this folder's files under its path from \
+                                 the drive root; move or delete it",
+                                path, remote
+                            ));
+                            continue;
+                        }
+                    }
                     let local_info = &local_files[*path];
                     match self.upload_file(path, local_info).await {
                         Ok(_) => result.uploaded += 1,
@@ -1023,9 +1073,11 @@ mod tests {
     /// downloaded ids. Downloads of ids in `fail_ids` fail with a (transient) network error,
     /// of ids in `gone_ids` with a (permanent) not-found; `get_changes` hands out
     /// `next_cursor`, except for `stale_cursor`, which it rejects as expired. While
-    /// `list_fails` is set, the full listing fails.
+    /// `list_fails` is set, the full listing fails. `drive_rooted` answers
+    /// `had_drive_rooted_layout`.
     #[derive(Default)]
     struct MockProvider {
+        drive_rooted: bool,
         files: Vec<CloudFile>,
         uploads: Mutex<Vec<String>>,
         downloads: Mutex<Vec<String>>,
@@ -1129,6 +1181,9 @@ mod tests {
                 total: None,
                 trash: None,
             })
+        }
+        fn had_drive_rooted_layout(&self, _: Option<&str>) -> bool {
+            self.drive_rooted
         }
     }
 
@@ -1836,6 +1891,87 @@ mod tests {
         let mut names = sync.provider.uploads.lock().unwrap().clone();
         names.sort();
         assert_eq!(names, vec!["a/same.pdf", "b/c/same.pdf", "top.pdf"]);
+    }
+
+    fn remote_folder(path: &str) -> CloudFile {
+        CloudFile {
+            is_folder: true,
+            ..cf(path, path)
+        }
+    }
+
+    /// A leftover of the drive-rooted layout is a top-level remote file's name inside local
+    /// directories that don't exist remotely, however deep the folder was in the drive.
+    #[test]
+    fn leftovers_of_the_drive_rooted_layout() {
+        let cloud: HashMap<String, CloudFile> = [
+            cf("a", "/a.pdf"),
+            remote_folder("/Sub"),
+            cf("b", "/Sub/b.pdf"),
+            remote_folder("/Dir"),
+            cf("c", "/Implicit/c.pdf"), // a folder known only from what's in it
+        ]
+        .into_iter()
+        .map(|f| (f.path.clone(), f))
+        .collect();
+        for (local, leftover) in [
+            ("/Notes/a.pdf", Some("/a.pdf")),
+            ("/Documents/Notes/a.pdf", Some("/a.pdf")),
+            ("/Su/a.pdf", Some("/a.pdf")), // a prefix of a remote folder's name isn't it
+            ("/a.pdf", None),              // top level: the same in both layouts
+            ("/Notes/new.pdf", None),      // no remote file of that name
+            ("/Notes/b.pdf", None),        // `b.pdf` isn't at the top remotely
+            ("/Notes/Sub", None),          // the top-level `Sub` is a folder
+            ("/Sub/a.pdf", None),          // under a folder the remote has
+            ("/Dir/Deeper/a.pdf", None),   // likewise, further down
+            ("/Implicit/a.pdf", None),
+        ] {
+            assert_eq!(leftover_of(local, &cloud), leftover, "{local}");
+        }
+    }
+
+    /// Where the provider had the drive-rooted layout for the folder, a full sync reports a
+    /// leftover of it and doesn't upload it (it would land one level down for good), and syncs
+    /// everything else as usual. Otherwise the same file is just a new local file.
+    #[tokio::test]
+    async fn leftovers_of_the_drive_rooted_layout_are_not_uploaded() {
+        for drive_rooted in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            for (path, body) in [
+                ("Notes/a.pdf", "old copy"),
+                ("Sub/new.pdf", "new"),
+                ("mine.pdf", "new"),
+            ] {
+                let path = dir.path().join(path);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, body).unwrap();
+            }
+            let provider = MockProvider {
+                drive_rooted,
+                files: vec![cf("a", "/a.pdf"), remote_folder("/Sub")],
+                ..Default::default()
+            };
+            let mut sync = CloudSync::new(provider, cfg(dir.path(), SyncDirection::Bidirectional));
+            let r = sync.sync().await.unwrap();
+
+            assert_eq!(r.downloaded, 1, "{drive_rooted}");
+            assert_eq!(std::fs::read(dir.path().join("a.pdf")).unwrap(), b"a");
+            let kept = std::fs::read(dir.path().join("Notes/a.pdf")).unwrap();
+            assert_eq!(kept, b"old copy");
+            let mut uploads = sync.provider.uploads.lock().unwrap().clone();
+            uploads.sort();
+            if drive_rooted {
+                assert_eq!(uploads, vec!["Sub/new.pdf", "mine.pdf"]);
+                assert_eq!(r.status, SyncStatus::PartialSuccess);
+                assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+                let e = &r.errors[0];
+                assert!(e.starts_with("Not uploading /Notes/a.pdf: "), "{e}");
+                assert!(e.contains("copy of /a.pdf"), "{e}");
+            } else {
+                assert!(r.errors.is_empty(), "{:?}", r.errors);
+                assert_eq!(uploads, vec!["Notes/a.pdf", "Sub/new.pdf", "mine.pdf"]);
+            }
+        }
     }
 
     #[test]

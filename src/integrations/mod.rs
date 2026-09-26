@@ -289,6 +289,17 @@ pub trait CloudProvider: Send + Sync {
 
     /// Get storage quota info
     async fn get_quota(&self) -> Result<StorageQuota>;
+
+    /// Whether a full sync of `folder_id` by this server before #34 laid the folder's files out
+    /// by their path from the drive root (`<local>/Notes/a.pdf` for `/Notes/a.pdf`) rather than
+    /// relative to the folder (`<local>/a.pdf`), as Dropbox and OneDrive did for any folder
+    /// other than the root. Full sync then holds back local files that look like leftovers of
+    /// that layout instead of uploading them into the folder again one level down (see
+    /// [`CloudSync::sync`]). Default: no.
+    fn had_drive_rooted_layout(&self, folder_id: Option<&str>) -> bool {
+        let _ = folder_id;
+        false
+    }
 }
 
 /// Storage quota information

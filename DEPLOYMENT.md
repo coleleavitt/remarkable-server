@@ -257,6 +257,18 @@ the server adopts it (and logs a warning) instead of serving the older tree; if
 both are at the same generation with different hashes it refuses to start until
 one is fixed by hand.
 
+Cloud sync folders after upgrading past #34 (Dropbox and OneDrive only): a sync of
+a `cloud_folder` other than the drive root used to lay the folder out under
+`integrations/<local_path>/` by each file's path from the drive root
+(`Notes/a.pdf` for the Dropbox folder `/Notes`; for OneDrive, the folder's whole
+path, e.g. `Documents/Notes/a.pdf`). Files now go at their path inside the folder
+(`a.pdf`). Nothing needs doing before the first sync: it downloads the folder into
+the new layout, and reports each old copy (`Not uploading /Notes/a.pdf: it looks
+like a copy of /a.pdf ...`) instead of uploading it into the folder one level down.
+Afterwards, move anything edited in the old directory since the last sync over the
+new copy, then delete the old directory (`integrations/<local_path>/Notes/`); the
+errors stop once it is gone. Whole-drive syncs keep their layout.
+
 Migrating storage from a local server: stop both, `rsync -a test-storage/ linode:/var/lib/remarkable-server/`,
 `chown -R remarkable:remarkable`, start. `sync.db` (with its `-wal`/`-shm`
 files), `jwt_secret` and `devices.db` must go together with the blobs: without

@@ -567,6 +567,12 @@ impl CloudProvider for Dropbox {
         Ok(out)
     }
 
+    /// Before #34 a folder's listing kept each entry's `path_display`, its path from the
+    /// Dropbox root. The root itself (`""`, `/`) was listed the same way it is now.
+    fn had_drive_rooted_layout(&self, folder_id: Option<&str>) -> bool {
+        !api_path(folder_id).is_empty()
+    }
+
     async fn list_folders(&self) -> Result<Vec<CloudFolder>> {
         let first = self
             .api_request("files/list_folder", &ListFolderArg::recursive(""))
@@ -1504,6 +1510,70 @@ mod tests {
                 b"mine"
             );
             assert_eq!(sync.state().cursor.as_deref(), Some("C2"));
+        }
+
+        /// Upgrading from the layout a folder sync had before #34, which kept the folder's files
+        /// by their `path_display` (`<local>/Notes/a.pdf`): a full sync brings the files down to
+        /// their folder-relative paths, but reports the old copy instead of uploading it to
+        /// `/Notes/Notes/a.pdf`. Other new local files still go up. The root never had that
+        /// layout, so nothing is held back there.
+        #[tokio::test]
+        async fn full_sync_does_not_upload_leftovers_of_the_old_layout() {
+            let (base, log) = fake_dropbox().await;
+            let uploaded = |log: &Log| -> Vec<Value> {
+                calls(log, "upload")
+                    .iter()
+                    .map(|b| b["path"].clone())
+                    .collect()
+            };
+            let config = |root: &std::path::Path, folder: &str| SyncConfig {
+                local_path: root.to_path_buf(),
+                cloud_folder: Some(folder.into()),
+                direction: SyncDirection::Bidirectional,
+                ..Default::default()
+            };
+
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join("Notes")).unwrap();
+            std::fs::write(dir.path().join("Notes/a.pdf"), "old copy").unwrap();
+            std::fs::write(dir.path().join("mine.pdf"), "new").unwrap();
+            let mut sync = CloudSync::new(dropbox(&base), config(dir.path(), "/Notes"));
+            let r = sync.sync().await.unwrap();
+            assert_eq!((r.uploaded, r.downloaded), (1, 3), "{:?}", r.errors);
+            assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+            assert!(r.errors[0].starts_with("Not uploading /Notes/a.pdf: "));
+            assert_eq!(uploaded(&log), vec![json!("/Notes/mine.pdf")]);
+            assert_eq!(
+                std::fs::read(dir.path().join("a.pdf")).unwrap(),
+                b"id:/notes/a.pdf"
+            );
+            assert!(dir.path().join("Sub/Deeper/c.pdf").exists());
+            assert_eq!(
+                std::fs::read(dir.path().join("Notes/a.pdf")).unwrap(),
+                b"old copy"
+            );
+
+            // The root: the same shape of file is just a new one.
+            log.lock().unwrap().clear();
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join("Stuff")).unwrap();
+            std::fs::write(dir.path().join("Stuff/Top.pdf"), "mine").unwrap();
+            let mut sync = CloudSync::new(dropbox(&base), config(dir.path(), "/"));
+            let r = sync.sync().await.unwrap();
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+            assert_eq!(uploaded(&log), vec![json!("/Stuff/Top.pdf")]);
+        }
+
+        /// Only a folder other than the root was listed by `path_display` before #34.
+        #[test]
+        fn drive_rooted_layout_only_for_folders() {
+            let d = dropbox(API_BASE);
+            for root in [None, Some(""), Some("/")] {
+                assert!(!d.had_drive_rooted_layout(root), "{root:?}");
+            }
+            for folder in ["/Notes", "/Notes/", "id:abc"] {
+                assert!(d.had_drive_rooted_layout(Some(folder)), "{folder}");
+            }
         }
 
         /// An invalidated cursor, or none yet, falls back to a full (recursive) sync and a
