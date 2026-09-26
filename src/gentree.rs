@@ -290,7 +290,7 @@ mod tests {
             payload.len()
         );
         let root_hash = "b".repeat(64);
-        put_file(
+        let _ = put_file(
             State(state.clone()),
             hdrs(&tk),
             Json(put_body(

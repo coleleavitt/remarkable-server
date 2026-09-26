@@ -492,7 +492,6 @@ pub struct PocketProvider {
 
 impl PocketProvider {
     const API_BASE: &'static str = "https://getpocket.com/v3";
-    const AUTH_URL: &'static str = "https://getpocket.com/auth/authorize";
 
     pub fn new() -> Self {
         Self {
@@ -763,7 +762,7 @@ impl ReadLaterProviderTrait for PocketProvider {
 
     async fn fetch_article_content(
         &self,
-        config: &ProviderConfig,
+        _config: &ProviderConfig,
         article: &Article,
     ) -> Result<ArticleContent> {
         // Pocket doesn't provide article content directly via API
@@ -1249,6 +1248,8 @@ impl ReadLaterProviderTrait for InstapaperProvider {
                 starred: String,
             },
             Meta {
+                // Never read, but serde needs it to recognise this (untagged) variant.
+                #[allow(dead_code)]
                 #[serde(rename = "type")]
                 item_type: String,
             },
@@ -1775,9 +1776,9 @@ impl ReadLaterProviderTrait for WallabagProvider {
     async fn complete_oauth(
         &self,
         callback: &OAuthCallback,
-        state: &OAuthState,
+        _state: &OAuthState,
     ) -> Result<ProviderConfig> {
-        let code = callback
+        let _code = callback
             .code
             .as_ref()
             .ok_or_else(|| ReadLaterError::OAuth("Missing authorization code".into()))?;
@@ -3210,8 +3211,8 @@ impl ReadLaterManager {
         self.sync_tx = Some(tx.clone());
 
         let accounts = Arc::clone(&self.accounts);
-        let articles = Arc::clone(&self.articles);
-        let storage_path = self.storage_path.clone();
+        let _articles = Arc::clone(&self.articles);
+        let _storage_path = self.storage_path.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));

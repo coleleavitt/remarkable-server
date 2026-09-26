@@ -35,6 +35,7 @@ These are done and, in several cases, ahead of rmfakecloud:
 - ✅ **Handwriting** — convert + **full-text handwriting search** (rmfakecloud
   has convert only, no search). Recognition runs **locally** (the `tesseract`
   binary, or any recogniser via `HWR_COMMAND`) — no MyScript keys, no paywall.
+  The host needs `tesseract` installed (not yet on the Linode).
 - ✅ **Screen-share browser viewer** — `/screenshare/view`, WebRTC from the
   tablet, MQTT **and** REST-room brokers, with a **pen-tip presenter cursor**
   (the "show the pen pointer" ask) and correct cursor/frame pairing.
@@ -45,14 +46,27 @@ These are done and, in several cases, ahead of rmfakecloud:
   history.
 - ✅ **Cloud-storage OAuth** — Google Drive / Dropbox / OneDrive integration
   scaffolding; sync confined to `<storage>/integrations`, path-traversal and
-  symlink-safe, provider grants revoked on disconnect (#16).
+  symlink-safe, provider grants revoked on disconnect (#16). Google Drive
+  listings are paged and recursive, its delta is scoped to the sync folder, and
+  a delta cursor only advances once every change applied (#26).
+- ✅ **Read-later credentials persist** — provider tokens (and the optional
+  Wallabag password) are stored in `readlater.db` apart from the config, survive
+  restarts, refreshed tokens are saved at once, never returned by the API;
+  Wallabag refreshes on 401, Instapaper xAuth login; Omnivore removed (#27).
 - ✅ **Security hardening (Sept 2026 review)** — OAuth device-code sign-ins need
   owner approval (#18); deleting or re-pairing a device revokes its tokens, and
   users only see and delete their own devices (#17); pairing codes are
   admin-only (#20); a device can't approve its own passcode reset (#20);
   firmware downloads are pinned to the device model (#20); `/debug/clear` is
   admin-only (#14). Server-side uploads refuse to rewrite a root index they
-  can't fully parse, instead of dropping entries (#19).
+  can't fully parse, instead of dropping entries (#19). The anonymous crash sink
+  (`/post`) is bounded (32 MiB body, per-part/part-count caps, oldest-first
+  eviction to `CRASH_MAX_TOTAL_BYTES`/`CRASH_MAX_REPORTS`), beta-flag writes need
+  a token, inbound SMTP `DATA` is capped (#23). `/oauth/device/code` is rate
+  limited (5 per IP per 10 min, 20/min overall), polling too fast gets
+  `slow_down`, and `PUBLIC_URL` sets the verification link (#24). Deleting a
+  device revokes its user tokens too (not only its device tokens) and closes its
+  open `/notifications/ws` and `/mqtt` sessions (#25).
 
 ---
 
@@ -71,14 +85,18 @@ The community's top *concrete* pains. Small, bounded, high-value.
   moved it ahead), a `blobs` table replacing `meta/*.meta`, and a derived-only
   projection of the index files (the tablet is still served the stored bytes).
   Adds a read-only unreachable-blob report.
-- ⬜ **Large-file upload robustness** — stream uploads to disk instead of
-  buffering the full body in memory: every upload route takes `Bytes` (whole
-  file in RAM) — sync v3 `put_file`, sync15 `blob_put`, gentree `PutFile`, the
-  v2/v4 blob PUTs in `protocol.rs`, and `documents::upload_v2`; verify checksum
-  on the fly. The official cloud's
-  `302 → Google-upload` redirect that resets progress to 0% does **not** apply
-  here (we accept the PUT directly) — document that as a self-hosting win, and
-  add resumable/chunked upload only if a client needs it. *Effort: M.*
+- ✅ **Search reachable-only + admin GC** *(#28)* — search indexes only blobs
+  reachable from the current root, so deleted documents drop out; `POST
+  /admin/storage/gc` (admin token, `dry_run` defaults to true, 7-day grace)
+  deletes unreachable blobs, refusing on an unparsed tree and stopping with 409
+  if a sync commits mid-run. Never automatic.
+- ✅ **Large-file upload robustness** *(#29)* — upload bodies are streamed to
+  `<storage>/.uploads/` with the checksum computed on the fly (sync v3
+  `put_file`, sync15 `blob_put`, the v2/v4 blob PUTs, document uploads, share
+  links; gentree `PutFile` decodes its base64 straight to disk), instead of
+  holding whole files in RAM. The official cloud's `302 → Google-upload`
+  redirect that resets progress to 0% does **not** apply here (we accept the
+  PUT directly). Resumable/chunked upload only if a client needs it.
 - ⬜ **Skip re-pair across migrations** — persist device serial↔identity so
   storage moves / binary swaps don't force re-pairing (today `jwt_secret` +
   `devices.db` must move together or every token invalidates). Harden + document.
@@ -95,6 +113,25 @@ The community's top *concrete* pains. Small, bounded, high-value.
   *Effort: M per integration.*
 - ⬜ **Offline-cache guidance / API** — support clients doing offline-first
   with per-folder keep/download semantics (server-side hints/flags). *Effort: M.*
+
+### Known follow-ups (from the #23–#29 reviews)
+
+- ⬜ **Read-later sync never runs** — `/integrations/v2/readlater/sync` and
+  `/accounts/{id}/sync` only answer `queued` / zero counts, and the manager's
+  scheduler is never started; wire them to an actual sync.
+- ⬜ **Dropbox / OneDrive listings** — full listings are non-recursive, and
+  their delta (change feed) ignores the configured sync folder (Drive got both
+  fixes in #26).
+- ⬜ **Screenshare MQTT broker vs revocation** — sessions on the `SCREENSHARE_BIND`
+  broker are not closed when their device is revoked (the `/notifications/ws`
+  and `/mqtt` sessions are).
+- ⬜ **Remaining buffered bodies** — gentree `PutFile` (base64 inside JSON),
+  handwriting convert and share-by-email still read the whole request into
+  memory.
+- ⬜ **Remote calendar providers** — only local ICS files sync; CalDAV, Google
+  and Office 365 calendars answer "not implemented".
+- 🧪 **`/mqtt` topic** — MQTT-over-WebSocket push publishes on whatever concrete
+  topics the client subscribes to; not yet verified against a real tablet.
 
 ---
 

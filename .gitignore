@@ -1,6 +1,5 @@
 # Rust
 /target/
-Cargo.lock
 **/*.rs.bk
 
 # IDE
@@ -28,3 +27,6 @@ jwt_secret
 # Cross-compile output
 /target-linode/
 rm-proxy/target/
+
+# Local dependency overrides (see SETUP.md)
+/.cargo/config.toml

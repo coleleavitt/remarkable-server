@@ -13,11 +13,13 @@
 - /sync/reports/v1 - Sync reports endpoint ✓
 
 ### Authentication/Device Management
-- /token/* - JWT token handling ✓
-- /identifier/json/2/device/new - Device registration ✓
-- /identifier/json/2/user/new - Token refresh ✓
-- /identifier/json/3/device/delete - Device deletion ✓
-- /devices/v1 - Pairing code generation (admin token only), device listing ✓
+- /token/json/2/device/new - Device registration ✓
+- /token/json/2/user/new - Token refresh ✓
+- /token/json/{2,3}/device/delete - Device self-revoke ✓
+- /token/json/4/device/exchange - Legacy credential → OAuth bundle (3.28) ✓
+- /devices/v1 - Pairing code generation (admin token only), own-device listing/deletion ✓
+- Deleting a device revokes its device + user tokens and closes its /notifications/ws and /mqtt sessions ✓
+- /oauth/device/code, /oauth/token, /oauth/revoke - OAuth2 device-code flow (3.28); owner approval via /oauth/verify or POST /admin/oauth/approve, per-IP + global rate limit, `PUBLIC_URL` for the verification URI ✓
 
 ### Discovery & Settings
 - /discovery/v1/endpoints - Service discovery ✓
@@ -28,6 +30,7 @@
 
 ### Notifications
 - /notifications/ws/json/1 - WebSocket for real-time notifications ✓
+- /mqtt - MQTT 3.1.1 over WebSocket push (auth: `Authorization` header on the upgrade, or the token as the CONNECT password/username) ✓ — topic not yet verified against a real tablet
 
 ### Passcode
 - /passcode/v1/resets/{uuid} - Create/get reset request ✓
@@ -36,12 +39,13 @@
 - /admin/passcode/resets/{uuid}/approve - Admin approve ✓
 
 ### Handwriting/Convert
-- /convert/v1/handwriting - Handwriting recognition (tesseract-backed) ✓
+- /convert/v1/handwriting - Handwriting recognition (needs the `tesseract` binary, or `HWR_COMMAND`) ✓
 - /handwriting/v1/search - Handwriting search ✓
 - /api/v1/page - Alternative handwriting endpoint ✓
 
 ### Screenshare
-- /screenshare/v1 - Main screenshare endpoint ✓
+- MQTT 3.1.1-over-TLS signalling broker (`SCREENSHARE_BIND`; :8883 on the Linode) ✓
+- /screenshare/view - Browser viewer (`SCREENSHARE_VIEWER=1`, ADMIN_TOKEN) ✓
 - /screenshare/v1/rooms - Room management ✓
 - /screenshare/v1/rooms/join-active - Join active room ✓
 - /screenshare/v1/rooms/{roomId} - Get/delete room ✓
@@ -58,6 +62,7 @@
 ### Report/Analytics
 - /report/v1 - Client reports ✓
 - /analytics/v2/events - Analytics event ingestion ✓
+- /post - Crash-report sink (backtrace-proxy host; 32 MiB body, `CRASH_MAX_TOTAL_BYTES` / `CRASH_MAX_REPORTS` quota) ✓
 
 ### Gentree (Document Tree)
 - /gentree/v1/DeleteEntry - Delete document ✓
@@ -69,9 +74,9 @@
 ### Integrations
 - /integrations/v1/ - List integrations ✓
 - /integrations/v2/instances - Integration instances ✓
-- /integrations/v2/calendars/* - Calendar integration (Google Calendar) ✓
-- /integrations/v2/readlater/* - Read-it-later integration ✓
-- /integrations/v2/cloud/* - Cloud storage OAuth (Google Drive, Dropbox, OneDrive) ✓
+- /integrations/v2/calendars/* - Calendar integration ✓ (only ICS files sync; CalDAV/Google/Office 365 sync answers "not implemented")
+- /integrations/v2/readlater/* - Read-it-later accounts/articles ✓ (credentials persisted; the sync endpoints are placeholders that don't sync)
+- /integrations/v2/cloud/* - Cloud storage OAuth (Google Drive, Dropbox, OneDrive) ✓ (sync confined to `<storage>/integrations`)
 
 
 ## ⚠️ GAPS - Based on firmware analysis
@@ -104,9 +109,14 @@ The firmware references these cloud hosts:
 - errors.cloud.remarkable.com
 - Internal: dev.internal.cloud.remarkable.com, qa.internal.cloud.remarkable.com
 
-### MQTT Broker
-The firmware expects MQTT connection for real-time notifications.
-Server status: Not implemented (out of scope for local server)
+### MQTT
+Two MQTT endpoints exist:
+- `/mqtt` — MQTT 3.1.1 over WebSocket on the API host, authenticated with a device/user token, for
+  sync push. It forwards the same `WsMessage` JSON as `/notifications/ws/json/1` on every concrete
+  topic the client subscribed to, because nothing pins the topic xochitl expects; unverified
+  against a real tablet.
+- The screenshare broker (`SCREENSHARE_BIND`, MQTT over TLS; :8883 on the Linode). Its sessions
+  are not closed when a device is revoked.
 
 ### Full Sync15 Protocol
 The V3/V4 sync handlers exist but may not fully implement:

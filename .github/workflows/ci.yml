@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  # The toolchain this server is developed and deployed with: rust-lang/rust main,
+  # installed fresh on every run (unpinned, like ~/.local/bin/rustc-master-update).
+  rustc-master:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install rustup-toolchain-install-master
+        run: cargo install --locked rustup-toolchain-install-master
+      - name: Install rustc-master (latest rust-lang/rust main)
+        run: |
+          rustup-toolchain-install-master --name rustc-master --component rustfmt clippy \
+            --github-token "${{ github.token }}" --retry 3
+          rustc +rustc-master -Vv
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: rustc-master
+      - name: Install PDF text and OCR tools used by tests
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils tesseract-ocr
+      - name: Format
+        run: cargo +rustc-master fmt --check
+      - name: No new warnings in this crate
+        # Only this crate's files (src/, tests/) are gated; git dependencies may warn.
+        run: |
+          cargo +rustc-master build --all-targets --locked --message-format=short 2>&1 | tee build.log
+          if grep -E '^(src|tests)/.*warning' build.log; then echo "::error::remarkable-server has compiler warnings"; exit 1; fi
+      - name: Test
+        run: cargo +rustc-master test --workspace --all-targets --locked
+
+  # Guard: the code must also build and pass on stable, so nothing silently
+  # depends on a nightly-only behaviour.
+  stable:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: stable
+      - name: Install PDF text and OCR tools used by tests
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils tesseract-ocr
+      - name: Test
+        run: cargo test --workspace --all-targets --locked

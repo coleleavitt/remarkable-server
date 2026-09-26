@@ -7,7 +7,7 @@
 //! - Highlight matches
 //! - Incremental indexing on sync
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
@@ -49,7 +49,6 @@ pub struct SearchIndex {
 
 struct SearchIndexInner {
     conn: Mutex<Connection>,
-    storage_path: PathBuf,
 }
 
 /// Indexed document entry
@@ -143,7 +142,6 @@ impl SearchIndex {
         Ok(Self {
             inner: Arc::new(SearchIndexInner {
                 conn: Mutex::new(conn),
-                storage_path,
             }),
         })
     }

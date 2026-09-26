@@ -427,7 +427,7 @@ pub async fn sync_account(
 
 pub async fn sync_all(State(state): State<ReadLaterState>) -> Result<Json<SyncAllResponse>> {
     // Get enabled account count, then release lock
-    let account_count = {
+    let _account_count = {
         let manager = state.manager.lock();
         manager
             .list_accounts()

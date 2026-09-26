@@ -8,6 +8,7 @@ Complete guide to running your own reMarkable sync server over USB.
 - Linux host with USB connection to tablet
 - Rust toolchain (`cargo`)
 - OpenSSL (for certificate generation)
+- Optional: `tesseract` (`apt install tesseract-ocr`) for handwriting convert/search, `sqlite3` CLI for backups
 
 ## 1. Build the Server
 
@@ -194,7 +195,10 @@ The server waits for the USB interface to come back. When the tablet wakes, conn
 
 ```
 remarkable-storage/
-├── root.json              # Current sync generation and root hash
+├── sync.db                # SQLite: root hash/generation (source of truth), blob index
+├── root.json              # Human-readable mirror of the root
+├── devices.db, jwt_secret # Pairing state
+├── .uploads/              # Staging for streamed uploads
 ├── aa/                    # Content-addressed blob storage
 │   └── bb...              # First 2 chars of hash = directory
 ├── bb/
@@ -202,24 +206,42 @@ remarkable-storage/
 └── ...
 ```
 
-Each document is a tree of blobs referenced by SHA-256 hash. The `root.json` points to the current root hash, which contains the document index.
+Each document is a tree of blobs referenced by SHA-256 hash. `sync.db` holds the current root hash, which points to the document index. Back it up with `sqlite3 sync.db ".backup '…'"`, not a live `cp`.
 
 ## Environment Variables
 
 | Variable | Description |
 |----------|-------------|
 | `RUST_LOG` | Logging level (e.g., `remarkable_server=debug`) |
-| `ADMIN_TOKEN` | Token for admin endpoints |
+| `ADMIN_TOKEN` | Token for admin endpoints (see README "Admin endpoints") |
 | `SCREENSHARE_BIND` | Address for screenshare broker |
-| `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS` | Email sharing (optional) |
-| `SOFTWARE_ARCHIVE` | Path to OTA update files (optional) |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM` | Email sharing (optional) |
+| `PUBLIC_URL` | Public base URL for the OAuth verification link and firmware downloads (optional) |
+| `FIRMWARE_ARCHIVE` | Path to OTA update files (optional) |
+| `CRASH_DIR`, `CRASH_MAX_TOTAL_BYTES`, `CRASH_MAX_REPORTS` | Crash-report storage and quota (default `./crash-dumps`, 512 MiB, 200) |
 
 ## Security Notes
 
 - The server stores your notebooks in plain files. **Back up `remarkable-storage/`**.
-- The admin token protects device pairing. Keep `certs/admin-token` secret.
+- The admin token mints pairing codes and user tokens, approves passcode resets and OAuth sign-ins, and can wipe or garbage-collect storage. Keep `certs/admin-token` secret.
 - TLS certificates are self-signed but trusted by your tablet only.
 
 ## Remote deployment
 
 For running the server on a VPS (remarkable.unwrap.rs) and the two ways to point the tablet at it (on-tablet `rm-proxy` vs. direct `/etc/hosts`), see [DEPLOYMENT.md](DEPLOYMENT.md).
+
+## Working on remarkable-rs at the same time
+
+The `remarkable-*` crates come from `coleleavitt/remarkable-rs` as git dependencies pinned to a commit
+(see `Cargo.toml`). To build against a local checkout instead, add an uncommitted override in
+`.cargo/config.toml`:
+
+```toml
+[patch."https://github.com/coleleavitt/remarkable-rs"]
+remarkable-lines = { path = "../remarkable/crates/remarkable-lines" }
+remarkable-core = { path = "../remarkable/crates/remarkable-core" }
+remarkable-screenshare = { path = "../remarkable/crates/remarkable-screenshare" }
+remarkable-mqtt = { path = "../remarkable/crates/remarkable-mqtt" }
+```
+
+To move to a newer remarkable-rs, push it, then bump the `rev` in `Cargo.toml` and run `cargo update`.

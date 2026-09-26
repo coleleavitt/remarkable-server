@@ -297,7 +297,15 @@ impl ScreenViewer {
     /// Keep a session up while anyone is watching, retrying like the desktop
     /// app: failures back off (2, 4, 8, 16, 30 s, then give up), a stopped
     /// share waits for a new room, and screen share being off is polled.
-    async fn supervise(self) {
+    ///
+    /// Boxed because the supervisor is (re)spawned from code it runs itself: the
+    /// concrete `BoxFuture` breaks the recursive opaque type, which stable rustc
+    /// can't otherwise prove `Send` for `tokio::spawn`.
+    fn supervise(self) -> futures_util::future::BoxFuture<'static, ()> {
+        Box::pin(self.supervise_loop())
+    }
+
+    async fn supervise_loop(self) {
         let mut attempt = 0;
         // Room of a share the tablet ended; not rejoined.
         let mut ended_room: Option<String> = None;

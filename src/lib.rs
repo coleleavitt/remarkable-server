@@ -42,7 +42,7 @@ use std::path::Path;
 pub use api::AppState;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{delete, get, patch, post, put};
+use axum::routing::{delete, get, post, put};
 pub use calendar::{Calendar, CalendarConfig, CalendarManager, CalendarProvider};
 pub use calendar_api::CalendarState;
 pub use device::DeviceManager;

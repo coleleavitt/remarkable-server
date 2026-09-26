@@ -127,7 +127,7 @@ pub async fn send_integration_message(
     State(state): State<AppState>,
     headers: HeaderMap,
     axum::extract::Path(instance_id): axum::extract::Path<String>,
-    Json(body): Json<Value>,
+    Json(_body): Json<Value>,
 ) -> Result<Json<Value>> {
     state.auth_user(&headers)?;
     tracing::info!(instance_id = %instance_id, "messaging integration message (no-op)");
