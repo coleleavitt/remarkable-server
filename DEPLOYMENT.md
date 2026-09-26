@@ -43,7 +43,8 @@ xochitl ──/etc/hosts──▶ 127.0.0.1:443 / 127.0.0.2:443  (rm-proxy on ta
 ## Security model
 
 - Every API route requires a valid device JWT except health, discovery,
-  and pairing (which needs a one-time code from `--pair`). The legacy v1/v2
+  and pairing (which needs a one-time code from `--pair`, or from `POST /devices/v1`
+  with `x-admin-token`, optionally `?user=<id>` (default `local-user`); device/user tokens cannot mint codes). The legacy v1/v2
   blob handlers in `protocol.rs` were unauthenticated until commit `a59cf70`
   ("protocol: require device auth on legacy … handlers"); they now use the same `auth_user`
   check as v3.
