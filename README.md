@@ -127,7 +127,7 @@ V4 root response includes capability flags:
 | `/token/json/3/device/delete` | POST | Unregister the calling device (self-revoke) |
 | `/discovery/v1/endpoints` | GET | Service discovery |
 
-Deleting a device (either route above) revokes every device token and every user token it has minted, even if it is paired again later, and closes its open `/notifications/ws` and `/mqtt` sessions (immediately, plus a 60 s re-check). Re-pairing a device to a different user revokes the previous owner's tokens the same way. Admin-minted user tokens (`/admin/create-user`) have no device and are not affected. The screenshare MQTT broker (`SCREENSHARE_BIND`) is not tied to this: its open sessions survive a revocation.
+Deleting a device (either route above) revokes every device token and every user token it has minted, even if it is paired again later, and closes its open `/notifications/ws` and `/mqtt` sessions (immediately, plus a 60 s re-check). Re-pairing a device to a different user revokes the previous owner's tokens the same way. Admin-minted user tokens (`/admin/create-user`) have no device and are not affected. Sessions on the screenshare MQTT broker (`SCREENSHARE_BIND`) are closed the same way (the device also leaves its rooms); the in-process browser viewer is not tied to a device.
 
 ## Search API
 
@@ -336,8 +336,10 @@ parts are kept per report, and after each report the oldest reports are deleted 
 `CRASH_MAX_TOTAL_BYTES` and `CRASH_MAX_REPORTS`. New reports are never rejected, so the tablet stops retrying.
 
 Uploads (sync v3 / sync15 / v2 / v4 blob PUTs, document uploads, share links, gentree `PutFile`) are streamed to
-`<storage>/.uploads/` rather than buffered, up to 1 GiB per blob. gentree `PutFile` still buffers its JSON body
-(the blob is base64 inside it), and handwriting convert and share-by-email still buffer the request.
+`<storage>/.uploads/` rather than buffered, up to 1 GiB per blob. gentree `PutFile` reads its JSON body
+incrementally and decodes the base64 blob inside it straight to disk. Handwriting convert (stroke JSON, read only
+after auth) is capped at 64 MiB and share-by-email at 25 MiB (attachments included; over it is a 413): both are still
+read into memory.
 
 Authenticated feature APIs (Bearer token): `/search/v1/*`, `/versions/v1/*`, `/feeds/v1/*` (RSS/Atom to EPUB), `/integrations/v2/{calendars,readlater,cloud}/*`, `/email/v1/*` (when inbound email is on).
 
@@ -369,7 +371,10 @@ verified against a real 3.28 device. They are additive and do not affect 3.3.2 s
 `POST .../messages/broadcast`, `POST .../messages/direct`. Signalling is relayed to the
 user's other clients as `ScreenshareMessage` / `ScreenshareRoomCreated` events on the
 notifications channel (data = base64 inner JSON). ICE servers come from
-`SCREENSHARE_ICE_SERVERS`. Rooms expire 60 s after the last keepalive.
+`SCREENSHARE_ICE_SERVERS`. Rooms expire 60 s after the last keepalive. When a device is
+revoked, rooms it created or joined under that registration are cleaned up (immediately, plus a
+60 s re-check): rooms it owns close and it is dropped from rooms it joined. Rooms it makes after
+being paired again to the same account are not affected.
 
 ### gentree/v1 delta sync (rm-sync)
 `POST /gentree/v1/{GetEntries,GetFiles,GetFile,PutFile,DeleteEntry,EntrySession}`
