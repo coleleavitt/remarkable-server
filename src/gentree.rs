@@ -10,6 +10,7 @@
 //! Untested against a real 3.28 device. Read paths reuse the existing content store.
 
 use axum::Json;
+use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -17,6 +18,7 @@ use serde_json::{Value, json};
 
 use crate::api::AppState;
 use crate::error::{Result, ServerError};
+use crate::json_scan::{Member, Scanned, Streamed};
 use crate::storage::is_valid_hash;
 
 /// JSON field carrying an inline blob body in PutFile.
@@ -124,41 +126,86 @@ pub async fn get_file(
         .into_response())
 }
 
+/// PutFile members read besides the blob (indices into [`Scanned::captured`]).
+const PUT_FIELDS: &[&str] = &["fileHash", "filePath"];
+const FILE_HASH: usize = 0;
+const FILE_PATH: usize = 1;
+
 /// `POST /gentree/v1/PutFile` req `{fileHash, filePath, sizeBytes, <blob>: b64}` -> stores the blob.
-pub async fn put_file(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(mut body): Json<Value>,
-) -> Result<Json<Value>> {
-    state.auth_user(&headers)?;
-    let file_hash = body
-        .get("fileHash")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_owned();
-    if !is_valid_hash(&file_hash) {
-        return Err(ServerError::InvalidHash(file_hash));
+///
+/// The blob arrives base64 inside JSON. The body is read incrementally and the blob
+/// decoded straight to a staged file as it arrives ([`crate::upload::stage_json_base64`]),
+/// so neither a 1 GiB body nor its decoded blob is ever held in memory. Once the body is
+/// in, the checks are those of the `Json<Value>` handler this replaced, in its order
+/// (fileHash, blob present as a string, valid base64), with the same responses; only
+/// auth now comes before the body rather than after it.
+pub async fn put_file(State(state): State<AppState>, headers: HeaderMap, body: Body) -> Response {
+    if let Some(rejection) = crate::upload::json_content_type_rejection(&headers).await {
+        return rejection;
     }
-    // The blob arrives base64 inside JSON, so the request is necessarily buffered (a
-    // streaming JSON parser would be needed otherwise). Take the payload string out of
-    // the tree and decode it step by step straight to a staged file, so the decoded
-    // blob (3/4 of the body again) never sits in memory next to it.
-    let b64 = match body.get_mut(BLOB_FIELD).map(Value::take) {
-        Some(Value::String(b64)) => b64,
+    put_file_streamed(&state, &headers, body)
+        .await
+        .into_response()
+}
+
+async fn put_file_streamed(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<Json<Value>> {
+    state.auth_user(headers)?;
+    let (scanned, blob) = crate::upload::stage_json_base64(
+        &state.storage,
+        headers,
+        body,
+        crate::MAX_BLOB_BYTES as u64,
+        BLOB_FIELD,
+        PUT_FIELDS,
+    )
+    .await?;
+    let file_hash = put_file_hash(&scanned)?;
+    let blob = match (scanned.streamed, blob) {
+        (Streamed::Text, Some(blob)) => blob,
         _ => return Err(ServerError::MissingHeader(BLOB_FIELD.into())),
     };
-    let staged = crate::upload::stage_base64(&state.storage, &b64, false)
+    let staged = blob
+        .finish()
         .await?
         .ok_or_else(|| ServerError::MissingHeader(format!("{BLOB_FIELD} (base64)")))?;
-    drop(b64);
-    let file_path = body
-        .get("filePath")
-        .and_then(|v| v.as_str())
-        .unwrap_or("gentree-blob");
-    let size = staged.commit(&state.storage, &file_hash, file_path)?;
+    let file_path = put_file_path(&scanned)?;
+    let size = staged.commit(&state.storage, &file_hash, &file_path)?;
     Ok(Json(
         json!({"fileHash": file_hash, "sizeBytes": size, "state": "stored"}),
     ))
+}
+
+/// `fileHash` as `body.get("fileHash").and_then(Value::as_str).unwrap_or_default()`,
+/// which must be a valid blob hash.
+fn put_file_hash(scanned: &Scanned) -> Result<String> {
+    let hash = match &scanned.captured[FILE_HASH] {
+        Member::TooLong => {
+            return Err(ServerError::InvalidHash(format!(
+                "(longer than {} bytes)",
+                crate::upload::MAX_JSON_FIELD
+            )));
+        }
+        m => m.as_str().unwrap_or_default().to_owned(),
+    };
+    if !is_valid_hash(&hash) {
+        return Err(ServerError::InvalidHash(hash));
+    }
+    Ok(hash)
+}
+
+/// `filePath` as `body.get("filePath").and_then(Value::as_str).unwrap_or("gentree-blob")`.
+fn put_file_path(scanned: &Scanned) -> Result<String> {
+    match &scanned.captured[FILE_PATH] {
+        Member::TooLong => Err(ServerError::PayloadTooLarge(format!(
+            "filePath longer than {} bytes",
+            crate::upload::MAX_JSON_FIELD
+        ))),
+        m => Ok(m.as_str().unwrap_or("gentree-blob").to_owned()),
+    }
 }
 
 /// `POST /gentree/v1/DeleteEntry` req `{entryUuid}` -> tombstone acknowledgement.
@@ -257,6 +304,20 @@ mod tests {
         );
         Value::Object(m)
     }
+    /// PutFile `body` (as JSON) straight to the handler; the response must be a 200.
+    async fn put(state: &AppState, tk: &str, body: &Value) -> Value {
+        let mut h = hdrs(tk);
+        h.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let resp = put_file(State(state.clone()), h, Body::from(body.to_string())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
 
     #[tokio::test]
     async fn blob_roundtrip_and_session() {
@@ -265,13 +326,7 @@ mod tests {
         // PutFile then GetFile returns the same bytes
         let blob_hash = "a".repeat(64);
         let payload = b"hello gentree";
-        let Json(r) = put_file(
-            State(state.clone()),
-            hdrs(&tk),
-            Json(put_body(&blob_hash, "doc/1.rm", payload)),
-        )
-        .await
-        .unwrap();
+        let r = put(&state, &tk, &put_body(&blob_hash, "doc/1.rm", payload)).await;
         assert_eq!(r["state"], "stored");
         let mut m = serde_json::Map::new();
         m.insert("hash".into(), Value::String(blob_hash.clone()));
@@ -290,17 +345,12 @@ mod tests {
             payload.len()
         );
         let root_hash = "b".repeat(64);
-        let _ = put_file(
-            State(state.clone()),
-            hdrs(&tk),
-            Json(put_body(
-                &root_hash,
-                "root.docSchema",
-                root_index.as_bytes(),
-            )),
+        put(
+            &state,
+            &tk,
+            &put_body(&root_hash, "root.docSchema", root_index.as_bytes()),
         )
-        .await
-        .unwrap();
+        .await;
 
         let mut s = serde_json::Map::new();
         s.insert("sessionId".into(), Value::String("sess-1".into()));
@@ -345,5 +395,502 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+}
+
+/// Streaming PutFile against the buffered handler it replaced, through the real router.
+#[cfg(test)]
+mod put_file_tests {
+    use std::time::Duration;
+
+    use axum::Router;
+    use axum::extract::DefaultBodyLimit;
+    use axum::http::Request;
+    use axum::routing::post;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use bytes::Bytes;
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config, TestRunner};
+    use sha2::{Digest, Sha256};
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::device::DeviceManager;
+    use crate::storage::Storage;
+
+    const URI: &str = "/gentree/v1/PutFile";
+
+    /// The PutFile handler before streaming (`Json<Value>` body, whole-string decode),
+    /// kept as the oracle for today's behaviour.
+    async fn buffered_put_file(
+        State(state): State<AppState>,
+        headers: HeaderMap,
+        Json(mut body): Json<Value>,
+    ) -> Result<Json<Value>> {
+        state.auth_user(&headers)?;
+        let file_hash = body
+            .get("fileHash")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        if !is_valid_hash(&file_hash) {
+            return Err(ServerError::InvalidHash(file_hash));
+        }
+        let b64 = match body.get_mut(BLOB_FIELD).map(Value::take) {
+            Some(Value::String(b64)) => b64,
+            _ => return Err(ServerError::MissingHeader(BLOB_FIELD.into())),
+        };
+        let data = STANDARD
+            .decode(&b64)
+            .map_err(|_| ServerError::MissingHeader(format!("{BLOB_FIELD} (base64)")))?;
+        let file_path = body
+            .get("filePath")
+            .and_then(|v| v.as_str())
+            .unwrap_or("gentree-blob");
+        state.storage.put_with_hash(&data, &file_hash, file_path)?;
+        Ok(Json(
+            json!({"fileHash": file_hash, "sizeBytes": data.len(), "state": "stored"}),
+        ))
+    }
+
+    fn setup() -> (AppState, String, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path().join("storage")).unwrap();
+        let devices =
+            DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        let tk = devices.create_user_token("u@test").unwrap();
+        (AppState::new(storage, devices), format!("Bearer {tk}"), tmp)
+    }
+
+    fn request(auth: &str, body: Body) -> Request<Body> {
+        Request::post(URI)
+            .header("authorization", auth)
+            .header("content-type", "application/json")
+            .body(body)
+            .unwrap()
+    }
+
+    /// `doc` as a body arriving in frames cut at `cuts`.
+    fn framed(doc: &[u8], cuts: &[usize]) -> Body {
+        let mut cuts: Vec<usize> = cuts.iter().copied().filter(|&c| c <= doc.len()).collect();
+        cuts.extend([0, doc.len()]);
+        cuts.sort_unstable();
+        cuts.dedup();
+        let frames: Vec<std::io::Result<Bytes>> = cuts
+            .windows(2)
+            .map(|w| Ok(Bytes::copy_from_slice(&doc[w[0]..w[1]])))
+            .collect();
+        Body::from_stream(futures_util::stream::iter(frames))
+    }
+
+    async fn send(router: &Router, req: Request<Body>) -> (StatusCode, HeaderMap, Bytes) {
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let (parts, body) = resp.into_parts();
+        let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        (parts.status, parts.headers, body)
+    }
+
+    fn staged_bytes(state: &AppState) -> u64 {
+        std::fs::read_dir(state.storage.staging_dir())
+            .map(|d| {
+                d.flatten()
+                    .filter_map(|e| e.metadata().ok())
+                    .map(|m| m.len())
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    fn staging_empty(state: &AppState) -> bool {
+        std::fs::read_dir(state.storage.staging_dir())
+            .map(|d| d.count() == 0)
+            .unwrap_or(true)
+    }
+
+    /// JSON string literal for `s`, each char escaped or not as `choices` says: raw,
+    /// short escape (`\/` included) or `\u` (surrogate pair past the BMP).
+    fn render_str(s: &str, choices: &[u8]) -> String {
+        let mut out = String::from("\"");
+        for (i, c) in s.chars().enumerate() {
+            let r = choices.get(i % choices.len().max(1)).copied().unwrap_or(0);
+            let short = match c {
+                '"' => Some("\\\""),
+                '\\' => Some("\\\\"),
+                '/' => Some("\\/"),
+                '\u{8}' => Some("\\b"),
+                '\u{c}' => Some("\\f"),
+                '\n' => Some("\\n"),
+                '\r' => Some("\\r"),
+                '\t' => Some("\\t"),
+                _ => None,
+            };
+            let must = matches!(c, '"' | '\\') || (c as u32) < 0x20;
+            match (r % 6, short) {
+                (0..=2, _) if !must => out.push(c),
+                (3 | 4, Some(esc)) => out.push_str(esc),
+                _ => {
+                    let mut units = [0u16; 2];
+                    for u in c.encode_utf16(&mut units) {
+                        if r & 0x80 == 0 {
+                            out.push_str(&format!("\\u{u:04x}"));
+                        } else {
+                            out.push_str(&format!("\\u{u:04X}"));
+                        }
+                    }
+                }
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    /// One PutFile member value: a string (escaped per `choices`) or other JSON.
+    #[derive(Debug, Clone)]
+    enum Val {
+        Str(String),
+        Raw(String),
+    }
+
+    fn any_json() -> impl Strategy<Value = String> {
+        let leaf = prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::Bool),
+            any::<i32>().prop_map(Value::from),
+            any::<f64>().prop_map(Value::from),
+            "\\PC{0,6}".prop_map(Value::String),
+        ];
+        leaf.prop_recursive(3, 12, 4, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..4).prop_map(Value::Array),
+                prop::collection::vec(("[a-z]{0,4}", inner), 0..4)
+                    .prop_map(|kv| Value::Object(kv.into_iter().collect())),
+            ]
+        })
+        .prop_map(|v| v.to_string())
+    }
+
+    fn member() -> impl Strategy<Value = (String, Val)> {
+        let hash = prop_oneof![
+            4 => "[0-9a-f]{64}",
+            1 => "[0-9a-fA-F/]{62,65}",
+        ];
+        let blob = prop_oneof![
+            6 => prop::collection::vec(any::<u8>(), 0..160).prop_map(|d| STANDARD.encode(d)),
+            1 => "[A-Za-z0-9+/=]{0,12}",
+            1 => "\\PC{0,4}",
+        ];
+        prop_oneof![
+            3 => hash.prop_map(|h| ("fileHash".to_owned(), Val::Str(h))),
+            3 => blob.prop_map(|b| ("payload".to_owned(), Val::Str(b))),
+            2 => "(\\PC|/){0,16}".prop_map(|p| ("filePath".to_owned(), Val::Str(p))),
+            1 => any::<u32>().prop_map(|n| ("sizeBytes".to_owned(), Val::Raw(n.to_string()))),
+            1 => (
+                prop_oneof![Just("fileHash"), Just("payload"), Just("filePath"), Just("other")],
+                any_json()
+            ).prop_map(|(k, v)| (k.to_owned(), Val::Raw(v))),
+            1 => ("\\PC{0,6}", any_json()).prop_map(|(k, v)| (k, Val::Raw(v))),
+        ]
+    }
+
+    #[derive(Debug, Clone)]
+    struct Case {
+        doc: Vec<u8>,
+        cuts: Vec<usize>,
+    }
+
+    /// PutFile bodies: an object of random members in random order (duplicates
+    /// included), random whitespace and escapes; sometimes another top-level value;
+    /// sometimes damaged by a few byte edits. Split into random frames.
+    fn case() -> impl Strategy<Value = Case> {
+        // A well-formed request plus a few random members, in any order.
+        let request = (
+            "[0-9a-f]{64}",
+            prop::collection::vec(any::<u8>(), 0..160),
+            prop::option::of("(\\PC|/){0,16}"),
+            prop::collection::vec(member(), 0..3),
+        )
+            .prop_flat_map(|(hash, data, path, mut members)| {
+                members.push(("fileHash".to_owned(), Val::Str(hash)));
+                members.push(("payload".to_owned(), Val::Str(STANDARD.encode(data))));
+                if let Some(path) = path {
+                    members.push(("filePath".to_owned(), Val::Str(path)));
+                }
+                Just(members).prop_shuffle()
+            });
+        let members = prop_oneof![1 => prop::collection::vec(member(), 0..6), 2 => request];
+        let object = (
+            members,
+            prop::collection::vec(any::<u8>(), 1..32),
+            prop::collection::vec(0usize..5, 1..16),
+        )
+            .prop_map(|(members, choices, ws)| {
+                let sp = |i: usize| ["", " ", "\n", "\t ", "\r\n  "][ws[i % ws.len()]];
+                let mut doc = format!("{}{{", sp(0));
+                for (i, (k, v)) in members.iter().enumerate() {
+                    if i > 0 {
+                        doc.push(',');
+                    }
+                    let v = match v {
+                        Val::Str(s) => render_str(s, &choices[i % choices.len()..]),
+                        Val::Raw(r) => r.clone(),
+                    };
+                    let key = render_str(k, &choices[(i * 7) % choices.len()..]);
+                    doc.push_str(&format!(
+                        "{}{key}{}:{}{v}{}",
+                        sp(i + 1),
+                        sp(i + 2),
+                        sp(i + 3),
+                        sp(i + 4)
+                    ));
+                }
+                doc.push_str(&format!("}}{}", sp(members.len() + 5)));
+                doc.into_bytes()
+            });
+        let top = prop_oneof![9 => object, 1 => any_json().prop_map(String::into_bytes)];
+        let edit = (
+            any::<prop::sample::Index>(),
+            0u8..4,
+            prop::sample::select(b"\"\\{}[]:,u0e-. a=/\x00\xc3\xff".to_vec()),
+        );
+        (
+            top,
+            prop_oneof![3 => Just(Vec::new()), 1 => prop::collection::vec(edit, 1..3)],
+            prop_oneof![
+                6 => prop::collection::vec(0usize..600, 0..8),
+                1 => Just((0..600).collect::<Vec<usize>>()),
+            ],
+        )
+            .prop_map(|(mut doc, edits, cuts)| {
+                for (at, op, byte) in edits {
+                    let i = at.index(doc.len() + 1);
+                    match op {
+                        0 if i < doc.len() => {
+                            doc.remove(i);
+                        }
+                        1 => doc.insert(i, byte),
+                        2 if i < doc.len() => doc[i] = byte,
+                        _ => doc.truncate(i),
+                    }
+                }
+                Case { doc, cuts }
+            })
+    }
+
+    /// Byte-for-byte the old handler's responses and stored blobs, whatever the body.
+    #[test]
+    fn streamed_put_file_matches_buffered_handler() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let devices =
+            DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        let auth = format!("Bearer {}", devices.create_user_token("u@test").unwrap());
+        let old = AppState::new(
+            Storage::new(tmp.path().join("old")).unwrap(),
+            devices.clone(),
+        );
+        let new = AppState::new(Storage::new(tmp.path().join("new")).unwrap(), devices);
+        let old_router = Router::new()
+            .route(
+                URI,
+                post(buffered_put_file).layer(DefaultBodyLimit::max(crate::MAX_BLOB_BYTES)),
+            )
+            .with_state(old.clone());
+        let new_router = crate::create_router(new.clone());
+
+        let (ok, json_err) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+        let mut runner = TestRunner::new(Config {
+            cases: 512,
+            failure_persistence: None,
+            ..Config::default()
+        });
+        let result = runner.run(&case(), |Case { doc, cuts }| {
+            rt.block_on(async {
+                let (s_old, h_old, b_old) =
+                    send(&old_router, request(&auth, Body::from(doc.clone()))).await;
+                let (s_new, _, b_new) =
+                    send(&new_router, request(&auth, framed(&doc, &cuts))).await;
+                let shown = String::from_utf8_lossy(&doc).into_owned();
+                prop_assert_eq!(s_new, s_old, "{:?}: {:?} vs {:?}", shown, b_new, b_old);
+                if h_old[header::CONTENT_TYPE] == "application/json" {
+                    // Success, or one of the handler's own errors: same body.
+                    prop_assert_eq!(&b_new, &b_old, "{:?}", shown);
+                } else {
+                    // axum's JSON syntax rejection (plain text): ours is a 400 too.
+                    json_err.set(json_err.get() + 1);
+                    prop_assert!(String::from_utf8_lossy(&b_new).contains("bad_request"));
+                }
+                if s_old == StatusCode::OK {
+                    ok.set(ok.get() + 1);
+                    let r: Value = serde_json::from_slice(&b_old).unwrap();
+                    let hash = r["fileHash"].as_str().unwrap();
+                    prop_assert!(new.storage.get(hash).unwrap() == old.storage.get(hash).unwrap());
+                    prop_assert_eq!(
+                        new.storage.filename_for_hash(hash),
+                        old.storage.filename_for_hash(hash)
+                    );
+                }
+                prop_assert!(staging_empty(&new), "staged file left behind");
+                Ok(())
+            })
+        });
+        if let Err(e) = result {
+            panic!("{e}");
+        }
+        // The generator must reach both stores and refusals.
+        let (ok, json_err) = (ok.get(), json_err.get());
+        assert!(ok > 100 && json_err > 50, "ok {ok}, json errors {json_err}");
+    }
+
+    #[tokio::test]
+    async fn blob_decodes_while_the_body_is_still_arriving() {
+        let (state, auth, _tmp) = setup();
+        let data: Vec<u8> = (0..16 * 1024 * 1024u32)
+            .map(|i| i.wrapping_mul(2_654_435_761).to_be_bytes()[0])
+            .collect();
+        let hash = hex::encode(Sha256::digest(&data));
+        let b64 = STANDARD.encode(&data);
+        let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(4);
+        let body = Body::from_stream(futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|frame| (frame, rx))
+        }));
+        let router = crate::create_router(state.clone());
+        let resp = tokio::spawn(async move { send(&router, request(&auth, body)).await });
+
+        // Blob first, fileHash after it: validated only once the body is in.
+        tx.send(Ok(Bytes::from_static(
+            br#"{"filePath":"doc/big.rm","payload":""#,
+        )))
+        .await
+        .unwrap();
+        let (first, rest) = b64.as_bytes().split_at(b64.len() / 2);
+        for frame in first.chunks(64 * 1024) {
+            tx.send(Ok(Bytes::copy_from_slice(frame))).await.unwrap();
+        }
+        // Half the blob sent, body still open: it's already on disk, so the body isn't
+        // being buffered first.
+        let mut waited = Duration::ZERO;
+        while staged_bytes(&state) < data.len() as u64 / 4 {
+            assert!(waited < Duration::from_secs(60), "nothing staged yet");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            waited += Duration::from_millis(10);
+        }
+        for frame in rest.chunks(64 * 1024) {
+            tx.send(Ok(Bytes::copy_from_slice(frame))).await.unwrap();
+        }
+        let tail = format!(r#"","fileHash":"{hash}","sizeBytes":{}}}"#, data.len());
+        tx.send(Ok(tail.into())).await.unwrap();
+        drop(tx);
+
+        let (status, _, body) = resp.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"fileHash": hash, "sizeBytes": data.len(), "state": "stored"})
+        );
+        assert!(state.storage.get(&hash).unwrap() == data);
+        assert_eq!(
+            state.storage.filename_for_hash(&hash).as_deref(),
+            Some("doc/big.rm")
+        );
+        assert!(staging_empty(&state));
+    }
+
+    #[tokio::test]
+    async fn refusals_before_and_while_streaming() {
+        let (state, auth, _tmp) = setup();
+        let router = crate::create_router(state.clone());
+        let hash = "e".repeat(64);
+        let doc = format!(r#"{{"fileHash":"{hash}","payload":"QUJD"}}"#);
+
+        // No JSON content type: axum's own 415, as the `Json` extractor gave.
+        let (s, _, b) = send(
+            &router,
+            Request::post(URI)
+                .header("authorization", &auth)
+                .body(Body::from(doc.clone()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(
+            b,
+            "Expected request with `Content-Type: application/json`".as_bytes()
+        );
+
+        // Unauthenticated: refused before anything is staged.
+        let (s, _, _) = send(&router, request("Bearer nope", Body::from(doc.clone()))).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+        // Declared over the 1 GiB limit: 413 up front.
+        let mut req = request(&auth, Body::from(doc.clone()));
+        req.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            (crate::MAX_BLOB_BYTES as u64 + 1).into(),
+        );
+        assert_eq!(send(&router, req).await.0, StatusCode::PAYLOAD_TOO_LARGE);
+
+        // A filePath too long to hold: 413, nothing stored.
+        let long = "p".repeat(crate::upload::MAX_JSON_FIELD + 1);
+        let big = format!(r#"{{"fileHash":"{hash}","filePath":"{long}","payload":"QUJD"}}"#);
+        assert_eq!(
+            send(&router, request(&auth, Body::from(big))).await.0,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert!(!state.storage.exists(&hash));
+
+        // The client goes away mid-blob: 400, staged file removed.
+        let frames: Vec<std::io::Result<Bytes>> = vec![
+            Ok(Bytes::from(format!(r#"{{"fileHash":"{hash}","payload":""#))),
+            Ok(Bytes::from(vec![b'Q'; 1024 * 1024])),
+            Err(std::io::Error::other("client went away")),
+        ];
+        let body = Body::from_stream(futures_util::stream::iter(frames));
+        assert_eq!(
+            send(&router, request(&auth, body)).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(!state.storage.exists(&hash));
+        assert!(staging_empty(&state));
+
+        // Still fine afterwards.
+        let (s, _, _) = send(&router, request(&auth, Body::from(doc))).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(state.storage.get(&hash).unwrap(), b"ABC");
+    }
+
+    #[tokio::test]
+    async fn body_limit_applies_while_streaming() {
+        let (state, _auth, _tmp) = setup();
+        let doc = format!(
+            r#"{{"fileHash":"{}","payload":"QUJDREVG"}}"#,
+            "f".repeat(64)
+        );
+        let staged = crate::upload::stage_json_base64(
+            &state.storage,
+            &HeaderMap::new(),
+            framed(doc.as_bytes(), &[10, 40]),
+            doc.len() as u64 - 1,
+            BLOB_FIELD,
+            PUT_FIELDS,
+        )
+        .await;
+        assert!(matches!(staged, Err(ServerError::PayloadTooLarge(_))));
+        assert!(staging_empty(&state));
+        let (scanned, blob) = crate::upload::stage_json_base64(
+            &state.storage,
+            &HeaderMap::new(),
+            framed(doc.as_bytes(), &[10, 40]),
+            doc.len() as u64,
+            BLOB_FIELD,
+            PUT_FIELDS,
+        )
+        .await
+        .unwrap();
+        assert_eq!(scanned.streamed, Streamed::Text);
+        assert_eq!(blob.unwrap().finish().await.unwrap().unwrap().len(), 6);
     }
 }

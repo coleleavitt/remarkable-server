@@ -32,6 +32,15 @@ const PEN: f32 = 5.0;
 const MAX_SIDE: f32 = 3000.0;
 const TESSERACT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Largest request body (the route's `DefaultBodyLimit`; over it is a 413). A request is
+/// the ink of one conversion (a selection, at most a page): per stroke, `x`/`y` (and
+/// optionally `t`/`p`) arrays of JSON numbers of roughly 10 bytes each, so at most ~40
+/// bytes a point. Even a very dense page is some 200k points (its .rm file, at 14 bytes a
+/// point, runs to a few MB), which is about 8 MB of JSON. 32 MiB leaves several times
+/// that; the body and its parse into point vectors are held in memory, so the 1 GiB of
+/// the blob routes is no limit for it.
+pub(crate) const MAX_BODY: usize = 32 * 1024 * 1024;
+
 #[derive(Deserialize)]
 struct Request {
     #[serde(default)]
@@ -380,5 +389,63 @@ mod tests {
     fn empty_page_still_well_formed() {
         let (text, _) = read_like_firmware(&to_jiix(&[])).expect("well-formed");
         assert!(text.is_empty());
+    }
+
+    mod route {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        use super::*;
+        use crate::device::DeviceManager;
+        use crate::storage::Storage;
+
+        async fn post(uri: &str, auth: &str, body: Vec<u8>) -> (StatusCode, String) {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let storage = Storage::new(tmp.path().join("storage")).unwrap();
+            let devices =
+                DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+            let auth = match auth {
+                "" => format!("Bearer {}", devices.create_user_token("u@test").unwrap()),
+                a => a.to_owned(),
+            };
+            let req = Request::post(uri)
+                .header("authorization", auth)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let resp = crate::create_router(AppState::new(storage, devices))
+                .oneshot(req)
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+
+        /// A request of exactly `len` bytes with no strokes in it.
+        fn no_strokes(len: usize) -> Vec<u8> {
+            let head =
+                br#"{"configuration":{"lang":"en_US"},"strokeGroups":[{"strokes":[]}],"pad":""#;
+            let mut body = head.to_vec();
+            body.resize(len - 2, b'x');
+            body.extend_from_slice(b"\"}");
+            body
+        }
+
+        #[tokio::test]
+        async fn body_limit_is_explicit() {
+            for uri in ["/convert/v1/handwriting", "/api/v1/page"] {
+                // Over the limit: 413, before auth (the body is buffered by the extractor).
+                let (status, _) = post(uri, "Bearer nope", no_strokes(MAX_BODY + 1)).await;
+                assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{uri}");
+                // At the limit (far past axum's 2 MiB default): parsed as before.
+                let (status, body) = post(uri, "", no_strokes(MAX_BODY)).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+                assert!(body.contains("no strokes"), "{uri}: {body}");
+            }
+        }
     }
 }

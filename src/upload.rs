@@ -1,7 +1,8 @@
-//! Streaming uploads: a request body (or multipart field, or a base64 payload) is written
-//! to a temp file under [`Storage::staging_dir`] as it arrives, with its crc32c (and
-//! sha256 when the caller needs a content hash) computed on the way. Nothing larger than
-//! one write buffer is held in memory, so concurrent large uploads can't exhaust RAM.
+//! Streaming uploads: a request body (or multipart field, or a base64 string inside a
+//! JSON body) is written to a temp file under [`Storage::staging_dir`] as it arrives,
+//! with its crc32c (and sha256 when the caller needs a content hash) computed on the
+//! way. Nothing larger than one write buffer is held in memory, so concurrent large
+//! uploads can't exhaust RAM.
 //!
 //! A [`Staged`] file is removed when dropped unless it was handed to storage
 //! ([`Staged::commit`]) or moved elsewhere ([`Staged::persist`]), so every error path
@@ -11,8 +12,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use axum::body::Body;
+use axum::extract::FromRequest;
 use axum::extract::multipart::Field;
+use axum::extract::rejection::JsonRejection;
 use axum::http::{HeaderMap, header};
+use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use futures_util::StreamExt;
@@ -20,6 +24,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncWriteExt, BufWriter};
 
 use crate::error::{Result, ServerError};
+use crate::json_scan::{JsonScanner, Output, ScanError, Scanned};
 use crate::storage::Storage;
 
 /// Axum's `DefaultBodyLimit` default (2 MiB): what routes without an explicit limit
@@ -202,6 +207,17 @@ pub async fn stage_body(
     limit: u64,
     want_sha: bool,
 ) -> Result<Staged> {
+    check_declared_length(headers, limit)?;
+    let mut stager = Stager::new(storage, limit, want_sha).await?;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        stager.write(&chunk.map_err(body_read_error)?).await?;
+    }
+    stager.finish().await
+}
+
+/// 413 up front when `content-length` already exceeds `limit`.
+fn check_declared_length(headers: &HeaderMap, limit: u64) -> Result<()> {
     let declared = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
@@ -209,14 +225,12 @@ pub async fn stage_body(
     if declared.is_some_and(|n| n > limit) {
         return Err(too_large(limit));
     }
-    let mut stager = Stager::new(storage, limit, want_sha).await?;
-    let mut stream = body.into_data_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk
-            .map_err(|e| ServerError::BadRequest(format!("failed to read request body: {e}")))?;
-        stager.write(&chunk).await?;
-    }
-    stager.finish().await
+    Ok(())
+}
+
+/// A body read error is a 400, as axum's `Bytes` extractor reported it.
+fn body_read_error(e: axum::Error) -> ServerError {
+    ServerError::BadRequest(format!("failed to read request body: {e}"))
 }
 
 /// Stream a multipart field to a staged file. Field read errors map to
@@ -238,37 +252,212 @@ pub async fn stage_field(
     stager.finish().await
 }
 
-/// Decode standard (padded) base64 into a staged file a step at a time, so the decoded
-/// blob never exists in memory. Accepts exactly what `STANDARD.decode` of the whole
-/// string accepts; `None` means it isn't valid base64.
-pub async fn stage_base64(storage: &Storage, b64: &str, want_sha: bool) -> Result<Option<Staged>> {
-    stage_base64_in_steps(storage, b64, want_sha, B64_STEP).await
+/// Standard (padded) base64 decoded as it arrives, a step of whole quads at a time, so
+/// the decoded blob never has to exist in memory. Accepts exactly what `STANDARD.decode`
+/// of the whole input accepts, with the same bytes: padding may only end the input, and
+/// the input is cut into the same `step`-sized pieces whatever the pushes look like, each
+/// decoded like the corresponding part of a whole-input decode.
+struct Base64Decoder {
+    step: usize,
+    /// Input not decoded yet (less than one step).
+    pending: Vec<u8>,
+    /// What the last `push`/`finish` decoded.
+    decoded: Vec<u8>,
+    pad_seen: bool,
+    valid: bool,
 }
 
-/// [`stage_base64`] with an explicit step (a non-zero multiple of 4), so tests can
-/// exercise step boundaries with small inputs.
-async fn stage_base64_in_steps(
-    storage: &Storage,
-    b64: &str,
-    want_sha: bool,
-    step: usize,
-) -> Result<Option<Staged>> {
-    debug_assert!(step > 0 && step % 4 == 0);
-    // Padding may only end the string: every step but the last is whole quads without
-    // '=', each decoded like the corresponding part of a whole-string decode.
-    if b64.trim_end_matches('=').contains('=') {
-        return Ok(None);
-    }
-    let mut stager = Stager::new(storage, u64::MAX, want_sha).await?;
-    let mut buf = Vec::with_capacity(step / 4 * 3);
-    for quads in b64.as_bytes().chunks(step) {
-        buf.clear();
-        if STANDARD.decode_vec(quads, &mut buf).is_err() {
-            return Ok(None);
+impl Base64Decoder {
+    /// `step` must be a non-zero multiple of 4.
+    fn new(step: usize) -> Self {
+        debug_assert!(step > 0 && step % 4 == 0);
+        Self {
+            step,
+            pending: Vec::new(),
+            decoded: Vec::new(),
+            pad_seen: false,
+            valid: true,
         }
-        stager.write(&buf).await?;
     }
-    stager.finish().await.map(Some)
+
+    /// Take the next part of the input; returns the bytes it completed (none once the
+    /// input is known to be invalid).
+    fn push(&mut self, mut chars: &[u8]) -> &[u8] {
+        self.decoded.clear();
+        if !self.valid {
+            return &[];
+        }
+        // After the first '=' only more '=' may follow.
+        let pad_from = if self.pad_seen {
+            Some(0)
+        } else {
+            chars.iter().position(|&c| c == b'=')
+        };
+        if let Some(p) = pad_from {
+            self.pad_seen = true;
+            if chars[p..].iter().any(|&c| c != b'=') {
+                return self.invalid();
+            }
+        }
+        if !self.pending.is_empty() {
+            let take = (self.step - self.pending.len()).min(chars.len());
+            self.pending.extend_from_slice(&chars[..take]);
+            chars = &chars[take..];
+            if self.pending.len() < self.step {
+                return &[];
+            }
+            if STANDARD
+                .decode_vec(&self.pending, &mut self.decoded)
+                .is_err()
+            {
+                return self.invalid();
+            }
+            self.pending.clear();
+        }
+        while chars.len() >= self.step {
+            let (quads, rest) = chars.split_at(self.step);
+            if STANDARD.decode_vec(quads, &mut self.decoded).is_err() {
+                return self.invalid();
+            }
+            chars = rest;
+        }
+        self.pending.extend_from_slice(chars);
+        &self.decoded
+    }
+
+    /// End of input: the remaining bytes, or `None` if it wasn't valid base64.
+    fn finish(&mut self) -> Option<&[u8]> {
+        self.decoded.clear();
+        if self.valid
+            && STANDARD
+                .decode_vec(&self.pending, &mut self.decoded)
+                .is_err()
+        {
+            self.invalid();
+        }
+        self.valid.then_some(&self.decoded[..])
+    }
+
+    fn invalid(&mut self) -> &[u8] {
+        self.valid = false;
+        self.pending = Vec::new();
+        self.decoded.clear();
+        &[]
+    }
+}
+
+/// A base64 string decoded into a staged file as its characters arrive.
+pub(crate) struct Base64Stager {
+    dec: Base64Decoder,
+    stager: Stager,
+}
+
+impl Base64Stager {
+    pub(crate) async fn new(storage: &Storage, want_sha: bool) -> Result<Self> {
+        Ok(Self {
+            dec: Base64Decoder::new(B64_STEP),
+            stager: Stager::new(storage, u64::MAX, want_sha).await?,
+        })
+    }
+
+    /// The next base64 characters (any split). Invalid input is noted, not an error:
+    /// see [`Self::finish`].
+    pub(crate) async fn push(&mut self, chars: &[u8]) -> Result<()> {
+        let decoded = self.dec.push(chars);
+        if !decoded.is_empty() {
+            self.stager.write(decoded).await?;
+        }
+        Ok(())
+    }
+
+    /// The staged blob, or `None` if the input wasn't valid base64 (the file is removed).
+    pub(crate) async fn finish(self) -> Result<Option<Staged>> {
+        let Self {
+            mut dec,
+            mut stager,
+        } = self;
+        let Some(tail) = dec.finish() else {
+            return Ok(None);
+        };
+        if !tail.is_empty() {
+            stager.write(tail).await?;
+        }
+        stager.finish().await.map(Some)
+    }
+}
+
+/// Largest unescaped `capture` member [`stage_json_base64`] holds in memory.
+pub(crate) const MAX_JSON_FIELD: usize = 4096;
+
+/// Input handed to the JSON scanner at a time, so one huge body frame doesn't mean an
+/// equally huge unescaped copy.
+const FEED_STEP: usize = 64 * 1024;
+
+/// Read a JSON request body whose top-level `key` member is a base64 string, decoding
+/// that string into a staged file as the body arrives (see [`crate::json_scan`]); the
+/// `capture` members come back as strings of at most [`MAX_JSON_FIELD`] bytes. Neither
+/// the body nor the blob is held whole. The body is refused past `limit` bytes (413,
+/// up front when `content-length` says so); a read error is a 400 as in [`stage_body`];
+/// invalid JSON is a 400.
+///
+/// The staged blob is the last occurrence of `key`, if that was a string (see
+/// [`Scanned::streamed`]); call [`Base64Stager::finish`] to get it.
+pub(crate) async fn stage_json_base64(
+    storage: &Storage,
+    headers: &HeaderMap,
+    body: Body,
+    limit: u64,
+    key: &'static str,
+    capture: &'static [&'static str],
+) -> Result<(Scanned, Option<Base64Stager>)> {
+    check_declared_length(headers, limit)?;
+    let mut scanner = JsonScanner::new(key, capture, MAX_JSON_FIELD);
+    let mut out = Output::default();
+    let mut blob: Option<Base64Stager> = None;
+    let mut received = 0u64;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(body_read_error)?;
+        received += chunk.len() as u64;
+        if received > limit {
+            return Err(too_large(limit));
+        }
+        for piece in chunk.chunks(FEED_STEP) {
+            scanner.feed(piece, &mut out).map_err(scan_error)?;
+            if std::mem::take(&mut out.restart) {
+                // A (new) occurrence of `key`: whatever an earlier one staged is dropped.
+                blob = Some(Base64Stager::new(storage, false).await?);
+            }
+            if let Some(blob) = &mut blob {
+                blob.push(&out.bytes).await?;
+            }
+            out.bytes.clear();
+        }
+    }
+    let scanned = scanner.finish().map_err(scan_error)?;
+    Ok((scanned, blob))
+}
+
+fn scan_error(e: ScanError) -> ServerError {
+    match e {
+        ScanError::Syntax { .. } => ServerError::BadRequest(e.to_string()),
+        ScanError::TooLong { .. } => ServerError::PayloadTooLarge(e.to_string()),
+    }
+}
+
+/// The 415 axum's `Json` extractor gives a request without a JSON `content-type`, for
+/// handlers that read a JSON body themselves. Runs axum's own check on the headers.
+pub(crate) async fn json_content_type_rejection(headers: &HeaderMap) -> Option<Response> {
+    let mut probe = axum::extract::Request::new(Body::empty());
+    if let Some(ct) = headers.get(header::CONTENT_TYPE) {
+        probe.headers_mut().insert(header::CONTENT_TYPE, ct.clone());
+    }
+    match axum::Json::<serde::de::IgnoredAny>::from_request(probe, &()).await {
+        Err(rejection @ JsonRejection::MissingJsonContentType(_)) => {
+            Some(rejection.into_response())
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -281,24 +470,54 @@ mod tests {
             .unwrap_or(0)
     }
 
+    /// `input` pushed through a [`Base64Decoder`] in pieces cut at `cuts` (offsets,
+    /// any order, out of range ignored).
+    fn decode_in_pieces(input: &[u8], step: usize, cuts: &[usize]) -> Option<Vec<u8>> {
+        let mut cuts: Vec<usize> = cuts.iter().copied().filter(|&c| c <= input.len()).collect();
+        cuts.push(0);
+        cuts.push(input.len());
+        cuts.sort_unstable();
+        let mut dec = Base64Decoder::new(step);
+        let mut out = Vec::new();
+        for w in cuts.windows(2) {
+            out.extend_from_slice(dec.push(&input[w[0]..w[1]]));
+        }
+        out.extend_from_slice(dec.finish()?);
+        Some(out)
+    }
+
     #[tokio::test]
-    async fn base64_steps_match_whole_decode() {
+    async fn base64_stager_matches_whole_decode() {
         let tmp = tempfile::TempDir::new().unwrap();
         let storage = Storage::new(tmp.path()).unwrap();
         let data: Vec<u8> = (0..(B64_STEP * 3 + 7))
             .map(|i| (i * 31 % 251) as u8)
             .collect();
         let b64 = STANDARD.encode(&data);
-        let staged = stage_base64(&storage, &b64, true).await.unwrap().unwrap();
+        // Pushed in uneven pieces, so steps straddle pushes.
+        let mut blob = Base64Stager::new(&storage, true).await.unwrap();
+        let mut rest = b64.as_bytes();
+        for n in [1, 3, 5, 7, 4093, 65_537].into_iter().cycle() {
+            if rest.is_empty() {
+                break;
+            }
+            let (piece, tail) = rest.split_at(n.min(rest.len()));
+            blob.push(piece).await.unwrap();
+            rest = tail;
+        }
+        let staged = blob.finish().await.unwrap().unwrap();
         assert_eq!(staged.len(), data.len() as u64);
         assert_eq!(staged.crc32c(), crc32c::crc32c(&data));
         assert_eq!(
             staged.sha256_hex().unwrap(),
             hex::encode(Sha256::digest(&data))
         );
+        assert!(std::fs::read(staged.path.as_deref().unwrap()).unwrap() == data);
         drop(staged);
         for s in ["", "QQ==", "QUI=", "QUJD"] {
-            let ok = stage_base64(&storage, s, false).await.unwrap();
+            let mut blob = Base64Stager::new(&storage, false).await.unwrap();
+            blob.push(s.as_bytes()).await.unwrap();
+            let ok = blob.finish().await.unwrap();
             assert_eq!(
                 ok.map(|s| s.len() as usize),
                 STANDARD.decode(s).ok().map(|d| d.len()),
@@ -307,44 +526,31 @@ mod tests {
         }
         for bad in ["QQ", "QQ==QUJD", "QU J", "Q===", "QR==", "!!!!"] {
             assert!(STANDARD.decode(bad).is_err(), "{bad:?}");
-            assert!(
-                stage_base64(&storage, bad, false).await.unwrap().is_none(),
-                "{bad:?}"
-            );
+            let mut blob = Base64Stager::new(&storage, false).await.unwrap();
+            blob.push(bad.as_bytes()).await.unwrap();
+            assert!(blob.finish().await.unwrap().is_none(), "{bad:?}");
         }
         assert_eq!(residue(&storage), 0);
     }
 
     proptest::proptest! {
-        // Each case opens a store (SQLite); fewer cases keep the suite quick.
-        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
-        /// Stepwise decoding accepts exactly what a whole-string decode accepts, with
-        /// the same bytes, across step boundaries (4- and 8-char steps).
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(1024))]
+        /// Incremental decoding accepts exactly what a whole-string decode accepts, with
+        /// the same bytes, whatever the pushes and across step boundaries (4- and 8-char
+        /// steps).
         #[test]
-        fn base64_steps_agree_with_whole_decode(
+        fn base64_decoder_agrees_with_whole_decode(
             s in "[A-Za-z0-9+/=]{0,40}",
             data in proptest::collection::vec(proptest::num::u8::ANY, 0..40),
+            cuts in proptest::collection::vec(0usize..60, 0..6),
         ) {
-            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-            let tmp = tempfile::TempDir::new().unwrap();
-            let storage = Storage::new(tmp.path()).unwrap();
             for input in [s, STANDARD.encode(&data)] {
                 let want = STANDARD.decode(&input).ok();
                 for step in [4, 8] {
-                    let got = rt.block_on(async {
-                        let staged = stage_base64_in_steps(&storage, &input, false, step)
-                            .await
-                            .unwrap();
-                        staged.map(|st| {
-                            let bytes = std::fs::read(st.path.as_deref().unwrap()).unwrap();
-                            assert_eq!(st.len(), bytes.len() as u64);
-                            bytes
-                        })
-                    });
-                    proptest::prop_assert_eq!(&got, &want, "{:?} step {}", input, step);
+                    let got = decode_in_pieces(input.as_bytes(), step, &cuts);
+                    proptest::prop_assert_eq!(&got, &want, "{:?} step {} cuts {:?}", input, step, cuts);
                 }
             }
-            proptest::prop_assert_eq!(residue(&storage), 0);
         }
     }
 

@@ -14,6 +14,7 @@ pub mod gentree;
 pub mod handwriting;
 pub mod hw_search;
 pub mod integrations;
+mod json_scan;
 pub mod mdm;
 pub mod mqtt_ws;
 pub mod notifications;
@@ -141,12 +142,12 @@ pub fn create_router(state: AppState) -> Router {
         // Handwriting conversion (local tesseract; see handwriting.rs)
         .route(
             "/convert/v1/handwriting",
-            post(handwriting::convert).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
+            post(handwriting::convert).layer(DefaultBodyLimit::max(handwriting::MAX_BODY)),
         )
         .route("/handwriting/v1/search", get(hw_search::search))
         .route(
             "/api/v1/page",
-            post(handwriting::convert).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
+            post(handwriting::convert).layer(DefaultBodyLimit::max(handwriting::MAX_BODY)),
         )
         // Share a page as a link (3.27+)
         .route(
@@ -157,7 +158,7 @@ pub fn create_router(state: AppState) -> Router {
         // Send by email (SMTP via env)
         .route(
             "/share/v1/email",
-            post(share_email::send).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
+            post(share_email::send).layer(DefaultBodyLimit::max(share_email::MAX_BODY)),
         )
         // Read on reMarkable / desktop uploads (PDF, EPUB)
         .route(
