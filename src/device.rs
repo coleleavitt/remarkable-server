@@ -154,26 +154,33 @@ impl DeviceManager {
     /// A token from an earlier registration (older epoch) deletes nothing, so it can't knock out a re-pair.
     pub fn revoke_device_token(&self, device_token: &str) -> Result<bool> {
         let c = self.decode_device_token_signature(device_token)?; let conn = self.inner.conn.lock();
-        if Self::check_registered(&conn, &c).is_err() { return Ok(false); }
-        conn.execute("DELETE FROM devices WHERE device_id = ? AND user_id = ?", params![c.device_id, c.auth0_userid])?;
-        Self::bump_epoch(&conn, &c.device_id)?; Ok(true)
+        match Self::check_registered(&conn, &c) { Ok(()) => {} Err(ServerError::InvalidToken) => return Ok(false), Err(e) => return Err(e) }
+        Self::unregister(&conn, &c.device_id, Some(&c.auth0_userid))
     }
     pub fn refresh_user_token(&self, device_token: &str) -> Result<String> {
         let c = self.touch_device_token(device_token)?;
         self.gen_user_token(&c.device_id, &c.device_desc, &c.auth0_userid)
     }
-    pub fn list_devices(&self) -> Result<Vec<Device>> {
+    /// Registered devices; `Some(user)` limits it to that user's own, `None` (admin/startup) lists all.
+    pub fn list_devices(&self, owner: Option<&str>) -> Result<Vec<Device>> {
         let conn = self.inner.conn.lock();
-        let mut stmt = conn.prepare("SELECT device_id, device_desc, registered_at, last_refresh, user_id FROM devices")?;
-        let devices = stmt.query_map([], |row| Ok(Device { device_id: row.get(0)?, device_desc: row.get(1)?, registered_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(2)?).map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()), last_refresh: DateTime::parse_from_rfc3339(&row.get::<_, String>(3)?).map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()), user_id: row.get(4)? }))?.filter_map(|r| r.ok()).collect();
+        let mut stmt = conn.prepare("SELECT device_id, device_desc, registered_at, last_refresh, user_id FROM devices WHERE ?1 IS NULL OR user_id = ?1")?;
+        let devices = stmt.query_map(params![owner], |row| Ok(Device { device_id: row.get(0)?, device_desc: row.get(1)?, registered_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(2)?).map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()), last_refresh: DateTime::parse_from_rfc3339(&row.get::<_, String>(3)?).map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()), user_id: row.get(4)? }))?.filter_map(|r| r.ok()).collect();
         Ok(devices)
     }
     /// Unregister a device and revoke every device token issued for it so far.
-    pub fn delete_device(&self, device_id: &str) -> Result<bool> {
-        let conn = self.inner.conn.lock();
-        let deleted = conn.execute("DELETE FROM devices WHERE device_id = ?", params![device_id])? > 0;
-        if deleted { Self::bump_epoch(&conn, device_id)?; }
-        Ok(deleted)
+    /// `Some(user)` only deletes it if that user owns it (another user's device is a no-op, false);
+    /// `None` (admin) deletes regardless of owner.
+    pub fn delete_device(&self, device_id: &str, owner: Option<&str>) -> Result<bool> {
+        Self::unregister(&self.inner.conn.lock(), device_id, owner)
+    }
+    /// Delete the registration and bump the epoch in one transaction: a delete without the bump
+    /// would let a later re-pair revive every token minted before it.
+    fn unregister(conn: &Connection, device_id: &str, owner: Option<&str>) -> Result<bool> {
+        let tx = conn.unchecked_transaction()?; // callers hold the connection mutex
+        let deleted = tx.execute("DELETE FROM devices WHERE device_id = ?1 AND (?2 IS NULL OR user_id = ?2)", params![device_id, owner])? > 0;
+        if deleted { Self::bump_epoch(&tx, device_id)?; }
+        tx.commit()?; Ok(deleted)
     }
     /// Invalidate all device tokens minted for `device_id` so far, even if it is paired again later.
     fn bump_epoch(conn: &Connection, device_id: &str) -> Result<()> {
@@ -182,12 +189,15 @@ impl DeviceManager {
     /// Upsert a device registration; returns the epoch to mint its device token with.
     /// Moving a device to another user revokes the previous owner's tokens (they'd otherwise
     /// come back to life if the device were later paired back to that user).
+    /// Bump + upsert run in one transaction so a failure can't hand the device over un-revoked.
     fn register(conn: &Connection, device_id: &str, device_desc: &str, user_id: &str) -> Result<i64> {
-        let prev: Option<String> = conn.query_row("SELECT user_id FROM devices WHERE device_id = ?", params![device_id], |r| r.get(0)).optional()?;
-        if prev.is_some_and(|u| u != user_id) { Self::bump_epoch(conn, device_id)?; }
+        let tx = conn.unchecked_transaction()?; // callers hold the connection mutex
+        let prev: Option<String> = tx.query_row("SELECT user_id FROM devices WHERE device_id = ?", params![device_id], |r| r.get(0)).optional()?;
+        if prev.is_some_and(|u| u != user_id) { Self::bump_epoch(&tx, device_id)?; }
         let now = Utc::now().to_rfc3339();
-        conn.execute(UPSERT_DEVICE, params![device_id, device_desc, now, now, user_id])?;
-        Ok(conn.query_row("SELECT COALESCE((SELECT epoch FROM device_token_epochs WHERE device_id = ?), 0)", params![device_id], |r| r.get(0))?)
+        tx.execute(UPSERT_DEVICE, params![device_id, device_desc, now, now, user_id])?;
+        let epoch = tx.query_row("SELECT COALESCE((SELECT epoch FROM device_token_epochs WHERE device_id = ?), 0)", params![device_id], |r| r.get(0))?;
+        tx.commit()?; Ok(epoch)
     }
 
     // ---- MDM instruction queue (enterprise device management, /mdm/v1) ----
@@ -481,7 +491,7 @@ mod revocation_tests {
     fn deleted_device_token_is_rejected_everywhere() {
         let (dm, _tmp) = setup();
         let dt = pair(&dm, "local-user", "RM110-1");
-        assert!(dm.delete_device("RM110-1").unwrap());
+        assert!(dm.delete_device("RM110-1", None).unwrap());
         assert!(matches!(dm.validate_token(&bearer(&dt)), Err(ServerError::InvalidToken)));
         assert!(dm.caller(&bearer(&dt)).is_err());
         assert!(dm.refresh_user_token(&dt).is_err());
@@ -525,7 +535,7 @@ mod revocation_tests {
         let (dm, _tmp) = setup();
         let old = pair(&dm, "local-user", "RM110-1");
         let (_, old_refresh, _) = dm.refresh_oauth(&old).unwrap();
-        assert!(dm.delete_device("RM110-1").unwrap());
+        assert!(dm.delete_device("RM110-1", None).unwrap());
         let new = pair(&dm, "local-user", "RM110-1");
         assert!(dm.validate_token(&bearer(&new)).is_ok());
         for t in [&old, &old_refresh] {
@@ -579,6 +589,63 @@ mod revocation_tests {
         // A pre-existing token (minted before this column/claim existed) is still accepted.
         assert!(dm.validate_token(&bearer(&dt)).is_ok());
         assert!(dm.refresh_oauth(&dt).is_ok());
+    }
+
+    /// A second connection to the same DB, to break things under the manager's feet.
+    fn side_conn(tmp: &tempfile::TempDir) -> Connection { Connection::open(tmp.path().join("devices.db")).unwrap() }
+    /// Make every epoch bump fail (both the insert and the ON CONFLICT update path).
+    fn fail_epoch_bumps(tmp: &tempfile::TempDir) {
+        side_conn(tmp).execute_batch("CREATE TRIGGER fail_ins BEFORE INSERT ON device_token_epochs BEGIN SELECT RAISE(ABORT, 'forced'); END; CREATE TRIGGER fail_upd BEFORE UPDATE ON device_token_epochs BEGIN SELECT RAISE(ABORT, 'forced'); END;").unwrap();
+    }
+
+    #[test]
+    fn self_revoke_propagates_db_errors() {
+        let (dm, tmp) = setup();
+        let dt = pair(&dm, "local-user", "RM110-1");
+        side_conn(&tmp).execute_batch("ALTER TABLE devices RENAME TO devices_gone").unwrap();
+        assert!(matches!(dm.revoke_device_token(&dt), Err(ServerError::Database(_))), "a DB error is not 'already unregistered'");
+        side_conn(&tmp).execute_batch("ALTER TABLE devices_gone RENAME TO devices").unwrap();
+        assert!(dm.validate_token(&bearer(&dt)).is_ok(), "nothing was deleted");
+        assert!(dm.revoke_device_token(&dt).unwrap());
+    }
+
+    #[test]
+    fn failed_epoch_bump_rolls_back_the_delete() {
+        let (dm, tmp) = setup();
+        let dt = pair(&dm, "local-user", "RM110-1");
+        pair(&dm, "local-user", "RM110-2");
+        assert!(dm.delete_device("RM110-2", None).unwrap()); // RM110-2 now has an epochs row (update path)
+        let other2 = pair(&dm, "local-user", "RM110-2");
+        fail_epoch_bumps(&tmp);
+        // Admin/user delete (insert path for RM110-1, update path for RM110-2) and self-unregister.
+        assert!(dm.delete_device("RM110-1", None).is_err());
+        assert!(dm.delete_device("RM110-2", Some("local-user")).is_err());
+        assert!(dm.revoke_device_token(&dt).is_err());
+        assert!(dm.revoke_device_token(&other2).is_err());
+        for (d, t) in [("RM110-1", &dt), ("RM110-2", &other2)] {
+            assert!(dm.get_device(d).unwrap().is_some(), "{d}: delete rolled back");
+            assert!(dm.validate_token(&bearer(t)).is_ok(), "{d}: token still valid, epoch unchanged");
+        }
+        // Re-pairing to another user must not hand the device over un-revoked.
+        let code = dm.create_pairing_code("user-b").unwrap();
+        assert!(dm.exchange_code(&code, "RM110-1", "remarkable").is_err());
+        assert_eq!(dm.get_device("RM110-1").unwrap().unwrap().user_id, "local-user");
+        assert!(dm.validate_token(&bearer(&dt)).is_ok());
+        side_conn(&tmp).execute_batch("DROP TRIGGER fail_ins; DROP TRIGGER fail_upd;").unwrap();
+        assert!(dm.delete_device("RM110-1", None).unwrap());
+        assert!(dm.validate_token(&bearer(&dt)).is_err());
+    }
+
+    #[test]
+    fn delete_device_respects_owner() {
+        let (dm, _tmp) = setup();
+        let b = pair(&dm, "user-b", "RM110-B");
+        assert!(!dm.delete_device("RM110-B", Some("user-a")).unwrap());
+        assert!(dm.validate_token(&bearer(&b)).is_ok());
+        assert_eq!(dm.list_devices(Some("user-a")).unwrap().len(), 0);
+        assert_eq!(dm.list_devices(Some("user-b")).unwrap().len(), 1);
+        assert!(dm.delete_device("RM110-B", Some("user-b")).unwrap());
+        assert!(dm.validate_token(&bearer(&b)).is_err());
     }
 
     #[test]
