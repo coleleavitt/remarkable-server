@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>How We Cut Our CI Build Times in Half | Northwind Engineering Blog</title>
+  <meta name="description" content="Caching, sharding and a few surprising wins from a year of CI work.">
+  <meta property="og:site_name" content="Northwind Engineering Blog">
+  <meta property="og:title" content="How We Cut Our CI Build Times in Half">
+  <meta name="author" content="Priya Raman">
+  <link rel="stylesheet" href="/assets/site.css">
+  <script src="https://cdn.tracker.example/analytics.js" async></script>
+  <script>window.dataLayer = window.dataLayer || []; dataLayer.push({event: "pageview"});</script>
+  <style>.ad-slot { min-height: 250px; }</style>
+</head>
+<body class="post-template">
+  <div id="cookie-banner" class="cookie-consent popup">
+    We use cookies to improve your experience. <a href="/privacy">Learn more</a>
+    <button>Accept all</button>
+  </div>
+  <header class="site-header">
+    <a class="logo" href="/"><img src="/assets/logo.svg" alt="Northwind"></a>
+    <nav class="main-menu">
+      <ul>
+        <li><a href="/">Home</a></li>
+        <li><a href="/tags/infrastructure/">Infrastructure</a></li>
+        <li><a href="/tags/frontend/">Frontend</a></li>
+        <li><a href="/tags/data/">Data</a></li>
+        <li><a href="/careers/">Careers</a></li>
+        <li><a href="/about/">About</a></li>
+      </ul>
+    </nav>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="ad-slot sponsor">
+        <a href="https://ads.example.net/click?id=42"><img src="https://ads.example.net/banner-300x250.png" alt="Advertisement"></a>
+        <p>Sponsored: Ship faster with HyperCloud. Start your free trial today!</p>
+      </div>
+      <div class="widget popular-posts">
+        <h3>Popular posts</h3>
+        <ul>
+          <li><a href="/2025/10/postgres-upgrade/">Upgrading Postgres without downtime</a></li>
+          <li><a href="/2025/08/feature-flags/">Feature flags at scale</a></li>
+          <li><a href="/2025/06/oncall/">What we learned from a year of on-call</a></li>
+        </ul>
+      </div>
+    </aside>
+
+    <main id="main-content">
+      <article class="post">
+        <h1 class="post-title">How We Cut Our CI Build Times in Half</h1>
+        <p class="byline">By <a href="/authors/priya/" rel="author">Priya Raman</a> &middot; <time datetime="2026-03-14">March 14, 2026</time></p>
+        <div class="share-buttons">
+          <a href="https://twitter.com/intent/tweet?url=x">Tweet</a>
+          <a href="https://www.facebook.com/sharer/sharer.php?u=x">Share</a>
+        </div>
+        <div class="post-content">
+          <p>Twelve months ago, a clean build of our main repository took forty-one minutes on CI. Engineers had learned to push a change, go to lunch, and hope. This post walks through what we changed, in the order we changed it, and how much each step actually bought us.</p>
+          <p>The short version: remote caching gave us the biggest single win, test sharding the second, and a handful of boring fixes to our Docker layers made up the rest. None of it was magic, but the combination took the median pipeline from forty-one minutes down to nineteen.</p>
+          <h2>Measuring before optimizing</h2>
+          <p>Before touching anything, we exported six weeks of pipeline timings into a spreadsheet and grouped them by stage. It turned out that compilation was only a third of the wall-clock time; the rest was split between dependency installation, container image builds, and a long tail of flaky integration tests that were retried automatically.</p>
+          <figure>
+            <img src="/images/2026/ci-stage-breakdown.png" alt="Bar chart of CI time per stage" width="720" height="400">
+            <figcaption>Where the forty-one minutes went, by pipeline stage.</figcaption>
+          </figure>
+          <p>We also discovered that a single integration suite, the one exercising the billing service, accounted for almost nine minutes on its own because it spun up a fresh database for every test case.</p>
+          <h2>Remote caching</h2>
+          <p>Our build tool already supported a content-addressed cache, but it was only enabled on developer laptops. Turning on a shared remote cache for CI meant that most pull requests only rebuilt the handful of targets they actually touched. We wrote up the configuration in <a href="../../docs/remote-cache.html">our internal guide</a>, and the relevant flags are documented in the <a href="https://buildtool.example.org/docs/caching">upstream manual</a>.</p>
+          <blockquote>
+            <p>The cache hit rate on the first day was 83 percent. By the end of the week it had settled at 91 percent, and the compile stage dropped from fourteen minutes to under three.</p>
+          </blockquote>
+          <h2>Sharding the slow suites</h2>
+          <p>Next, we split the billing integration suite across four parallel runners and replaced the per-test database with transactions that roll back at the end of each case. That alone saved seven minutes, and it had the pleasant side effect of making the suite deterministic enough that we could turn off automatic retries.</p>
+          <pre><code>ci:
+  billing-tests:
+    parallelism: 4
+    command: make test-billing SHARD=$CI_NODE_INDEX</code></pre>
+          <p>Finally, we reordered our Dockerfile so that dependency manifests are copied and installed before the application source. A change to a single source file no longer invalidates the dependency layer, which saves another four to five minutes on most runs.</p>
+          <p>If you want to try the same approach, start with measurement. The biggest wins were not where we expected them, and without the data we would have spent weeks tuning the compiler flags instead.</p>
+        </div>
+        <div class="post-tags">
+          Tags: <a href="/tags/ci/">ci</a>, <a href="/tags/build/">build</a>, <a href="/tags/performance/">performance</a>
+        </div>
+      </article>
+
+      <section id="newsletter" class="newsletter-signup">
+        <h3>Get new posts by email</h3>
+        <form action="/subscribe" method="post">
+          <input type="email" name="email" placeholder="you@example.com">
+          <input type="submit" value="Subscribe">
+        </form>
+      </section>
+
+      <section id="comments" class="comments">
+        <h3>3 Comments</h3>
+        <div class="comment">
+          <p class="comment-author">devops_dan</p>
+          <p>Great write-up! Did you consider a merge queue as well? Leave a comment below if anyone has numbers.</p>
+        </div>
+        <div class="comment">
+          <p class="comment-author">maria.k</p>
+          <p>We saw almost identical cache hit rates. The Dockerfile trick is underrated.</p>
+        </div>
+        <div class="comment">
+          <p class="comment-author">anon</p>
+          <p>First!</p>
+        </div>
+      </section>
+
+      <section class="related-posts">
+        <h3>Related articles</h3>
+        <ul>
+          <li><a href="/2025/11/monorepo/">Why we moved to a monorepo</a></li>
+          <li><a href="/2025/09/flaky-tests/">Hunting flaky tests</a></li>
+        </ul>
+      </section>
+    </main>
+  </div>
+
+  <footer class="site-footer">
+    <p>&copy; 2026 Northwind Traders. All rights reserved.</p>
+    <p><a href="/privacy">Privacy</a> &middot; <a href="/terms">Terms</a> &middot; <a href="/rss.xml">RSS</a></p>
+  </footer>
+  <script>document.querySelectorAll('.share-buttons a').forEach(a => a.target = '_blank');</script>
+</body>
+</html>

@@ -612,27 +612,15 @@ impl FeedManager {
             .send()
             .await
             .map_err(|e| ServerError::Internal(format!("Failed to fetch article: {}", e)))?;
+        // Relative links in the page are relative to where it was served from, after redirects.
+        let page_url = response.url().to_string();
 
         let html = response
             .text()
             .await
             .map_err(|e| ServerError::Internal(format!("Failed to read article: {}", e)))?;
 
-        // Use readability to extract main content
-        let extracted =
-            readability::extractor::extract(&mut html.as_bytes(), &url.parse().unwrap())
-                .map_err(|e| ServerError::Internal(format!("Failed to extract article: {}", e)))?;
-
-        let text = strip_html(&extracted.content);
-        let word_count = text.split_whitespace().count() as u32;
-
-        Ok(ExtractedArticle {
-            title: extracted.title,
-            content_html: extracted.content,
-            content_text: text,
-            word_count,
-            reading_time_mins: (word_count / 200).max(1),
-        })
+        extract_readable(&html, &page_url)
     }
 
     // ========================================================================
@@ -1383,6 +1371,44 @@ fn strip_html(html: &str) -> String {
         .replace("&#39;", "'")
 }
 
+/// Readability (Mozilla Readability.js algorithm) over already-fetched HTML; no network. Keeps
+/// the main content and drops page furniture (navigation, ads, sidebars, comments, scripts);
+/// relative links and images are made absolute against `page_url`, which must be absolute.
+fn extract_readable(html: &str, page_url: &str) -> Result<ExtractedArticle> {
+    let failed = |e: dom_smoothie::ReadabilityError| {
+        ServerError::Internal(format!("Failed to extract article: {e}"))
+    };
+    let cfg = dom_smoothie::Config {
+        // JSON-LD would only add metadata, and it is parsed with gjson, which can turn crafted
+        // escapes in a hostile page into a String that is not UTF-8. Title and body come from
+        // the DOM.
+        disable_json_ld: true,
+        ..Default::default()
+    };
+    let mut readability =
+        dom_smoothie::Readability::new(html, Some(page_url), Some(cfg)).map_err(failed)?;
+    let (title, content_html) = match readability.parse() {
+        Ok(article) => (article.title, article.content.to_string()),
+        // No readable text at all (empty page, empty body). The previous extractor still
+        // answered with the page title and a content-free body, so keep answering.
+        Err(dom_smoothie::ReadabilityError::GrabFailed) => {
+            (readability.get_article_title().to_string(), String::new())
+        }
+        Err(e) => return Err(failed(e)),
+    };
+
+    let text = strip_html(&content_html);
+    let word_count = text.split_whitespace().count() as u32;
+
+    Ok(ExtractedArticle {
+        title,
+        content_html,
+        content_text: text,
+        word_count,
+        reading_time_mins: (word_count / 200).max(1),
+    })
+}
+
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -1874,5 +1900,164 @@ mod folder_sync_tests {
         assert_eq!(msg.message.attributes.event, "SyncComplete");
         assert!(tree(&storage).iter().any(|n| n.1 == "Title a1"));
         assert!(rx.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod readability_tests {
+    use super::*;
+
+    const BLOG: &str = include_str!("../tests/fixtures/articles/engineering_blog.html");
+    const BLOG_URL: &str = "https://blog.northwind.example/2026/03/ci-build-times/";
+    const NEWS: &str = include_str!("../tests/fixtures/articles/news_div_soup.html");
+    const NEWS_URL: &str = "https://gazette.example/news/2026/09/ferry-schedule";
+
+    fn assert_absent(content: &str, furniture: &[&str]) {
+        for f in furniture {
+            assert!(
+                !content.contains(f),
+                "{f:?} should have been stripped:\n{content}"
+            );
+        }
+    }
+
+    #[test]
+    fn blog_post_keeps_the_article_and_drops_page_furniture() {
+        let a = extract_readable(BLOG, BLOG_URL).unwrap();
+        assert_eq!(a.title, "How We Cut Our CI Build Times in Half");
+        for kept in [
+            "Twelve months ago, a clean build",
+            "<h2>Measuring before optimizing</h2>",
+            "The cache hit rate on the first day was 83 percent.",
+            "parallelism: 4",
+            "<figcaption>Where the forty-one minutes went",
+            "without the data we would have spent weeks",
+        ] {
+            assert!(
+                a.content_html.contains(kept),
+                "missing {kept:?}:\n{}",
+                a.content_html
+            );
+        }
+        assert_absent(
+            &a.content_html,
+            &[
+                "Accept all",             // cookie banner
+                "Careers",                // site navigation
+                "Sponsored: Ship faster", // sidebar ad
+                "ads.example.net",        // ad banner image
+                "Popular posts",          // sidebar widget
+                "Tweet",                  // share buttons
+                "Get new posts by email", // newsletter form
+                "<form",                  // newsletter form
+                "devops_dan",             // comments
+                "Related articles",       // related posts rail
+                "All rights reserved",    // footer
+                "<script",                // trackers
+                "dataLayer",              // inline tracker
+                "class=\"post-content\"", // page classes
+            ],
+        );
+        // Relative image and link are resolved against the page URL, absolute ones kept.
+        assert!(a.content_html.contains(
+            r#"src="https://blog.northwind.example/images/2026/ci-stage-breakdown.png""#
+        ));
+        assert!(
+            a.content_html
+                .contains(r#"href="https://blog.northwind.example/2026/docs/remote-cache.html""#)
+        );
+        assert!(
+            a.content_html
+                .contains(r#"href="https://buildtool.example.org/docs/caching""#)
+        );
+
+        assert!(a.content_text.contains("Twelve months ago"));
+        assert!(!a.content_text.contains('<'));
+        assert_eq!(
+            a.word_count as usize,
+            a.content_text.split_whitespace().count()
+        );
+        // The article body is 423 words; with the page furniture it would be 554.
+        assert!((410..=435).contains(&a.word_count), "{}", a.word_count);
+        assert_eq!(a.reading_time_mins, a.word_count / 200);
+    }
+
+    #[test]
+    fn div_soup_news_story_is_extracted() {
+        let a = extract_readable(NEWS, NEWS_URL).unwrap();
+        assert_eq!(a.title, "Harbor Council Approves New Ferry Schedule");
+        for kept in [
+            "voted five to two on Tuesday night",
+            "the first boat will leave the island terminal at 5:40 a.m.",
+            "said council chair Denise Okafor",
+            "a lifeline for restaurant and hospitality workers",
+            "results expected before the summer season",
+        ] {
+            assert!(
+                a.content_html.contains(kept),
+                "missing {kept:?}:\n{}",
+                a.content_html
+            );
+        }
+        assert_absent(
+            &a.content_html,
+            &[
+                "E-paper",       // top bar
+                "Obituaries",    // menu
+                "<iframe",       // leaderboard ad
+                "Most read",     // right rail
+                "Island Realty", // sponsor box
+                "Print",         // share tools
+                "Copyright 2026",
+                "_gaq",
+            ],
+        );
+        // A path-relative image resolves against the article's directory, a root-relative link
+        // against the host.
+        assert!(
+            a.content_html.contains(
+                r#"src="https://gazette.example/news/2026/09/photos/ferry-terminal.jpg""#
+            )
+        );
+        assert!(
+            a.content_html
+                .contains(r#"href="https://gazette.example/ferry/schedule.pdf""#)
+        );
+    }
+
+    #[test]
+    fn page_without_readable_text_still_answers_with_its_title() {
+        let a = extract_readable(
+            "<html><head><title>Nothing here</title></head><body></body></html>",
+            "https://example.com/empty",
+        )
+        .unwrap();
+        assert_eq!(a.title, "Nothing here");
+        assert_eq!(a.content_html, "");
+        assert_eq!((a.word_count, a.reading_time_mins), (0, 1));
+
+        let a = extract_readable("", "https://example.com/blank").unwrap();
+        assert_eq!((a.title.as_str(), a.content_html.as_str()), ("", ""));
+    }
+
+    /// gjson (dom_smoothie's JSON-LD parser) builds a non-UTF-8 `String` from `\u000` followed by
+    /// a multi-byte character. JSON-LD is off, so a hostile block cannot reach the title.
+    #[test]
+    fn hostile_json_ld_does_not_reach_the_output() {
+        let html = r#"<html><head><title>Ferry schedule approved</title>
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"NewsArticle","headline":"\u000é x","name":"\u000é x"}
+</script></head><body><article>
+<p>The Port Ellis harbor council voted five to two on Tuesday night to adopt a new ferry timetable
+that adds early-morning crossings on weekdays and cuts two of the least-used evening sailings.</p>
+<p>Commuters who work on the mainland have asked for an earlier departure for years, and the first
+boat will now leave the island terminal twenty minutes earlier than it does today.</p>
+</article></body></html>"#;
+        let a = extract_readable(html, "https://gazette.example/ferry").unwrap();
+        assert_eq!(a.title, "Ferry schedule approved");
+        for s in [&a.title, &a.content_html, &a.content_text] {
+            assert!(std::str::from_utf8(s.as_bytes()).is_ok());
+        }
+        assert!(a.content_html.contains("voted five to two"));
     }
 }

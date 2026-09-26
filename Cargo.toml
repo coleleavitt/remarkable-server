@@ -39,7 +39,10 @@ urlencoding = "2"
 
 # Feed sync dependencies
 feed-rs = "2"
-readability = "0.3"
+# Readability.js port for /feeds/v1/extract, run on HTML we already fetched (no HTTP client of
+# its own). Replaces `readability` 0.3, whose default reqwest 0.11 feature pulled h2 0.3
+# (RUSTSEC-2026-0258) and rustls-pemfile 1 (unmaintained).
+dom_smoothie = "0.18.2"
 epub-builder = "0.7"
 imap = "3.0.0-alpha.15"
 native-tls = "0.2"
