@@ -51,6 +51,43 @@ pub(crate) fn local_path_for(base: &Path, cloud_path: &str) -> Result<PathBuf> {
     Ok(joined)
 }
 
+/// Create `root/rel` one level at a time from the canonical root, resolving each existing
+/// entry and refusing (`Ok(None)`) any that lands outside the root or isn't a directory, so
+/// a symlinked subdirectory can't make us create directories elsewhere. Returns the
+/// canonical directory. `rel` must already be validated (plain `Normal` components).
+async fn create_dirs_within(root: &Path, rel: &Path) -> Result<Option<PathBuf>> {
+    let root = fs::canonicalize(root).await?;
+    let mut cur = root.clone();
+    for c in rel.components() {
+        let next = cur.join(c);
+        match fs::create_dir(&next).await {
+            Ok(()) => { cur = next; continue; }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+        let real = fs::canonicalize(&next).await?;
+        if !real.starts_with(&root) || !fs::metadata(&real).await?.is_dir() { return Ok(None); }
+        cur = real;
+    }
+    Ok(Some(cur))
+}
+
+/// Replace `target` (in `dir`) via a fresh temp file + rename: `create_new` never follows a
+/// symlink and `rename` replaces the directory entry rather than writing through it, so a
+/// symlink swapped in after our checks can't redirect the content. Also makes writes atomic.
+async fn write_replace(dir: &Path, target: &Path, content: &[u8]) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let tmp = dir.join(format!(".rms-sync-{}.tmp", uuid::Uuid::new_v4()));
+    let res = async {
+        let mut f = fs::OpenOptions::new().write(true).create_new(true).open(&tmp).await?;
+        f.write_all(content).await?;
+        f.sync_all().await?;
+        fs::rename(&tmp, target).await
+    }.await;
+    if res.is_err() { let _ = fs::remove_file(&tmp).await; }
+    Ok(res?)
+}
+
 /// Sync direction
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyncDirection {
@@ -518,19 +555,21 @@ impl<P: CloudProvider> CloudSync<P> {
         })?;
         let content = self.provider.download_file(&cloud_file.id).await?;
 
-        // Create parent directories
-        if let Some(parent) = local_path.parent() {
-            fs::create_dir_all(parent).await?;
-            // Symlinks already inside the sync root must not redirect the write elsewhere.
-            let (root, dir) = (fs::canonicalize(&self.config.local_path).await?, fs::canonicalize(parent).await?);
-            let is_link = fs::symlink_metadata(&local_path).await.map(|m| m.file_type().is_symlink()).unwrap_or(false);
-            if !dir.starts_with(&root) || is_link {
-                tracing::error!("cloud sync: {:?} resolves outside sync root, skipping", cloud_file.path);
-                return Err(IntegrationError::InvalidPath(format!("{:?} resolves outside sync root", cloud_file.path)));
-            }
+        // Symlinks already inside the sync root must not redirect the write (or any mkdir) elsewhere.
+        let escape = || {
+            tracing::error!("cloud sync: {:?} resolves outside sync root, skipping", cloud_file.path);
+            IntegrationError::InvalidPath(format!("{:?} resolves outside sync root", cloud_file.path))
+        };
+        let (rel_dir, name) = match (local_path.parent().and_then(|p| p.strip_prefix(&self.config.local_path).ok()), local_path.file_name()) {
+            (Some(d), Some(n)) => (d, n),
+            _ => return Err(escape()),
+        };
+        let dir = create_dirs_within(&self.config.local_path, rel_dir).await?.ok_or_else(escape)?;
+        let target = dir.join(name);
+        if fs::symlink_metadata(&target).await.map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+            return Err(escape());
         }
-
-        fs::write(&local_path, &content).await?;
+        write_replace(&dir, &target, &content).await?;
 
         // Update state
         self.state.file_map.insert(cloud_file.path.clone(), cloud_file.id.clone());
@@ -734,6 +773,30 @@ mod tests {
         let r = sync.sync().await.unwrap();
         assert_eq!(r.downloaded, 0);
         assert!(!outer.path().join("pwned.txt").exists());
+    }
+
+    /// No directory may be created through a symlinked subdirectory, a symlinked target file
+    /// is never written through, and symlinks that stay inside the root still work.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_never_creates_or_writes_through_escaping_symlinks() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("root");
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(outer.path(), root.join("link")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
+        // Hidden, so the local scan skips it and the cloud copy is a pure download.
+        std::fs::write(outer.path().join("victim.txt"), "orig").unwrap();
+        std::os::unix::fs::symlink(outer.path().join("victim.txt"), root.join(".f.txt")).unwrap();
+        let files = vec![cf("evil1", "/link/new/deep/pwned.txt"), cf("evil2", "/.f.txt"), cf("ok", "/alias/sub/ok.txt")];
+        let mut sync = CloudSync::new(MockProvider { files, ..Default::default() }, cfg(&root, SyncDirection::Download));
+        let r = sync.sync().await.unwrap();
+        assert_eq!((r.downloaded, r.errors.len()), (1, 2), "{:?}", r.errors);
+        assert!(!outer.path().join("new").exists(), "mkdir escaped through symlink");
+        assert_eq!(std::fs::read(outer.path().join("victim.txt")).unwrap(), b"orig");
+        assert_eq!(std::fs::read(root.join("real/sub/ok.txt")).unwrap(), b"ok");
+        // Temp files from the atomic write don't linger.
+        assert!(std::fs::read_dir(root.join("real/sub")).unwrap().all(|e| e.unwrap().file_name() == "ok.txt"));
     }
 
     #[tokio::test]

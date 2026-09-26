@@ -15,7 +15,7 @@ pub mod oauth;
 pub mod onedrive;
 pub mod sync;
 
-pub use api::{IntegrationState, integration_router};
+pub use api::{IntegrationState, integration_api_router, integration_oauth_router, integration_router};
 pub use conflict::{ConflictResolution, ConflictResolver, ConflictStrategy};
 pub use oauth::{OAuthConfig, OAuthProvider, OAuthToken, PkceFlow};
 pub use sync::{CloudSync, SyncConfig, SyncDirection, SyncResult, SyncStatus};

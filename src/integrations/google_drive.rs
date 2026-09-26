@@ -390,7 +390,9 @@ impl CloudProvider for GoogleDrive {
                 None => self.create_folder(Some(&parent), dir).await?.id,
             };
         }
-        self.upload_file(Some(&parent), name, content, mime_type).await
+        let mut file = self.upload_file(Some(&parent), name, content, mime_type).await?;
+        file.path = format!("/{}", components.join("/")); // full relative path, not just the basename
+        Ok(file)
     }
 
     async fn create_folder(&self, parent_id: Option<&str>, name: &str) -> Result<CloudFolder> {

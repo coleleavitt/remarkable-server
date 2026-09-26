@@ -36,6 +36,9 @@ struct IntegrationStateInner {
     configs: RwLock<HashMap<ProviderType, OAuthConfig>>,
     /// Sync states (provider -> state)
     sync_states: RwLock<HashMap<ProviderType, SyncState>>,
+    /// Serializes syncs: concurrent runs would race on local files and (Drive) could both
+    /// create the same missing folder, splitting nested files across duplicate folders.
+    sync_lock: tokio::sync::Mutex<()>,
     /// HTTP client
     client: reqwest::Client,
 }
@@ -54,6 +57,7 @@ impl IntegrationState {
                 tokens: RwLock::new(HashMap::new()),
                 configs: RwLock::new(HashMap::new()),
                 sync_states: RwLock::new(HashMap::new()),
+                sync_lock: tokio::sync::Mutex::new(()),
                 client: reqwest::Client::new(),
             }),
         }
@@ -359,6 +363,7 @@ pub async fn trigger_sync(
         .unwrap_or_default();
 
     // Create provider and run sync
+    let _running = state.inner.sync_lock.lock().await;
     let result = match req.provider {
         ProviderType::GoogleDrive => {
             let provider = GoogleDrive::with_token(config, token);
@@ -506,8 +511,24 @@ fn parse_provider(s: &str) -> std::result::Result<ProviderType, (StatusCode, Str
     }
 }
 
-/// Create the integration router
+/// Create the integration router (API + OAuth browser routes)
 pub fn integration_router(state: IntegrationState) -> axum::Router {
+    integration_api_router(state.clone()).merge(integration_oauth_router(state))
+}
+
+/// Routes the provider redirects the user's *browser* to. That browser has no device token,
+/// so these must sit outside token auth: the callback is authenticated by the one-time PKCE
+/// `state` (only issued by the token-guarded `/auth` route), and the success page is static.
+pub fn integration_oauth_router(state: IntegrationState) -> axum::Router {
+    use axum::routing::get;
+    axum::Router::new()
+        .route("/providers/{provider}/success", get(oauth_success))
+        .route("/callback", get(oauth_callback))
+        .with_state(state)
+}
+
+/// Token-guarded integration API routes.
+pub fn integration_api_router(state: IntegrationState) -> axum::Router {
     use axum::routing::{delete, get, post};
 
     axum::Router::new()
@@ -518,8 +539,6 @@ pub fn integration_router(state: IntegrationState) -> axum::Router {
         .route("/providers/{provider}/refresh", post(refresh_token))
         .route("/providers/{provider}/quota", get(get_quota))
         .route("/providers/{provider}/disconnect", delete(disconnect_provider))
-        .route("/providers/{provider}/success", get(oauth_success))
-        .route("/callback", get(oauth_callback))
         .route("/sync", post(trigger_sync))
         .with_state(state)
 }

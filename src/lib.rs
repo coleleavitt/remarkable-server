@@ -416,8 +416,8 @@ pub fn feature_routes(state: AppState, storage_path: &Path, email: Option<email:
         .nest("/integrations/v2/calendars", calendar_router(CalendarState::new(init_calendar_manager(storage_path)?)))
         .nest("/integrations/v2/readlater", readlater_router(ReadLaterState::new(init_readlater_manager(storage_path)?)))
         // xochitl 3.29 uses /storage/; older builds use /cloud. Share one state so both see the same accounts.
-        .nest("/integrations/v2/cloud", integration_router(cloud.clone()))
-        .nest("/integrations/v2/storage", integration_router(cloud));
+        .nest("/integrations/v2/cloud", integrations::integration_api_router(cloud.clone()))
+        .nest("/integrations/v2/storage", integrations::integration_api_router(cloud.clone()));
 
     if let Some(server) = email {
         router = router.nest("/email/v1", Router::new()
@@ -437,7 +437,12 @@ pub fn feature_routes(state: AppState, storage_path: &Path, email: Option<email:
         }
     }
 
-    Ok(router.layer(axum::middleware::from_fn_with_state(state, require_auth)))
+    // The OAuth callback/success pages are hit by the user's browser (no device token), so they
+    // are merged after the auth layer; the callback is authenticated by its one-time PKCE state.
+    let oauth = Router::new()
+        .nest("/integrations/v2/cloud", integrations::integration_oauth_router(cloud.clone()))
+        .nest("/integrations/v2/storage", integrations::integration_oauth_router(cloud));
+    Ok(router.layer(axum::middleware::from_fn_with_state(state, require_auth)).merge(oauth))
 }
 
 #[cfg(test)]
@@ -454,5 +459,27 @@ mod router_tests {
         let state = AppState::new(storage, devices);
         let _ = create_router(state.clone());
         let _ = feature_routes(state, tmp.path(), None).unwrap();
+    }
+
+    /// A browser returning from the OAuth provider carries no device token: the callback and
+    /// success page must be reachable through the production auth layer; the API must not.
+    #[tokio::test]
+    async fn oauth_browser_routes_bypass_device_auth() {
+        use tower::ServiceExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        let devices = DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        let state = AppState::new(storage, devices);
+        // Merged exactly as main.rs does, so any route conflict would panic here too.
+        let app = create_router(state.clone()).merge(feature_routes(state, tmp.path(), None).unwrap());
+        let get = |uri: &str| axum::http::Request::get(uri).body(axum::body::Body::empty()).unwrap();
+        for mount in ["/integrations/v2/cloud", "/integrations/v2/storage"] {
+            let status = |uri: String| { let app = app.clone(); async move { app.oneshot(get(&uri)).await.unwrap().status() } };
+            assert_eq!(status(format!("{mount}/providers/dropbox/success")).await, axum::http::StatusCode::OK);
+            // Reaches the handler (unknown PKCE state -> 400), not the auth layer (401).
+            assert_eq!(status(format!("{mount}/callback?code=c&state=bogus")).await, axum::http::StatusCode::BAD_REQUEST);
+            assert_eq!(status(format!("{mount}/providers")).await, axum::http::StatusCode::UNAUTHORIZED);
+            assert_eq!(status(format!("{mount}/providers/dropbox/status")).await, axum::http::StatusCode::UNAUTHORIZED);
+        }
     }
 }
