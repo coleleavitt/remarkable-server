@@ -16,8 +16,48 @@ use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Monotonic counter for unique temp-file names within this process.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Write `data` to `path` atomically: write to a temp file in the *same*
+/// directory (rename is only atomic within one filesystem), fsync it so the
+/// bytes are durable, then rename it over `path`.
+///
+/// A crash may leave the old file or a stray temp file, but never a
+/// half-written `path`. This matters most for `root.json`: a torn write there
+/// makes the tablet sync a corrupt root and lose the whole cloud.
+fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("tmp");
+    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.tmp.{}.{seq}", std::process::id()));
+
+    let write = || -> std::io::Result<()> {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?; // durable on disk before we rename over the target
+        Ok(())
+    };
+    if let Err(e) = write() {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    // Best-effort: fsync the directory so the rename itself survives a crash.
+    // Not all platforms permit opening a directory for fsync; ignore failures.
+    if let Ok(d) = fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
 
 /// Blob hashes are 64-char lowercase hex (sha256). Anything else is rejected
 /// before it can be used as a path component.
@@ -120,11 +160,11 @@ impl Storage {
         root.hash = hash;
         root.generation += 1;
         
-        // Persist
+        // Persist atomically: a torn root.json would empty the whole cloud.
         let root_path = self.inner.base_path.join("root.json");
         let data = serde_json::to_string_pretty(&*root)?;
-        fs::write(root_path, data)?;
-        
+        atomic_write(&root_path, data.as_bytes())?;
+
         Ok(root.clone())
     }
     
@@ -187,11 +227,11 @@ impl Storage {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&path, data)?;
-        
+        atomic_write(&path, data)?;
+
         // Store filename mapping
         let meta_path = self.inner.base_path.join("meta").join(format!("{}.meta", hash));
-        fs::write(meta_path, filename)?;
+        atomic_write(&meta_path, filename.as_bytes())?;
         
         // Update in-memory mapping
         self.inner.filename_map.write().insert(filename.to_string(), hash.clone());
@@ -215,11 +255,11 @@ impl Storage {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&path, data)?;
-        
+        atomic_write(&path, data)?;
+
         // Store mapping
         let meta_path = self.inner.base_path.join("meta").join(format!("{}.meta", hash));
-        fs::write(meta_path, filename)?;
+        atomic_write(&meta_path, filename.as_bytes())?;
         self.inner.filename_map.write().insert(filename.to_string(), hash.to_string());
         
         Ok(())
@@ -389,6 +429,39 @@ mod tests {
         // Retrieve
         let retrieved = storage.get(&hash).unwrap();
         assert_eq!(retrieved, data);
+    }
+
+    fn temp_residue(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect()
+    }
+
+    #[test]
+    fn atomic_write_overwrites_without_temp_residue() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("root.json");
+        atomic_write(&path, b"first").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        // Overwrite with different-length content: never truncated, fully replaced.
+        atomic_write(&path, b"second-and-longer").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second-and-longer");
+        assert!(temp_residue(tmp.path()).is_empty(), "temp files left behind");
+    }
+
+    #[test]
+    fn set_root_persists_atomically_and_reloads() {
+        let tmp = TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        let h = "a".repeat(64);
+        storage.set_root(h.clone()).unwrap();
+        // A fresh Storage over the same dir reads the persisted root back.
+        let reloaded = Storage::new(tmp.path()).unwrap();
+        assert_eq!(reloaded.get_root().hash, h);
+        assert!(temp_residue(tmp.path()).is_empty(), "temp files left behind");
     }
 
     #[test]
