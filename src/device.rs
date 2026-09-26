@@ -2,7 +2,7 @@ use crate::error::{Result, ServerError};
 use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{encode, decode, Algorithm, Header, Validation};
 use rand::Rng;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -145,8 +145,11 @@ impl DeviceManager {
         let dt = self.gen_device_token(device_id, device_desc, &user_id)?; let ut = self.gen_user_token(device_id, device_desc, &user_id)?;
         Ok((dt, ut))
     }
-    pub fn device_id_for_token(&self, device_token: &str) -> Result<String> {
-        Ok(self.decode_device_token(device_token)?.device_id)
+    /// Unregister the device a (validly signed) device token names, scoped to the token's user.
+    /// Idempotent: a token whose device is already gone is still accepted here and deletes nothing.
+    pub fn revoke_device_token(&self, device_token: &str) -> Result<bool> {
+        let c = self.decode_device_token_signature(device_token)?;
+        Ok(self.inner.conn.lock().execute("DELETE FROM devices WHERE device_id = ? AND user_id = ?", params![c.device_id, c.auth0_userid])? > 0)
     }
     pub fn refresh_user_token(&self, device_token: &str) -> Result<String> {
         let claims = self.decode_device_token(device_token)?; let conn = self.inner.conn.lock();
@@ -185,9 +188,10 @@ impl DeviceManager {
     }
 
     /// Record a device-reported status for an instruction.
-    pub fn mdm_set_status(&self, id: &str, status: &str, detail: Option<&str>) -> Result<bool> {
+    /// Only the owning user's instructions can be updated; another user's id is a no-op (false).
+    pub fn mdm_set_status(&self, user_id: &str, id: &str, status: &str, detail: Option<&str>) -> Result<bool> {
         let conn = self.inner.conn.lock();
-        Ok(conn.execute("UPDATE mdm_instructions SET status = ?, detail = ? WHERE id = ?", params![status, detail, id])? > 0)
+        Ok(conn.execute("UPDATE mdm_instructions SET status = ?, detail = ? WHERE id = ? AND user_id = ?", params![status, detail, id, user_id])? > 0)
     }
 
     /// All instructions for the user: (id, name, status, detail).
@@ -205,7 +209,18 @@ impl DeviceManager {
         let now = Utc::now().timestamp();
         encode(&Header::new(Algorithm::HS256), &UserTokenClaims { sub: user_id.into(), iss: self.inner.issuer.clone(), iat: now, exp: now + USER_TOKEN_LIFETIME, nbf: now, jti: uuid::Uuid::new_v4().to_string(), tectonic: self.inner.region.clone(), scopes: USER_SCOPES.into(), auth0_profile: Auth0Profile { user_id: user_id.into(), email: format!("local@{}", self.inner.issuer), name: user_id.into(), nickname: user_id.into(), level: "connect".into(), is_connected: true, is_beta: false }, device_id: device_id.into(), device_desc: device_desc.into(), subscription: SubscriptionClaim { status: "active".into(), plan: "connect".into() } }, &self.inner.encoding_key).map_err(|e| ServerError::TokenError(e.to_string()))
     }
+    /// Device tokens carry no `exp` (long-lived by design, like the real cloud's), so revocation
+    /// is by registration: the token is only honoured while its device is still in `devices`
+    /// and still paired to the user the token names. Deleting the row revokes it immediately.
     fn decode_device_token(&self, token: &str) -> Result<DeviceTokenClaims> {
+        let c = self.decode_device_token_signature(token)?;
+        // devices.device_id is the PRIMARY KEY, so this is a single index lookup.
+        let registered = self.inner.conn.lock().query_row("SELECT 1 FROM devices WHERE device_id = ? AND user_id = ?", params![c.device_id, c.auth0_userid], |_| Ok(())).optional()?;
+        if registered.is_none() { tracing::warn!(device_id = %c.device_id, "rejecting device token: device not registered to this user"); return Err(ServerError::InvalidToken); }
+        Ok(c)
+    }
+    /// Signature/claims check only, no registration lookup. Use `decode_device_token` for auth.
+    fn decode_device_token_signature(&self, token: &str) -> Result<DeviceTokenClaims> {
         let mut val = Validation::new(Algorithm::HS256); val.validate_exp = false; val.set_required_spec_claims(&["sub", "iss", "iat"]);
         decode::<DeviceTokenClaims>(token, &self.inner.decoding_key, &val).map(|d| d.claims).map_err(|_| ServerError::InvalidToken)
     }
@@ -398,5 +413,86 @@ mod jwt_secret_tests {
         if std::env::var_os("JWT_SECRET").is_none() && std::env::var_os("JWT_SECRET_FILE").is_none() {
             assert!(load_jwt_secret(dir.path()).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod revocation_tests {
+    use super::*;
+
+    fn setup() -> (DeviceManager, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        (DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap(), tmp)
+    }
+    /// Pair `device` to `user` the way the tablet does (pairing code -> /token/json/2/device/new).
+    fn pair(dm: &DeviceManager, user: &str, device: &str) -> String {
+        let code = dm.create_pairing_code(user).unwrap();
+        dm.exchange_code(&code, device, "remarkable").unwrap().0
+    }
+    fn bearer(t: &str) -> String { format!("Bearer {t}") }
+
+    #[test]
+    fn registered_device_token_is_accepted() {
+        let (dm, _tmp) = setup();
+        let dt = pair(&dm, "local-user", "RM110-1");
+        assert_eq!(dm.validate_token(&bearer(&dt)).unwrap(), "local-user");
+        assert_eq!(dm.caller(&bearer(&dt)).unwrap().1, "RM110-1");
+        let ut = dm.refresh_user_token(&dt).unwrap();
+        assert_eq!(dm.caller(&bearer(&ut)).unwrap(), ("local-user".into(), "RM110-1".into(), "remarkable".into()));
+        assert!(dm.exchange_device_token(&dt).is_ok());
+    }
+
+    #[test]
+    fn deleted_device_token_is_rejected_everywhere() {
+        let (dm, _tmp) = setup();
+        let dt = pair(&dm, "local-user", "RM110-1");
+        assert!(dm.delete_device("RM110-1").unwrap());
+        assert!(matches!(dm.validate_token(&bearer(&dt)), Err(ServerError::InvalidToken)));
+        assert!(dm.caller(&bearer(&dt)).is_err());
+        assert!(dm.refresh_user_token(&dt).is_err());
+        // Refresh/exchange must not silently re-register the deleted device.
+        assert!(dm.refresh_oauth(&dt).is_err());
+        assert!(dm.exchange_device_token(&dt).is_err());
+        assert!(dm.get_device("RM110-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn self_revoke_invalidates_token_and_is_idempotent() {
+        let (dm, _tmp) = setup();
+        let dt = pair(&dm, "local-user", "RM110-1");
+        let other = pair(&dm, "local-user", "RM110-2");
+        assert!(dm.revoke_device_token(&dt).unwrap());
+        assert!(dm.validate_token(&bearer(&dt)).is_err());
+        assert!(!dm.revoke_device_token(&dt).unwrap(), "second delete is a no-op, not an error");
+        assert!(dm.revoke_device_token("not-a-jwt").is_err());
+        assert!(dm.validate_token(&bearer(&other)).is_ok(), "other devices unaffected");
+    }
+
+    #[test]
+    fn token_for_another_users_device_is_rejected() {
+        let (dm, _tmp) = setup();
+        let _b = pair(&dm, "user-b", "RM110-B");
+        // Validly signed, but claims user A for a device registered to user B.
+        let forged = dm.gen_device_token("RM110-B", "remarkable", "user-a").unwrap();
+        assert!(dm.validate_token(&bearer(&forged)).is_err());
+        assert!(dm.caller(&bearer(&forged)).is_err());
+        assert!(!dm.revoke_device_token(&forged).unwrap(), "must not delete user B's device");
+        assert!(dm.get_device("RM110-B").unwrap().is_some());
+        // A device re-paired to a new user drops the old user's token.
+        let old = pair(&dm, "user-a", "RM110-X");
+        let new = pair(&dm, "user-b", "RM110-X");
+        assert!(dm.validate_token(&bearer(&old)).is_err());
+        assert_eq!(dm.validate_token(&bearer(&new)).unwrap(), "user-b");
+    }
+
+    #[test]
+    fn user_tokens_keep_exp_validation() {
+        let (dm, _tmp) = setup();
+        let ut = dm.create_user_token("local-user").unwrap();
+        assert_eq!(dm.validate_token(&bearer(&ut)).unwrap(), "local-user");
+        let now = Utc::now().timestamp();
+        let expired = encode(&Header::new(Algorithm::HS256), &UserTokenClaims { sub: "local-user".into(), iss: "local.test".into(), iat: now - 7200, exp: now - 3600, nbf: now - 7200, jti: "x".into(), tectonic: "local".into(), scopes: USER_SCOPES.into(), auth0_profile: Auth0Profile { user_id: "local-user".into(), email: String::new(), name: String::new(), nickname: String::new(), level: String::new(), is_connected: true, is_beta: false }, device_id: "RM110-1".into(), device_desc: "remarkable".into(), subscription: SubscriptionClaim { status: "active".into(), plan: "connect".into() } }, &dm.inner.encoding_key).unwrap();
+        assert!(dm.validate_token(&bearer(&expired)).is_err());
+        assert!(dm.caller(&bearer(&expired)).is_err());
     }
 }

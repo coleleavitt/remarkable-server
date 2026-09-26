@@ -156,8 +156,7 @@ pub async fn register_device(State(state): State<AppState>, Json(req): Json<Devi
 }
 
 pub async fn delete_device_token(State(state): State<AppState>, headers: HeaderMap) -> Result<StatusCode> {
-    let device_id = state.devices.device_id_for_token(bearer(&headers)?)?;
-    state.devices.delete_device(&device_id)?;
+    state.devices.revoke_device_token(bearer(&headers)?)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
