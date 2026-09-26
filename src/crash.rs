@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use axum::extract::multipart::Field;
 use axum::extract::{Multipart, Query};
 use axum::http::StatusCode;
 
@@ -42,9 +43,12 @@ pub async fn upload(
         } else {
             safe
         };
-        if let Ok(bytes) = field.bytes().await {
-            let _ = std::fs::write(base.join(&name), &bytes);
+        // Streamed to disk chunk by chunk; a part that fails mid-way is removed.
+        let path = base.join(&name);
+        if write_field(field, &path).await.is_ok() {
             parts += 1;
+        } else {
+            let _ = tokio::fs::remove_file(&path).await;
         }
     }
     tracing::info!(
@@ -52,6 +56,15 @@ pub async fn upload(
         params.get("format")
     );
     StatusCode::OK
+}
+
+async fn write_field(mut field: Field<'_>, path: &Path) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut out = tokio::io::BufWriter::new(tokio::fs::File::create(path).await?);
+    while let Some(chunk) = field.chunk().await.map_err(std::io::Error::other)? {
+        out.write_all(&chunk).await?;
+    }
+    out.flush().await
 }
 
 #[cfg(test)]

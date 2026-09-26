@@ -36,6 +36,8 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const PARSER_VERSION: i64 = 1;
 /// Index entry type of a leaf file; anything else (e.g. `80000000`, a document) is an index.
 const FILE_KIND: &str = "0";
+/// Blobs garbage-collected per transaction; the root is re-checked before each batch.
+const GC_BATCH: usize = 256;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS root (
@@ -195,6 +197,9 @@ struct StorageInner {
     db: Mutex<Connection>,
     /// Last root read from or written to the database; served if a read fails.
     root: RwLock<SyncRoot>,
+    /// Held shared by blob writes and exclusively by garbage collection while it deletes,
+    /// so a blob can't be (re)written between GC's final checks and its removal.
+    blob_writes: RwLock<()>,
 }
 
 impl Storage {
@@ -218,6 +223,7 @@ impl Storage {
                 base_path,
                 db: Mutex::new(conn),
                 root: RwLock::new(root.clone()),
+                blob_writes: RwLock::new(()),
             }),
         };
         storage.reconcile_blobs()?;
@@ -567,6 +573,7 @@ impl Storage {
         if !is_valid_hash(hash) {
             return Err(ServerError::InvalidHash(hash.to_string()));
         }
+        let _gc = self.inner.blob_writes.read();
         let path = self.hash_path(hash);
         if let Some(parent) = path.parent() {
             if !parent.exists() {
@@ -592,9 +599,60 @@ impl Storage {
         Ok(())
     }
 
+    /// Directory for in-flight streamed uploads ([`crate::upload`]). It lives inside the
+    /// store so a finished upload is on the same filesystem and can be renamed into place
+    /// atomically; its name is not a 2-char prefix, so the blob scan never reads it.
+    pub fn staging_dir(&self) -> PathBuf {
+        self.inner.base_path.join(".uploads")
+    }
+
+    /// Store an already-written file under the client-supplied hash by renaming it into
+    /// place: the streaming counterpart of [`Storage::put_with_hash`], with the same
+    /// catalogue semantics (the hash is not recomputed; the caller checks integrity).
+    ///
+    /// `staged` must be on the store's filesystem (see [`Storage::staging_dir`]) and should
+    /// already be fsynced. Like `put_with_hash`, the file lands before its row. On error the
+    /// staged file is left where it is for the caller to remove. Returns the stored size.
+    pub fn put_file_with_hash(&self, staged: &Path, hash: &str, filename: &str) -> Result<u64> {
+        if !is_valid_hash(hash) {
+            return Err(ServerError::InvalidHash(hash.to_string()));
+        }
+        // Same as put_with_hash: GC holds this for writing while it deletes, so a blob can't be
+        // committed (renamed + catalogued) between GC's last check and its delete. Taken only for
+        // the commit, never while the body streams; lock order blob_writes -> db, as in GC.
+        let _gc = self.inner.blob_writes.read();
+        let size = fs::metadata(staged)?.len();
+        let path = self.hash_path(hash);
+        let dir = path.parent().unwrap_or(&self.inner.base_path).to_path_buf();
+        if !dir.exists() {
+            fs::create_dir_all(&dir)?;
+            // Best-effort: make the new prefix directory's entry durable too.
+            if let Ok(base) = fs::File::open(&self.inner.base_path) {
+                let _ = base.sync_all();
+            }
+        }
+        fs::rename(staged, &path)?;
+        // Best-effort: fsync the directory so the rename itself survives a crash.
+        if let Ok(d) = fs::File::open(&dir) {
+            let _ = d.sync_all();
+        }
+
+        self.inner.db.lock().execute(
+            "INSERT INTO blobs (hash, filename, size, updated_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(hash) DO UPDATE SET filename = excluded.filename, size = excluded.size, updated_at = excluded.updated_at",
+            params![hash, filename, size as i64, unix_now()],
+        )?;
+        // New bytes under this hash: forget any earlier parse of it.
+        self.inner
+            .db
+            .lock()
+            .execute("DELETE FROM indexes WHERE hash = ?1", [hash])?;
+        Ok(size)
+    }
+
     /// Mark stored blobs as just used. A client told a blob is present won't upload it
-    /// again, so this keeps it inside the unreachable report's grace period until the
-    /// root that references it is committed.
+    /// again, so this keeps it inside the unreachable report's (and so GC's) grace period
+    /// until the root that references it is committed.
     pub fn touch(&self, hashes: &[String]) -> Result<()> {
         let mut db = self.inner.db.lock();
         let tx = db.transaction()?;
@@ -776,30 +834,186 @@ impl Storage {
     /// guess if an index in the current tree is missing or unparsed, since its children
     /// would otherwise look unreachable.
     pub fn unreachable_blobs(&self, grace: Duration) -> Result<Vec<String>> {
-        let root = self.get_root();
-        let previous: String = self.inner.db.lock().query_row(
-            "SELECT previous_hash FROM root WHERE id = 1",
-            [],
-            |r| r.get(0),
-        )?;
-        let mut live = self.version_hashes()?;
-        self.add_tree(&root.hash, true, &mut live)?;
-        // The previous root is best effort: it may predate this server or be gone.
-        self.add_tree(&previous, false, &mut live)?;
+        Ok(self.gc_plan(grace)?.candidates)
+    }
 
-        let grace = i64::try_from(grace.as_secs()).unwrap_or(i64::MAX);
-        let cutoff = unix_now().saturating_sub(grace);
+    /// The unreachable report together with the root it was computed against.
+    fn gc_plan(&self, grace: Duration) -> Result<GcPlan> {
+        // Root and previous root in one read, so the live set belongs to one generation.
+        let (root_hash, generation, previous_hash) = self.root_row()?;
+        let mut live = self.version_hashes()?;
+        self.add_tree(&root_hash, true, &mut live)?;
+        // The previous root is best effort: it may predate this server or be gone.
+        self.add_tree(&previous_hash, false, &mut live)?;
+
+        let grace_secs = grace.as_secs();
+        let cutoff = unix_now().saturating_sub(i64::try_from(grace_secs).unwrap_or(i64::MAX));
         let db = self.inner.db.lock();
         let mut stmt = db.prepare("SELECT hash FROM blobs WHERE updated_at <= ?1 ORDER BY hash")?;
         let rows = stmt.query_map([cutoff], |r| r.get::<_, String>(0))?;
-        let mut unreachable = Vec::new();
+        let mut candidates = Vec::new();
         for hash in rows {
             let hash = hash?;
             if !live.contains(&hash) {
-                unreachable.push(hash);
+                candidates.push(hash);
             }
         }
-        Ok(unreachable)
+        Ok(GcPlan {
+            root_hash,
+            generation,
+            previous_hash,
+            grace_secs,
+            cutoff,
+            candidates,
+        })
+    }
+
+    /// `(hash, generation, previous_hash)` of the root row.
+    fn root_row(&self) -> Result<(String, u64, String)> {
+        Ok(self.inner.db.lock().query_row(
+            "SELECT hash, generation, previous_hash FROM root WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64, r.get(2)?)),
+        )?)
+    }
+
+    /// Every hash in the current root's tree (root index, document indexes, files), or
+    /// `None` when there is no root or part of the tree is missing or unparsed, since a
+    /// partial answer would make live blobs look unreachable.
+    pub fn reachable_from_root(&self) -> Option<HashSet<String>> {
+        let root = self.get_root();
+        if root.hash.is_empty() {
+            return None;
+        }
+        let mut live = HashSet::new();
+        match self.add_tree(&root.hash, true, &mut live) {
+            Ok(()) => Some(live),
+            Err(e) => {
+                tracing::warn!(error = %e, "current sync tree not fully readable");
+                None
+            }
+        }
+    }
+
+    /// Delete the blobs [`Self::unreachable_blobs`] reports (unless `dry_run`).
+    ///
+    /// Refuses (errors) when there is no current root or its tree isn't fully parsed.
+    /// Deletion runs in batches, each inside one write transaction that first re-checks
+    /// the root (hash, generation and previous hash) against the one the report was
+    /// computed from and stops, reporting `aborted`, if a sync committed meanwhile. Within
+    /// a batch each blob is re-checked before removal: never the current or previous
+    /// root, never in version history (re-read per batch), and neither its row nor its
+    /// file touched within `grace`. Blob writes are held off while deleting.
+    pub fn gc(&self, grace: Duration, dry_run: bool) -> Result<GcReport> {
+        let plan = self.gc_plan(grace)?;
+        self.gc_execute(&plan, dry_run)
+    }
+
+    fn gc_execute(&self, plan: &GcPlan, dry_run: bool) -> Result<GcReport> {
+        if plan.root_hash.is_empty() {
+            return Err(ServerError::Internal(
+                "no current root; refusing to garbage-collect".into(),
+            ));
+        }
+        let mut report = GcReport {
+            dry_run,
+            grace_secs: plan.grace_secs,
+            generation: plan.generation,
+            candidates: plan.candidates.len(),
+            ..GcReport::default()
+        };
+        if dry_run {
+            let db = self.inner.db.lock();
+            let mut size = db.prepare("SELECT size FROM blobs WHERE hash = ?1")?;
+            for hash in &plan.candidates {
+                let bytes: Option<i64> = size.query_row([hash], |r| r.get(0)).optional()?;
+                report.bytes += bytes.unwrap_or(0) as u64;
+            }
+            report.hashes = plan.candidates.clone();
+            return Ok(report);
+        }
+
+        let _no_writes = self.inner.blob_writes.write();
+        for batch in plan.candidates.chunks(GC_BATCH) {
+            let mut db = self.inner.db.lock();
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let (root_hash, generation, previous_hash): (String, i64, String) = tx.query_row(
+                "SELECT hash, generation, previous_hash FROM root WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            if (generation as u64, &root_hash, &previous_hash)
+                != (plan.generation, &plan.root_hash, &plan.previous_hash)
+            {
+                let reason = format!(
+                    "root changed from generation {} to {generation} during GC; stopped",
+                    plan.generation
+                );
+                tracing::warn!("{reason}");
+                report.aborted = Some(reason);
+                break;
+            }
+            let versions = self.version_hashes()?;
+            for hash in batch {
+                if *hash == root_hash || *hash == previous_hash || versions.contains(hash) {
+                    report.skipped += 1;
+                    continue;
+                }
+                let row: Option<(i64, i64)> = tx
+                    .query_row(
+                        "SELECT size, updated_at FROM blobs WHERE hash = ?1",
+                        [hash],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                let Some((size, updated_at)) = row else {
+                    report.skipped += 1;
+                    continue;
+                };
+                let path = self.hash_path(hash);
+                let modified = fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map_or(i64::MIN, |d| d.as_secs() as i64);
+                if updated_at > plan.cutoff || modified > plan.cutoff {
+                    report.skipped += 1; // touched or rewritten since the report
+                    continue;
+                }
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        tracing::warn!(%hash, error = %e, "gc: could not delete blob; keeping it");
+                        report.skipped += 1;
+                        continue;
+                    }
+                }
+                let _ = fs::remove_file(
+                    self.inner
+                        .base_path
+                        .join("meta")
+                        .join(format!("{hash}.meta")),
+                );
+                tx.execute("DELETE FROM blobs WHERE hash = ?1", [hash])?;
+                tx.execute("DELETE FROM indexes WHERE hash = ?1", [hash])?;
+                tracing::info!(%hash, size, "gc: deleted unreachable blob");
+                report.deleted += 1;
+                report.bytes += size as u64;
+                report.hashes.push(hash.clone());
+            }
+            tx.commit()?;
+        }
+        tracing::info!(
+            generation = plan.generation,
+            candidates = report.candidates,
+            deleted = report.deleted,
+            bytes = report.bytes,
+            skipped = report.skipped,
+            aborted = report.aborted.is_some(),
+            "gc finished"
+        );
+        Ok(report)
     }
 
     /// Add the tree under `root_hash` to `live`. With `strict`, a missing or unparsed
@@ -965,6 +1179,39 @@ impl Storage {
             Vec::new()
         })
     }
+}
+
+/// An unreachable-blob report pinned to the root it was computed from.
+struct GcPlan {
+    root_hash: String,
+    generation: u64,
+    previous_hash: String,
+    grace_secs: u64,
+    /// Blobs last written or touched at or before this unix time are past grace.
+    cutoff: i64,
+    candidates: Vec<String>,
+}
+
+/// Outcome of [`Storage::gc`].
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GcReport {
+    pub dry_run: bool,
+    pub grace_secs: u64,
+    /// Root generation the unreachable set was computed against.
+    pub generation: u64,
+    /// Blobs found unreachable and past grace.
+    pub candidates: usize,
+    /// Blobs deleted (always 0 on a dry run).
+    pub deleted: usize,
+    /// Bytes of the candidates on a dry run, of the deleted blobs otherwise.
+    pub bytes: u64,
+    /// Candidates kept because a re-check right before deletion found them live or recent.
+    pub skipped: usize,
+    /// Why deletion stopped early (the root changed), if it did.
+    pub aborted: Option<String>,
+    /// The candidates on a dry run, the deleted hashes otherwise.
+    pub hashes: Vec<String>,
 }
 
 /// Storage statistics
@@ -1464,6 +1711,216 @@ mod tests {
         );
         // Report only: nothing was deleted.
         assert!(storage.exists(&orphan));
+    }
+
+    /// Make `hash` look untouched for a long time: its row and its file's mtime.
+    fn age(storage: &Storage, hash: &str) {
+        storage
+            .inner
+            .db
+            .lock()
+            .execute("UPDATE blobs SET updated_at = 0 WHERE hash = ?1", [hash])
+            .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(storage.hash_path(hash))
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(1_000))
+            .unwrap();
+    }
+
+    fn age_all(storage: &Storage) {
+        for hash in storage.list_hashes().unwrap() {
+            age(storage, &hash);
+        }
+    }
+
+    const WEEK: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+    #[test]
+    fn gc_dry_run_deletes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        crate::documents::create_document(&storage, "Live", "pdf", b"%PDF-1.4 live").unwrap();
+        let orphan = storage.put(b"orphan page", "old.rm").unwrap();
+        age_all(&storage);
+        let before = storage.list_hashes().unwrap();
+
+        let report = storage.gc(WEEK, true).unwrap();
+        assert!(report.dry_run);
+        assert_eq!(
+            (report.candidates, report.deleted, report.bytes),
+            (1, 0, 11)
+        );
+        assert_eq!(report.hashes, vec![orphan.clone()]);
+        assert_eq!(storage.list_hashes().unwrap(), before);
+        assert!(storage.exists(&orphan));
+    }
+
+    #[test]
+    fn gc_deletes_only_true_orphans_past_grace() {
+        let tmp = TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        crate::documents::create_document(&storage, "One", "pdf", b"%PDF-1.4 one").unwrap();
+        let first_tree = storage.list_hashes().unwrap();
+        crate::documents::create_document(&storage, "Two", "pdf", b"%PDF-1.4 two").unwrap();
+        let old = storage.put(b"superseded page", "old.rm").unwrap();
+        let versioned = storage.put(b"old content", "doc.content").unwrap();
+        let versions = tmp.path().join("versions");
+        fs::create_dir_all(&versions).unwrap();
+        let vdb = Connection::open(versions.join("versions.db")).unwrap();
+        vdb.execute_batch("CREATE TABLE versions (content_hash TEXT NOT NULL)")
+            .unwrap();
+        vdb.execute("INSERT INTO versions VALUES (?1)", [&versioned])
+            .unwrap();
+        age_all(&storage);
+        // Written after aging: an in-flight upload inside the grace window.
+        let fresh = storage.put(b"just uploaded", "new.rm").unwrap();
+        let live_before: Vec<String> = storage
+            .list_hashes()
+            .unwrap()
+            .into_iter()
+            .filter(|h| *h != old)
+            .collect();
+
+        let report = storage.gc(WEEK, false).unwrap();
+        assert_eq!(report.hashes, vec![old.clone()]);
+        assert_eq!(
+            (report.deleted, report.bytes, report.aborted),
+            (1, 15, None)
+        );
+        assert!(!storage.exists(&old) && storage.filename_for_hash(&old).is_none());
+        // Current tree, previous root's tree, version history and fresh uploads survive.
+        assert_eq!(storage.list_hashes().unwrap(), live_before);
+        assert!(first_tree.iter().all(|h| storage.exists(h)));
+        assert!(storage.exists(&versioned) && storage.exists(&fresh));
+        assert!(storage.missing_from_root().unwrap().is_empty());
+        // Nothing left to collect.
+        assert_eq!(storage.gc(WEEK, false).unwrap().deleted, 0);
+    }
+
+    #[test]
+    fn gc_rechecks_each_blob_before_deleting() {
+        let tmp = TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        crate::documents::create_document(&storage, "Live", "pdf", b"%PDF-1.4 live").unwrap();
+        let touched = storage.put(b"checked by a client", "a.rm").unwrap();
+        let rewritten = storage.put(b"re-uploaded", "b.rm").unwrap();
+        age_all(&storage);
+        let plan = storage.gc_plan(WEEK).unwrap();
+        assert_eq!(plan.candidates.len(), 2);
+
+        // After the report: a client's check-files touch, and a re-upload of the same bytes.
+        storage.touch(&[touched.clone()]).unwrap();
+        storage
+            .put_with_hash(b"re-uploaded", &rewritten, "b.rm")
+            .unwrap();
+        let report = storage.gc_execute(&plan, false).unwrap();
+        assert_eq!((report.deleted, report.skipped), (0, 2));
+        assert!(storage.exists(&touched) && storage.exists(&rewritten));
+    }
+
+    #[test]
+    fn gc_aborts_when_root_changes_after_the_report() {
+        let tmp = TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        crate::documents::create_document(&storage, "One", "pdf", b"%PDF-1.4 one").unwrap();
+        let orphan = storage.put(b"orphan", "o.rm").unwrap();
+        age_all(&storage);
+        let plan = storage.gc_plan(WEEK).unwrap();
+        assert_eq!(plan.candidates, vec![orphan.clone()]);
+
+        // A sync commits a root that references the "orphan" before deletion starts.
+        let root = storage.get_root().hash;
+        let mut index = String::from_utf8(storage.get(&root).unwrap()).unwrap();
+        index.push_str(&format!("{orphan}:0:o.rm:0:6\n"));
+        let new_root = storage.put(index.as_bytes(), "root.docSchema").unwrap();
+        storage
+            .set_root_if(new_root, Some(plan.generation))
+            .unwrap();
+
+        let report = storage.gc_execute(&plan, false).unwrap();
+        assert!(report.aborted.is_some(), "{report:?}");
+        assert_eq!(report.deleted, 0);
+        assert!(storage.exists(&orphan));
+    }
+
+    #[test]
+    fn gc_refuses_without_a_fully_parsed_tree() {
+        let tmp = TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        let orphan = storage.put(b"orphan", "o.rm").unwrap();
+        age_all(&storage);
+        // No root at all: everything would look unreachable.
+        assert!(storage.gc(Duration::ZERO, false).is_err());
+        assert!(storage.gc(Duration::ZERO, true).is_err());
+
+        // A root in a format the parser doesn't know.
+        let index_hash = "f".repeat(64);
+        storage
+            .put_with_hash(
+                format!("7\n{orphan}:future:x\n").as_bytes(),
+                &index_hash,
+                "root.docSchema",
+            )
+            .unwrap();
+        storage.set_root(index_hash.clone()).unwrap();
+        age_all(&storage);
+        assert!(storage.gc(Duration::ZERO, false).is_err());
+        assert!(storage.reachable_from_root().is_none());
+
+        // A parsed root whose document index was never uploaded.
+        let root = format!("3\n{}:80000000:doc:1:0\n", "d".repeat(64));
+        let root_hash = storage.put(root.as_bytes(), "root.docSchema").unwrap();
+        storage.set_root(root_hash).unwrap();
+        age_all(&storage);
+        assert!(storage.gc(Duration::ZERO, false).is_err());
+        assert!(storage.exists(&orphan) && storage.exists(&index_hash));
+    }
+
+    #[test]
+    fn streamed_commit_waits_for_gc() {
+        let tmp = TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        let data = b"streamed blob";
+        let hash = hex::encode(Sha256::digest(data));
+        let staged = storage.staging_dir().join("t");
+        fs::create_dir_all(storage.staging_dir()).unwrap();
+        fs::write(&staged, data).unwrap();
+
+        // GC holds the write lock: the streamed commit must not land until it's released.
+        let gc = storage.inner.blob_writes.write();
+        let s = storage.clone();
+        let (h, st) = (hash.clone(), staged.clone());
+        let commit = std::thread::spawn(move || s.put_file_with_hash(&st, &h, "f.rm").unwrap());
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!commit.is_finished(), "commit ran while GC held the lock");
+        assert!(!storage.exists(&hash));
+        drop(gc);
+        commit.join().unwrap();
+        assert_eq!(storage.get(&hash).unwrap(), data);
+    }
+
+    #[test]
+    fn reachable_from_root_is_the_current_tree_only() {
+        let tmp = TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        assert!(storage.reachable_from_root().is_none());
+        crate::documents::create_document(&storage, "One", "pdf", b"%PDF-1.4 one").unwrap();
+        let first_root = storage.get_root().hash;
+        crate::documents::create_document(&storage, "Two", "pdf", b"%PDF-1.4 two").unwrap();
+        let reachable = storage.reachable_from_root().unwrap();
+        let root = storage.get_root().hash;
+        let mut expected = HashSet::from([root.clone()]);
+        for doc in storage.index_entries(&root).unwrap().unwrap() {
+            let files = storage.index_entries(&doc.hash).unwrap().unwrap();
+            expected.extend(files.into_iter().map(|f| f.hash));
+            expected.insert(doc.hash);
+        }
+        assert_eq!(reachable, expected);
+        assert!(!reachable.contains(&first_root));
+        let orphan = storage.put(b"orphan", "o.rm").unwrap();
+        assert!(!storage.reachable_from_root().unwrap().contains(&orphan));
     }
 
     mod props {

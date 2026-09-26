@@ -7,7 +7,7 @@
 //! Mirrors rmfakecloud's `blobStorageDownload`/`blobStorageUpload`/`/blobstorage`.
 
 use axum::Json;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -22,6 +22,8 @@ use crate::storage::is_valid_hash;
 const ROOT_BLOB: &str = "root";
 const GENERATION_HEADER: &str = "x-goog-generation";
 const GENERATION_MATCH_HEADER: &str = "x-goog-if-generation-match";
+/// Most a root blob upload may be: a 64-char hash plus whatever whitespace a client adds.
+const ROOT_BODY_LIMIT: usize = 4096;
 
 #[derive(Deserialize)]
 pub struct SignedUrlRequest {
@@ -169,16 +171,37 @@ pub async fn blob_put(
     State(state): State<AppState>,
     Query(q): Query<BlobQuery>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response> {
     state.devices.verify_blob(&q.token, &q.blob, true)?;
     check_blob_id(&q.blob)?;
 
-    checksum::verify_goog_hash_header(&headers, &body)?;
+    // Parsed before the body is read, so a malformed header is refused up front.
+    let expected = checksum::GoogHash::from_headers(&headers)?;
 
     if q.blob != ROOT_BLOB {
-        state.storage.put_with_hash(&body, &q.blob, &q.blob)?;
+        let staged = crate::upload::stage_body(
+            &state.storage,
+            &headers,
+            body,
+            crate::MAX_BLOB_BYTES as u64,
+            false,
+        )
+        .await?;
+        if let Some(expected) = &expected {
+            expected.verify(staged.crc32c())?;
+        }
+        staged.commit(&state.storage, &q.blob, &q.blob)?;
         return Ok(Json(serde_json::json!({})).into_response());
+    }
+
+    // The root blob is just a hash as text: buffer it, but never more than a small cap.
+    // Anything longer can't be a valid hash, so it gets the same 400 it always did.
+    let body = axum::body::to_bytes(body, ROOT_BODY_LIMIT)
+        .await
+        .map_err(|_| ServerError::InvalidHash("root body too large or unreadable".into()))?;
+    if let Some(expected) = &expected {
+        expected.verify(checksum::crc32c(&body))?;
     }
 
     let hash = std::str::from_utf8(&body)
@@ -249,7 +272,7 @@ mod tests {
                 token,
             }),
             h,
-            Bytes::from_static(body),
+            Body::from(body),
         )
         .await
     }

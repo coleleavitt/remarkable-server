@@ -18,7 +18,16 @@ use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use crate::api::AppState;
+use crate::device::SessionIdentity;
+use crate::error::ServerError;
 use crate::notifications::WsMessage;
+
+/// An accepted CONNECT: the session's user, and a future that resolves when the device it
+/// authenticated as is revoked (the session is then closed).
+struct SessionAuth {
+    user_id: String,
+    revoked: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+}
 
 /// MQTT packet types
 #[repr(u8)]
@@ -214,33 +223,51 @@ fn build_publish(topic: &str, payload: &[u8], qos: u8, packet_id: Option<u16>) -
 /// `Authorization` header on the upgrade (an invalid one is rejected with 401),
 /// or, when there is no such header, the token as the MQTT CONNECT password (or
 /// username), as the screenshare broker accepts. A CONNECT without a valid token
-/// gets CONNACK "not authorized" and the socket is closed.
+/// gets CONNACK "not authorized" and the socket is closed. A connected session is
+/// closed once the device its token belongs to is revoked (deleted or re-paired).
 pub async fn mqtt_notifications_ws(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> crate::error::Result<impl IntoResponse> {
-    let header_user = match headers.get(AUTHORIZATION) {
-        Some(_) => Some(state.auth_user(&headers)?),
+    let header_identity = match headers.get(AUTHORIZATION) {
+        Some(v) => Some(
+            state
+                .devices
+                .session_identity(v.to_str().map_err(|_| ServerError::Unauthorized)?)?,
+        ),
         None => None,
     };
     info!("MQTT WebSocket upgrade request for notifications");
     Ok(ws
         .protocols(["mqtt"])
-        .on_upgrade(move |socket| handle_mqtt_socket(socket, state, header_user)))
+        .on_upgrade(move |socket| handle_mqtt_socket(socket, state, header_identity)))
 }
 
 /// Handle an individual MQTT WebSocket connection
-async fn handle_mqtt_socket(socket: WebSocket, state: AppState, header_user: Option<String>) {
+async fn handle_mqtt_socket(
+    socket: WebSocket,
+    state: AppState,
+    header_identity: Option<SessionIdentity>,
+) {
     let (sender, receiver) = socket.split();
     // Subscribe to broadcast channel for sync notifications
     let rx = state.notification_tx.subscribe();
     let storage = state.storage.clone();
     let devices = state.devices.clone();
     let authenticate = move |token: Option<&str>| {
-        header_user
-            .clone()
-            .or_else(|| devices.validate_token(&format!("Bearer {}", token?)).ok())
+        let identity = match &header_identity {
+            Some(i) => i.clone(),
+            None => devices
+                .session_identity(&format!("Bearer {}", token?))
+                .ok()?,
+        };
+        // Built at CONNECT: its first registration check also covers a revocation that
+        // landed between the upgrade and the CONNECT.
+        Some(SessionAuth {
+            revoked: Box::pin(devices.session_revoked(&identity)),
+            user_id: identity.user_id,
+        })
     };
     run_mqtt_session(
         sender,
@@ -298,14 +325,14 @@ fn notification_publishes(
 /// The MQTT session loop: answers the client's packets and pushes broadcast
 /// notifications to it once it has CONNECTed. `generation` supplies the current
 /// root generation for the catch-up SyncComplete sent after a lagged receiver.
-/// `authenticate` maps the CONNECT's token (if any) to the session's user id;
-/// `None` refuses the CONNECT and ends the session.
+/// `authenticate` maps the CONNECT's token (if any) to the session's user id and
+/// revocation signal; `None` refuses the CONNECT and ends the session.
 async fn run_mqtt_session<S, R>(
     mut sender: S,
     mut receiver: R,
     mut rx: broadcast::Receiver<WsMessage>,
     generation: impl Fn() -> u64,
-    authenticate: impl Fn(Option<&str>) -> Option<String>,
+    authenticate: impl Fn(Option<&str>) -> Option<SessionAuth>,
 ) where
     S: Sink<Message> + Unpin,
     R: Stream<Item = Result<Message, axum::Error>> + Unpin,
@@ -315,12 +342,21 @@ async fn run_mqtt_session<S, R>(
 
     let mut connected = false;
     let mut user_id = String::new();
+    // Pending until CONNECT authenticates the session.
+    let mut revoked: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+        Box::pin(std::future::pending());
     let mut subscriptions: Vec<String> = Vec::new();
     let mut notifications_open = true;
 
     loop {
         let result = tokio::select! {
             incoming = receiver.next() => match incoming { Some(r) => r, None => break },
+            () = &mut revoked => {
+                info!(session_id = %session_id, "device revoked, closing MQTT session");
+                // MQTT 3.1.1 has no server DISCONNECT; closing the connection is how a broker ends it.
+                let _ = sender.send(Message::Close(None)).await;
+                break;
+            }
             notif = rx.recv(), if notifications_open => {
                 let msg = match notif {
                     Ok(msg) => msg,
@@ -375,14 +411,15 @@ async fn run_mqtt_session<S, R>(
                                 let token = connect_token(
                                     &data[payload_start..payload_start + remaining_len],
                                 );
-                                let Some(user) = authenticate(token.as_deref()) else {
+                                let Some(auth) = authenticate(token.as_deref()) else {
                                     warn!(session_id = %session_id, "MQTT CONNECT without a valid token, refusing");
                                     let _ = sender
                                         .send(Message::Binary(build_connack(false, 5).into()))
                                         .await; // not authorized
                                     break;
                                 };
-                                user_id = user;
+                                user_id = auth.user_id;
+                                revoked = auth.revoked;
                                 connected = true;
 
                                 // Send CONNACK
@@ -557,8 +594,22 @@ mod tests {
         start_with(|_| Some("u1".into()))
     }
 
+    /// A session of `user` that is never revoked.
+    fn never_revoked(user: String) -> SessionAuth {
+        SessionAuth {
+            user_id: user,
+            revoked: Box::pin(std::future::pending()),
+        }
+    }
+
     fn start_with(
         authenticate: impl Fn(Option<&str>) -> Option<String> + Send + 'static,
+    ) -> Harness {
+        start_with_auth(move |t| authenticate(t).map(never_revoked))
+    }
+
+    fn start_with_auth(
+        authenticate: impl Fn(Option<&str>) -> Option<SessionAuth> + Send + 'static,
     ) -> Harness {
         let (in_tx, in_rx) = mpsc::unbounded_channel::<Message>();
         let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();

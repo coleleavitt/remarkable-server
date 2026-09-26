@@ -436,10 +436,13 @@ impl SearchIndex {
         })
     }
 
-    /// Rebuild entire index from storage. Rows are upserted one at a time as text is
-    /// extracted (hashes are content addresses, so re-indexing one is idempotent and no
-    /// library-wide batch of text is held in memory), then rows whose blob is gone from
-    /// storage or no longer mapped to any filename are pruned, so deleted and superseded
+    /// Rebuild entire index from storage. Only blobs reachable from the current root's
+    /// tree are indexed, so documents deleted on the tablet (still stored until garbage
+    /// collection) drop out of search; if that tree can't be fully read, every stored blob
+    /// is indexed as before rather than wiping search. Rows are upserted one at a time as
+    /// text is extracted (hashes are content addresses, so re-indexing one is idempotent and
+    /// no library-wide batch of text is held in memory), then rows whose blob is gone,
+    /// unreachable, or no longer mapped to any filename are pruned, so deleted and superseded
     /// documents (e.g. the old blob left behind when a filename is re-uploaded with new
     /// content) drop out of search. A live, mapped blob that can't be read this time keeps its
     /// previous row, and rows written meanwhile by an overlapping (re)index survive.
@@ -447,7 +450,7 @@ impl SearchIndex {
         info!("Rebuilding search index from storage...");
 
         let mut indexed = 0;
-        for hash in storage.list_hashes()? {
+        for hash in Self::live_hashes(storage)? {
             let Some(filename) = storage.filename_for_hash(&hash) else {
                 continue;
             };
@@ -480,7 +483,24 @@ impl SearchIndex {
         Ok(indexed)
     }
 
-    /// Delete rows whose blob is no longer in storage or no longer mapped to a filename, and
+    /// Stored blobs search may index: those in the current root's tree, or every stored blob
+    /// when that tree can't be fully read (no root yet, or an index missing or unparsed).
+    fn live_hashes(storage: &Storage) -> Result<Vec<String>> {
+        let stored = storage.list_hashes()?;
+        Ok(match storage.reachable_from_root() {
+            Some(reachable) => stored
+                .into_iter()
+                .filter(|h| reachable.contains(h))
+                .collect(),
+            None => {
+                warn!("sync tree not fully readable; search covers every stored blob");
+                stored
+            }
+        })
+    }
+
+    /// Delete rows whose blob is no longer in storage (or, when the current tree is readable,
+    /// no longer reachable from it) or no longer mapped to a filename, and
     /// repoint rows whose own filename moved on to another blob while a different filename
     /// still currently maps their hash (so an unreadable blob can't keep a stale name). The
     /// listing and mapping lookups happen while holding the DB lock, so every row already
@@ -489,7 +509,8 @@ impl SearchIndex {
     fn prune_missing(&self, storage: &Storage) -> Result<usize> {
         let db = |e: rusqlite::Error| ServerError::Database(e.to_string());
         let mut conn = self.inner.conn.lock();
-        let live: std::collections::HashSet<String> = storage.list_hashes()?.into_iter().collect();
+        let live: std::collections::HashSet<String> =
+            Self::live_hashes(storage)?.into_iter().collect();
         let tx = conn.transaction().map_err(db)?;
         let (mut stale, mut renamed) = (Vec::new(), Vec::new());
         {
@@ -849,6 +870,97 @@ mod tests {
             q("beta").iter().map(|r| r.hash.clone()).collect::<Vec<_>>(),
             vec![old]
         );
+    }
+
+    /// Commit a new root that lists every document of the current one except `doc_id`,
+    /// as the tablet does when a document is deleted. Returns the hashes that left the tree.
+    fn delete_from_root(storage: &Storage, doc_id: &str) -> Vec<String> {
+        let root = storage.get_root().hash;
+        let doc = storage
+            .index_entries(&root)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == doc_id)
+            .unwrap();
+        let mut dropped: Vec<String> = storage
+            .index_entries(&doc.hash)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|f| f.hash)
+            .collect();
+        dropped.push(doc.hash.clone());
+        let index: String = String::from_utf8(storage.get(&root).unwrap())
+            .unwrap()
+            .lines()
+            .filter(|l| !l.starts_with(&doc.hash))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let new_root = storage.put(index.as_bytes(), "root.docSchema").unwrap();
+        storage.set_root(new_root).unwrap();
+        // Identical files (e.g. two PDFs' `.content`) are one blob; keep only what left the tree.
+        let still = storage.reachable_from_root().unwrap();
+        dropped.retain(|h| !still.contains(h));
+        dropped
+    }
+
+    #[test]
+    fn test_rebuild_drops_documents_deleted_from_the_root() {
+        let tmp = TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path().join("store")).unwrap();
+        let index = SearchIndex::new(tmp.path()).unwrap();
+        let (kept, _) =
+            crate::documents::create_document(&storage, "Kept", "pdf", b"%PDF-1.4 kept").unwrap();
+        let (gone, _) =
+            crate::documents::create_document(&storage, "Gone", "pdf", b"%PDF-1.4 gone").unwrap();
+        index.rebuild_from_storage(&storage).unwrap();
+        let file_hash =
+            |id: &str, ext: &str| storage.hash_for_filename(&format!("{id}.{ext}")).unwrap();
+        let gone_pdf = file_hash(&gone, "pdf");
+        assert!(index.is_indexed(&gone_pdf) && index.is_indexed(&file_hash(&kept, "pdf")));
+
+        let dropped = delete_from_root(&storage, &gone);
+        assert!(dropped.contains(&gone_pdf));
+        // Still stored (nothing is garbage-collected yet), but no longer in the tree.
+        assert!(storage.exists(&gone_pdf));
+        index.rebuild_from_storage(&storage).unwrap();
+        for hash in &dropped {
+            assert!(
+                !index.is_indexed(hash),
+                "deleted document's {hash} still searchable"
+            );
+        }
+        for ext in ["pdf", "metadata"] {
+            assert!(index.is_indexed(&file_hash(&kept, ext)), "{ext}");
+        }
+        // Blobs outside the tree (e.g. an uncommitted upload) aren't indexed either.
+        let stray = storage.put(b"{}", "stray.metadata").unwrap();
+        index.rebuild_from_storage(&storage).unwrap();
+        assert!(!index.is_indexed(&stray));
+    }
+
+    #[test]
+    fn test_rebuild_indexes_everything_when_tree_is_unparsed() {
+        let tmp = TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path().join("store")).unwrap();
+        let index = SearchIndex::new(tmp.path()).unwrap();
+        let doc = storage.put(b"{}", "notes.metadata").unwrap();
+        index.index_document(&doc, "notes.metadata", None).unwrap();
+        let root = "f".repeat(64);
+        storage
+            .put_with_hash(
+                format!("7\n{doc}:future\n").as_bytes(),
+                &root,
+                "root.docSchema",
+            )
+            .unwrap();
+        storage.set_root(root).unwrap();
+        assert!(storage.reachable_from_root().is_none());
+
+        // Search isn't wiped: every stored, current blob stays indexed.
+        assert_eq!(index.rebuild_from_storage(&storage).unwrap(), 2);
+        assert!(index.is_indexed(&doc));
     }
 
     #[test]

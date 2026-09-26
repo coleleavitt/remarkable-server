@@ -53,7 +53,9 @@ async fn main() -> Result<()> {
     let ice_servers: serde_json::Value =
         serde_json::from_str(&env::var("SCREENSHARE_ICE_SERVERS").unwrap_or_else(|_| "[]".into()))
             .unwrap_or_else(|_| serde_json::json!([]));
-    let state = AppState::new(storage, devices).with_ice_servers(ice_servers);
+    let state = AppState::new(storage, devices)
+        .with_ice_servers(ice_servers)
+        .with_public_url(env::var("PUBLIC_URL").ok().as_deref());
 
     // Create router
     // Inbound email -> documents: an SMTP listener, only when EMAIL_INBOUND_BIND is set.
@@ -145,13 +147,18 @@ async fn main() -> Result<()> {
 
         tracing::info!("Listening on {} (HTTPS)", config.bind);
         axum_server::from_tcp_rustls(listener, tls_config)?
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await?;
     } else {
         // Plain HTTP mode
         let listener = remarkable_server::bind_when_available(config.bind.parse()?).await?;
         tracing::info!("Listening on {} (HTTP)", config.bind);
-        axum::serve(listener, app).await?;
+        // Peer address feeds the OAuth device-code rate limiter (see `oauth::ClientIp`).
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await?;
     }
 
     Ok(())
