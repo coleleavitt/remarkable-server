@@ -54,7 +54,7 @@ pub type Result<T> = std::result::Result<T, ReadLaterError>;
 // Provider Types
 // ============================================================================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReadLaterProvider {
     Pocket,
@@ -122,6 +122,14 @@ pub struct Article {
     pub document_id: Option<String>,
     pub synced_to_device: bool,
     pub last_sync: Option<DateTime<Utc>>,
+    /// The account whose sync recorded the article; `None` for rows from before accounts were
+    /// recorded, until a sync of that provider takes them over.
+    #[serde(default)]
+    pub account_id: Option<String>,
+    /// `status` was changed here (`PUT /articles/{id}`) and is still to be sent to the
+    /// provider by the account's next sync (with `sync_read_status`).
+    #[serde(default)]
+    pub read_status_pending: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -371,6 +379,7 @@ pub struct SyncResult {
     /// Selected articles skipped because they are already on the device.
     #[serde(default)]
     pub articles_already_synced: u32,
+    /// Status changes made here (`PUT /articles/{id}`) sent to the provider in this sync.
     pub read_status_synced: u32,
     pub errors: Vec<String>,
     pub duration_ms: u64,
@@ -463,17 +472,64 @@ pub trait ReadLaterProviderTrait: Send + Sync {
     }
 }
 
-/// Construct the provider implementation for `kind`. Instapaper's consumer key/secret come
-/// from `INSTAPAPER_CONSUMER_KEY` / `INSTAPAPER_CONSUMER_SECRET`.
+/// Time limits for requests to a provider's API. Without them a server that accepts the
+/// connection and never answers would stall a sync, and with it the scheduler, for good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpTimeouts {
+    /// Establishing the connection (TCP and TLS).
+    pub connect: std::time::Duration,
+    /// The whole request, from connecting until the response body has been read.
+    pub request: std::time::Duration,
+}
+
+impl Default for HttpTimeouts {
+    /// 10 s to connect and 30 s per request, as feed fetches get.
+    fn default() -> Self {
+        Self {
+            connect: std::time::Duration::from_secs(10),
+            request: std::time::Duration::from_secs(30),
+        }
+    }
+}
+
+impl HttpTimeouts {
+    /// An HTTP client that gives up after these limits. Building one fails only if the TLS
+    /// backend can't be set up (when `reqwest::Client::new()` would panic).
+    pub fn client(self) -> Result<reqwest::Client> {
+        reqwest::Client::builder()
+            .connect_timeout(self.connect)
+            .timeout(self.request)
+            .build()
+            .map_err(|e| ReadLaterError::Network(format!("HTTP client: {e}")))
+    }
+}
+
+/// A client with the default [`HttpTimeouts`] for the providers' `new()` constructors; like
+/// `reqwest::Client::new()`, it panics only if no TLS backend can be set up.
+fn default_client() -> reqwest::Client {
+    HttpTimeouts::default().client().unwrap_or_default()
+}
+
+/// Construct the provider implementation for `kind`, with the default [`HttpTimeouts`].
 pub fn provider_for(kind: ReadLaterProvider) -> Result<Box<dyn ReadLaterProviderTrait>> {
+    provider_with_timeouts(kind, HttpTimeouts::default())
+}
+
+/// Construct the provider implementation for `kind`, its requests limited by `timeouts`.
+/// Instapaper's consumer key/secret come from `INSTAPAPER_CONSUMER_KEY` /
+/// `INSTAPAPER_CONSUMER_SECRET`.
+pub fn provider_with_timeouts(
+    kind: ReadLaterProvider,
+    timeouts: HttpTimeouts,
+) -> Result<Box<dyn ReadLaterProviderTrait>> {
     Ok(match kind {
-        ReadLaterProvider::Pocket => Box::new(PocketProvider::new()),
+        ReadLaterProvider::Pocket => Box::new(PocketProvider::with_client(timeouts.client()?)),
         ReadLaterProvider::Instapaper => {
             let key = std::env::var("INSTAPAPER_CONSUMER_KEY").unwrap_or_default();
             let secret = std::env::var("INSTAPAPER_CONSUMER_SECRET").unwrap_or_default();
-            Box::new(InstapaperProvider::new(key, secret))
+            Box::new(InstapaperProvider::new(key, secret).with_client(timeouts.client()?))
         }
-        ReadLaterProvider::Wallabag => Box::new(WallabagProvider::new()),
+        ReadLaterProvider::Wallabag => Box::new(WallabagProvider::with_client(timeouts.client()?)),
         ReadLaterProvider::Omnivore => {
             return Err(ReadLaterError::Discontinued(OMNIVORE_DISCONTINUED.into()));
         }
@@ -492,9 +548,12 @@ impl PocketProvider {
     const API_BASE: &'static str = "https://getpocket.com/v3";
 
     pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::new(),
-        }
+        Self::with_client(default_client())
+    }
+
+    /// Use `client` (e.g. one with other [`HttpTimeouts`]) for API requests.
+    pub fn with_client(client: reqwest::Client) -> Self {
+        Self { client }
     }
 }
 
@@ -751,6 +810,8 @@ impl ReadLaterProviderTrait for PocketProvider {
                     document_id: None,
                     synced_to_device: false,
                     last_sync: None,
+                    account_id: None,
+                    read_status_pending: false,
                 }
             })
             .collect();
@@ -911,6 +972,8 @@ impl ReadLaterProviderTrait for PocketProvider {
             document_id: None,
             synced_to_device: false,
             last_sync: None,
+            account_id: None,
+            read_status_pending: false,
         })
     }
 
@@ -971,11 +1034,17 @@ impl InstapaperProvider {
 
     pub fn new(consumer_key: String, consumer_secret: String) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: default_client(),
             consumer_key,
             consumer_secret,
             api_base: Self::API_BASE.to_string(),
         }
+    }
+
+    /// Use `client` (e.g. one with other [`HttpTimeouts`]) for API requests.
+    pub fn with_client(mut self, client: reqwest::Client) -> Self {
+        self.client = client;
+        self
     }
 
     /// Point the provider at a different API root (used by tests against a local server).
@@ -1303,6 +1372,8 @@ impl ReadLaterProviderTrait for InstapaperProvider {
                         document_id: None,
                         synced_to_device: false,
                         last_sync: None,
+                        account_id: None,
+                        read_status_pending: false,
                     })
                 }
                 InstapaperItem::Meta { .. } => None,
@@ -1482,6 +1553,8 @@ impl ReadLaterProviderTrait for InstapaperProvider {
             document_id: None,
             synced_to_device: false,
             last_sync: None,
+            account_id: None,
+            read_status_pending: false,
         })
     }
 
@@ -1547,8 +1620,13 @@ struct WallabagToken {
 
 impl WallabagProvider {
     pub fn new() -> Self {
+        Self::with_client(default_client())
+    }
+
+    /// Use `client` (e.g. one with other [`HttpTimeouts`]) for API and token requests.
+    pub fn with_client(client: reqwest::Client) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client,
             refreshed: parking_lot::Mutex::new(None),
         }
     }
@@ -1907,6 +1985,8 @@ impl ReadLaterProviderTrait for WallabagProvider {
                     document_id: None,
                     synced_to_device: false,
                     last_sync: None,
+                    account_id: None,
+                    read_status_pending: false,
                 }
             })
             .collect();
@@ -2044,6 +2124,8 @@ impl ReadLaterProviderTrait for WallabagProvider {
             document_id: None,
             synced_to_device: false,
             last_sync: None,
+            account_id: None,
+            read_status_pending: false,
         })
     }
 
@@ -2225,38 +2307,114 @@ img {{ max-width: 100%; }}
         )
     }
 
-    /// Print the HTML rendering with `weasyprint`, else `wkhtmltopdf`, in a scratch directory.
+    /// Print the HTML rendering with `weasyprint`, else `wkhtmltopdf` (see [`pdf_printers`]),
+    /// in a scratch directory.
     fn pdf(article: &Article, content: &ArticleContent) -> Result<Vec<u8>> {
-        use std::process::Command;
-
         let dir = tempfile::tempdir()?;
-        let html_path = dir.path().join("article.html");
-        let pdf_path = dir.path().join("article.pdf");
-        std::fs::write(&html_path, Self::html_document(article, content))?;
+        let html = dir.path().join("article.html");
+        let pdf = dir.path().join("article.pdf");
+        std::fs::write(&html, Self::html_document(article, content))?;
+        print_pdf(
+            &pdf_printers(dir.path(), &html, &pdf),
+            &pdf,
+            PDF_PRINT_TIMEOUT,
+        )
+    }
+}
 
-        let converters: [(&str, &[&std::ffi::OsStr]); 2] = [
-            ("weasyprint", &[html_path.as_os_str(), pdf_path.as_os_str()]),
-            (
-                "wkhtmltopdf",
-                &[
-                    std::ffi::OsStr::new("--quiet"),
-                    html_path.as_os_str(),
-                    pdf_path.as_os_str(),
-                ],
-            ),
-        ];
-        for (program, args) in converters {
-            let printed = Command::new(program)
-                .args(args)
-                .output()
-                .is_ok_and(|o| o.status.success());
-            if printed {
-                return Ok(std::fs::read(&pdf_path)?);
+/// Longest one PDF printer may run on one article before it is killed, so a converter stuck
+/// on a page can't stall the sync (and the scheduler) for good.
+const PDF_PRINT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A PDF converter command line.
+#[derive(Debug, Clone)]
+struct PdfPrinter {
+    program: std::ffi::OsString,
+    args: Vec<std::ffi::OsString>,
+}
+
+/// The printers tried for `html` (inside the scratch directory `dir`), writing `pdf`. The HTML
+/// comes from the provider, i.e. from any web page, so each is confined as far as its options
+/// allow: WeasyPrint may fetch only `http`, `https` and `data:` URLs, never `file:` ones, so no
+/// file from this machine (a TLS key, a database) can be pulled into the PDF, e.g. as an
+/// attachment; this needs a WeasyPrint with `--allowed-protocols`, and an older one just fails.
+/// wkhtmltopdf runs without JavaScript and may read no local file outside `dir`. Both may still
+/// load http(s) resources such as images, as any renderer of the page would.
+fn pdf_printers(dir: &Path, html: &Path, pdf: &Path) -> Vec<PdfPrinter> {
+    let args = |args: &[&std::ffi::OsStr]| args.iter().map(|&a| a.to_owned()).collect();
+    let os = std::ffi::OsStr::new;
+    vec![
+        PdfPrinter {
+            program: "weasyprint".into(),
+            args: args(&[
+                os("--allowed-protocols"),
+                os("http,https,data"),
+                html.as_os_str(),
+                pdf.as_os_str(),
+            ]),
+        },
+        PdfPrinter {
+            program: "wkhtmltopdf".into(),
+            args: args(&[
+                os("--quiet"),
+                os("--disable-javascript"),
+                os("--disable-local-file-access"),
+                os("--allow"),
+                dir.as_os_str(),
+                html.as_os_str(),
+                pdf.as_os_str(),
+            ]),
+        },
+    ]
+}
+
+/// Run `printers` in turn until one exits successfully, each killed after `limit`, and return
+/// the `pdf` it wrote.
+fn print_pdf(printers: &[PdfPrinter], pdf: &Path, limit: std::time::Duration) -> Result<Vec<u8>> {
+    let mut failures = Vec::new();
+    for printer in printers {
+        let name = printer.program.to_string_lossy();
+        match run_with_deadline(printer, limit) {
+            Ok(true) => return Ok(std::fs::read(pdf)?),
+            Ok(false) => failures.push(format!("{name} failed")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                failures.push(format!("{name} not installed"));
             }
+            Err(e) => failures.push(format!("{name}: {e}")),
         }
-        Err(ReadLaterError::Conversion(
-            "No PDF converter available (install weasyprint or wkhtmltopdf)".into(),
-        ))
+    }
+    Err(ReadLaterError::Conversion(format!(
+        "no PDF printed ({}); install a weasyprint with --allowed-protocols, or wkhtmltopdf",
+        failures.join(", ")
+    )))
+}
+
+/// Run `printer` without input or output until it exits, killing it once `limit` has passed.
+/// Returns whether it exited successfully.
+fn run_with_deadline(printer: &PdfPrinter, limit: std::time::Duration) -> std::io::Result<bool> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(&printer.program)
+        .args(&printer.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status.success());
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            // It may have exited just now; either way, reap it.
+            let _ = child.kill();
+            child.wait()?;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("killed after {} s", limit.as_secs_f32()),
+            ));
+        }
+        std::thread::sleep((deadline - now).min(std::time::Duration::from_millis(50)));
     }
 }
 
@@ -2346,6 +2504,15 @@ impl ReadLaterManager {
         // Provider credentials (JSON `ProviderSecrets`), split from `config` so they survive
         // restarts without ever being part of the client-facing config JSON.
         Self::ensure_column(db, "readlater_accounts", "secrets", "TEXT")?;
+        // Which account recorded an article (so status changes go back to the right one), and
+        // whether a status change made here is still to be sent to the provider.
+        Self::ensure_column(db, "readlater_articles", "account_id", "TEXT")?;
+        Self::ensure_column(
+            db,
+            "readlater_articles",
+            "read_status_pending",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
 
         Ok(())
     }
@@ -2462,7 +2629,7 @@ impl ReadLaterManager {
 
     fn load_articles(&mut self) -> Result<()> {
         let mut stmt = self.db.prepare(
-            "SELECT id, provider, provider_id, url, title, excerpt, author, word_count, reading_time_minutes,              tags, status, favorite, added_at, updated_at, read_at, image_url, document_id, synced_to_device, last_sync              FROM readlater_articles"
+            "SELECT id, provider, provider_id, url, title, excerpt, author, word_count, reading_time_minutes,              tags, status, favorite, added_at, updated_at, read_at, image_url, document_id, synced_to_device, last_sync,              account_id, read_status_pending FROM readlater_articles"
         ).map_err(|e| ReadLaterError::Database(e.to_string()))?;
 
         let rows = stmt
@@ -2486,6 +2653,8 @@ impl ReadLaterManager {
                 let document_id: Option<String> = row.get(16)?;
                 let synced: bool = row.get::<_, i32>(17)? != 0;
                 let last_sync: Option<String> = row.get(18)?;
+                let account_id: Option<String> = row.get(19)?;
+                let read_status_pending: bool = row.get::<_, i32>(20)? != 0;
 
                 Ok((
                     id,
@@ -2507,6 +2676,8 @@ impl ReadLaterManager {
                     document_id,
                     synced,
                     last_sync,
+                    account_id,
+                    read_status_pending,
                 ))
             })
             .map_err(|e| ReadLaterError::Database(e.to_string()))?;
@@ -2534,6 +2705,8 @@ impl ReadLaterManager {
                 document_id,
                 synced,
                 last_sync,
+                account_id,
+                read_status_pending,
             ) = row.map_err(|e| ReadLaterError::Database(e.to_string()))?;
 
             let provider: ReadLaterProvider =
@@ -2576,6 +2749,8 @@ impl ReadLaterManager {
                     document_id,
                     synced_to_device: synced,
                     last_sync: last_sync.map(|s| parse_dt(&s)),
+                    account_id,
+                    read_status_pending,
                 },
             );
         }
@@ -2730,35 +2905,13 @@ impl ReadLaterManager {
                 if article.last_sync.is_none() {
                     article.last_sync = prev.last_sync;
                 }
+                if article.account_id.is_none() {
+                    article.account_id = prev.account_id.clone();
+                }
             }
             article.id = existing_id;
         }
-        let tags_json = serde_json::to_string(&article.tags)?;
-
-        self.db.execute(
-            "INSERT OR REPLACE INTO readlater_articles              (id, provider, provider_id, url, title, excerpt, author, word_count, reading_time_minutes,               tags, status, favorite, added_at, updated_at, read_at, image_url, document_id, synced_to_device, last_sync)              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
-            params![
-                article.id,
-                article.provider.to_string(),
-                article.provider_id,
-                article.url,
-                article.title,
-                article.excerpt,
-                article.author,
-                article.word_count,
-                article.reading_time_minutes,
-                tags_json,
-                format!("{:?}", article.status).to_lowercase(),
-                article.favorite as i32,
-                article.added_at.to_rfc3339(),
-                article.updated_at.to_rfc3339(),
-                article.read_at.map(|d| d.to_rfc3339()),
-                article.image_url,
-                article.document_id,
-                article.synced_to_device as i32,
-                article.last_sync.map(|d| d.to_rfc3339()),
-            ],
-        ).map_err(|e| ReadLaterError::Database(e.to_string()))?;
+        write_article(&self.db, &article)?;
 
         self.articles
             .write()
@@ -2782,19 +2935,125 @@ impl ReadLaterManager {
         self.upsert_article(&article)
     }
 
-    /// Articles of `provider` on the device whose read/archived status goes back to the
-    /// provider when an account has `sync_read_status`.
-    pub(crate) fn read_status_candidates(&self, provider: ReadLaterProvider) -> Vec<Article> {
+    /// Record the articles `account_id` just fetched from its provider, all in one transaction,
+    /// and return what became of each (in order).
+    ///
+    /// An article seen before (same provider and provider id) keeps its id and device state
+    /// (`document_id`, `synced_to_device`), so it is never delivered twice. If its status was
+    /// changed here and not yet sent (`read_status_pending`), that status is kept over the
+    /// provider's when `keep_pending_status` (the account sends status changes), so the change
+    /// isn't lost before it is pushed; otherwise the provider's status wins and the change is
+    /// dropped. A row recorded for no account (from before accounts were recorded) or for a
+    /// deleted one is taken over by this account, minus any pending status change, which was
+    /// meant for the old account. A row of another existing account is left alone: articles are
+    /// unique per provider id.
+    pub(crate) fn record_fetched(
+        &mut self,
+        account_id: &str,
+        keep_pending_status: bool,
+        articles: Vec<Article>,
+    ) -> Result<Vec<Recorded>> {
+        let db_err = |e: rusqlite::Error| ReadLaterError::Database(e.to_string());
+        let mut known: HashMap<(ReadLaterProvider, String), Article> = {
+            let wanted: std::collections::HashSet<(ReadLaterProvider, &str)> = articles
+                .iter()
+                .map(|a| (a.provider, a.provider_id.as_str()))
+                .collect();
+            self.articles
+                .read()
+                .values()
+                .filter(|a| wanted.contains(&(a.provider, a.provider_id.as_str())))
+                .map(|a| ((a.provider, a.provider_id.clone()), a.clone()))
+                .collect()
+        };
+        let accounts = self.accounts.read();
+        let tx = self.db.unchecked_transaction().map_err(db_err)?;
+        let mut recorded = Vec::with_capacity(articles.len());
+        for mut article in articles {
+            let key = (article.provider, article.provider_id.clone());
+            if let Some(prev) = known.get(&key) {
+                match prev.account_id.as_deref() {
+                    Some(owner) if owner != account_id && accounts.contains_key(owner) => {
+                        recorded.push(Recorded::OtherAccount {
+                            provider_id: article.provider_id,
+                            owner: owner.to_owned(),
+                        });
+                        continue;
+                    }
+                    owner => {
+                        article.id = prev.id.clone();
+                        if article.document_id.is_none() {
+                            article.document_id = prev.document_id.clone();
+                        }
+                        article.synced_to_device |= prev.synced_to_device;
+                        if article.last_sync.is_none() {
+                            article.last_sync = prev.last_sync;
+                        }
+                        if prev.read_status_pending
+                            && keep_pending_status
+                            && owner == Some(account_id)
+                        {
+                            article.status = prev.status;
+                            article.read_at = prev.read_at;
+                            article.read_status_pending = true;
+                        }
+                    }
+                }
+            }
+            article.account_id = Some(account_id.to_owned());
+            write_article(&tx, &article)?;
+            known.insert(key, article.clone());
+            recorded.push(Recorded::Stored(article));
+        }
+        tx.commit().map_err(db_err)?;
+        drop(accounts);
+        let mut map = self.articles.write();
+        for r in &recorded {
+            if let Recorded::Stored(article) = r {
+                map.insert(article.id.clone(), article.clone());
+            }
+        }
+        Ok(recorded)
+    }
+
+    /// Articles recorded for `account_id` whose status was changed here and is still to be
+    /// sent to the provider.
+    pub(crate) fn pending_read_status(&self, account_id: &str) -> Vec<Article> {
         self.articles
             .read()
             .values()
-            .filter(|a| {
-                a.provider == provider
-                    && a.synced_to_device
-                    && matches!(a.status, ReadStatus::Read | ReadStatus::Archived)
-            })
+            .filter(|a| a.read_status_pending && a.account_id.as_deref() == Some(account_id))
             .cloned()
             .collect()
+    }
+
+    /// The provider was sent `status` for `article_id`: nothing is pending any more, unless the
+    /// status was changed again meanwhile (that change is still to be sent).
+    pub(crate) fn read_status_sent(&mut self, article_id: &str, status: ReadStatus) -> Result<()> {
+        self.clear_read_status_pending(article_id, Some(status))
+    }
+
+    /// Stop trying to send `article_id`'s status change (the provider keeps refusing it).
+    pub(crate) fn drop_read_status_change(&mut self, article_id: &str) -> Result<()> {
+        self.clear_read_status_pending(article_id, None)
+    }
+
+    /// Clear `read_status_pending`, if `sent` is `None` or still the article's status.
+    fn clear_read_status_pending(
+        &mut self,
+        article_id: &str,
+        sent: Option<ReadStatus>,
+    ) -> Result<()> {
+        let Some(mut article) = self.get_article(article_id) else {
+            return Ok(()); // deleted meanwhile
+        };
+        if !article.read_status_pending || sent.is_some_and(|s| s != article.status) {
+            return Ok(());
+        }
+        article.read_status_pending = false;
+        write_article(&self.db, &article)?;
+        self.articles.write().insert(article.id.clone(), article);
+        Ok(())
     }
 
     pub fn query_articles(&self, query: &ArticleQuery) -> Vec<Article> {
@@ -2937,6 +3196,50 @@ impl ReadLaterManager {
     }
 }
 
+/// What [`ReadLaterManager::record_fetched`] did with one fetched article.
+#[derive(Debug, Clone)]
+pub(crate) enum Recorded {
+    /// Stored for the account, as it is now recorded (`synced_to_device` tells whether it is
+    /// already on the device).
+    Stored(Article),
+    /// Not stored: the same provider id is recorded for `owner`, another account of the same
+    /// provider, and articles are unique per provider id.
+    OtherAccount { provider_id: String, owner: String },
+}
+
+/// Write `article` as its row, replacing any row with its id (or its provider id).
+fn write_article(db: &Connection, article: &Article) -> Result<()> {
+    let tags_json = serde_json::to_string(&article.tags)?;
+    db.execute(
+        "INSERT OR REPLACE INTO readlater_articles          (id, provider, provider_id, url, title, excerpt, author, word_count, reading_time_minutes,           tags, status, favorite, added_at, updated_at, read_at, image_url, document_id, synced_to_device,           last_sync, account_id, read_status_pending)          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+        params![
+            article.id,
+            article.provider.to_string(),
+            article.provider_id,
+            article.url,
+            article.title,
+            article.excerpt,
+            article.author,
+            article.word_count,
+            article.reading_time_minutes,
+            tags_json,
+            format!("{:?}", article.status).to_lowercase(),
+            article.favorite as i32,
+            article.added_at.to_rfc3339(),
+            article.updated_at.to_rfc3339(),
+            article.read_at.map(|d| d.to_rfc3339()),
+            article.image_url,
+            article.document_id,
+            article.synced_to_device as i32,
+            article.last_sync.map(|d| d.to_rfc3339()),
+            article.account_id,
+            article.read_status_pending as i32,
+        ],
+    )
+    .map_err(|e| ReadLaterError::Database(e.to_string()))?;
+    Ok(())
+}
+
 /// Apply the account's sync filters (tags, favorites, archived) and cap the result at
 /// `max_articles` (0 = unlimited), keeping the most recently added articles. The cap is per
 /// sync: articles it drops are older than everything kept and are not revisited later.
@@ -3068,6 +3371,8 @@ mod tests {
             document_id: None,
             synced_to_device: false,
             last_sync: None,
+            account_id: None,
+            read_status_pending: false,
         }
     }
 
@@ -3789,5 +4094,192 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("INSTAPAPER_CONSUMER_KEY"), "{err}");
+    }
+    fn pocket_account(id: &str) -> ProviderAccount {
+        let config = ProviderConfig::Pocket {
+            consumer_key: "ck".into(),
+            access_token: None,
+            username: None,
+        };
+        test_account(id, ReadLaterProvider::Pocket, config, None)
+    }
+
+    /// A delivered article recorded for `owner`, archived here and not yet sent.
+    fn delivered(provider_id: &str, owner: Option<&str>) -> Article {
+        let mut a = article(&format!("id-{provider_id}"), provider_id, 0);
+        a.account_id = owner.map(Into::into);
+        a.synced_to_device = true;
+        a.document_id = Some(format!("doc-{provider_id}"));
+        a.status = ReadStatus::Archived;
+        a.read_status_pending = true;
+        a
+    }
+
+    fn stored(r: &Recorded) -> &Article {
+        match r {
+            Recorded::Stored(a) => a,
+            other => panic!("not stored: {other:?}"),
+        }
+    }
+
+    /// Fetched articles are recorded per account, in one transaction: a row seen before keeps
+    /// its id and device state, and its status change not yet sent wins over the provider's
+    /// (only if the account sends changes). Rows of no account or a deleted one are taken over
+    /// without their pending change, another account's row is left alone, and a provider id
+    /// listed twice is one row.
+    #[test]
+    fn record_fetched_keeps_device_state_and_scopes_rows_to_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rl.db");
+        let mut mgr = ReadLaterManager::new(&db).unwrap();
+        mgr.add_account(pocket_account("a")).unwrap();
+        mgr.add_account(pocket_account("b")).unwrap();
+        for (provider_id, owner) in [("p1", Some("a")), ("p2", Some("gone")), ("p3", None)] {
+            mgr.save_article(&delivered(provider_id, owner)).unwrap();
+        }
+        // As a provider fetch returns them: fresh ids, unread, nothing on the device.
+        let fetched = |provider_id: &str| article(&format!("new-{provider_id}"), provider_id, 0);
+
+        let r = mgr.record_fetched("a", true, vec![fetched("p1")]).unwrap();
+        let p1 = stored(&r[0]);
+        assert_eq!(
+            (
+                p1.id.as_str(),
+                p1.synced_to_device,
+                p1.document_id.as_deref()
+            ),
+            ("id-p1", true, Some("doc-p1"))
+        );
+        assert_eq!(
+            (p1.status, p1.read_status_pending),
+            (ReadStatus::Archived, true)
+        );
+        let r = mgr.record_fetched("a", false, vec![fetched("p1")]).unwrap();
+        let p1 = stored(&r[0]);
+        assert_eq!(
+            (p1.status, p1.read_status_pending),
+            (ReadStatus::Unread, false)
+        );
+
+        let fetched_by_b = ["p1", "p2", "p3", "p4", "p4"].map(fetched).to_vec();
+        let r = mgr.record_fetched("b", true, fetched_by_b).unwrap();
+        assert!(
+            matches!(&r[0], Recorded::OtherAccount { provider_id, owner } if provider_id == "p1" && owner == "a"),
+            "{r:?}"
+        );
+        for (rec, provider_id) in r[1..3].iter().zip(["p2", "p3"]) {
+            let a = stored(rec);
+            assert_eq!(a.id, format!("id-{provider_id}"));
+            assert_eq!(a.account_id.as_deref(), Some("b"));
+            assert!(a.synced_to_device);
+            assert_eq!(
+                (a.status, a.read_status_pending),
+                (ReadStatus::Unread, false)
+            );
+        }
+        assert_eq!(stored(&r[3]).id, stored(&r[4]).id);
+        assert!(mgr.pending_read_status("b").is_empty());
+        assert_eq!(mgr.articles.read().len(), 4);
+
+        drop(mgr);
+        let mgr = ReadLaterManager::new(&db).unwrap();
+        let rows: i64 = mgr
+            .db
+            .query_row("SELECT COUNT(*) FROM readlater_articles", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((rows, mgr.articles.read().len()), (4, 4));
+        let a = |id: &str| mgr.get_article(id).unwrap();
+        assert_eq!(a("id-p1").account_id.as_deref(), Some("a"));
+        assert_eq!(a("id-p2").account_id.as_deref(), Some("b"));
+        assert!(!a("id-p2").read_status_pending);
+        assert_eq!(a("new-p4").account_id.as_deref(), Some("b"));
+    }
+
+    /// Status changes to send are per account, and a sent one is cleared unless the status
+    /// was changed again meanwhile.
+    #[test]
+    fn pending_status_changes_are_per_account_and_cleared_once_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rl.db");
+        let mut mgr = ReadLaterManager::new(&db).unwrap();
+        mgr.save_article(&delivered("p1", Some("a"))).unwrap();
+        mgr.save_article(&delivered("p2", Some("b"))).unwrap();
+        let mut sent = delivered("p3", Some("a"));
+        sent.read_status_pending = false;
+        mgr.save_article(&sent).unwrap();
+        let ids = |mgr: &ReadLaterManager, account: &str| -> Vec<String> {
+            mgr.pending_read_status(account)
+                .into_iter()
+                .map(|a| a.id)
+                .collect()
+        };
+        assert_eq!(ids(&mgr, "a"), ["id-p1"]);
+
+        mgr.read_status_sent("id-p1", ReadStatus::Read).unwrap();
+        assert_eq!(ids(&mgr, "a"), ["id-p1"], "changed again since");
+        mgr.read_status_sent("id-p1", ReadStatus::Archived).unwrap();
+        mgr.drop_read_status_change("id-p2").unwrap();
+        mgr.read_status_sent("gone", ReadStatus::Read).unwrap();
+        drop(mgr);
+        let mgr = ReadLaterManager::new(&db).unwrap();
+        assert!(ids(&mgr, "a").is_empty() && ids(&mgr, "b").is_empty());
+    }
+
+    /// The PDF printers are confined: WeasyPrint fetches only http(s) and `data:` URLs, so no
+    /// local file can be pulled into the PDF, and wkhtmltopdf runs no JavaScript and reads no
+    /// local file outside the scratch directory.
+    #[test]
+    fn pdf_printers_are_confined() {
+        let dir = Path::new("/scratch");
+        let printers = pdf_printers(dir, &dir.join("a.html"), &dir.join("a.pdf"));
+        let args = |i: usize| -> Vec<&str> {
+            printers[i]
+                .args
+                .iter()
+                .map(|a| a.to_str().unwrap())
+                .collect()
+        };
+        assert_eq!(printers[0].program, "weasyprint");
+        assert!(
+            args(0)
+                .windows(2)
+                .any(|w| w == ["--allowed-protocols", "http,https,data"])
+        );
+        assert_eq!(printers[1].program, "wkhtmltopdf");
+        let wk = args(1);
+        assert!(wk.contains(&"--disable-javascript"));
+        assert!(wk.contains(&"--disable-local-file-access"));
+        assert!(wk.windows(2).any(|w| w == ["--allow", "/scratch"]));
+    }
+
+    /// A printer that doesn't finish in time is killed and the next one is tried; when none
+    /// prints, the error says what each did.
+    #[cfg(unix)]
+    #[test]
+    fn a_stuck_pdf_printer_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let pdf = dir.path().join("a.pdf");
+        let sh = |script: String| PdfPrinter {
+            program: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+        };
+        let limit = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let printers = [
+            sh("exec sleep 30".into()),
+            sh(format!("printf '%%PDF-1.4' > '{}'", pdf.display())),
+        ];
+        assert_eq!(print_pdf(&printers, &pdf, limit).unwrap(), b"%PDF-1.4");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+
+        let missing = PdfPrinter {
+            program: "no-such-pdf-printer".into(),
+            args: Vec::new(),
+        };
+        let err = print_pdf(&[sh("exec sleep 30".into()), missing], &pdf, limit)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sh: killed after"), "{err}");
+        assert!(err.contains("no-such-pdf-printer not installed"), "{err}");
     }
 }

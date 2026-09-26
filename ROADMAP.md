@@ -54,9 +54,12 @@ These are done and, in several cases, ahead of rmfakecloud:
   restarts, refreshed tokens are saved at once, never returned by the API;
   Wallabag refreshes on 401, Instapaper xAuth login; Omnivore removed (#27).
 - ✅ **Read-later sync runs** — a scheduler (per-account interval, backoff on
-  failures, one sync per account at a time) and the `/sync` endpoints put new
-  articles on the tablet as EPUB/PDF documents through the strict document path,
-  push SyncComplete only when the root changed, and never add an article twice.
+  account-wide failures, one sync per account at a time) and the `/sync`
+  endpoints put new articles on the tablet as EPUB/PDF documents through the
+  strict document path, push SyncComplete only when the root changed, and never
+  add an article twice. Provider requests time out, PDF converters are confined
+  and killed after a deadline, and status changes go back once, to the account
+  that recorded the article (#33).
 - ✅ **Security hardening (Sept 2026 review)** — OAuth device-code sign-ins need
   owner approval (#18); deleting or re-pairing a device revokes its tokens, and
   users only see and delete their own devices (#17); pairing codes are
@@ -131,6 +134,13 @@ The community's top *concrete* pains. Small, bounded, high-value.
   memory.
 - ⬜ **Remote calendar providers** — only local ICS files sync; CalDAV, Google
   and Office 365 calendars answer "not implemented".
+- ⬜ **Read-later: one root update per sync** — each delivered article is its
+  own root commit, so a first import of `max_articles` documents bumps the
+  generation that many times (a tablet syncing meanwhile retries its root PUT).
+- ⬜ **Read-later: articles unique per provider id** — the table's
+  `UNIQUE(provider, provider_id)` means two accounts of one provider listing the
+  same id (e.g. two Wallabag instances) can't both have it; the second one's is
+  skipped and reported. Key articles by account instead (table rebuild).
 - 🧪 **`/mqtt` topic** — MQTT-over-WebSocket push publishes on whatever concrete
   topics the client subscribes to; not yet verified against a real tablet.
 

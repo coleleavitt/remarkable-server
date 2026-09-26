@@ -619,14 +619,8 @@ pub fn feature_routes(
         init_readlater_manager(storage_path)?,
         state.storage.clone(),
         state.notification_tx.clone(),
-    );
-    let readlater_schedule = readlater_sync::SchedulerConfig::from_env();
-    if readlater_schedule.enabled && tokio::runtime::Handle::try_current().is_ok() {
-        readlater
-            .syncer
-            .clone()
-            .spawn_scheduler(readlater_schedule.tick);
-    }
+    )
+    .with_scheduler(readlater_sync::SchedulerConfig::from_env());
 
     // Cloud syncs may only touch directories under <storage>/integrations.
     let cloud = IntegrationState::with_sync_base(storage_path.join("integrations"));

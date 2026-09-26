@@ -4,26 +4,35 @@
 //!
 //! One account's sync:
 //! 1. refresh the credentials, persisting new tokens at once (the old ones may have been
-//!    rotated out), then fetch the articles changed since the account's `last_sync`;
-//! 2. apply the account's filters and `max_articles`, record the articles, and skip the ones
-//!    already on the device (`synced_to_device`);
-//! 3. render each new article (EPUB or PDF) and add it to the sync tree with
+//!    rotated out);
+//! 2. with `sync_read_status`, send the provider the status changes made here (`PUT
+//!    /articles/{id}`) to this account's articles, each once. This comes before the fetch, so
+//!    the fetch already reflects them; a change not sent yet also survives the fetch;
+//! 3. fetch the articles changed since the account's `last_sync`;
+//! 4. apply the account's filters and `max_articles`, record the articles (one transaction, off
+//!    the async threads), and skip the ones already on the device (`synced_to_device`);
+//! 5. render each new article (EPUB or PDF) and add it to the sync tree with
 //!    [`documents::create_document_in`], inside `folder_id` (resolved or created by
 //!    [`documents::ensure_folder`]; none = top level). Both refuse a root index they don't
 //!    fully understand, so the tablet's library is never rewritten lossily. The article is
 //!    marked delivered right after its document is committed, on the same blocking thread;
-//! 4. if the root changed, tell connected devices to pull it (SyncComplete);
-//! 5. push read/archived status back to the provider (`sync_read_status`);
-//! 6. only if the fetch and every delivery succeeded, advance `last_sync` to when the fetch
-//!    started. Otherwise the next sync fetches the same window again and retries what is
-//!    missing; delivered articles are skipped, never added twice.
+//! 6. if the root changed, tell connected devices to pull it (SyncComplete);
+//! 7. advance `last_sync` to when the fetch started, unless something is to be retried over the
+//!    same window: the fetch or recording failed, the tree refused a document, the provider
+//!    could not be reached, or an article failed that hasn't yet failed
+//!    [`MAX_ITEM_FAILURES`] syncs in a row. Delivered articles are skipped, never added twice.
 //!
 //! Accounts with `convert_format: html` are recorded but not delivered: the tablet opens only
 //! PDF and EPUB.
 //!
 //! At most one sync of an account runs at a time. The scheduler syncs enabled `auto_sync`
 //! accounts every `sync_interval_minutes` (at least [`MIN_INTERVAL_MINUTES`]), one after
-//! another, and backs off an account whose syncs keep failing.
+//! another, and backs off an account whose syncs keep failing as a whole (credentials, fetch,
+//! recording, the tree, the provider unreachable). An article or status change the provider or
+//! converter rejects is reported and retried on the next sync as usual, without delaying the
+//! account; after [`MAX_ITEM_FAILURES`] syncs in a row it stops holding the account back.
+//! Provider requests time out ([`HttpTimeouts`]) and PDF converters are killed after a
+//! deadline, so nothing a provider does can stall the scheduler.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -40,12 +49,15 @@ use crate::readlater::{
     ArticleContent,
     ArticleConverter,
     ArticleFormat,
+    HttpTimeouts,
     ProviderAccount,
+    ReadLaterError,
     ReadLaterManager,
     ReadLaterProvider,
     ReadLaterProviderTrait,
+    Recorded,
     SyncResult,
-    provider_for,
+    provider_with_timeouts,
     select_articles_for_sync,
 };
 use crate::storage::Storage;
@@ -62,6 +74,13 @@ pub const MIN_INTERVAL_MINUTES: i64 = 5;
 const MAX_BACKOFF_HOURS: i64 = 24;
 /// Default time between scheduler passes looking for due accounts.
 const DEFAULT_TICK_SECS: u64 = 60;
+/// Syncs in a row an article (or a status change) may be rejected before it stops holding the
+/// account back: a failed article then no longer keeps `last_sync` where it is (it is still
+/// retried while the provider lists it), and a status change is dropped.
+pub const MAX_ITEM_FAILURES: u32 = 3;
+/// Provider requests in a row that may fail to get through before a sync stops, taking the
+/// provider for unreachable.
+const MAX_UNREACHABLE: u32 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
@@ -118,8 +137,41 @@ impl SchedulerConfig {
 #[derive(Debug, Clone, Copy)]
 struct Attempt {
     at: DateTime<Utc>,
-    /// Consecutive attempts that ended with errors.
+    /// Consecutive attempts in which the account as a whole failed.
     failures: u32,
+}
+
+/// What started a sync, which decides whether it may (still) run.
+#[derive(Debug, Clone, Copy)]
+enum Trigger {
+    /// `POST .../accounts/{id}/sync`: runs whatever the account's settings.
+    Manual,
+    /// `POST .../sync`: enabled accounts.
+    All,
+    /// A scheduler pass at this time: enabled `auto_sync` accounts that are due.
+    Scheduled(DateTime<Utc>),
+}
+
+impl Trigger {
+    /// Whether a sync of `account` started this way may go on (checked again before each
+    /// delivery, so disabling an account stops a sync in progress). Timing is checked once, when
+    /// a scheduled sync starts.
+    fn allows(self, account: &ProviderAccount) -> bool {
+        match self {
+            Self::Manual => true,
+            Self::All => account.enabled,
+            Self::Scheduled(_) => schedulable(account),
+        }
+    }
+}
+
+/// Something of one account that can fail on its own, sync after sync.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Item {
+    /// Delivering the article with this provider id.
+    Article(String),
+    /// Sending the status change of the article with this id.
+    Status(String),
 }
 
 /// Runs read-later syncs into the device's sync tree. Shared by the scheduler and the sync
@@ -128,9 +180,12 @@ pub struct ReadLaterSyncer {
     manager: Arc<Mutex<ReadLaterManager>>,
     storage: Storage,
     notification_tx: broadcast::Sender<WsMessage>,
+    http: HttpTimeouts,
     /// Accounts with a sync in progress.
     running: Mutex<HashSet<String>>,
     attempts: Mutex<HashMap<String, Attempt>>,
+    /// Consecutive failed syncs of each (account, item) that failed last time.
+    item_failures: Mutex<HashMap<(String, Item), u32>>,
 }
 
 /// An account's place in [`ReadLaterSyncer::running`], released however the sync ends
@@ -156,70 +211,39 @@ impl ReadLaterSyncer {
             manager,
             storage,
             notification_tx,
+            http: HttpTimeouts::default(),
             running: Mutex::new(HashSet::new()),
             attempts: Mutex::new(HashMap::new()),
+            item_failures: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Limit provider requests by `http` rather than the default [`HttpTimeouts`].
+    pub fn with_http_timeouts(mut self, http: HttpTimeouts) -> Self {
+        self.http = http;
+        self
     }
 
     /// Sync one account now, whether or not it is enabled or due. Fails only if the account
     /// doesn't exist or is already syncing; everything else is reported in the result.
     pub async fn sync_account(&self, account_id: &str) -> Result<SyncResult, SyncError> {
-        self.sync_started_at(account_id, Utc::now()).await
-    }
-
-    /// [`sync_account`](Self::sync_account), recording the attempt for the scheduler as made
-    /// at `started` (intervals run from one attempt's start to the next).
-    async fn sync_started_at(
-        &self,
-        account_id: &str,
-        started: DateTime<Utc>,
-    ) -> Result<SyncResult, SyncError> {
-        let _running = self.claim(account_id)?;
-        let account = self
-            .manager
-            .lock()
-            .get_account(account_id)
-            .ok_or_else(|| SyncError::AccountNotFound(account_id.into()))?;
-        let name = account.name.clone();
-        let result = self.run(account).await;
-        let failures = self.record_attempt(&result, started);
-        if result.errors.is_empty() {
-            tracing::info!(
-                account = %name,
-                provider = %result.provider,
-                fetched = result.articles_fetched,
-                synced = result.articles_synced,
-                already_synced = result.articles_already_synced,
-                "read-later sync done"
-            );
-        } else {
-            tracing::warn!(
-                account = %name,
-                provider = %result.provider,
-                fetched = result.articles_fetched,
-                synced = result.articles_synced,
-                failures_in_a_row = failures,
-                errors = ?result.errors,
-                "read-later sync had errors"
-            );
-        }
-        Ok(result)
+        let (_running, account) = self.claim(account_id)?;
+        Ok(self.run_logged(account, Trigger::Manual, Utc::now()).await)
     }
 
     /// Sync every enabled account, one after another (oldest account first).
     pub async fn sync_all(&self) -> SyncAllReport {
-        let mut accounts: Vec<ProviderAccount> = self
-            .manager
-            .lock()
-            .list_accounts()
+        let accounts: Vec<ProviderAccount> = self
+            .accounts_oldest_first()
             .into_iter()
             .filter(|a| a.enabled)
             .collect();
-        accounts.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
         let mut report = SyncAllReport::default();
         for account in accounts {
-            match self.sync_account(&account.id).await {
-                Ok(result) => report.results.push(result),
+            match self.sync_if_allowed(&account.id, Trigger::All).await {
+                Ok(Some(result)) => report.results.push(result),
+                // Disabled since it was listed.
+                Ok(None) => {}
                 Err(SyncError::AlreadyRunning(id)) => report.already_running.push(id),
                 // Deleted since it was listed.
                 Err(SyncError::AccountNotFound(_)) => {}
@@ -229,14 +253,18 @@ impl ReadLaterSyncer {
     }
 
     /// One scheduler pass: sync each account that is due at `now` (enabled, `auto_sync`, and
-    /// its interval, stretched by backoff after failures, has passed), one after another, and
-    /// return the results. With no accounts it returns at once, touching neither the network
-    /// nor the sync tree.
+    /// its interval, stretched by backoff after failures, has passed), one after another (oldest
+    /// account first), and return the results. Each account is checked again just before its
+    /// sync, so one disabled, or synced by request, while an earlier one ran is skipped. With no
+    /// accounts it returns at once, touching neither the network nor the sync tree.
     pub async fn run_due(&self, now: DateTime<Utc>) -> Vec<SyncResult> {
-        let accounts = self.manager.lock().list_accounts();
+        let accounts = self.accounts_oldest_first();
         let due: Vec<String> = {
             let mut attempts = self.attempts.lock();
             attempts.retain(|id, _| accounts.iter().any(|a| a.id == *id));
+            self.item_failures
+                .lock()
+                .retain(|(id, _), _| accounts.iter().any(|a| a.id == *id));
             accounts
                 .iter()
                 .filter(|a| is_due(a, attempts.get(&a.id), now))
@@ -245,8 +273,9 @@ impl ReadLaterSyncer {
         };
         let mut results = Vec::new();
         for id in due {
-            match self.sync_started_at(&id, now).await {
-                Ok(result) => results.push(result),
+            match self.sync_if_allowed(&id, Trigger::Scheduled(now)).await {
+                Ok(Some(result)) => results.push(result),
+                Ok(None) => tracing::debug!(account = %id, "no longer due; not synced"),
                 Err(e) => tracing::debug!("scheduled read-later sync skipped: {e}"),
             }
         }
@@ -255,11 +284,12 @@ impl ReadLaterSyncer {
 
     /// Run [`run_due`](Self::run_due) every `tick` (which must be non-zero), the first time one
     /// tick after startup rather than while the server and the tablet reconnect. Passes never
-    /// overlap.
+    /// overlap. Logs each account's schedule first.
     pub fn spawn_scheduler(
         self: Arc<Self>,
         tick: std::time::Duration,
     ) -> tokio::task::JoinHandle<()> {
+        self.log_schedule(tick);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + tick, tick);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -270,34 +300,144 @@ impl ReadLaterSyncer {
         })
     }
 
-    fn claim(&self, account_id: &str) -> Result<Running<'_>, SyncError> {
+    fn log_schedule(&self, tick: std::time::Duration) {
+        let accounts = self.accounts_oldest_first();
+        tracing::info!(
+            tick_secs = tick.as_secs(),
+            accounts = accounts.len(),
+            "read-later scheduler started; first pass after one tick"
+        );
+        for a in accounts {
+            let s = &a.sync_settings;
+            tracing::info!(
+                account = %a.name,
+                id = %a.id,
+                provider = %a.provider,
+                scheduled = schedulable(&a),
+                every_minutes = interval(&a).num_minutes(),
+                max_articles = s.max_articles,
+                format = ?s.convert_format,
+                folder = s.folder_id.as_deref().unwrap_or("(top level)"),
+                last_sync = ?a.last_sync,
+                "read-later account"
+            );
+        }
+    }
+
+    fn accounts_oldest_first(&self) -> Vec<ProviderAccount> {
+        let mut accounts = self.manager.lock().list_accounts();
+        accounts.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        accounts
+    }
+
+    /// Take `account_id`'s place in [`running`](Self::running) and load the account as it is
+    /// now.
+    fn claim(&self, account_id: &str) -> Result<(Running<'_>, ProviderAccount), SyncError> {
         if !self.running.lock().insert(account_id.to_owned()) {
             return Err(SyncError::AlreadyRunning(account_id.into()));
         }
-        Ok(Running {
+        let running = Running {
             set: &self.running,
             id: account_id.to_owned(),
-        })
+        };
+        let account = self
+            .manager
+            .lock()
+            .get_account(account_id)
+            .ok_or_else(|| SyncError::AccountNotFound(account_id.into()))?;
+        Ok((running, account))
+    }
+
+    /// Sync `account_id` if `trigger` still allows it once claimed; `None` if not.
+    async fn sync_if_allowed(
+        &self,
+        account_id: &str,
+        trigger: Trigger,
+    ) -> Result<Option<SyncResult>, SyncError> {
+        let (_running, account) = self.claim(account_id)?;
+        let (allowed, started) = match trigger {
+            Trigger::Scheduled(now) => (
+                is_due(&account, self.attempts.lock().get(account_id), now),
+                now,
+            ),
+            _ => (trigger.allows(&account), Utc::now()),
+        };
+        if !allowed {
+            return Ok(None);
+        }
+        Ok(Some(self.run_logged(account, trigger, started).await))
+    }
+
+    /// Run a claimed account's sync, record the attempt for the scheduler as made at `started`
+    /// (intervals run from one attempt's start to the next) and log the outcome.
+    async fn run_logged(
+        &self,
+        account: ProviderAccount,
+        trigger: Trigger,
+        started: DateTime<Utc>,
+    ) -> SyncResult {
+        let name = account.name.clone();
+        let (result, failed) = self.run(account, trigger).await;
+        let failures = self.record_attempt(&result.account_id, failed, started);
+        if result.errors.is_empty() {
+            tracing::info!(
+                account = %name,
+                provider = %result.provider,
+                fetched = result.articles_fetched,
+                synced = result.articles_synced,
+                already_synced = result.articles_already_synced,
+                statuses_sent = result.read_status_synced,
+                "read-later sync done"
+            );
+        } else {
+            tracing::warn!(
+                account = %name,
+                provider = %result.provider,
+                fetched = result.articles_fetched,
+                synced = result.articles_synced,
+                statuses_sent = result.read_status_synced,
+                account_failed = failed,
+                failures_in_a_row = failures,
+                errors = ?result.errors,
+                "read-later sync had errors"
+            );
+        }
+        result
     }
 
     /// Remember this attempt for the scheduler; returns the account's failures in a row.
-    fn record_attempt(&self, result: &SyncResult, at: DateTime<Utc>) -> u32 {
+    fn record_attempt(&self, account_id: &str, failed: bool, at: DateTime<Utc>) -> u32 {
         let mut attempts = self.attempts.lock();
-        let failures = if result.errors.is_empty() {
-            0
-        } else {
+        let failures = if failed {
             attempts
-                .get(&result.account_id)
+                .get(account_id)
                 .map_or(0, |a| a.failures)
                 .saturating_add(1)
+        } else {
+            0
         };
-        attempts.insert(result.account_id.clone(), Attempt { at, failures });
+        attempts.insert(account_id.to_owned(), Attempt { at, failures });
         failures
     }
 
-    async fn run(&self, mut account: ProviderAccount) -> SyncResult {
+    /// Count one more failed sync for `item`; returns its failures in a row.
+    fn item_failed(&self, account_id: &str, item: Item) -> u32 {
+        let mut failures = self.item_failures.lock();
+        let n = failures.entry((account_id.to_owned(), item)).or_insert(0);
+        *n = n.saturating_add(1);
+        *n
+    }
+
+    fn item_done(&self, account_id: &str, item: Item) {
+        self.item_failures
+            .lock()
+            .remove(&(account_id.to_owned(), item));
+    }
+
+    /// Run the sync; returns its result and whether the account as a whole failed.
+    async fn run(&self, account: ProviderAccount, trigger: Trigger) -> (SyncResult, bool) {
         let started = std::time::Instant::now();
-        let mut result = SyncResult {
+        let result = SyncResult {
             account_id: account.id.clone(),
             provider: account.provider,
             articles_fetched: 0,
@@ -309,147 +449,326 @@ impl ReadLaterSyncer {
             duration_ms: 0,
             completed_at: Utc::now(),
         };
-        // A discontinued provider (Omnivore) is an error for this account only.
-        match provider_for(account.provider) {
+        let (mut result, failed) = match provider_with_timeouts(account.provider, self.http) {
             Ok(provider) => {
-                self.run_with(provider.as_ref(), &mut account, &mut result)
-                    .await
+                let mut run = Run {
+                    syncer: self,
+                    provider: provider.as_ref(),
+                    account,
+                    trigger,
+                    result,
+                    failed: false,
+                    retry: false,
+                    unreachable: 0,
+                };
+                run.sync().await;
+                (run.result, run.failed)
             }
-            Err(e) => result.errors.push(e.to_string()),
-        }
+            // A discontinued provider (Omnivore) is an error for this account only.
+            Err(e) => {
+                let mut result = result;
+                result.errors.push(e.to_string());
+                (result, true)
+            }
+        };
         result.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         result.completed_at = Utc::now();
-        result
+        (result, failed)
     }
+}
 
-    async fn run_with(
-        &self,
-        provider: &dyn ReadLaterProviderTrait,
-        account: &mut ProviderAccount,
-        result: &mut SyncResult,
-    ) {
+/// One account's sync in progress.
+struct Run<'a> {
+    syncer: &'a ReadLaterSyncer,
+    provider: &'a dyn ReadLaterProviderTrait,
+    account: ProviderAccount,
+    trigger: Trigger,
+    result: SyncResult,
+    /// The account as a whole failed (the scheduler backs off).
+    failed: bool,
+    /// Something is to be retried over the same window, so `last_sync` stays.
+    retry: bool,
+    /// Provider requests in a row that didn't get through.
+    unreachable: u32,
+}
+
+impl Run<'_> {
+    async fn sync(&mut self) {
         // Refresh once (a no-op unless the token is missing, expired or about to be) so the
         // calls below don't each refresh. A failed refresh ends the sync before anything else.
-        match provider.refresh_auth(&account.config).await {
+        match self.provider.refresh_auth(&self.account.config).await {
             Ok(config) => {
-                let refreshed = provider.take_refreshed_config().is_some();
-                account.config = config;
+                let refreshed = self.provider.take_refreshed_config().is_some();
+                self.account.config = config;
                 if refreshed {
-                    self.persist_config(account, &mut result.errors);
+                    self.persist_config();
                 }
             }
-            Err(e) => {
-                result.errors.push(format!("Auth refresh: {e}"));
-                return;
+            Err(e) => return self.fail(format!("Auth refresh: {e}")),
+        }
+
+        if self.account.sync_settings.sync_read_status {
+            self.send_read_status().await;
+            if self.failed {
+                return; // the provider seems unreachable
             }
         }
 
         let window_start = Utc::now();
-        let fetched = provider
-            .fetch_articles(&account.config, account.last_sync)
+        let fetched = self
+            .provider
+            .fetch_articles(&self.account.config, self.account.last_sync)
             .await;
-        self.absorb_refreshed(provider, account, &mut result.errors);
-        let complete = match fetched {
+        self.absorb_refreshed();
+        match fetched {
             Ok(articles) => {
-                result.articles_fetched = u32::try_from(articles.len()).unwrap_or(u32::MAX);
-                self.deliver_new(provider, account, articles, result).await
+                self.result.articles_fetched = u32::try_from(articles.len()).unwrap_or(u32::MAX);
+                self.deliver_new(articles).await;
             }
-            Err(e) => {
-                result.errors.push(format!("Fetch: {e}"));
-                false
-            }
-        };
-
-        if account.sync_settings.sync_read_status {
-            self.push_read_status(provider, account, result).await;
+            Err(e) => return self.fail(format!("Fetch: {e}")),
         }
 
-        if complete {
-            let saved = self.manager.lock().set_last_sync(&account.id, window_start);
+        if !self.retry {
+            let saved = self
+                .syncer
+                .manager
+                .lock()
+                .set_last_sync(&self.account.id, window_start);
             if let Err(e) = saved {
-                result.errors.push(format!("Save last sync: {e}"));
+                self.result.errors.push(format!("Save last sync: {e}"));
             }
         }
+    }
+
+    /// The account as a whole failed: report `message`, retry the window, back off.
+    fn fail(&mut self, message: String) {
+        self.result.errors.push(message);
+        self.failed = true;
+        self.retry = true;
+    }
+
+    /// A provider request didn't get through: returns whether to stop, the provider seeming
+    /// unreachable ([`MAX_UNREACHABLE`] requests in a row failed so), which fails the sync.
+    fn unreachable(&mut self) -> bool {
+        self.unreachable += 1;
+        if self.unreachable < MAX_UNREACHABLE {
+            return false;
+        }
+        self.fail(format!(
+            "Stopped: {} requests in a row didn't get through",
+            self.unreachable
+        ));
+        true
+    }
+
+    /// An article (or status change) the provider or converter rejected, reported as `message`.
+    /// It holds `last_sync` back until it has failed [`MAX_ITEM_FAILURES`] syncs in a row;
+    /// returns whether it has now.
+    fn item_rejected(&mut self, item: Item, message: String) -> bool {
+        self.result.errors.push(message);
+        let failures = self.syncer.item_failed(&self.account.id, item.clone());
+        if failures < MAX_ITEM_FAILURES {
+            if matches!(item, Item::Article(_)) {
+                self.retry = true;
+            }
+            return false;
+        }
+        if failures == MAX_ITEM_FAILURES {
+            tracing::warn!(
+                account = %self.account.name,
+                ?item,
+                failures,
+                "read-later item keeps failing; it no longer holds the account back"
+            );
+        }
+        true
     }
 
     /// Adopt a token refresh the provider did inside its last call (e.g. a retry after a 401)
     /// and persist it at once.
-    fn absorb_refreshed(
-        &self,
-        provider: &dyn ReadLaterProviderTrait,
-        account: &mut ProviderAccount,
-        errors: &mut Vec<String>,
-    ) {
-        if let Some(config) = provider.take_refreshed_config() {
-            account.config = config;
-            self.persist_config(account, errors);
+    fn absorb_refreshed(&mut self) {
+        if let Some(config) = self.provider.take_refreshed_config() {
+            self.account.config = config;
+            self.persist_config();
         }
     }
 
-    fn persist_config(&self, account: &ProviderAccount, errors: &mut Vec<String>) {
+    fn persist_config(&mut self) {
         let saved = self
+            .syncer
             .manager
             .lock()
-            .update_account_config(&account.id, &account.config);
+            .update_account_config(&self.account.id, &self.account.config);
         if let Err(e) = saved {
-            errors.push(format!("Persist refreshed credentials: {e}"));
+            self.result
+                .errors
+                .push(format!("Persist refreshed credentials: {e}"));
         }
     }
 
-    /// Record the selected articles and put the ones not yet on the device there. Returns
-    /// whether every selected article is now recorded and, unless the account's format is
-    /// HTML, on the device.
-    async fn deliver_new(
-        &self,
-        provider: &dyn ReadLaterProviderTrait,
-        account: &mut ProviderAccount,
-        articles: Vec<Article>,
-        result: &mut SyncResult,
-    ) -> bool {
-        let mut complete = true;
-        let mut pending = Vec::new();
-        {
-            let mut manager = self.manager.lock();
-            for mut article in select_articles_for_sync(articles, &account.sync_settings) {
-                // Content is fetched per article on delivery; don't keep it in memory.
-                article.content = None;
-                // Keeps the id and device state of an article seen before.
-                match manager.upsert_article(&article) {
-                    Ok(stored) if stored.synced_to_device => result.articles_already_synced += 1,
-                    Ok(stored) => pending.push(stored),
-                    Err(e) => {
-                        result
+    /// Whether the account may still be synced this way: not if it was deleted, or disabled
+    /// (or, for a scheduled sync, its `auto_sync` turned off) since the sync started.
+    fn still_allowed(&mut self) -> bool {
+        let current = self.syncer.manager.lock().get_account(&self.account.id);
+        let why = match current {
+            Some(account) if self.trigger.allows(&account) => return true,
+            Some(_) => "the account was disabled (or its auto_sync turned off)",
+            None => "the account was deleted",
+        };
+        self.result
+            .errors
+            .push(format!("Stopped: {why} during the sync"));
+        self.retry = true;
+        false
+    }
+
+    /// Send the provider the status changes made here to this account's articles.
+    async fn send_read_status(&mut self) {
+        let changes = self
+            .syncer
+            .manager
+            .lock()
+            .pending_read_status(&self.account.id);
+        for article in changes {
+            let sent = self
+                .provider
+                .update_read_status(&self.account.config, &article.provider_id, article.status)
+                .await;
+            self.absorb_refreshed();
+            let item = Item::Status(article.id.clone());
+            let e = match sent {
+                Ok(()) => {
+                    self.unreachable = 0;
+                    self.syncer.item_done(&self.account.id, item);
+                    self.result.read_status_synced += 1;
+                    let recorded = self
+                        .syncer
+                        .manager
+                        .lock()
+                        .read_status_sent(&article.id, article.status);
+                    if let Err(e) = recorded {
+                        self.result
                             .errors
-                            .push(format!("Save {}: {e}", article.provider_id));
-                        complete = false;
+                            .push(format!("Record status of {}: {e}", article.id));
                     }
+                    continue;
+                }
+                Err(e) => e,
+            };
+            let message = format!("Status {}: {e}", article.id);
+            if matches!(e, ReadLaterError::Network(_)) {
+                // Not the change's fault; it stays pending for the next sync.
+                self.result.errors.push(message);
+                if self.unreachable() {
+                    return;
+                }
+                continue;
+            }
+            self.unreachable = 0;
+            if self.item_rejected(item.clone(), message) {
+                self.syncer.item_done(&self.account.id, item);
+                let dropped = self
+                    .syncer
+                    .manager
+                    .lock()
+                    .drop_read_status_change(&article.id);
+                if let Err(e) = dropped {
+                    self.result
+                        .errors
+                        .push(format!("Drop status change of {}: {e}", article.id));
                 }
             }
         }
-        let format = account.sync_settings.convert_format;
+    }
+
+    /// Record the selected articles and put the ones not yet on the device there.
+    async fn deliver_new(&mut self, articles: Vec<Article>) {
+        let selected: Vec<Article> =
+            select_articles_for_sync(articles, &self.account.sync_settings)
+                .into_iter()
+                .map(|mut article| {
+                    // Content is fetched per article on delivery; don't keep it in memory.
+                    article.content = None;
+                    article
+                })
+                .collect();
+        if selected.is_empty() {
+            return;
+        }
+        let manager = Arc::clone(&self.syncer.manager);
+        let account_id = self.account.id.clone();
+        let keep_pending = self.account.sync_settings.sync_read_status;
+        let recorded = tokio::task::spawn_blocking(move || {
+            manager
+                .lock()
+                .record_fetched(&account_id, keep_pending, selected)
+        })
+        .await;
+        let recorded = match recorded {
+            Ok(Ok(recorded)) => recorded,
+            Ok(Err(e)) => return self.fail(format!("Save articles: {e}")),
+            Err(e) => return self.fail(format!("Save articles: {e}")),
+        };
+        let mut pending = Vec::new();
+        for r in recorded {
+            match r {
+                Recorded::Stored(article) if article.synced_to_device => {
+                    self.result.articles_already_synced += 1;
+                }
+                Recorded::Stored(article) => pending.push(article),
+                Recorded::OtherAccount { provider_id, owner } => self.result.errors.push(format!(
+                    "Skip {provider_id}: already recorded for account {owner} (articles are \
+                     unique per provider id)"
+                )),
+            }
+        }
+        let format = self.account.sync_settings.convert_format;
         if pending.is_empty() || format == ArticleFormat::Html {
-            return complete;
+            return;
         }
 
-        let folder = account.sync_settings.folder_id.clone().unwrap_or_default();
-        let generation_before = self.storage.get_root().generation;
+        let folder = self
+            .account
+            .sync_settings
+            .folder_id
+            .clone()
+            .unwrap_or_default();
+        let generation_before = self.syncer.storage.get_root().generation;
         let mut parent = None;
         for article in pending {
-            let content = provider
-                .fetch_article_content(&account.config, &article)
+            if !self.still_allowed() {
+                break;
+            }
+            let content = self
+                .provider
+                .fetch_article_content(&self.account.config, &article)
                 .await;
-            self.absorb_refreshed(provider, account, &mut result.errors);
+            self.absorb_refreshed();
+            let item = Item::Article(article.provider_id.clone());
             let content = match content {
-                Ok(content) => content,
+                Ok(content) => {
+                    self.unreachable = 0;
+                    content
+                }
                 Err(e) => {
-                    result.errors.push(format!("Content {}: {e}", article.id));
-                    complete = false;
+                    let message = format!("Content {}: {e}", article.id);
+                    if matches!(e, ReadLaterError::Network(_)) {
+                        // Not the article's fault: retried over the same window.
+                        self.result.errors.push(message);
+                        self.retry = true;
+                        if self.unreachable() {
+                            break;
+                        }
+                    } else {
+                        self.unreachable = 0;
+                        self.item_rejected(item, message);
+                    }
                     continue;
                 }
             };
             let delivery = Delivery {
-                storage: self.storage.clone(),
-                manager: Arc::clone(&self.manager),
+                storage: self.syncer.storage.clone(),
+                manager: Arc::clone(&self.syncer.manager),
                 folder: folder.clone(),
                 parent: parent.clone(),
                 article,
@@ -459,73 +778,66 @@ impl ReadLaterSyncer {
             let outcome = match tokio::task::spawn_blocking(move || delivery.run()).await {
                 Ok(outcome) => outcome,
                 Err(e) => {
-                    result.errors.push(format!("Deliver: {e}"));
-                    complete = false;
-                    continue;
+                    self.fail(format!("Deliver: {e}"));
+                    break;
                 }
             };
-            result.articles_converted += u32::from(outcome.converted);
-            result.articles_synced += u32::from(outcome.document_id.is_some());
+            self.result.articles_converted += u32::from(outcome.converted);
+            self.result.articles_synced += u32::from(outcome.document_id.is_some());
             if outcome.parent.is_some() {
                 parent = outcome.parent;
             }
-            if let Some(failure) = outcome.failure {
-                result.errors.push(failure.message);
-                complete = false;
-                // The tree refused the change (e.g. a root index we won't rewrite); the rest
-                // would be refused the same way.
-                if failure.stage == Stage::Tree {
+            match outcome.failure {
+                None => self.syncer.item_done(&self.account.id, item),
+                Some(failure) if failure.stage == Stage::Render => {
+                    self.item_rejected(item, failure.message);
+                }
+                // The tree refused the change (e.g. a root index we won't rewrite), and the
+                // rest would be refused the same way; or a delivery couldn't be recorded, and
+                // the next one wouldn't be either (it would be added again).
+                Some(failure) => {
+                    self.fail(failure.message);
                     break;
                 }
             }
         }
 
-        let root = self.storage.get_root();
+        let root = self.syncer.storage.get_root();
         if root.generation != generation_before {
             // Tell connected devices to pull the new root, as document uploads do.
-            let _ = self.notification_tx.send(WsMessage::sync_complete(
+            let _ = self.syncer.notification_tx.send(WsMessage::sync_complete(
                 root.generation,
                 SOURCE_DEVICE,
                 DEVICE_USER,
             ));
         }
-        complete
-    }
-
-    async fn push_read_status(
-        &self,
-        provider: &dyn ReadLaterProviderTrait,
-        account: &mut ProviderAccount,
-        result: &mut SyncResult,
-    ) {
-        let articles = self.manager.lock().read_status_candidates(account.provider);
-        for article in articles {
-            let updated = provider
-                .update_read_status(&account.config, &article.provider_id, article.status)
-                .await;
-            self.absorb_refreshed(provider, account, &mut result.errors);
-            match updated {
-                Ok(()) => result.read_status_synced += 1,
-                Err(e) => result.errors.push(format!("Status {}: {e}", article.id)),
-            }
-        }
     }
 }
 
-/// Whether the scheduler should sync `account` at `now`: it is enabled with `auto_sync`, its
-/// provider still exists, and its interval (at least [`MIN_INTERVAL_MINUTES`]) has passed since
-/// this process last tried it — stretched by [`retry_after`] after failures — or, if not tried
-/// yet, since its last successful sync.
+/// Whether the scheduler syncs `account` at all: enabled, `auto_sync`, and its provider still
+/// exists.
+fn schedulable(account: &ProviderAccount) -> bool {
+    account.enabled
+        && account.sync_settings.auto_sync
+        && account.provider != ReadLaterProvider::Omnivore
+}
+
+/// The account's time between scheduled syncs: its `sync_interval_minutes`, at least
+/// [`MIN_INTERVAL_MINUTES`].
+fn interval(account: &ProviderAccount) -> Duration {
+    Duration::minutes(
+        i64::from(account.sync_settings.sync_interval_minutes).max(MIN_INTERVAL_MINUTES),
+    )
+}
+
+/// Whether the scheduler should sync `account` at `now`: it is [`schedulable`] and its
+/// [`interval`] has passed since this process last tried it — stretched by [`retry_after`]
+/// after failures — or, if not tried yet, since its last successful sync.
 fn is_due(account: &ProviderAccount, attempt: Option<&Attempt>, now: DateTime<Utc>) -> bool {
-    if !account.enabled
-        || !account.sync_settings.auto_sync
-        || account.provider == ReadLaterProvider::Omnivore
-    {
+    if !schedulable(account) {
         return false;
     }
-    let interval = Duration::minutes(
-        i64::from(account.sync_settings.sync_interval_minutes).max(MIN_INTERVAL_MINUTES),
-    );
+    let interval = interval(account);
     match attempt {
         Some(attempt) => now - attempt.at >= retry_after(interval, attempt.failures),
         None => account.last_sync.is_none_or(|last| now - last >= interval),
@@ -666,21 +978,31 @@ mod tests {
 
     use super::*;
     use crate::readlater::test_support::{spawn_server, test_account, wallabag_config};
-    use crate::readlater::{ProviderConfig, SyncSettings};
+    use crate::readlater::{ProviderConfig, ReadStatus, SyncSettings};
     use crate::readlater_api::{ReadLaterState, readlater_router};
 
     /// A Wallabag instance. `/api/entries.json` lists `entries` whatever `since` says, so every
-    /// sync sees them all again; `/api/entries/{id}.json` serves one entry's content.
+    /// sync sees them all again; `/api/entries/{id}.json` serves one entry's content (GET) and
+    /// archives or unarchives it (PATCH).
     #[derive(Default)]
     struct MockWallabag {
         entries: Mutex<Vec<Value>>,
         /// Access token the API accepts, and the token endpoint issues.
         valid_token: String,
         fail_list: AtomicBool,
+        /// List requests never get an answer.
+        hang_list: AtomicBool,
         /// Entry ids whose content request fails.
         fail_content: Mutex<HashSet<i64>>,
+        /// Content requests never get an answer.
+        hang_content: AtomicBool,
+        /// Entry ids whose PATCH fails.
+        fail_patch: Mutex<HashSet<i64>>,
+        /// `(entry id, archive)` of every PATCH that succeeded.
+        patches: Mutex<Vec<(i64, i64)>>,
         list_calls: AtomicUsize,
         content_calls: AtomicUsize,
+        patch_calls: AtomicUsize,
         token_requests: Mutex<Vec<HashMap<String, String>>>,
         /// When set, a list request signals `listing`, then waits for a permit.
         gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
@@ -704,6 +1026,9 @@ mod tests {
             return Err(StatusCode::UNAUTHORIZED);
         }
         m.list_calls.fetch_add(1, Ordering::SeqCst);
+        if m.hang_list.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         let gate = m.gate.lock().clone();
         if let Some(gate) = gate {
             m.listing.notify_one();
@@ -729,10 +1054,53 @@ mod tests {
             .and_then(|id| id.parse().ok())
             .ok_or(StatusCode::NOT_FOUND)?;
         m.content_calls.fetch_add(1, Ordering::SeqCst);
+        if m.hang_content.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         if m.fail_content.lock().contains(&id) {
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
         Ok(Json(json!({"content": format!("<p>Body of {id}</p>")})))
+    }
+
+    async fn patch_entry(
+        State(m): State<Arc<MockWallabag>>,
+        headers: HeaderMap,
+        UrlPath(file): UrlPath<String>,
+        Json(body): Json<Value>,
+    ) -> Result<Json<Value>, StatusCode> {
+        if !m.authorized(&headers) {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        let id: i64 = file
+            .strip_suffix(".json")
+            .and_then(|id| id.parse().ok())
+            .ok_or(StatusCode::NOT_FOUND)?;
+        m.patch_calls.fetch_add(1, Ordering::SeqCst);
+        if m.fail_patch.lock().contains(&id) {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        let archive = body["archive"].as_i64().ok_or(StatusCode::BAD_REQUEST)?;
+        m.patches.lock().push((id, archive));
+        for e in m.entries.lock().iter_mut().filter(|e| e["id"] == id) {
+            e["is_archived"] = json!(archive);
+        }
+        Ok(Json(json!({"id": id, "is_archived": archive})))
+    }
+
+    /// Serve a [`MockWallabag`] listing `entries`; returns it and its base URL.
+    async fn spawn_mock(entries: Vec<Value>) -> (Arc<MockWallabag>, String) {
+        let mock = Arc::new(MockWallabag {
+            entries: Mutex::new(entries),
+            valid_token: "tok".into(),
+            ..Default::default()
+        });
+        let app = axum::Router::new()
+            .route("/oauth/v2/token", post(issue_token))
+            .route("/api/entries.json", get(list_entries))
+            .route("/api/entries/{file}", get(get_entry).patch(patch_entry))
+            .with_state(Arc::clone(&mock));
+        (mock, spawn_server(app).await)
     }
 
     async fn issue_token(
@@ -771,23 +1139,24 @@ mod tests {
 
     impl Fixture {
         async fn new(entries: Vec<Value>) -> Self {
+            Self::with_timeouts(entries, HttpTimeouts::default()).await
+        }
+
+        /// A fixture whose syncer limits provider requests by `http`.
+        async fn with_timeouts(entries: Vec<Value>, http: HttpTimeouts) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let db = dir.path().join("rl.db");
             let storage = Storage::new(dir.path().join("storage")).unwrap();
-            let (tx, rx) = broadcast::channel(16);
-            let state =
-                ReadLaterState::new(ReadLaterManager::new(&db).unwrap(), storage.clone(), tx);
-            let mock = Arc::new(MockWallabag {
-                entries: Mutex::new(entries),
-                valid_token: "tok".into(),
-                ..Default::default()
-            });
-            let app = axum::Router::new()
-                .route("/oauth/v2/token", post(issue_token))
-                .route("/api/entries.json", get(list_entries))
-                .route("/api/entries/{file}", get(get_entry))
-                .with_state(Arc::clone(&mock));
-            let base = spawn_server(app).await;
+            let (tx, rx) = broadcast::channel(64);
+            let manager = Arc::new(Mutex::new(ReadLaterManager::new(&db).unwrap()));
+            let syncer = ReadLaterSyncer::new(Arc::clone(&manager), storage.clone(), tx)
+                .with_http_timeouts(http);
+            let state = ReadLaterState {
+                manager,
+                syncer: Arc::new(syncer),
+                scheduler: None,
+            };
+            let (mock, base) = spawn_mock(entries).await;
             Self {
                 _dir: dir,
                 db,
@@ -803,10 +1172,16 @@ mod tests {
             &self.state.syncer
         }
 
-        /// Add a Wallabag account with a valid token; `settings` adjusts its sync settings.
+        /// Add a Wallabag account on the fixture's mock with a valid token; `settings` adjusts
+        /// its sync settings.
         fn add_account(&self, id: &str, settings: impl FnOnce(&mut SyncSettings)) {
+            self.add_account_at(id, &self.base, settings);
+        }
+
+        /// [`add_account`](Self::add_account) on the Wallabag at `base`.
+        fn add_account_at(&self, id: &str, base: &str, settings: impl FnOnce(&mut SyncSettings)) {
             let config = wallabag_config(
-                &self.base,
+                base,
                 Some("tok"),
                 None,
                 Some(Utc::now() + Duration::hours(1)),
@@ -814,6 +1189,19 @@ mod tests {
             let mut account = test_account(id, ReadLaterProvider::Wallabag, config, None);
             settings(&mut account.sync_settings);
             self.state.manager.lock().add_account(account).unwrap();
+        }
+
+        /// The recorded article with this Wallabag entry id.
+        fn article(&self, entry_id: i64) -> Article {
+            self.articles()
+                .into_iter()
+                .find(|a| a.provider_id == entry_id.to_string())
+                .unwrap()
+        }
+
+        /// Consecutive failures the scheduler holds against the account.
+        fn account_failures(&self, id: &str) -> Option<u32> {
+            self.syncer().attempts.lock().get(id).map(|a| a.failures)
         }
 
         fn account(&self, id: &str) -> ProviderAccount {
@@ -885,6 +1273,21 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// A Wallabag config with no token and no way to get one: a refresh fails before any
+    /// request.
+    fn no_credentials(base: &str) -> ProviderConfig {
+        ProviderConfig::Wallabag {
+            instance_url: base.into(),
+            client_id: "c".into(),
+            client_secret: None,
+            access_token: None,
+            refresh_token: None,
+            token_expires_at: None,
+            username: None,
+            password: None,
+        }
     }
 
     fn post_request(uri: &str) -> Request<Body> {
@@ -1015,21 +1418,10 @@ mod tests {
     async fn failed_refresh_or_fetch_changes_nothing() {
         let mut f = Fixture::new(vec![entry(1)]).await;
         let last = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        // No token and no way to get one: the refresh fails before any request.
-        let no_credentials = ProviderConfig::Wallabag {
-            instance_url: f.base.clone(),
-            client_id: "c".into(),
-            client_secret: None,
-            access_token: None,
-            refresh_token: None,
-            token_expires_at: None,
-            username: None,
-            password: None,
-        };
         let account = test_account(
             "wb",
             ReadLaterProvider::Wallabag,
-            no_credentials,
+            no_credentials(&f.base),
             Some(last),
         );
         f.state.manager.lock().add_account(account).unwrap();
@@ -1446,5 +1838,388 @@ mod tests {
         assert_eq!(document_name(&article), "Title");
         article.title = " ".into();
         assert_eq!(document_name(&article), "https://ex.com/1");
+    }
+    /// An article the provider keeps refusing is reported on every sync but doesn't back the
+    /// account off, and holds `last_sync` back only until it has failed MAX_ITEM_FAILURES syncs
+    /// in a row. It is still retried while the provider lists it.
+    #[tokio::test]
+    async fn a_failing_article_does_not_back_off_the_account() {
+        let f = Fixture::new(vec![entry(1), entry(2)]).await;
+        f.add_account("wb", |s| s.sync_interval_minutes = 60);
+        f.mock.fail_content.lock().insert(2);
+        let now = Utc::now();
+        let pass = |minutes: i64| f.syncer().run_due(now + Duration::minutes(minutes));
+
+        for (failures, minutes) in (1..=MAX_ITEM_FAILURES).zip([0, 60, 120]) {
+            let r = pass(minutes).await;
+            assert_eq!(r.len(), 1, "due after the plain interval at {minutes}");
+            assert_eq!(r[0].errors.len(), 1, "{:?}", r[0].errors);
+            assert!(r[0].errors[0].starts_with("Content"), "{:?}", r[0].errors);
+            assert_eq!(f.account_failures("wb"), Some(0), "no backoff");
+            assert_eq!(
+                f.account("wb").last_sync.is_none(),
+                failures < MAX_ITEM_FAILURES,
+                "last_sync held back after {failures} failures"
+            );
+        }
+        assert_eq!(f.document_names(), ["Article 1"]);
+
+        f.mock.fail_content.lock().clear();
+        let r = pass(180).await;
+        assert!(r.len() == 1 && r[0].errors.is_empty(), "{r:?}");
+        assert_eq!(f.document_names(), ["Article 1", "Article 2"]);
+    }
+
+    /// A status changed here (`PUT /articles/{id}`) goes to the provider of the account that
+    /// recorded the article, once. Another account of the same provider (a second Wallabag
+    /// numbering its entries alike) never sends it, nor takes the article over.
+    #[tokio::test]
+    async fn status_changes_are_sent_once_by_their_own_account() {
+        let f = Fixture::new(vec![entry(1), entry(2)]).await;
+        f.add_account("wb", |_| {});
+        assert_eq!(
+            f.syncer().sync_account("wb").await.unwrap().articles_synced,
+            2
+        );
+        let app = readlater_router(f.state.clone());
+        let set_status = |status: &str| {
+            let body = json!({ "status": status }).to_string();
+            let request = Request::put(format!("/articles/{}", f.article(1).id))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            app.clone().oneshot(request)
+        };
+        assert_eq!(
+            set_status("archived").await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert!(f.article(1).read_status_pending);
+
+        let mut other_entry = entry(1);
+        other_entry["title"] = json!("Another instance's 1");
+        let (other, other_base) = spawn_mock(vec![other_entry, entry(3)]).await;
+        f.add_account_at("wb2", &other_base, |_| {});
+        let r = f.syncer().sync_account("wb2").await.unwrap();
+        assert_eq!((r.read_status_synced, r.articles_synced), (0, 1));
+        assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+        assert!(
+            r.errors[0].starts_with("Skip 1: already recorded for account wb"),
+            "{:?}",
+            r.errors
+        );
+        assert_eq!(f.account_failures("wb2"), Some(0));
+        assert!(f.account("wb2").last_sync.is_some());
+        assert_eq!(other.patch_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(f.mock.patch_calls.load(Ordering::SeqCst), 0);
+        let a = f.article(1);
+        assert_eq!(
+            (a.title.as_str(), a.account_id.as_deref()),
+            ("Article 1", Some("wb"))
+        );
+
+        let r = f.syncer().sync_account("wb").await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(r.read_status_synced, 1);
+        assert_eq!(*f.mock.patches.lock(), [(1, 1)]);
+        let a = f.article(1);
+        assert_eq!(
+            (a.status, a.read_status_pending),
+            (ReadStatus::Archived, false)
+        );
+
+        // Sent once, and setting the same status again is no change.
+        assert_eq!(
+            set_status("archived").await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert!(!f.article(1).read_status_pending);
+        let r = f.syncer().sync_account("wb").await.unwrap();
+        assert_eq!(r.read_status_synced, 0);
+        assert_eq!(f.mock.patch_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(f.document_names().len(), 3);
+    }
+
+    /// A status change the provider refuses stays pending and wins over the provider's status
+    /// when the article is fetched again, without backing the account off or holding
+    /// `last_sync` back; after MAX_ITEM_FAILURES refusals in a row it is dropped.
+    #[tokio::test]
+    async fn a_refused_status_change_survives_fetches_then_is_dropped() {
+        let f = Fixture::new(vec![entry(1)]).await;
+        f.add_account("wb", |_| {});
+        f.syncer().sync_account("wb").await.unwrap();
+        let mut article = f.article(1);
+        article.status = ReadStatus::Read;
+        article.read_status_pending = true;
+        f.state.manager.lock().save_article(&article).unwrap();
+        f.mock.fail_patch.lock().insert(1);
+
+        for failures in 1..=MAX_ITEM_FAILURES {
+            let r = f.syncer().sync_account("wb").await.unwrap();
+            assert_eq!(r.read_status_synced, 0);
+            assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+            assert!(r.errors[0].starts_with("Status"), "{:?}", r.errors);
+            assert_eq!(f.account_failures("wb"), Some(0));
+            assert!(f.account("wb").last_sync.is_some());
+            let a = f.article(1);
+            if failures < MAX_ITEM_FAILURES {
+                // Listed unread again, but the change made here is kept.
+                assert_eq!((a.status, a.read_status_pending), (ReadStatus::Read, true));
+            } else {
+                // Dropped: the provider's status is taken again.
+                assert_eq!(
+                    (a.status, a.read_status_pending),
+                    (ReadStatus::Unread, false)
+                );
+            }
+        }
+        let sent = f.mock.patch_calls.load(Ordering::SeqCst);
+        assert_eq!(sent, MAX_ITEM_FAILURES as usize);
+        f.syncer().sync_account("wb").await.unwrap();
+        assert_eq!(
+            f.mock.patch_calls.load(Ordering::SeqCst),
+            sent,
+            "not sent again"
+        );
+    }
+
+    /// Provider requests time out: a Wallabag that accepts connections and never answers can't
+    /// stall a scheduler pass or keep the account claimed. Content requests that don't get
+    /// through stop the sync after MAX_UNREACHABLE of them and back the account off.
+    #[tokio::test]
+    async fn a_hung_provider_times_out() {
+        let http = HttpTimeouts {
+            connect: std::time::Duration::from_secs(5),
+            request: std::time::Duration::from_millis(300),
+        };
+        let f = Fixture::with_timeouts(vec![entry(1), entry(2), entry(3)], http).await;
+        f.add_account("wb", |_| {});
+        let limit = std::time::Duration::from_secs(20);
+
+        f.mock.hang_list.store(true, Ordering::SeqCst);
+        let results = tokio::time::timeout(limit, f.syncer().run_due(Utc::now()))
+            .await
+            .expect("the pass ends");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].errors.len(), 1, "{:?}", results[0].errors);
+        assert!(results[0].errors[0].starts_with("Fetch"));
+        assert_eq!(f.account_failures("wb"), Some(1));
+
+        f.mock.hang_list.store(false, Ordering::SeqCst);
+        f.mock.hang_content.store(true, Ordering::SeqCst);
+        let r = tokio::time::timeout(limit, f.syncer().sync_account("wb"))
+            .await
+            .expect("the sync ends")
+            .expect("the account was released");
+        assert_eq!(
+            f.mock.content_calls.load(Ordering::SeqCst),
+            MAX_UNREACHABLE as usize
+        );
+        assert!(
+            r.errors.last().unwrap().starts_with("Stopped"),
+            "{:?}",
+            r.errors
+        );
+        assert_eq!(r.articles_synced, 0);
+        assert_eq!(f.account_failures("wb"), Some(2));
+        assert_eq!(f.account("wb").last_sync, None);
+    }
+
+    /// The scheduler's first pass comes one tick after it starts (not at once, while the
+    /// tablet reconnects), and passes keep coming every tick.
+    #[tokio::test(start_paused = true)]
+    async fn scheduler_passes_start_one_tick_after_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ReadLaterState::new(
+            ReadLaterManager::new(&dir.path().join("rl.db")).unwrap(),
+            Storage::new(dir.path().join("storage")).unwrap(),
+            broadcast::channel(4).0,
+        );
+        // Syncs of these fail before any request, so no I/O races the paused clock.
+        let add = |id: &str| {
+            let config = no_credentials("http://wb.invalid");
+            let account = test_account(id, ReadLaterProvider::Wallabag, config, None);
+            state.manager.lock().add_account(account).unwrap();
+        };
+        let tried = |id: &str| state.syncer.attempts.lock().contains_key(id);
+        let second = std::time::Duration::from_secs(1);
+        let tick = second * 60;
+        add("a");
+        let scheduler = Arc::clone(&state.syncer).spawn_scheduler(tick);
+
+        tokio::time::sleep(tick - second).await;
+        assert!(!tried("a"), "no pass before the first tick");
+        tokio::time::sleep(second * 2).await;
+        assert!(tried("a"), "a pass one tick after startup");
+        add("b");
+        tokio::time::sleep(tick).await;
+        assert!(tried("b"), "and one every tick");
+        scheduler.abort();
+    }
+
+    /// `with_scheduler` (what `feature_routes` calls) starts the scheduler unless it is off or
+    /// there is no runtime.
+    #[tokio::test]
+    async fn with_scheduler_starts_it_unless_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = |enabled: bool| {
+            ReadLaterState::new(
+                ReadLaterManager::new(&dir.path().join(format!("{enabled}.db"))).unwrap(),
+                Storage::new(dir.path().join("storage")).unwrap(),
+                broadcast::channel(4).0,
+            )
+            .with_scheduler(SchedulerConfig {
+                enabled,
+                tick: std::time::Duration::from_secs(60),
+            })
+        };
+        let on = state(true);
+        assert!(!on.scheduler.as_ref().expect("started").is_finished());
+        assert!(state(false).scheduler.is_none());
+    }
+
+    #[test]
+    fn with_scheduler_needs_a_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ReadLaterState::new(
+            ReadLaterManager::new(&dir.path().join("rl.db")).unwrap(),
+            Storage::new(dir.path().join("storage")).unwrap(),
+            broadcast::channel(4).0,
+        )
+        .with_scheduler(SchedulerConfig::from_vars(None, None));
+        assert!(state.scheduler.is_none());
+    }
+
+    /// A sync requested over HTTP runs to completion even if the client goes away mid-sync.
+    #[tokio::test]
+    async fn a_dropped_request_does_not_cut_the_sync_short() {
+        let mut f = Fixture::new(vec![entry(1), entry(2)]).await;
+        f.add_account("wb", |_| {});
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *f.mock.gate.lock() = Some(Arc::clone(&gate));
+
+        let mut request =
+            Box::pin(readlater_router(f.state.clone()).oneshot(post_request("/accounts/wb/sync")));
+        tokio::select! {
+            _ = &mut request => panic!("answered before the fetch"),
+            () = f.mock.listing.notified() => {}
+        }
+        drop(request); // the client goes away
+        *f.mock.gate.lock() = None;
+        gate.add_permits(1);
+
+        let next = async {
+            loop {
+                match f.syncer().sync_account("wb").await {
+                    Err(SyncError::AlreadyRunning(_)) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    other => break other.unwrap(),
+                }
+            }
+        };
+        let r = tokio::time::timeout(std::time::Duration::from_secs(10), next)
+            .await
+            .expect("the first sync ends");
+        // The first sync delivered both articles, so this one finds nothing new.
+        assert_eq!((r.articles_synced, r.articles_already_synced), (0, 2));
+        assert_eq!(f.document_names(), ["Article 1", "Article 2"]);
+        assert!(f.articles().iter().all(|a| a.synced_to_device));
+        assert_eq!(f.pushes().len(), 1);
+    }
+
+    /// `POST /sync` still answers 200 when an account fails, with the failure in its result
+    /// and the totals.
+    #[tokio::test]
+    async fn sync_all_reports_a_failing_account() {
+        let f = Fixture::new(vec![entry(1)]).await;
+        f.add_account("wb", |_| {});
+        f.mock.fail_list.store(true, Ordering::SeqCst);
+        let response = readlater_router(f.state.clone())
+            .oneshot(post_request("/sync"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(
+            (&body["total_errors"], &body["total_synced"]),
+            (&json!(1), &json!(0))
+        );
+        let errors = body["results"][0]["errors"].as_array().unwrap();
+        assert!(
+            errors[0].as_str().unwrap().starts_with("Fetch"),
+            "{errors:?}"
+        );
+    }
+
+    /// A sync writes back only `last_sync` (and refreshed credentials), so edits to the
+    /// account made while it runs are kept.
+    #[tokio::test]
+    async fn edits_made_during_a_sync_are_kept() {
+        let f = Fixture::new(vec![entry(1)]).await;
+        f.add_account("wb", |_| {});
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *f.mock.gate.lock() = Some(Arc::clone(&gate));
+        let syncer = Arc::clone(&f.state.syncer);
+        let sync = tokio::spawn(async move { syncer.sync_account("wb").await });
+        f.mock.listing.notified().await;
+
+        let mut edited = f.account("wb");
+        edited.name = "Renamed".into();
+        edited.sync_settings.max_articles = 7;
+        f.state.manager.lock().update_account(edited).unwrap();
+        gate.add_permits(1);
+        let r = sync.await.unwrap().unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+
+        let reopened = ReadLaterManager::new(&f.db).unwrap();
+        let account = reopened.get_account("wb").unwrap();
+        assert_eq!(
+            (account.name.as_str(), account.sync_settings.max_articles),
+            ("Renamed", 7)
+        );
+        assert!(account.last_sync.is_some());
+    }
+
+    /// A scheduled pass checks each account again right before its sync and before each
+    /// delivery: an account disabled during its own sync stops delivering, and one whose
+    /// `auto_sync` was turned off while an earlier account ran is skipped.
+    #[tokio::test]
+    async fn disabling_accounts_stops_a_scheduled_pass() {
+        let mut f = Fixture::new(vec![entry(1), entry(2)]).await;
+        f.add_account("a", |_| {});
+        let (other, other_base) = spawn_mock(vec![entry(3)]).await;
+        f.add_account_at("b", &other_base, |_| {});
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *f.mock.gate.lock() = Some(Arc::clone(&gate));
+        let syncer = Arc::clone(&f.state.syncer);
+        let now = Utc::now();
+        let pass = tokio::spawn(async move { syncer.run_due(now).await });
+        f.mock.listing.notified().await; // "a", the older account, is fetching
+
+        let mut a = f.account("a");
+        a.enabled = false;
+        f.state.manager.lock().update_account(a).unwrap();
+        let mut b = f.account("b");
+        b.sync_settings.auto_sync = false;
+        f.state.manager.lock().update_account(b).unwrap();
+        gate.add_permits(1);
+
+        let results = pass.await.unwrap();
+        assert_eq!(results.len(), 1, "b was skipped");
+        assert_eq!(results[0].account_id, "a");
+        assert!(
+            results[0]
+                .errors
+                .iter()
+                .any(|e| e.starts_with("Stopped: the account was disabled")),
+            "{:?}",
+            results[0].errors
+        );
+        assert_eq!(results[0].articles_synced, 0);
+        assert!(tree(&f.storage).is_empty());
+        assert!(f.pushes().is_empty());
+        assert_eq!(f.account("a").last_sync, None);
+        assert_eq!(other.list_calls.load(Ordering::SeqCst), 0);
     }
 }

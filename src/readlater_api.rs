@@ -27,7 +27,7 @@ use crate::readlater::{
     SyncSettings,
     provider_for,
 };
-use crate::readlater_sync::{ReadLaterSyncer, SyncAllReport, SyncError};
+use crate::readlater_sync::{ReadLaterSyncer, SchedulerConfig, SyncAllReport, SyncError};
 use crate::storage::Storage;
 
 // ============================================================================
@@ -39,11 +39,13 @@ pub struct ReadLaterState {
     pub manager: Arc<Mutex<ReadLaterManager>>,
     /// Runs syncs into `storage` (the device's sync tree); shared with the scheduler.
     pub syncer: Arc<ReadLaterSyncer>,
+    /// The scheduler's task, once [`with_scheduler`](Self::with_scheduler) started it.
+    pub scheduler: Option<Arc<tokio::task::JoinHandle<()>>>,
 }
 
 impl ReadLaterState {
     /// Articles are delivered into `storage`, and devices are told to pull through
-    /// `notification_tx` (`AppState::notification_tx`).
+    /// `notification_tx` (`AppState::notification_tx`). No scheduler runs yet.
     pub fn new(
         manager: ReadLaterManager,
         storage: Storage,
@@ -55,7 +57,23 @@ impl ReadLaterState {
             storage,
             notification_tx,
         ));
-        Self { manager, syncer }
+        Self {
+            manager,
+            syncer,
+            scheduler: None,
+        }
+    }
+
+    /// Start scheduled syncs as `config` says: not when it turns them off, nor outside a Tokio
+    /// runtime (as in plain unit tests).
+    pub fn with_scheduler(mut self, config: SchedulerConfig) -> Self {
+        if !config.enabled {
+            tracing::info!("read-later scheduler off (READLATER_AUTO_SYNC)");
+        } else if tokio::runtime::Handle::try_current().is_ok() {
+            let task = Arc::clone(&self.syncer).spawn_scheduler(config.tick);
+            self.scheduler = Some(Arc::new(task));
+        }
+        self
     }
 }
 
@@ -400,6 +418,10 @@ pub async fn update_article(
         .ok_or_else(|| ServerError::NotFound(id))?;
 
     if let Some(status) = req.status {
+        if status != article.status {
+            // Sent to the provider by the account's next sync (with `sync_read_status`).
+            article.read_status_pending = true;
+        }
         article.status = status;
         if status == ReadStatus::Read {
             article.read_at = Some(chrono::Utc::now());
