@@ -256,6 +256,7 @@ impl ConflictResolver {
                             parent_id: None,
                             is_folder: false,
                             path: local_path.to_string_lossy().into_owned(),
+                            deleted: true,
                         },
                         local_modified_at,
                         local_size,
@@ -396,6 +397,7 @@ mod tests {
                 parent_id: None,
                 is_folder: false,
                 path: "/test.txt".into(),
+                deleted: false,
             },
             local_modified_at: 2000, // Local is newer
             local_size: 150,

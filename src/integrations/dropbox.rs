@@ -2,11 +2,14 @@
 //!
 //! Full read/write access via Dropbox API v2.
 
+use std::collections::{HashMap, HashSet};
+
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::integrations::oauth::{OAuthConfig, OAuthToken, refresh_token};
+use crate::integrations::sync::{MAX_LIST_DEPTH, is_safe_name};
 use crate::integrations::{
     CloudFile,
     CloudFolder,
@@ -36,6 +39,44 @@ fn header_safe_json(json: &str) -> String {
         }
     }
     out
+}
+
+/// The API spelling of a sync folder (a path or `id:`): Dropbox names its root `""` and
+/// rejects `"/"` or a trailing slash.
+fn api_path(folder: Option<&str>) -> &str {
+    folder.unwrap_or("").trim_end_matches('/')
+}
+
+/// `error_summary` of a Dropbox error body (`"reset/.."`, `"path/not_found/.."`).
+fn error_summary(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    v.get("error_summary")?.as_str().map(str::to_owned)
+}
+
+/// Argument for `files/list_folder` and `files/list_folder/get_latest_cursor`. Both use
+/// [`ListFolderArg::recursive`], so a change cursor covers exactly what a full listing does.
+#[derive(Serialize)]
+struct ListFolderArg<'a> {
+    path: &'a str,
+    recursive: bool,
+    include_mounted_folders: bool,
+    include_non_downloadable_files: bool,
+}
+
+impl<'a> ListFolderArg<'a> {
+    fn recursive(path: &'a str) -> Self {
+        Self {
+            path,
+            recursive: true,
+            include_mounted_folders: true,
+            include_non_downloadable_files: false,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CursorArg<'a> {
+    cursor: &'a str,
 }
 
 /// Dropbox provider
@@ -115,6 +156,58 @@ impl Dropbox {
             Err(response_error(response).await)
         }
     }
+
+    /// Every entry from `page` on, following `has_more` through `files/list_folder/continue`,
+    /// plus the cursor after the last page.
+    async fn drain(&self, mut page: ListFolderResponse) -> Result<(Vec<DropboxEntry>, String)> {
+        let mut entries = Vec::new();
+        let mut used = HashSet::new();
+        loop {
+            entries.extend(page.entries);
+            if !page.has_more {
+                return Ok((entries, page.cursor));
+            }
+            // A cursor handed back again would loop forever; fail rather than return a
+            // partial list (a partial list makes sync re-upload everything it didn't see).
+            if !used.insert(page.cursor.clone()) {
+                return Err(IntegrationError::Api(format!(
+                    "Dropbox returned repeated cursor {:?}",
+                    page.cursor
+                )));
+            }
+            page = self
+                .api_request(
+                    "files/list_folder/continue",
+                    &CursorArg {
+                        cursor: &page.cursor,
+                    },
+                )
+                .await?;
+        }
+    }
+
+    /// `path_lower` of the sync folder (`""` for the whole Dropbox), the prefix of every
+    /// `path_lower` below it. Asked of Dropbox rather than lowercased here: its case folding is
+    /// its own, and the folder may be given as an `id:`.
+    async fn root_lower(&self, path: &str) -> Result<String> {
+        if path.is_empty() {
+            return Ok(String::new());
+        }
+        #[derive(Serialize)]
+        struct GetMetadataArg<'a> {
+            path: &'a str,
+        }
+        let meta: MetadataResponse = self
+            .api_request("files/get_metadata", &GetMetadataArg { path })
+            .await?;
+        match (meta.entry.tag.as_str(), meta.entry.path_lower) {
+            ("folder", Some(lower)) => Ok(lower),
+            _ => Err(IntegrationError::Api(format!(
+                "sync folder {:?} is not a folder",
+                path
+            ))),
+        }
+    }
 }
 
 /// Map a non-success Dropbox response to an error. A missing path (409 `path/not_found`, or a
@@ -142,6 +235,9 @@ async fn response_error(response: reqwest::Response) -> IntegrationError {
                 IntegrationError::NotDownloadable(body)
             } else if body.contains("insufficient_space") {
                 IntegrationError::QuotaExceeded
+            } else if error_summary(&body).is_some_and(|s| s.starts_with("reset/")) {
+                // `list_folder/continue`: the cursor was invalidated.
+                IntegrationError::ResyncRequired(body)
             } else {
                 IntegrationError::Conflict(body)
             }
@@ -156,12 +252,11 @@ async fn response_error(response: reqwest::Response) -> IntegrationError {
 /// Dropbox file metadata
 #[derive(Debug, Deserialize)]
 struct DropboxEntry {
+    /// `file`, `folder` or (in change feeds) `deleted`.
     #[serde(rename = ".tag")]
-    #[allow(dead_code)]
     tag: String,
     id: Option<String>,
     name: String,
-    #[allow(dead_code)]
     path_lower: Option<String>,
     path_display: Option<String>,
     #[serde(default)]
@@ -172,6 +267,26 @@ struct DropboxEntry {
 
 impl DropboxEntry {
     fn to_cloud_file(&self) -> CloudFile {
+        self.to_cloud_file_at(self.path_display.clone().unwrap_or_default())
+    }
+
+    /// As a [`CloudFile`] at `path` (relative to the sync folder). A `deleted` entry has no id
+    /// or metadata, so it becomes a deletion addressed by its `path_lower`.
+    fn to_cloud_file_at(&self, path: String) -> CloudFile {
+        if self.tag == "deleted" {
+            return CloudFile {
+                id: self.path_lower.clone().unwrap_or_default(),
+                name: self.name.clone(),
+                mime_type: None,
+                size: 0,
+                modified_at: 0,
+                content_hash: None,
+                parent_id: None,
+                is_folder: false, // Dropbox doesn't say what was deleted
+                path,
+                deleted: true,
+            };
+        }
         CloudFile {
             id: self.id.clone().unwrap_or_default(),
             name: self.name.clone(),
@@ -186,7 +301,8 @@ impl DropboxEntry {
             content_hash: self.content_hash.clone(),
             parent_id: None, // Would need to parse from path
             is_folder: self.tag == "folder",
-            path: self.path_display.clone().unwrap_or_default(),
+            path,
+            deleted: false,
         }
     }
 
@@ -198,6 +314,66 @@ impl DropboxEntry {
             parent_id: None,
         }
     }
+}
+
+/// `path_lower` → name of every folder in `entries`, for casing the folders on a path.
+fn folder_names(entries: &[DropboxEntry]) -> HashMap<&str, &str> {
+    entries
+        .iter()
+        .filter(|e| e.tag == "folder")
+        .filter_map(|e| Some((e.path_lower.as_deref()?, e.name.as_str())))
+        .collect()
+}
+
+/// `e`'s path relative to the sync folder whose `path_lower` is `root` (`/Sub/b.pdf`), the
+/// same shape as the local scan. `None` for the folder itself, anything outside it, and paths
+/// deeper than [`MAX_LIST_DEPTH`] or with a component that isn't a safe single segment.
+///
+/// Membership is decided on `path_lower` (Dropbox is case-insensitive). Casing comes from `name`
+/// for the last component and, for the folders on the way, from their own entry in `folders`
+/// when listed — `path_display` only promises the last component's casing, so two files in
+/// one folder could otherwise land in differently cased local directories — else from
+/// `path_display`.
+fn relative_path(e: &DropboxEntry, root: &str, folders: &HashMap<&str, &str>) -> Option<String> {
+    let lower = e.path_lower.as_deref()?;
+    let rest = lower
+        .strip_prefix(root)?
+        .strip_prefix('/')
+        .filter(|r| !r.is_empty())?;
+    let parts: Vec<&str> = rest.split('/').collect();
+    if parts.len() > MAX_LIST_DEPTH {
+        tracing::warn!("dropbox: skipping {:?}: too deep", lower);
+        return None;
+    }
+    let depth_of_root = lower.split('/').count() - parts.len();
+    let display: Option<Vec<&str>> = e
+        .path_display
+        .as_deref()
+        .map(|d| d.split('/').collect::<Vec<_>>())
+        .filter(|d| d.len() == lower.split('/').count());
+
+    let mut key = root.to_string();
+    let mut path = String::new();
+    for (i, part) in parts.iter().enumerate() {
+        key.push('/');
+        key.push_str(part);
+        let name = if i + 1 == parts.len() {
+            e.name.as_str()
+        } else {
+            folders
+                .get(key.as_str())
+                .copied()
+                .or_else(|| display.as_ref().map(|d| d[depth_of_root + i]))
+                .unwrap_or(part)
+        };
+        if !is_safe_name(name) {
+            tracing::warn!("dropbox: skipping {:?}: unsafe name {:?}", lower, name);
+            return None;
+        }
+        path.push('/');
+        path.push_str(name);
+    }
+    Some(path)
 }
 
 /// List folder response
@@ -275,106 +451,52 @@ impl CloudProvider for Dropbox {
         Ok(())
     }
 
+    /// Everything under `folder_id` (a path or `id:`; default: the whole Dropbox) in one
+    /// recursive `list_folder`, paged with `list_folder/continue`. Paths are relative to that
+    /// folder (`/Sub/dir/file.pdf`), matching the local scan so nested files aren't seen as
+    /// missing and re-uploaded every sync. Entries that can't be given a safe relative path
+    /// (see [`relative_path`]) are skipped, and each item is listed once.
     async fn list_files(&self, folder_id: Option<&str>) -> Result<Vec<CloudFile>> {
-        #[derive(Serialize)]
-        struct ListFolderArg<'a> {
-            path: &'a str,
-            recursive: bool,
-            include_mounted_folders: bool,
-            include_non_downloadable_files: bool,
-        }
+        let path = api_path(folder_id);
+        let root = self.root_lower(path).await?;
+        let first = self
+            .api_request("files/list_folder", &ListFolderArg::recursive(path))
+            .await?;
+        let (entries, _) = self.drain(first).await?;
 
-        let path = folder_id.unwrap_or("");
-        let arg = ListFolderArg {
-            path,
-            recursive: false,
-            include_mounted_folders: true,
-            include_non_downloadable_files: false,
-        };
-
-        let response: ListFolderResponse = self.api_request("files/list_folder", &arg).await?;
-
-        let mut files: Vec<CloudFile> = response
-            .entries
-            .into_iter()
-            .map(|e| e.to_cloud_file())
-            .collect();
-
-        // Handle pagination
-        let mut cursor = response.cursor;
-        let mut has_more = response.has_more;
-
-        while has_more {
-            #[derive(Serialize)]
-            struct ContinueArg<'a> {
-                cursor: &'a str,
+        let folders = folder_names(&entries);
+        let mut seen_items = HashSet::new();
+        let mut seen_paths = HashSet::new();
+        let mut out = Vec::new();
+        for e in &entries {
+            if e.tag == "deleted" {
+                continue;
             }
-
-            let cont: ListFolderResponse = self
-                .api_request(
-                    "files/list_folder/continue",
-                    &ContinueArg { cursor: &cursor },
-                )
-                .await?;
-
-            files.extend(cont.entries.into_iter().map(|e| e.to_cloud_file()));
-            cursor = cont.cursor;
-            has_more = cont.has_more;
+            let Some(rel) = relative_path(e, &root, &folders) else {
+                continue;
+            };
+            if !seen_items.insert(e.path_lower.as_deref()) {
+                continue;
+            }
+            if !seen_paths.insert(rel.clone()) {
+                tracing::warn!("dropbox: duplicate path {:?}, keeping the first", rel);
+                continue;
+            }
+            out.push(e.to_cloud_file_at(rel));
         }
-
-        Ok(files)
+        Ok(out)
     }
 
     async fn list_folders(&self) -> Result<Vec<CloudFolder>> {
-        // List all folders recursively from root
-        #[derive(Serialize)]
-        struct ListFolderArg {
-            path: String,
-            recursive: bool,
-        }
-
-        let arg = ListFolderArg {
-            path: "".into(),
-            recursive: true,
-        };
-
-        let response: ListFolderResponse = self.api_request("files/list_folder", &arg).await?;
-
-        let mut folders: Vec<CloudFolder> = response
-            .entries
-            .into_iter()
+        let first = self
+            .api_request("files/list_folder", &ListFolderArg::recursive(""))
+            .await?;
+        let (entries, _) = self.drain(first).await?;
+        Ok(entries
+            .iter()
             .filter(|e| e.tag == "folder")
             .map(|e| e.to_cloud_folder())
-            .collect();
-
-        // Handle pagination
-        let mut cursor = response.cursor;
-        let mut has_more = response.has_more;
-
-        while has_more {
-            #[derive(Serialize)]
-            struct ContinueArg<'a> {
-                cursor: &'a str,
-            }
-
-            let cont: ListFolderResponse = self
-                .api_request(
-                    "files/list_folder/continue",
-                    &ContinueArg { cursor: &cursor },
-                )
-                .await?;
-
-            folders.extend(
-                cont.entries
-                    .into_iter()
-                    .filter(|e| e.tag == "folder")
-                    .map(|e| e.to_cloud_folder()),
-            );
-            cursor = cont.cursor;
-            has_more = cont.has_more;
-        }
-
-        Ok(folders)
+            .collect())
     }
 
     async fn get_file_metadata(&self, file_id: &str) -> Result<CloudFile> {
@@ -430,11 +552,8 @@ impl CloudProvider for Dropbox {
     ) -> Result<CloudFile> {
         let token = self.access_token()?;
 
-        let path = if let Some(parent) = parent_id {
-            format!("{}/{}", parent, name)
-        } else {
-            format!("/{}", name)
-        };
+        // Same folder spelling as listings: `/` or a trailing slash must not yield `//name`.
+        let path = format!("{}/{}", api_path(parent_id), name);
 
         #[derive(Serialize)]
         struct UploadArg {
@@ -470,11 +589,8 @@ impl CloudProvider for Dropbox {
     }
 
     async fn create_folder(&self, parent_id: Option<&str>, name: &str) -> Result<CloudFolder> {
-        let path = if let Some(parent) = parent_id {
-            format!("{}/{}", parent, name)
-        } else {
-            format!("/{}", name)
-        };
+        // Same folder spelling as listings: `/` or a trailing slash must not yield `//name`.
+        let path = format!("{}/{}", api_path(parent_id), name);
 
         #[derive(Serialize)]
         struct CreateFolderArg {
@@ -562,53 +678,74 @@ impl CloudProvider for Dropbox {
     }
 
     async fn get_changes(&self, cursor: Option<&str>) -> Result<(Vec<CloudFile>, Option<String>)> {
-        if let Some(cursor) = cursor {
-            // Get changes since cursor
-            #[derive(Serialize)]
-            struct ListFolderContinueArg<'a> {
-                cursor: &'a str,
-            }
+        self.get_changes_in(None, cursor).await
+    }
 
-            let response: ListFolderResponse = self
+    /// Changes under `folder_id` since `cursor`, all pages of `list_folder/continue`, pathed like
+    /// [`list_files`](CloudProvider::list_files). Without a cursor, returns no changes and
+    /// `get_latest_cursor` for the folder (recursive, so the cursor itself is scoped to it).
+    /// The feed is a log, so only each path's last entry is kept (deleted then re-created
+    /// gives just the file), in feed order; `deleted` entries become deletions. An invalidated
+    /// cursor (409 `reset`) is [`IntegrationError::ResyncRequired`].
+    async fn get_changes_in(
+        &self,
+        folder_id: Option<&str>,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<CloudFile>, Option<String>)> {
+        let path = api_path(folder_id);
+        let Some(cursor) = cursor else {
+            #[derive(Deserialize)]
+            struct LatestCursor {
+                cursor: String,
+            }
+            let latest: LatestCursor = self
                 .api_request(
-                    "files/list_folder/continue",
-                    &ListFolderContinueArg { cursor },
+                    "files/list_folder/get_latest_cursor",
+                    &ListFolderArg::recursive(path),
                 )
                 .await?;
+            return Ok((vec![], Some(latest.cursor)));
+        };
 
-            let files: Vec<CloudFile> = response
-                .entries
-                .into_iter()
-                .map(|e| e.to_cloud_file())
-                .collect();
-
-            Ok((files, Some(response.cursor)))
-        } else {
-            // Get initial cursor
-            #[derive(Serialize)]
-            struct ListFolderArg {
-                path: String,
-                recursive: bool,
-            }
-
-            let response: ListFolderResponse = self
-                .api_request(
-                    "files/list_folder",
-                    &ListFolderArg {
-                        path: "".into(),
-                        recursive: true,
-                    },
-                )
-                .await?;
-
-            let files: Vec<CloudFile> = response
-                .entries
-                .into_iter()
-                .map(|e| e.to_cloud_file())
-                .collect();
-
-            Ok((files, Some(response.cursor)))
+        let first = self
+            .api_request("files/list_folder/continue", &CursorArg { cursor })
+            .await?;
+        let (entries, next) = self.drain(first).await?;
+        if entries.is_empty() {
+            return Ok((vec![], Some(next)));
         }
+
+        let root = self.root_lower(path).await?;
+        let folders = folder_names(&entries);
+        let last: HashMap<&str, usize> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| Some((e.path_lower.as_deref()?, i)))
+            .collect();
+        let mut seen_paths = HashSet::new();
+        let mut out = Vec::new();
+        for (i, e) in entries.iter().enumerate() {
+            match e.path_lower.as_deref() {
+                Some(lower) if last[lower] == i => {}
+                _ => continue, // superseded by a later entry for the same path
+            }
+            let Some(rel) = relative_path(e, &root, &folders) else {
+                tracing::debug!(
+                    "dropbox: skipping change {:?}: not under the sync folder",
+                    e.path_lower
+                );
+                continue;
+            };
+            if !seen_paths.insert(rel.clone()) {
+                tracing::warn!(
+                    "dropbox: duplicate change path {:?}, keeping the first",
+                    rel
+                );
+                continue;
+            }
+            out.push(e.to_cloud_file_at(rel));
+        }
+        Ok((out, Some(next)))
     }
 
     async fn get_quota(&self) -> Result<StorageQuota> {
@@ -680,6 +817,433 @@ mod tests {
             assert!(!err.is_permanent(), "{path}: {err}");
         }
         assert_eq!(d.download_file("/ok").await.unwrap(), b"content");
+    }
+
+    mod listing {
+        use std::sync::{Arc, Mutex};
+
+        use axum::Json;
+        use axum::extract::State;
+        use axum::routing::post;
+        use serde_json::{Value, json};
+
+        use super::*;
+        use crate::integrations::sync::{CloudSync, SyncConfig, SyncDirection, SyncState};
+
+        fn entry(tag: &str, display: &str) -> Value {
+            let name = display.rsplit('/').next().unwrap();
+            let mut e = json!({
+                ".tag": tag,
+                "name": name,
+                "path_lower": display.to_lowercase(),
+                "path_display": display,
+            });
+            if tag != "deleted" {
+                e["id"] = json!(format!("id:{}", display.to_lowercase()));
+            }
+            if tag == "file" {
+                e["size"] = json!(3);
+                e["server_modified"] = json!("2024-01-02T03:04:05Z");
+                e["content_hash"] = json!("h");
+            }
+            e
+        }
+        fn file(display: &str) -> Value {
+            entry("file", display)
+        }
+        fn folder(display: &str) -> Value {
+            entry("folder", display)
+        }
+        fn deleted(display: &str) -> Value {
+            entry("deleted", display)
+        }
+
+        fn page(entries: Vec<Value>, cursor: &str, has_more: bool) -> Value {
+            json!({ "entries": entries, "cursor": cursor, "has_more": has_more })
+        }
+
+        /// `list_folder` first pages, by lowercased `path`.
+        fn first_page(path: &str) -> Value {
+            match path {
+                "/notes" | "id:notes" => page(
+                    vec![
+                        folder("/Notes"), // recursive listings include the folder itself
+                        file("/Notes/a.pdf"),
+                        // `path_display` casing is only reliable for the last component.
+                        json!({ ".tag": "file", "id": "id:b", "name": "b.pdf",
+                                "path_lower": "/notes/sub/b.pdf",
+                                "path_display": "/notes/sub/b.pdf" }),
+                        file("/Other/x.pdf"),  // outside the folder
+                        file("/Notes2/y.pdf"), // shares the prefix, still outside
+                    ],
+                    "L1",
+                    true,
+                ),
+                "" => page(vec![file("/Top.pdf"), file("/Notes/a.pdf")], "R1", false),
+                "/deep" => {
+                    let d = "/d".repeat(MAX_LIST_DEPTH - 1);
+                    page(
+                        vec![
+                            file(&format!("/Deep{}/ok.pdf", d)),
+                            file(&format!("/Deep{}/d/too-deep.pdf", d)),
+                        ],
+                        "D1",
+                        false,
+                    )
+                }
+                "/stuck" => page(vec![file("/Stuck/s.pdf")], "stuck", true),
+                _ => page(vec![], "none", false),
+            }
+        }
+
+        /// `list_folder/continue` pages, by cursor.
+        fn next_page(cursor: &str) -> Option<Value> {
+            Some(match cursor {
+                "L1" => page(
+                    vec![
+                        folder("/Notes/Sub"),
+                        file("/Notes/Sub/Deeper/c.pdf"), // its folder isn't listed
+                        file(r"/Notes/a\b.pdf"),
+                        folder(r"/Notes/we\ird"),
+                        file(r"/Notes/we\ird/z.pdf"),
+                        file("/Notes/a.pdf"), // listed twice
+                        deleted("/Notes/gone.pdf"),
+                    ],
+                    "L2",
+                    false,
+                ),
+                "stuck" => page(vec![], "stuck", true),
+                "C0" => page(
+                    vec![
+                        file("/Notes/new.pdf"),
+                        deleted("/Notes/Sub/old.pdf"),
+                        deleted("/Notes/re.pdf"),
+                        file("/Notes/later-gone.pdf"),
+                        file("/Other/x.pdf"),
+                    ],
+                    "C1",
+                    true,
+                ),
+                "C1" => page(
+                    vec![
+                        file("/Notes/re.pdf"), // re-created after the deletion above
+                        deleted("/Notes/later-gone.pdf"),
+                        folder("/Notes/Sub"),
+                    ],
+                    "C2",
+                    false,
+                ),
+                "RC" => page(vec![file("/Top.pdf")], "RC2", false),
+                "empty" => page(vec![], "empty2", false),
+                _ => return None,
+            })
+        }
+
+        type Log = Arc<Mutex<Vec<(String, Value)>>>;
+
+        /// Fake Dropbox API on a random local port; logs `(endpoint, body)` of each RPC call.
+        async fn fake_dropbox() -> (String, Log) {
+            use axum::http::{HeaderMap, StatusCode};
+            use axum::response::IntoResponse;
+
+            fn log(state: &Log, endpoint: &str, body: &Value) {
+                state
+                    .lock()
+                    .unwrap()
+                    .push((endpoint.to_string(), body.clone()));
+            }
+            let state = Log::default();
+            let app = axum::Router::new()
+                .route(
+                    "/files/get_metadata",
+                    post(|State(l): State<Log>, Json(b): Json<Value>| async move {
+                        log(&l, "get_metadata", &b);
+                        match b["path"].as_str().unwrap().to_lowercase().as_str() {
+                            "/notes" | "id:notes" => Json(folder("/Notes")).into_response(),
+                            p @ ("/deep" | "/stuck") => {
+                                let display = format!("/{}{}", p[1..2].to_uppercase(), &p[2..]);
+                                Json(folder(&display)).into_response()
+                            }
+                            "/notes/a.pdf" => Json(file("/Notes/a.pdf")).into_response(),
+                            _ => (
+                                StatusCode::CONFLICT,
+                                r#"{"error_summary":"path/not_found/.."}"#,
+                            )
+                                .into_response(),
+                        }
+                    }),
+                )
+                .route(
+                    "/files/list_folder",
+                    post(|State(l): State<Log>, Json(b): Json<Value>| async move {
+                        log(&l, "list_folder", &b);
+                        Json(first_page(&b["path"].as_str().unwrap().to_lowercase()))
+                    }),
+                )
+                .route(
+                    "/files/list_folder/continue",
+                    post(|State(l): State<Log>, Json(b): Json<Value>| async move {
+                        log(&l, "continue", &b);
+                        match next_page(b["cursor"].as_str().unwrap()) {
+                            Some(p) => Json(p).into_response(),
+                            None => (
+                                StatusCode::CONFLICT,
+                                r#"{"error_summary":"reset/..","error":{".tag":"reset"}}"#,
+                            )
+                                .into_response(),
+                        }
+                    }),
+                )
+                .route(
+                    "/files/list_folder/get_latest_cursor",
+                    post(|State(l): State<Log>, Json(b): Json<Value>| async move {
+                        log(&l, "get_latest_cursor", &b);
+                        Json(json!({ "cursor": format!("latest:{}", b["path"].as_str().unwrap()) }))
+                    }),
+                )
+                .route(
+                    "/files/download",
+                    post(|headers: HeaderMap| async move {
+                        let arg: Value =
+                            serde_json::from_str(headers["Dropbox-API-Arg"].to_str().unwrap())
+                                .unwrap();
+                        arg["path"].as_str().unwrap().to_string()
+                    }),
+                )
+                .with_state(state.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            (base, state)
+        }
+
+        fn dropbox(base: &str) -> Dropbox {
+            let config = OAuthConfig::dropbox("id".into(), None, "http://localhost/cb".into());
+            let token = OAuthToken {
+                access_token: "t".into(),
+                refresh_token: None,
+                token_type: "Bearer".into(),
+                expires_at: None,
+                scope: None,
+            };
+            Dropbox::with_token(config, token).with_base_urls(base, base)
+        }
+
+        fn paths(files: &[CloudFile]) -> Vec<&str> {
+            let mut v: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+            v.sort();
+            v
+        }
+
+        fn calls(log: &Log, endpoint: &str) -> Vec<Value> {
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|(e, _)| e == endpoint)
+                .map(|(_, b)| b.clone())
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn list_files_is_recursive_paged_and_relative_to_the_folder() {
+            let (base, log) = fake_dropbox().await;
+            let d = dropbox(&base);
+            let files = d.list_files(Some("/Notes")).await.unwrap();
+            // The folder itself, entries outside it, unsafe names (and everything under
+            // them), repeats and deletions are dropped; intermediate folders take the casing
+            // of their own entry, else of `path_display`.
+            assert_eq!(
+                paths(&files),
+                vec!["/Sub", "/Sub/Deeper/c.pdf", "/Sub/b.pdf", "/a.pdf"]
+            );
+            let a = files.iter().find(|f| f.path == "/a.pdf").unwrap();
+            assert_eq!(
+                (a.id.as_str(), a.size, a.is_folder, a.deleted),
+                ("id:/notes/a.pdf", 3, false, false)
+            );
+            assert!(files.iter().find(|f| f.path == "/Sub").unwrap().is_folder);
+
+            let listed = calls(&log, "list_folder");
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0]["path"], "/Notes");
+            assert_eq!(listed[0]["recursive"], true);
+            let cont = calls(&log, "continue");
+            assert_eq!(cont.len(), 1);
+            assert_eq!(cont[0]["cursor"], "L1");
+
+            // The same folder by id, or spelled in another case with a trailing slash.
+            for spelling in ["id:notes", "/notes/"] {
+                let again = d.list_files(Some(spelling)).await.unwrap();
+                assert_eq!(paths(&again), paths(&files), "{spelling}");
+            }
+        }
+
+        #[tokio::test]
+        async fn list_files_at_root_needs_no_folder_lookup() {
+            let (base, log) = fake_dropbox().await;
+            let d = dropbox(&base);
+            for root in [None, Some(""), Some("/")] {
+                let files = d.list_files(root).await.unwrap();
+                assert_eq!(paths(&files), vec!["/Notes/a.pdf", "/Top.pdf"], "{root:?}");
+            }
+            assert!(calls(&log, "get_metadata").is_empty());
+            assert!(
+                calls(&log, "list_folder")
+                    .iter()
+                    .all(|b| b["path"] == "" && b["recursive"] == true)
+            );
+        }
+
+        #[tokio::test]
+        async fn list_files_caps_depth_and_rejects_bad_folders() {
+            let (base, _) = fake_dropbox().await;
+            let d = dropbox(&base);
+            let files = d.list_files(Some("/Deep")).await.unwrap();
+            assert_eq!(files.len(), 1);
+            assert!(files[0].path.ends_with("/ok.pdf"));
+            assert_eq!(files[0].path.matches('/').count(), MAX_LIST_DEPTH);
+
+            let err = d.list_files(Some("/Stuck")).await.unwrap_err();
+            assert!(
+                matches!(err, IntegrationError::Api(ref m) if m.contains("repeated")),
+                "{err}"
+            );
+            let err = d.list_files(Some("/Notes/a.pdf")).await.unwrap_err();
+            assert!(
+                matches!(err, IntegrationError::Api(ref m) if m.contains("not a folder")),
+                "{err}"
+            );
+            let err = d.list_files(Some("/missing")).await.unwrap_err();
+            assert!(matches!(err, IntegrationError::NotFound(_)), "{err}");
+        }
+
+        #[tokio::test]
+        async fn changes_start_with_a_cursor_scoped_to_the_folder() {
+            let (base, log) = fake_dropbox().await;
+            let (files, cursor) = dropbox(&base)
+                .get_changes_in(Some("/Notes"), None)
+                .await
+                .unwrap();
+            assert!(files.is_empty());
+            assert_eq!(cursor.as_deref(), Some("latest:/Notes"));
+            let latest = calls(&log, "get_latest_cursor");
+            assert_eq!(latest.len(), 1);
+            assert_eq!(latest[0]["recursive"], true);
+            assert_eq!(latest[0]["include_mounted_folders"], true);
+            assert!(calls(&log, "continue").is_empty());
+        }
+
+        #[tokio::test]
+        async fn changes_are_paged_scoped_and_map_deletions() {
+            let (base, log) = fake_dropbox().await;
+            let d = dropbox(&base);
+            let (files, cursor) = d.get_changes_in(Some("/Notes"), Some("C0")).await.unwrap();
+            assert_eq!(cursor.as_deref(), Some("C2"));
+            // Feed order, each path's last entry only, outside entries dropped.
+            let got: Vec<(&str, bool)> =
+                files.iter().map(|f| (f.path.as_str(), f.deleted)).collect();
+            assert_eq!(
+                got,
+                vec![
+                    ("/new.pdf", false),
+                    ("/Sub/old.pdf", true),
+                    ("/re.pdf", false),
+                    ("/later-gone.pdf", true),
+                    ("/Sub", false),
+                ]
+            );
+            let gone = &files[1];
+            assert_eq!(gone.id, "/notes/sub/old.pdf");
+            let cont: Vec<Value> = calls(&log, "continue")
+                .iter()
+                .map(|b| b["cursor"].clone())
+                .collect();
+            assert_eq!(cont, vec![json!("C0"), json!("C1")]);
+
+            // Unscoped: paths from the Dropbox root.
+            let (files, cursor) = d.get_changes(Some("RC")).await.unwrap();
+            assert_eq!(
+                (paths(&files), cursor.as_deref()),
+                (vec!["/Top.pdf"], Some("RC2"))
+            );
+
+            // Nothing changed: no folder lookup at all.
+            log.lock().unwrap().clear();
+            let (files, cursor) = d
+                .get_changes_in(Some("/Notes"), Some("empty"))
+                .await
+                .unwrap();
+            assert!(files.is_empty());
+            assert_eq!(cursor.as_deref(), Some("empty2"));
+            assert!(calls(&log, "get_metadata").is_empty());
+        }
+
+        #[tokio::test]
+        async fn reset_cursor_requires_resync() {
+            let (base, _) = fake_dropbox().await;
+            let err = dropbox(&base)
+                .get_changes_in(Some("/Notes"), Some("expired"))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, IntegrationError::ResyncRequired(_)), "{err}");
+        }
+
+        fn sync_for(base: &str, root: &std::path::Path, cursor: &str) -> CloudSync<Dropbox> {
+            let config = SyncConfig {
+                local_path: root.to_path_buf(),
+                cloud_folder: Some("/Notes".into()),
+                direction: SyncDirection::Download,
+                ..Default::default()
+            };
+            let state = SyncState {
+                cursor: Some(cursor.into()),
+                ..Default::default()
+            };
+            CloudSync::with_state(dropbox(base), config, state)
+        }
+
+        /// Changes land at their folder-relative paths; a remote deletion never removes (or
+        /// tries to download) the local copy.
+        #[tokio::test]
+        async fn delta_sync_applies_scoped_changes_and_skips_deletions() {
+            let (base, _) = fake_dropbox().await;
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join("Sub")).unwrap();
+            std::fs::write(dir.path().join("Sub/old.pdf"), "mine").unwrap();
+            let mut sync = sync_for(&base, dir.path(), "C0");
+            let r = sync.delta_sync().await.unwrap();
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+            assert_eq!((r.downloaded, r.deleted), (2, 0));
+            assert_eq!(
+                std::fs::read(dir.path().join("new.pdf")).unwrap(),
+                b"id:/notes/new.pdf"
+            );
+            assert!(dir.path().join("re.pdf").exists());
+            assert_eq!(
+                std::fs::read(dir.path().join("Sub/old.pdf")).unwrap(),
+                b"mine"
+            );
+            assert_eq!(sync.state().cursor.as_deref(), Some("C2"));
+        }
+
+        /// An invalidated cursor falls back to a full (recursive) sync and a fresh cursor.
+        #[tokio::test]
+        async fn delta_sync_resyncs_after_reset() {
+            let (base, log) = fake_dropbox().await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut sync = sync_for(&base, dir.path(), "expired");
+            let r = sync.delta_sync().await.unwrap();
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+            assert_eq!(r.downloaded, 3);
+            assert!(dir.path().join("Sub/Deeper/c.pdf").exists());
+            assert!(dir.path().join("Sub/b.pdf").exists());
+            assert_eq!(sync.state().cursor.as_deref(), Some("latest:/Notes"));
+            // The fresh cursor was taken before the full listing started.
+            let order: Vec<String> = log.lock().unwrap().iter().map(|(e, _)| e.clone()).collect();
+            let latest = order.iter().position(|e| e == "get_latest_cursor").unwrap();
+            let listed = order.iter().position(|e| e == "list_folder").unwrap();
+            assert!(latest < listed, "{order:?}");
+        }
     }
 
     #[test]

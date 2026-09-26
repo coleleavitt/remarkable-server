@@ -61,6 +61,16 @@ pub(crate) fn safe_components(path: &str) -> Result<Vec<&str>> {
     Ok(parts)
 }
 
+/// Whether a remote item name is usable as one local path segment. Providers build listing
+/// paths from names, so an item (or a folder on its path) failing this is skipped.
+pub(crate) fn is_safe_name(name: &str) -> bool {
+    matches!(safe_components(name).as_deref(), Ok([_]))
+}
+
+/// Deepest relative path (in components) a provider listing or change feed returns; deeper
+/// items are skipped, so a pathological tree can't make a sync walk forever.
+pub(crate) const MAX_LIST_DEPTH: usize = 64;
+
 /// Components of a provider path. Providers root paths at `/` (e.g. `/Notes/a.pdf`), meaning
 /// the sync root, so exactly one leading slash is stripped before validation.
 pub(crate) fn cloud_path_components(cloud_path: &str) -> Result<Vec<&str>> {
@@ -693,13 +703,18 @@ impl<P: CloudProvider> CloudSync<P> {
         };
 
         // Get changes since last cursor
-        let (changes, new_cursor) = self
+        let (changes, new_cursor) = match self
             .provider
             .get_changes_in(
                 self.config.cloud_folder.as_deref(),
                 self.state.cursor.as_deref(),
             )
-            .await?;
+            .await
+        {
+            Ok(page) => page,
+            Err(IntegrationError::ResyncRequired(why)) => return self.resync(&why).await,
+            Err(e) => return Err(e),
+        };
 
         // Set when a change failed for a reason that may go away (network, I/O, rate limit);
         // the cursor is then held so the provider re-sends the page. Re-applying the changes
@@ -713,6 +728,15 @@ impl<P: CloudProvider> CloudSync<P> {
         };
 
         for cloud_file in changes {
+            if cloud_file.deleted {
+                // Not propagated: a local copy may hold edits the remote never saw, and the
+                // local mtime can't tell us (downloads are stamped with the write time).
+                tracing::info!(
+                    "cloud sync: {:?} was deleted remotely; keeping the local copy",
+                    cloud_file.path
+                );
+                continue;
+            }
             if cloud_file.is_folder {
                 continue;
             }
@@ -799,6 +823,27 @@ impl<P: CloudProvider> CloudSync<P> {
         result.duration_ms = start.elapsed().as_millis() as u64;
         Ok(result)
     }
+
+    /// Recover from a delta cursor the provider rejected: take a fresh cursor, then do a full
+    /// sync. The cursor is taken first so changes made during the full sync are replayed by the
+    /// next delta rather than missed. Until both succeed the old cursor is kept, so the next
+    /// delta hits the same rejection and retries the resync instead of silently skipping the
+    /// gap (a fresh cursor alone would never list the changes made before it).
+    async fn resync(&mut self, why: &str) -> Result<SyncResult> {
+        tracing::warn!(
+            "cloud sync: delta cursor rejected ({}); running a full sync",
+            why
+        );
+        let (_, fresh) = self
+            .provider
+            .get_changes_in(self.config.cloud_folder.as_deref(), None)
+            .await?;
+        let result = self.sync().await?;
+        if result.status != SyncStatus::Failed {
+            self.state.cursor = fresh;
+        }
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
@@ -812,13 +857,16 @@ mod tests {
 
     /// In-memory provider: serves `files` (content = id bytes) and records upload names.
     /// Downloads of ids in `fail_ids` fail with a (transient) network error; `get_changes`
-    /// hands out `next_cursor`.
+    /// hands out `next_cursor`, except for `stale_cursor`, which it rejects as expired.
+    /// While `list_fails` is set, the full listing fails.
     #[derive(Default)]
     struct MockProvider {
         files: Vec<CloudFile>,
         uploads: Mutex<Vec<String>>,
         fail_ids: Mutex<HashSet<String>>,
         next_cursor: Option<String>,
+        stale_cursor: Option<String>,
+        list_fails: std::sync::atomic::AtomicBool,
     }
 
     fn cf(id: &str, path: &str) -> CloudFile {
@@ -832,6 +880,7 @@ mod tests {
             parent_id: None,
             is_folder: false,
             path: path.into(),
+            deleted: false,
         }
     }
 
@@ -851,6 +900,9 @@ mod tests {
             Ok(())
         }
         async fn list_files(&self, _: Option<&str>) -> Result<Vec<CloudFile>> {
+            if self.list_fails.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(IntegrationError::Network("listing failed".into()));
+            }
             Ok(self.files.clone())
         }
         async fn list_folders(&self) -> Result<Vec<CloudFolder>> {
@@ -884,7 +936,13 @@ mod tests {
         async fn move_file(&self, id: &str, _: &str, _: Option<&str>) -> Result<CloudFile> {
             Err(IntegrationError::NotFound(id.into()))
         }
-        async fn get_changes(&self, _: Option<&str>) -> Result<(Vec<CloudFile>, Option<String>)> {
+        async fn get_changes(
+            &self,
+            cursor: Option<&str>,
+        ) -> Result<(Vec<CloudFile>, Option<String>)> {
+            if cursor.is_some() && cursor == self.stale_cursor.as_deref() {
+                return Err(IntegrationError::ResyncRequired("expired".into()));
+            }
             Ok((self.files.clone(), self.next_cursor.clone()))
         }
         async fn get_quota(&self) -> Result<StorageQuota> {
@@ -1125,6 +1183,66 @@ mod tests {
         assert!(!outer.path().join("x").exists());
     }
 
+    /// Remote deletions are never downloaded and never remove the local copy, and they don't
+    /// hold the cursor.
+    #[tokio::test]
+    async fn delta_skips_remote_deletions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("gone.txt"), "mine").unwrap();
+        let mut gone = cf("", "/gone.txt");
+        gone.deleted = true;
+        let provider = MockProvider {
+            files: vec![gone, cf("new", "/new.txt")],
+            next_cursor: Some("c2".into()),
+            ..Default::default()
+        };
+        let state = SyncState {
+            cursor: Some("c1".into()),
+            ..Default::default()
+        };
+        let mut sync =
+            CloudSync::with_state(provider, cfg(dir.path(), SyncDirection::Download), state);
+        let r = sync.delta_sync().await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!((r.downloaded, r.deleted), (1, 0));
+        assert_eq!(std::fs::read(dir.path().join("gone.txt")).unwrap(), b"mine");
+        assert_eq!(sync.state().cursor.as_deref(), Some("c2"));
+    }
+
+    /// A rejected cursor triggers a full sync; the fresh cursor is only stored once that
+    /// sync works, so a failed attempt is retried by the next delta instead of skipping the
+    /// changes made while the cursor was stale.
+    #[tokio::test]
+    async fn delta_resync_holds_cursor_until_full_sync_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider {
+            files: vec![cf("a", "/a.txt"), cf("b", "/sub/b.txt")],
+            next_cursor: Some("fresh".into()),
+            stale_cursor: Some("stale".into()),
+            list_fails: true.into(),
+            ..Default::default()
+        };
+        let state = SyncState {
+            cursor: Some("stale".into()),
+            ..Default::default()
+        };
+        let mut sync =
+            CloudSync::with_state(provider, cfg(dir.path(), SyncDirection::Download), state);
+
+        let r = sync.delta_sync().await.unwrap();
+        assert_eq!(r.status, SyncStatus::Failed, "{:?}", r.errors);
+        assert_eq!(sync.state().cursor.as_deref(), Some("stale"));
+
+        sync.provider
+            .list_fails
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let r = sync.delta_sync().await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(r.downloaded, 2);
+        assert_eq!(std::fs::read(dir.path().join("sub/b.txt")).unwrap(), b"b");
+        assert_eq!(sync.state().cursor.as_deref(), Some("fresh"));
+    }
+
     #[test]
     fn error_permanence() {
         assert!(IntegrationError::InvalidPath("x".into()).is_permanent());
@@ -1138,6 +1256,7 @@ mod tests {
             },
             IntegrationError::TokenExpired,
             IntegrationError::Api("500".into()),
+            IntegrationError::ResyncRequired("410".into()),
         ] {
             assert!(!e.is_permanent(), "{e}");
         }

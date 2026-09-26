@@ -76,6 +76,11 @@ pub enum IntegrationError {
     /// editor file, or the owner disabled downloads).
     #[error("Not downloadable: {0}")]
     NotDownloadable(String),
+
+    /// The provider no longer accepts the delta cursor (Dropbox `reset`, Graph `410 Gone`):
+    /// changes since it can't be listed, so the only way to catch up is a full listing.
+    #[error("Delta cursor expired, full resync required: {0}")]
+    ResyncRequired(String),
 }
 
 impl IntegrationError {
@@ -129,6 +134,11 @@ pub struct CloudFile {
     pub is_folder: bool,
     /// Full path in cloud storage
     pub path: String,
+    /// A change-feed entry saying this path was deleted remotely. Never set by full listings.
+    /// The other fields are best effort for such entries: `id` may be the path and
+    /// `is_folder` is only known when the provider reports it.
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 /// Cloud folder for selective sync
@@ -250,8 +260,11 @@ pub trait CloudProvider: Send + Sync {
     async fn get_changes(&self, cursor: Option<&str>) -> Result<(Vec<CloudFile>, Option<String>)>;
 
     /// Changes since `cursor` under `folder_id` (default: the drive root), with paths relative
-    /// to that folder like [`list_files`](Self::list_files). Providers whose change feed is
-    /// already scoped and pathed that way can rely on the default, which ignores `folder_id`.
+    /// to that folder like [`list_files`](Self::list_files); remote deletions come back with
+    /// [`CloudFile::deleted`] set. With no cursor, providers return no changes and a cursor for
+    /// "now" (the caller is expected to have done a full listing). A cursor the provider no
+    /// longer accepts yields [`IntegrationError::ResyncRequired`]. Providers whose change feed
+    /// is already scoped and pathed that way can rely on the default, which ignores `folder_id`.
     async fn get_changes_in(
         &self,
         folder_id: Option<&str>,

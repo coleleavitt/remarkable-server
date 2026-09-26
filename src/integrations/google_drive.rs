@@ -9,7 +9,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::integrations::oauth::{OAuthConfig, OAuthToken, refresh_token};
-use crate::integrations::sync::safe_components;
+use crate::integrations::sync::{MAX_LIST_DEPTH, is_safe_name};
 use crate::integrations::{
     CloudFile,
     CloudFolder,
@@ -28,8 +28,6 @@ const PAGE_SIZE: u32 = 1000;
 /// Fields requested for every listed file (plus `nextPageToken` for paging).
 const LIST_FIELDS: &str =
     "nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum,parents)";
-/// Recursion ceiling for [`GoogleDrive::list_files`]; deeper folders are listed but not entered.
-const MAX_LIST_DEPTH: usize = 64;
 
 /// Escape a value for a single-quoted string in a Drive `q` expression.
 fn escape_query(s: &str) -> String {
@@ -292,11 +290,6 @@ async fn response_error(response: reqwest::Response) -> IntegrationError {
     }
 }
 
-/// Whether a Drive name is usable as one local path segment (same rule as the full listing).
-fn is_safe_name(name: &str) -> bool {
-    matches!(safe_components(name).as_deref(), Ok([_]))
-}
-
 /// Folder that change paths are resolved against: its id as configured, plus the real id when
 /// that is the `root` alias.
 struct SyncRoot(String, Option<String>);
@@ -347,6 +340,7 @@ impl DriveFile {
             parent_id: self.parents.as_ref().and_then(|p| p.first().cloned()),
             is_folder: self.mime_type == "application/vnd.google-apps.folder",
             path,
+            deleted: false,
         }
     }
 }
