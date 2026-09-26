@@ -444,6 +444,64 @@ mod tests {
         assert_eq!(token(State(state.clone()), grant(&code)).await.status(), StatusCode::OK);
     }
 
+    /// One request through the real router (`create_router`), so the public handlers, their
+    /// extractors and the error->status mapping are exercised. Never sets `ADMIN_TOKEN`:
+    /// the owner credential here is a paired device's Bearer token.
+    async fn call(state: &AppState, method: &str, uri: &str, auth: Option<&str>, ctype: &str, body: String) -> (StatusCode, Value) {
+        use tower::ServiceExt;
+        let mut req = axum::http::Request::builder().method(method).uri(uri).header(header::CONTENT_TYPE, ctype);
+        if let Some(t) = auth { req = req.header(header::AUTHORIZATION, format!("Bearer {t}")); }
+        let resp = crate::create_router(state.clone()).oneshot(req.body(axum::body::Body::from(body)).unwrap()).await.unwrap();
+        body_json(resp).await
+    }
+    const FORM: &str = "application/x-www-form-urlencoded";
+
+    #[tokio::test]
+    async fn router_approve_and_verify_handlers_use_device_bearer() {
+        let (state, _tmp) = setup();
+        let dev = paired_device_token(&state);
+        let access = state.devices.oauth_bundle(LOCAL_USER, "paired-tablet", "remarkable").unwrap().0;
+        let (_, dc) = call(&state, "POST", "/oauth/device/code", None, FORM, String::new()).await;
+        let (code, user_code) = (dc["device_code"].as_str().unwrap().to_string(), dc["user_code"].as_str().unwrap().to_string());
+        let approve = json!({"user_code": user_code}).to_string();
+        let form = format!("user_code={user_code}");
+        let tok = format!("grant_type={}&device_code={code}", DEVICE_CODE_GRANT.replace(':', "%3A"));
+
+        // no credential / short-lived access credential / garbage -> 401 on both handlers
+        for auth in [None, Some(access.as_str()), Some("nope")] {
+            assert_eq!(call(&state, "POST", "/admin/oauth/approve", auth, "application/json", approve.clone()).await.0, StatusCode::UNAUTHORIZED, "{auth:?}");
+            assert_eq!(call(&state, "POST", "/oauth/verify", auth, FORM, form.clone()).await.0, StatusCode::UNAUTHORIZED, "{auth:?}");
+        }
+        // an empty admin_token form field falls through to the (missing) Bearer credential
+        assert_eq!(call(&state, "POST", "/oauth/verify", None, FORM, format!("{form}&admin_token=")).await.0, StatusCode::UNAUTHORIZED);
+        let (st, v) = call(&state, "POST", "/oauth/token", None, FORM, tok.clone()).await;
+        assert_eq!((st, v["error"].as_str()), (StatusCode::BAD_REQUEST, Some("authorization_pending")));
+
+        // paired-device Bearer -> approved via the JSON admin endpoint, then /oauth/token issues tokens
+        let (st, v) = call(&state, "POST", "/admin/oauth/approve", Some(&dev), "application/json", approve).await;
+        assert_eq!((st, v["approved"].as_bool(), v["user_code"].as_str()), (StatusCode::OK, Some(true), Some(user_code.as_str())));
+        let (st, v) = call(&state, "POST", "/oauth/token", None, FORM, tok).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(v["refresh_token"].is_string() && v["id_token"].is_string());
+        assert_eq!(state.devices.caller(&format!("Bearer {}", v["access_token"].as_str().unwrap())).unwrap().0, LOCAL_USER);
+
+        // same through the verification form handler (GET page + POST)
+        let (_, dc) = call(&state, "POST", "/oauth/device/code", None, FORM, String::new()).await;
+        let (code, user_code) = (dc["device_code"].as_str().unwrap().to_string(), dc["user_code"].as_str().unwrap().to_string());
+        let req = axum::http::Request::get(format!("/oauth/verify?user_code={user_code}")).body(axum::body::Body::empty()).unwrap();
+        let resp = tower::ServiceExt::oneshot(crate::create_router(state.clone()), req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let page = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&page).contains(&format!(r#"value="{user_code}""#)));
+        let (st, v) = call(&state, "POST", "/oauth/verify", Some(&dev), FORM, format!("user_code={user_code}")).await;
+        assert_eq!((st, v["approved"].as_bool()), (StatusCode::OK, Some(true)));
+        let (st, v) = call(&state, "POST", "/oauth/token", None, FORM, format!("grant_type={}&device_code={code}", DEVICE_CODE_GRANT.replace(':', "%3A"))).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(v["access_token"].is_string());
+        // unknown code with a valid credential -> 404 through the handler
+        assert_eq!(call(&state, "POST", "/oauth/verify", Some(&dev), FORM, "user_code=0000-000x".into()).await.0, StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn verify_page_only_echoes_wellformed_codes() {
         let Html(ok) = verify_page(Query(VerifyQuery { user_code: "1234-5678".into() })).await;
