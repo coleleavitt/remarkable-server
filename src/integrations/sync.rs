@@ -695,8 +695,22 @@ impl<P: CloudProvider> CloudSync<P> {
         // Get changes since last cursor
         let (changes, new_cursor) = self
             .provider
-            .get_changes(self.state.cursor.as_deref())
+            .get_changes_in(
+                self.config.cloud_folder.as_deref(),
+                self.state.cursor.as_deref(),
+            )
             .await?;
+
+        // Set when a change failed for a reason that may go away (network, I/O, rate limit);
+        // the cursor is then held so the provider re-sends the page. Re-applying the changes
+        // that did succeed is idempotent (atomic overwrite with the same content).
+        let mut retry_needed = false;
+        let mut record = |result: &mut SyncResult, what: &str, e: IntegrationError| {
+            if !e.is_permanent() {
+                retry_needed = true;
+            }
+            result.errors.push(format!("{}: {}", what, e));
+        };
 
         for cloud_file in changes {
             if cloud_file.is_folder {
@@ -706,10 +720,9 @@ impl<P: CloudProvider> CloudSync<P> {
             let local_path = match local_path_for(&self.config.local_path, &cloud_file.path) {
                 Ok(p) => p,
                 Err(e) => {
+                    // Validation reject: permanent, so it must not block the cursor forever.
                     tracing::error!("cloud sync: skipping change {:?}: {}", cloud_file.path, e);
-                    result
-                        .errors
-                        .push(format!("Skipped {}: {}", cloud_file.path, e));
+                    record(&mut result, &format!("Skipped {}", cloud_file.path), e);
                     continue;
                 }
             };
@@ -717,9 +730,15 @@ impl<P: CloudProvider> CloudSync<P> {
             // Check if local file exists
             let local_exists = local_path.exists();
 
-            if local_exists {
+            let outcome = if local_exists {
                 // Check for conflict
-                let metadata = fs::metadata(&local_path).await?;
+                let metadata = match fs::metadata(&local_path).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        record(&mut result, &format!("Stat {}", cloud_file.path), e.into());
+                        continue;
+                    }
+                };
                 let local_mtime = metadata
                     .modified()
                     .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64)
@@ -738,37 +757,39 @@ impl<P: CloudProvider> CloudSync<P> {
                         resolution: None,
                     };
 
-                    let resolution = self.conflict_resolver.resolve(&mut conflict);
-                    match resolution {
-                        ConflictResolution::UseCloud => {
-                            match self.download_file(&cloud_file).await {
-                                Ok(_) => result.downloaded += 1,
-                                Err(e) => result.errors.push(format!("Download failed: {}", e)),
-                            }
-                        }
+                    // Conflicts are reported, not retried: re-fetching the change can't
+                    // resolve them, so they don't hold the cursor.
+                    match self.conflict_resolver.resolve(&mut conflict) {
+                        ConflictResolution::UseCloud => Some(self.download_file(&cloud_file).await),
                         ConflictResolution::ManualRequired => {
                             result.conflicts.push(conflict);
+                            None
                         }
-                        _ => {}
+                        _ => None,
                     }
                 } else {
                     // Cloud is newer, download
-                    match self.download_file(&cloud_file).await {
-                        Ok(_) => result.downloaded += 1,
-                        Err(e) => result.errors.push(format!("Download failed: {}", e)),
-                    }
+                    Some(self.download_file(&cloud_file).await)
                 }
             } else {
                 // New file from cloud
-                match self.download_file(&cloud_file).await {
-                    Ok(_) => result.downloaded += 1,
-                    Err(e) => result.errors.push(format!("Download failed: {}", e)),
-                }
+                Some(self.download_file(&cloud_file).await)
+            };
+
+            match outcome {
+                Some(Ok(())) => result.downloaded += 1,
+                Some(Err(e)) => record(&mut result, "Download failed", e),
+                None => {}
             }
         }
 
-        // Update cursor
-        self.state.cursor = new_cursor;
+        // Only advance past this page once every change in it was applied or failed
+        // permanently; otherwise the transiently failed files would never be retried.
+        if retry_needed {
+            tracing::warn!("cloud sync: holding delta cursor; some changes will be retried");
+        } else {
+            self.state.cursor = new_cursor;
+        }
         self.state.last_sync = Some(chrono::Utc::now().timestamp());
 
         if !result.errors.is_empty() {
@@ -790,10 +811,14 @@ mod tests {
     use crate::integrations::{CloudFolder, OAuthToken, ProviderType, StorageQuota};
 
     /// In-memory provider: serves `files` (content = id bytes) and records upload names.
+    /// Downloads of ids in `fail_ids` fail with a (transient) network error; `get_changes`
+    /// hands out `next_cursor`.
     #[derive(Default)]
     struct MockProvider {
         files: Vec<CloudFile>,
         uploads: Mutex<Vec<String>>,
+        fail_ids: Mutex<HashSet<String>>,
+        next_cursor: Option<String>,
     }
 
     fn cf(id: &str, path: &str) -> CloudFile {
@@ -835,6 +860,9 @@ mod tests {
             Err(IntegrationError::NotFound(id.into()))
         }
         async fn download_file(&self, id: &str) -> Result<Vec<u8>> {
+            if self.fail_ids.lock().unwrap().contains(id) {
+                return Err(IntegrationError::Network("connection reset".into()));
+            }
             Ok(id.as_bytes().to_vec())
         }
         async fn upload_file(
@@ -857,7 +885,7 @@ mod tests {
             Err(IntegrationError::NotFound(id.into()))
         }
         async fn get_changes(&self, _: Option<&str>) -> Result<(Vec<CloudFile>, Option<String>)> {
-            Ok((self.files.clone(), None))
+            Ok((self.files.clone(), self.next_cursor.clone()))
         }
         async fn get_quota(&self) -> Result<StorageQuota> {
             Ok(StorageQuota {
@@ -1028,6 +1056,91 @@ mod tests {
                 .unwrap()
                 .all(|e| e.unwrap().file_name() == "ok.txt")
         );
+    }
+
+    /// A transient download failure holds the delta cursor so the change is re-fetched; once
+    /// it succeeds the cursor advances. Permanent (validation) rejects never hold it.
+    #[tokio::test]
+    async fn delta_cursor_held_until_transient_failures_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider {
+            files: vec![cf("ok", "/ok.txt"), cf("flaky", "/sub/flaky.txt")],
+            next_cursor: Some("c2".into()),
+            ..Default::default()
+        };
+        provider.fail_ids.lock().unwrap().insert("flaky".into());
+        let state = SyncState {
+            cursor: Some("c1".into()),
+            ..Default::default()
+        };
+        let mut sync =
+            CloudSync::with_state(provider, cfg(dir.path(), SyncDirection::Download), state);
+
+        let r = sync.delta_sync().await.unwrap();
+        assert_eq!((r.downloaded, r.errors.len()), (1, 1), "{:?}", r.errors);
+        assert_eq!(r.status, SyncStatus::PartialSuccess);
+        assert_eq!(
+            sync.state().cursor.as_deref(),
+            Some("c1"),
+            "cursor advanced past a failure"
+        );
+        assert!(!dir.path().join("sub/flaky.txt").exists());
+
+        // The failure clears (e.g. network back): the retried page applies and the cursor moves.
+        sync.provider.fail_ids.lock().unwrap().clear();
+        let r = sync.delta_sync().await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(r.status, SyncStatus::Success);
+        assert_eq!(sync.state().cursor.as_deref(), Some("c2"));
+        assert_eq!(
+            std::fs::read(dir.path().join("sub/flaky.txt")).unwrap(),
+            b"flaky"
+        );
+    }
+
+    #[tokio::test]
+    async fn delta_cursor_advances_past_permanent_rejects() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let mut files: Vec<CloudFile> = EVIL
+            .iter()
+            .enumerate()
+            .map(|(i, p)| cf(&format!("evil{}", i), p))
+            .collect();
+        files.push(cf("good", "/good.txt"));
+        let provider = MockProvider {
+            files,
+            next_cursor: Some("c2".into()),
+            ..Default::default()
+        };
+        let state = SyncState {
+            cursor: Some("c1".into()),
+            ..Default::default()
+        };
+        let mut sync = CloudSync::with_state(provider, cfg(&root, SyncDirection::Download), state);
+        let r = sync.delta_sync().await.unwrap();
+        assert_eq!((r.downloaded, r.errors.len()), (1, EVIL.len()));
+        assert_eq!(sync.state().cursor.as_deref(), Some("c2"));
+        assert!(!outer.path().join("x").exists());
+    }
+
+    #[test]
+    fn error_permanence() {
+        assert!(IntegrationError::InvalidPath("x".into()).is_permanent());
+        assert!(IntegrationError::NotFound("x".into()).is_permanent());
+        assert!(IntegrationError::NotDownloadable("x".into()).is_permanent());
+        for e in [
+            IntegrationError::Network("x".into()),
+            IntegrationError::Io(std::io::Error::other("x")),
+            IntegrationError::RateLimited {
+                retry_after_secs: 1,
+            },
+            IntegrationError::TokenExpired,
+            IntegrationError::Api("500".into()),
+        ] {
+            assert!(!e.is_permanent(), "{e}");
+        }
     }
 
     #[tokio::test]
