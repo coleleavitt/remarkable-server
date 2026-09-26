@@ -63,7 +63,10 @@ These are done and, in several cases, ahead of rmfakecloud:
   `calendars.db` (mode 0600) apart from the config and never reach API
   responses; OAuth tokens refresh on expiry or 401 and are saved even when the
   sync fails or the client disconnects. On-premises Exchange (EWS) is not
-  supported and says so.
+  supported and says so. From CalDAV servers that don't expand, series defined
+  only by RDATE (irregular series from Apple Calendar / Outlook) are expanded
+  like RRULE ones instead of showing just their first date, RDATE periods keep
+  their own length, and an unsupported RRULE's first occurrence honours EXDATE.
 - ✅ **Read-later sync runs** — a scheduler (per-account interval, backoff on
   account-wide failures, one sync per account at a time) and the `/sync`
   endpoints put new articles on the tablet as EPUB/PDF documents through the

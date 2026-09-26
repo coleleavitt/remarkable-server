@@ -980,6 +980,118 @@ async fn caldav_fallback_expands_recurring_events_in_their_time_zone() {
 }
 
 #[tokio::test]
+async fn caldav_fallback_expands_series_of_rdates_and_replaces_their_old_first_date() {
+    // A server without `expand` sends an irregular series as Apple Calendar writes it: no
+    // RRULE, its dates listed with RDATE in the series' zone (one a PERIOD), one cancelled.
+    let today = Utc::now().date_naive();
+    let d = |n: i64| (today + Duration::days(n)).format("%Y%m%d").to_string();
+    let ics = format!(
+        "BEGIN:VCALENDAR\r\nBEGIN:VTIMEZONE\r\nTZID:Asia/Kolkata\r\nBEGIN:STANDARD\r\nTZOFFSETFROM:+0530\r\nTZOFFSETTO:+0530\r\nDTSTART:19700101T000000\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:physio@dav\r\nSUMMARY:Physio\r\nDTSTART;TZID=Asia/Kolkata:{start}T090000\r\nDURATION:PT45M\r\nRDATE;TZID=Asia/Kolkata:{a}T090000,{b}T173000\r\nRDATE;VALUE=PERIOD;TZID=Asia/Kolkata:{c}T090000/PT2H\r\nEXDATE;TZID=Asia/Kolkata:{b}T173000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        start = d(-2),
+        a = d(5),
+        b = d(12),
+        c = d(40)
+    );
+    let base = serve({
+        let ics = ics.clone();
+        move |_| {
+            Router::new().fallback(move |method: Method, body: String| {
+                let ics = ics.clone();
+                async move {
+                    match method.as_str() {
+                        "PROPFIND" => multistatus(
+                            r#"<d:response><d:href>/cal/</d:href><d:propstat><d:prop>
+                                <d:resourcetype><d:collection/><cal:calendar/></d:resourcetype>
+                               </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"#,
+                        ),
+                        "REPORT" if body.contains("expand") => {
+                            (StatusCode::NOT_IMPLEMENTED, "expand unsupported").into_response()
+                        }
+                        "REPORT" => multistatus(&format!(
+                            r#"<d:response><d:href>/cal/physio.ics</d:href><d:propstat><d:prop>
+                                <d:getetag>"p1"</d:getetag>
+                                <cal:calendar-data>{}</cal:calendar-data>
+                               </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"#,
+                            ics_escape_xml(&ics)
+                        )),
+                        _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+                    }
+                }
+            })
+        }
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut mgr = CalendarManager::new(&dir.path().join("calendars.db")).unwrap();
+    mgr.add_calendar(calendar(
+        "r",
+        "Health",
+        CalendarProvider::Caldav,
+        CalendarConfig::Caldav {
+            url: format!("{}/cal/", base),
+            username: String::new(),
+            password: None,
+            bearer_token: None,
+            collection_url: None,
+        },
+    ))
+    .unwrap();
+    // What earlier versions stored for the series: its first date alone, under its UID.
+    let old = remarkable_server::calendar::parse_ics_str(&ics, "r")
+        .events
+        .pop()
+        .unwrap();
+    assert_eq!(old.id, "r:physio@dav");
+    mgr.upsert_event(&old).unwrap();
+    let state = CalendarState::new(mgr);
+
+    let axum::Json(result) = sync_calendar_endpoint(State(state.clone()), Path("r".into()))
+        .await
+        .unwrap();
+    assert!(result.success, "{:?}", result.error);
+    // DTSTART, the RDATE left and the PERIOD are stored as occurrences, with ids like an
+    // RRULE series'; the old first-date event is in the window and no longer listed, so it
+    // is removed rather than shown twice.
+    assert_eq!((result.events_synced, result.events_removed), (3, 1));
+    let at = |days: i64| {
+        (today + Duration::days(days))
+            .and_hms_opt(3, 30, 0)
+            .unwrap()
+            .and_utc()
+    };
+    let mut events: Vec<_> = all_events(&state, "r")
+        .into_iter()
+        .map(|e| (e.start, e.end - e.start, e.id, e.etag))
+        .collect();
+    events.sort();
+    let etag = Some("\"p1\"".to_string());
+    // 09:00 in India is 03:30 UTC.
+    assert_eq!(
+        events,
+        [
+            (
+                at(-2),
+                Duration::minutes(45),
+                format!("r:physio@dav:{}T033000Z", d(-2)),
+                etag.clone()
+            ),
+            (
+                at(5),
+                Duration::minutes(45),
+                format!("r:physio@dav:{}T033000Z", d(5)),
+                etag.clone()
+            ),
+            (
+                at(40),
+                Duration::hours(2),
+                format!("r:physio@dav:{}T033000Z", d(40)),
+                etag
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn caldav_fallback_reports_rules_it_cannot_expand_and_still_prunes() {
     // A server without `expand` sends the masters: Outlook's "last weekday of the month" at
     // 16:00 Berlin time (BYSETPOS), a rule no calendar engine here expands (BYWEEKNO), and a
