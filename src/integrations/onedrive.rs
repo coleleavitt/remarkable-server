@@ -72,7 +72,39 @@ impl OneDrive {
             .ok_or(IntegrationError::NotConfigured)
     }
 
+    /// Whether `url` has the Graph endpoint's origin (scheme, host and port), the only place the
+    /// bearer token may go. Graph hands back full URLs (`@odata.nextLink`, `@odata.deltaLink`)
+    /// that are followed as they are and stored as delta cursors, so none of them is trusted
+    /// to point there.
+    fn on_graph(&self, url: &str) -> bool {
+        match (
+            reqwest::Url::parse(url),
+            reqwest::Url::parse(&self.graph_base),
+        ) {
+            (Ok(url), Ok(base)) => url.origin() == base.origin(),
+            _ => false,
+        }
+    }
+
+    /// `link`, if it is on the Graph endpoint (see [`on_graph`](Self::on_graph)); an error
+    /// naming only its origin otherwise.
+    fn graph_link(&self, link: String) -> Result<String> {
+        if self.on_graph(&link) {
+            return Ok(link);
+        }
+        let origin = reqwest::Url::parse(&link)
+            .map(|u| u.origin().ascii_serialization())
+            .unwrap_or_else(|_| "an unparseable URL".into());
+        Err(IntegrationError::Api(format!(
+            "refusing a Graph link to {} (not {})",
+            origin, self.graph_base
+        )))
+    }
+
+    /// A request carrying the bearer token. Refused (nothing sent) unless `url` is on the
+    /// Graph endpoint: this is the one place the token is attached, so no link can leak it.
     async fn request(&self, method: reqwest::Method, url: &str) -> Result<reqwest::RequestBuilder> {
+        let url = self.graph_link(url.to_string())?;
         let token = self.access_token()?;
         Ok(self.client.request(method, url).bearer_auth(token))
     }
@@ -101,10 +133,10 @@ impl OneDrive {
         self.handle_response(response).await
     }
 
-    fn children_url(&self, folder_id: Option<&str>) -> String {
-        match folder_id {
-            Some(id) => format!("{}/me/drive/items/{}/children", self.graph_base, id),
-            None => format!("{}/me/drive/root/children", self.graph_base),
+    fn children_url(&self, root: &SyncRoot<'_>) -> String {
+        match root {
+            SyncRoot::Folder(id) => format!("{}/me/drive/items/{}/children", self.graph_base, id),
+            SyncRoot::Drive => format!("{}/me/drive/root/children", self.graph_base),
         }
     }
 
@@ -125,31 +157,49 @@ impl OneDrive {
                         next
                     )));
                 }
-                Some(next) => url = next,
+                Some(next) => url = self.graph_link(next)?,
                 None => return Ok(items),
             }
         }
     }
 
+    /// One page of a delta query. Only here does 410 mean the token expired (Graph's
+    /// `resyncRequired`); elsewhere it means the item is gone.
+    async fn delta_page(&self, url: &str) -> Result<DeltaResponse> {
+        let response = self
+            .request(reqwest::Method::GET, url)
+            .await?
+            .send()
+            .await
+            .map_err(|e| IntegrationError::Network(e.to_string()))?;
+        if response.status() == reqwest::StatusCode::GONE {
+            return Err(IntegrationError::ResyncRequired(
+                response.text().await.unwrap_or_default(),
+            ));
+        }
+        self.handle_response(response).await
+    }
+
     /// Every item of a delta query from `url` through its last page, and the
     /// `@odata.deltaLink` for next time. A 410 (expired token) is
-    /// [`IntegrationError::ResyncRequired`].
+    /// [`IntegrationError::ResyncRequired`]. A link off the Graph endpoint is an error, so it
+    /// is neither followed nor stored as the next cursor.
     async fn delta_all(&self, url: &str) -> Result<(Vec<DriveItem>, String)> {
         let mut items = Vec::new();
         let mut used = HashSet::from([url.to_string()]);
         let mut url = url.to_string();
         loop {
-            let page: DeltaResponse = self.get_json(&url).await?;
+            let page = self.delta_page(&url).await?;
             items.extend(page.value);
             match (page.delta_link, page.next_link) {
-                (Some(done), _) => return Ok((items, done)),
+                (Some(done), _) => return Ok((items, self.graph_link(done)?)),
                 (None, Some(next)) if !used.insert(next.clone()) => {
                     return Err(IntegrationError::Api(format!(
                         "Graph returned repeated delta nextLink {:?}",
                         next
                     )));
                 }
-                (None, Some(next)) => url = next,
+                (None, Some(next)) => url = self.graph_link(next)?,
                 (None, None) => {
                     return Err(IntegrationError::Api(
                         "delta page with neither nextLink nor deltaLink".into(),
@@ -170,52 +220,68 @@ impl OneDrive {
     }
 
     /// Path of folder `id` relative to `root` (`""` for the root itself, `"/A/B"` below it), or
-    /// `None` if its chain of parents doesn't reach the root within [`MAX_LIST_DEPTH`] (outside
-    /// the sync folder, deleted, unsafe name). Delta responses carry no `parentReference.path`,
-    /// so the chain is walked by id: folders in the delta itself (`known`) are used as they
-    /// are, others are fetched once and memoized in `cache`. A folder being resolved is
-    /// provisionally `None`, which also breaks cycles.
+    /// `None` if its chain of parents doesn't reach the root (outside the sync folder, deleted,
+    /// unsafe name, a cycle) or doesn't within [`MAX_LIST_DEPTH`] folders. Delta responses carry
+    /// no `parentReference.path`, so the chain is walked by id through `folders`: it starts with
+    /// the folders in the delta itself, and any other folder is fetched once and added.
+    ///
+    /// Every folder on a walk that reached an answer is memoized in `paths`. A walk cut short by
+    /// the depth limit memoizes nothing: a folder on it may be only a few levels below the root
+    /// and reached by a shorter walk from another item, so caching "not under the root" for it
+    /// would make an item's fate depend on the order of the delta.
     async fn folder_path(
         &self,
         id: &str,
         root: &SyncRoot<'_>,
-        known: &HashMap<String, FolderInfo>,
-        cache: &mut HashMap<String, Option<String>>,
-        depth: usize,
+        folders: &mut HashMap<String, Option<FolderInfo>>,
+        paths: &mut HashMap<String, Option<String>>,
     ) -> Result<Option<String>> {
-        if matches!(root, SyncRoot::Folder(r) if *r == id) {
-            return Ok(Some(String::new()));
-        }
-        if let Some(hit) = cache.get(id) {
-            return Ok(hit.clone());
-        }
-        if depth >= MAX_LIST_DEPTH {
-            return Ok(None);
-        }
-        cache.insert(id.to_string(), None);
-        let info = match known.get(id) {
-            Some(info) => Some(info.clone()),
-            None => self.folder_info(id).await?,
-        };
-        let resolved = match info {
-            Some(info) if info.is_drive_root => matches!(root, SyncRoot::Drive).then(String::new),
-            Some(FolderInfo {
-                name,
-                parent: Some(parent),
-                ..
-            }) if is_safe_name(&name) => {
-                Box::pin(self.folder_path(&parent, root, known, cache, depth + 1))
-                    .await?
-                    .map(|prefix| format!("{}/{}", prefix, name))
+        // Folders walked through, innermost first, with their names.
+        let mut walked: Vec<(String, String)> = Vec::new();
+        let mut cur = id.to_string();
+        let settled = loop {
+            if matches!(root, SyncRoot::Folder(r) if *r == cur) {
+                break Some(String::new());
             }
-            _ => None,
+            if let Some(hit) = paths.get(&cur) {
+                break hit.clone();
+            }
+            if walked.iter().any(|(w, _)| *w == cur) {
+                break None; // a cycle never reaches the root
+            }
+            if walked.len() >= MAX_LIST_DEPTH {
+                return Ok(None);
+            }
+            if !folders.contains_key(&cur) {
+                let info = self.folder_info(&cur).await?;
+                folders.insert(cur.clone(), info);
+            }
+            match &folders[&cur] {
+                Some(info) if info.is_drive_root => {
+                    break matches!(root, SyncRoot::Drive).then(String::new);
+                }
+                Some(FolderInfo {
+                    name,
+                    parent: Some(parent),
+                    ..
+                }) if is_safe_name(name) => {
+                    let parent = parent.clone();
+                    walked.push((std::mem::replace(&mut cur, parent), name.clone()));
+                }
+                _ => break None,
+            }
         };
-        cache.insert(id.to_string(), resolved.clone());
-        Ok(resolved)
+        let mut path = settled;
+        for (folder, name) in walked.into_iter().rev() {
+            path = path.map(|prefix| format!("{}/{}", prefix, name));
+            paths.insert(folder, path.clone());
+        }
+        Ok(path)
     }
 }
 
-/// The folder change paths are relative to: the whole drive, or a folder by item id.
+/// The folder listings and change paths are relative to: the whole drive, or a folder by item
+/// id. `root` is Graph's alias for the drive root.
 enum SyncRoot<'a> {
     Drive,
     Folder(&'a str),
@@ -263,8 +329,10 @@ async fn response_error(response: reqwest::Response) -> IntegrationError {
                 .unwrap_or(60),
         },
         404 => IntegrationError::NotFound("Item not found".into()),
-        // Only delta queries answer 410: the token expired (`resyncRequired`).
-        410 => IntegrationError::ResyncRequired(response.text().await.unwrap_or_default()),
+        // Gone for good. A delta query's 410 (expired token) never gets here: `delta_page`
+        // turns it into `ResyncRequired` first. Anywhere else, e.g. a download, the file
+        // can't be fetched however often it's retried.
+        410 => IntegrationError::NotFound("Item gone".into()),
         507 => IntegrationError::QuotaExceeded,
         409 => IntegrationError::Conflict(response.text().await.unwrap_or_default()),
         _ => {
@@ -467,10 +535,14 @@ impl CloudProvider for OneDrive {
     /// wins a duplicate path, names that aren't a single safe path segment are skipped (with
     /// everything under them), and folders deeper than [`MAX_LIST_DEPTH`] aren't entered.
     async fn list_files(&self, folder_id: Option<&str>) -> Result<Vec<CloudFile>> {
-        let folder_id = folder_id.filter(|id| !id.is_empty()); // same as `SyncRoot::of`
-        let mut seen_items: HashSet<String> = folder_id.map(str::to_string).into_iter().collect();
+        // The same root as `get_changes_in`, so `""` and `root` both mean the drive root.
+        let root = SyncRoot::of(folder_id);
+        let mut seen_items = HashSet::new();
+        if let SyncRoot::Folder(id) = root {
+            seen_items.insert(id.to_string());
+        }
         let mut seen_paths = HashSet::new();
-        let mut queue = VecDeque::from([(self.children_url(folder_id), String::new(), 0usize)]);
+        let mut queue = VecDeque::from([(self.children_url(&root), String::new(), 0usize)]);
         let mut out = Vec::new();
 
         while let Some((url, prefix, depth)) = queue.pop_front() {
@@ -496,7 +568,7 @@ impl CloudProvider for OneDrive {
                 }
                 if item.folder.is_some() {
                     if depth + 1 < MAX_LIST_DEPTH {
-                        let children = self.children_url(Some(&item.id));
+                        let children = self.children_url(&SyncRoot::Folder(&item.id));
                         queue.push_back((children, path.clone(), depth + 1));
                     } else {
                         tracing::warn!("onedrive: not descending into {:?}: too deep", path);
@@ -728,7 +800,9 @@ impl CloudProvider for OneDrive {
     /// and a `token=latest` link. Each item's last occurrence is its state; deleted items become
     /// deletions and come first, so applying the list in order never removes a path that a
     /// live item in it re-creates. An expired token (410) is
-    /// [`IntegrationError::ResyncRequired`].
+    /// [`IntegrationError::ResyncRequired`], and so is a stored cursor that isn't on the Graph
+    /// endpoint: it is never sent the token, and starting over from a fresh cursor is how to get
+    /// past it.
     async fn get_changes_in(
         &self,
         folder_id: Option<&str>,
@@ -739,6 +813,12 @@ impl CloudProvider for OneDrive {
             let (_, link) = self.delta_all(&latest).await?;
             return Ok((vec![], Some(link)));
         };
+        if !self.on_graph(cursor) {
+            return Err(IntegrationError::ResyncRequired(format!(
+                "stored delta link is not on {}",
+                self.graph_base
+            )));
+        }
         let (all, next) = self.delta_all(cursor).await?;
 
         let mut latest: HashMap<&str, &DriveItem> = HashMap::new();
@@ -754,12 +834,12 @@ impl CloudProvider for OneDrive {
         }
 
         let root = SyncRoot::of(folder_id);
-        let known: HashMap<String, FolderInfo> = items
+        let mut folders: HashMap<String, Option<FolderInfo>> = items
             .iter()
             .filter(|i| i.folder.is_some() || i.root.is_some())
-            .map(|i| (i.id.clone(), FolderInfo::from(*i)))
+            .map(|i| (i.id.clone(), Some(FolderInfo::from(*i))))
             .collect();
-        let mut cache = HashMap::new();
+        let mut folder_paths = HashMap::new();
         let mut deletions = Vec::new();
         let mut live = Vec::new();
         for item in items {
@@ -777,7 +857,7 @@ impl CloudProvider for OneDrive {
             let parent = item.parent_reference.as_ref().and_then(|p| p.id.as_deref());
             let prefix = match parent {
                 Some(parent) => {
-                    self.folder_path(parent, &root, &known, &mut cache, 0)
+                    self.folder_path(parent, &root, &mut folders, &mut folder_paths)
                         .await?
                 }
                 None => None,
@@ -948,8 +1028,9 @@ mod tests {
 
     use super::*;
 
-    /// A deleted item (404, directly or at the redirected download URL) fails permanently;
-    /// throttling and 5xx stay retryable.
+    /// A deleted item (404 or 410, directly or at the redirected download URL) fails
+    /// permanently; a 410 here is not an expired delta token. Throttling and 5xx stay
+    /// retryable.
     #[tokio::test]
     async fn download_error_mapping() {
         let app = axum::Router::new()
@@ -958,8 +1039,13 @@ mod tests {
                 axum::routing::get(|Path(id): Path<String>| async move {
                     match id.as_str() {
                         "gone" => StatusCode::NOT_FOUND.into_response(),
+                        "expired" => StatusCode::GONE.into_response(),
                         "moved" => {
                             (StatusCode::FOUND, [(header::LOCATION, "/blob/gone")]).into_response()
+                        }
+                        "moved-expired" => {
+                            (StatusCode::FOUND, [(header::LOCATION, "/blob/expired")])
+                                .into_response()
                         }
                         "flaky" => StatusCode::SERVICE_UNAVAILABLE.into_response(),
                         "busy" => StatusCode::TOO_MANY_REQUESTS.into_response(),
@@ -970,10 +1056,10 @@ mod tests {
             .route(
                 "/blob/{name}",
                 axum::routing::get(|Path(name): Path<String>| async move {
-                    if name == "ok" {
-                        "content".into_response()
-                    } else {
-                        StatusCode::NOT_FOUND.into_response()
+                    match name.as_str() {
+                        "ok" => "content".into_response(),
+                        "expired" => StatusCode::GONE.into_response(),
+                        _ => StatusCode::NOT_FOUND.into_response(),
                     }
                 }),
             );
@@ -990,7 +1076,7 @@ mod tests {
         };
         let d = OneDrive::with_token(config, token).with_base_url(&base);
 
-        for id in ["gone", "moved"] {
+        for id in ["gone", "moved", "expired", "moved-expired"] {
             let err = d.download_file(id).await.unwrap_err();
             assert!(matches!(err, IntegrationError::NotFound(_)), "{id}: {err}");
         }
@@ -1072,7 +1158,8 @@ mod tests {
             }
         }
 
-        /// Folders `GET items/{id}` knows (for path resolution); anything else is 404.
+        /// Folders `GET items/{id}` knows (for path resolution); anything else is 404. `chainN`
+        /// is `N` levels below `F`, each named `k`.
         fn item(id: &str) -> Option<Value> {
             Some(match id {
                 "ROOTID" => drive_root(),
@@ -1082,8 +1169,26 @@ mod tests {
                 "X" => folder("X", "..", "F"),
                 "c1" => folder("c1", "c1", "c2"),
                 "c2" => folder("c2", "c2", "c1"),
+                chain if chain.starts_with("chain") => {
+                    let n: usize = chain["chain".len()..].parse().ok()?;
+                    let parent = match n {
+                        1 => "F".to_string(),
+                        n => format!("chain{}", n - 1),
+                    };
+                    folder(chain, "k", &parent)
+                }
                 _ => return None,
             })
+        }
+
+        /// A file 10 levels below `F` and one 70 levels below it (too deep), on the same chain
+        /// of folders, which the delta doesn't include: the shallow one's folders are also on
+        /// the deep one's walk.
+        fn deep_and_shallow() -> [Value; 2] {
+            [
+                file("DEEP", "deep.pdf", "chain70"),
+                file("SHALLOW", "s.pdf", "chain10"),
+            ]
         }
 
         /// Delta pages by `token`: items, then `("next" | "delta", token)` for the link.
@@ -1115,9 +1220,29 @@ mod tests {
                     ],
                     Some(("delta", "D1")),
                 ),
+                // Neither the sync folder nor the drive root is in this delta: both are
+                // reached through `GET items/{id}`.
+                "rootless" => (
+                    vec![file("Y", "y.pdf", "S"), file("OUT", "out.pdf", "O")],
+                    Some(("delta", "RL1")),
+                ),
+                "deep-first" => (deep_and_shallow().to_vec(), Some(("delta", "DF1"))),
+                "shallow-first" => {
+                    let [deep, shallow] = deep_and_shallow();
+                    (vec![shallow, deep], Some(("delta", "SF1")))
+                }
                 "empty" => (vec![], Some(("delta", "E1"))),
                 "loop" => (vec![], Some(("next", "loop"))),
                 "none" => (vec![], None),
+                // Links to `Fake::foreign` rather than back to this server.
+                "leak-next" => (
+                    vec![file("N", "new.pdf", "F")],
+                    Some(("foreign-next", "D0")),
+                ),
+                "leak-delta" => (
+                    vec![file("N", "new.pdf", "F")],
+                    Some(("foreign-delta", "D1")),
+                ),
                 _ => return None,
             })
         }
@@ -1125,6 +1250,8 @@ mod tests {
         #[derive(Clone, Default)]
         struct Fake {
             base: Arc<Mutex<String>>,
+            /// Base of another server, for links that point away from this one.
+            foreign: Arc<Mutex<String>>,
             log: Arc<Mutex<Vec<String>>>,
         }
 
@@ -1141,14 +1268,23 @@ mod tests {
             }
         }
 
+        /// `children` of `items/{id}`, logged by id, or of `root` (the drive root route), logged
+        /// as `(root)`. `items/leak/children` pages on to `Fake::foreign`.
         async fn children_route(
             State(fake): State<Fake>,
             id: Option<Path<String>>,
             Query(q): Query<HashMap<String, String>>,
         ) -> Json<Value> {
-            let id = id.map_or("root".to_string(), |Path(id)| id);
+            let (id, label) = id.map_or(("root".to_string(), "(root)".to_string()), |Path(id)| {
+                (id.clone(), id)
+            });
             let page = q.get("page").map(String::as_str);
-            fake.log(format!("children {} {:?}", id, page));
+            fake.log(format!("children {} {:?}", label, page));
+            if id == "leak" {
+                let foreign = fake.foreign.lock().unwrap().clone();
+                let next = format!("{}/me/drive/items/F/children", foreign);
+                return Json(json!({ "value": [], "@odata.nextLink": next }));
+            }
             let (value, next) = children(&id, page);
             let base = fake.base.lock().unwrap().clone();
             let mut body = json!({ "value": value });
@@ -1176,9 +1312,12 @@ mod tests {
                 return (StatusCode::GONE, r#"{"error":{"code":"resyncRequired"}}"#)
                     .into_response();
             };
-            let base = fake.base.lock().unwrap().clone();
             let mut body = json!({ "value": value });
             if let Some((kind, token)) = link {
+                let (base, kind) = match kind.strip_prefix("foreign-") {
+                    Some(kind) => (fake.foreign.lock().unwrap().clone(), kind),
+                    None => (fake.base.lock().unwrap().clone(), kind),
+                };
                 let url = format!("{}/me/drive/root/delta?token={}", base, token);
                 let key = if kind == "next" {
                     "@odata.nextLink"
@@ -1188,6 +1327,27 @@ mod tests {
                 body[key] = json!(url);
             }
             Json(body).into_response()
+        }
+
+        /// A server that answers anything and records each request and whether it carried an
+        /// `Authorization` header. The bearer token must never reach it.
+        async fn foreign_server() -> (String, Arc<Mutex<Vec<String>>>) {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let app = axum::Router::new()
+                .fallback(
+                    |State(seen): State<Arc<Mutex<Vec<String>>>>,
+                     uri: axum::http::Uri,
+                     headers: axum::http::HeaderMap| async move {
+                        let auth = headers.contains_key(axum::http::header::AUTHORIZATION);
+                        seen.lock().unwrap().push(format!("{} auth={}", uri, auth));
+                        Json(json!({ "value": [] }))
+                    },
+                )
+                .with_state(seen.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            (base, seen)
         }
 
         /// Fake Graph on a random local port.
@@ -1372,7 +1532,132 @@ mod tests {
             assert_eq!(next, Some(link("E1")));
         }
 
-        fn sync_for(base: &str, root: &std::path::Path, token: &str) -> CloudSync<OneDrive> {
+        /// `""` and Graph's `root` alias list the drive root through the same route as no
+        /// folder at all, as the change feed already treated them.
+        #[tokio::test]
+        async fn list_files_treats_root_aliases_as_the_drive_root() {
+            let (base, fake) = fake_graph().await;
+            let d = onedrive(&base);
+            let all = d.list_files(None).await.unwrap();
+            for alias in ["", "root"] {
+                let again = d.list_files(Some(alias)).await.unwrap();
+                assert_eq!(paths(&again), paths(&all), "{alias:?}");
+            }
+            let children = fake.calls("children");
+            let at_root: Vec<&String> = children
+                .iter()
+                .filter(|c| c.starts_with("children (root)"))
+                .collect();
+            assert_eq!(at_root.len(), 3, "{children:?}");
+            assert!(!children.iter().any(|c| c.starts_with("children root")));
+        }
+
+        /// Neither the sync folder nor the drive root is in the delta, so the parent chains are
+        /// walked through `GET items/{id}` and the drive root is recognized by its `root`
+        /// facet: inside when syncing the whole drive, outside when syncing a folder.
+        #[tokio::test]
+        async fn changes_resolve_the_drive_root_by_lookup() {
+            let (base, fake) = fake_graph().await;
+            let d = onedrive(&base);
+            let cursor = format!("{}/me/drive/root/delta?token=rootless", base);
+
+            let (files, _) = d.get_changes(Some(&cursor)).await.unwrap();
+            assert_eq!(paths(&files), vec!["/Notes/Sub/y.pdf", "/Other/out.pdf"]);
+            let mut items = fake.calls("item");
+            items.sort();
+            assert_eq!(items, vec!["item F", "item O", "item ROOTID", "item S"]);
+
+            fake.log.lock().unwrap().clear();
+            let (files, _) = d.get_changes_in(Some("F"), Some(&cursor)).await.unwrap();
+            assert_eq!(paths(&files), vec!["/Sub/y.pdf"]);
+            let mut items = fake.calls("item");
+            items.sort();
+            assert_eq!(items, vec!["item O", "item ROOTID", "item S"]);
+        }
+
+        /// An item's fate doesn't depend on the order of the delta. Walking up from the deep
+        /// file gives up at the depth limit, partway along the chain the shallow file reaches
+        /// the folder through; that must not mark those folders as outside it.
+        #[tokio::test]
+        async fn depth_limited_walks_do_not_hide_shallow_items() {
+            let (base, fake) = fake_graph().await;
+            let d = onedrive(&base);
+            let shallow = format!("{}/s.pdf", "/k".repeat(10));
+            for token in ["deep-first", "shallow-first"] {
+                fake.log.lock().unwrap().clear();
+                let cursor = format!("{}/me/drive/root/delta?token={}", base, token);
+                let (files, _) = d.get_changes_in(Some("F"), Some(&cursor)).await.unwrap();
+                assert_eq!(paths(&files), vec![shallow.as_str()], "{token}");
+                // Each folder is fetched once, however many walks pass through it.
+                let items = fake.calls("item");
+                let unique: HashSet<&String> = items.iter().collect();
+                assert_eq!(unique.len(), items.len(), "{token}: {items:?}");
+            }
+        }
+
+        /// The bearer token only goes to the Graph endpoint's origin. A nextLink or deltaLink
+        /// pointing anywhere else is an error, neither followed nor handed back as a cursor; a
+        /// stored cursor pointing elsewhere is never sent the token either, and asks for a
+        /// resync instead.
+        #[tokio::test]
+        async fn links_off_the_graph_endpoint_are_refused() {
+            let (base, fake) = fake_graph().await;
+            let (foreign, seen) = foreign_server().await;
+            *fake.foreign.lock().unwrap() = foreign.clone();
+            let d = onedrive(&base);
+            let refused = |err: &IntegrationError| matches!(err, IntegrationError::Api(m) if m.contains("refusing") && m.contains(&foreign));
+
+            let err = d.list_files(Some("leak")).await.unwrap_err();
+            assert!(refused(&err), "{err}");
+            for token in ["leak-next", "leak-delta"] {
+                let cursor = format!("{}/me/drive/root/delta?token={}", base, token);
+                let err = d
+                    .get_changes_in(Some("F"), Some(&cursor))
+                    .await
+                    .unwrap_err();
+                assert!(refused(&err), "{token}: {err}");
+            }
+            let stored = format!("{}/me/drive/root/delta?token=D0", foreign);
+            let err = d
+                .get_changes_in(Some("F"), Some(&stored))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, IntegrationError::ResyncRequired(_)), "{err}");
+
+            assert!(seen.lock().unwrap().is_empty(), "{:?}", seen.lock());
+            assert_eq!(
+                fake.calls("delta"),
+                vec!["delta leak-next", "delta leak-delta"]
+            );
+        }
+
+        /// Scheme, host and port must all match; path and query don't matter.
+        #[test]
+        fn graph_origin_check() {
+            let d = onedrive(GRAPH_BASE);
+            for ok in [
+                "https://graph.microsoft.com/v1.0/me/drive/root/delta?token=x",
+                "https://GRAPH.microsoft.com:443/v1.0/x",
+                "https://graph.microsoft.com/beta/x",
+            ] {
+                assert!(d.on_graph(ok), "{ok}");
+            }
+            for bad in [
+                "http://graph.microsoft.com/v1.0/x",
+                "https://graph.microsoft.com:8443/v1.0/x",
+                "https://graph.microsoft.com.evil.example/v1.0/x",
+                "https://graph.microsoft.com@evil.example/v1.0/x",
+                "https://evil.example/v1.0/x?https://graph.microsoft.com",
+                "//graph.microsoft.com/v1.0/x",
+                "/me/drive/root/delta",
+                "not a url",
+                "",
+            ] {
+                assert!(!d.on_graph(bad), "{bad}");
+            }
+        }
+
+        fn sync_for(base: &str, root: &std::path::Path, cursor: &str) -> CloudSync<OneDrive> {
             let config = SyncConfig {
                 local_path: root.to_path_buf(),
                 cloud_folder: Some("F".into()),
@@ -1380,10 +1665,30 @@ mod tests {
                 ..Default::default()
             };
             let state = SyncState {
-                cursor: Some(format!("{}/me/drive/root/delta?token={}", base, token)),
+                cursor: Some(cursor.into()),
                 ..Default::default()
             };
             CloudSync::with_state(onedrive(base), config, state)
+        }
+
+        fn delta_link(base: &str, token: &str) -> String {
+            format!("{}/me/drive/root/delta?token={}", base, token)
+        }
+
+        /// A stored cursor off the Graph endpoint is replaced through a resync; the other
+        /// server never hears from us.
+        #[tokio::test]
+        async fn delta_sync_resyncs_from_a_cursor_off_the_graph_endpoint() {
+            let (base, fake) = fake_graph().await;
+            let (foreign, seen) = foreign_server().await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut sync = sync_for(&base, dir.path(), &delta_link(&foreign, "D0"));
+            let r = sync.delta_sync().await.unwrap();
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+            assert_eq!(r.downloaded, 4);
+            assert_eq!(sync.state().cursor, Some(delta_link(&base, "D0")));
+            assert_eq!(fake.calls("delta"), vec!["delta latest"]);
+            assert!(seen.lock().unwrap().is_empty(), "{:?}", seen.lock());
         }
 
         #[tokio::test]
@@ -1391,7 +1696,7 @@ mod tests {
             let (base, _) = fake_graph().await;
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join("gone.pdf"), "mine").unwrap();
-            let mut sync = sync_for(&base, dir.path(), "D0");
+            let mut sync = sync_for(&base, dir.path(), &delta_link(&base, "D0"));
             let r = sync.delta_sync().await.unwrap();
             assert!(r.errors.is_empty(), "{:?}", r.errors);
             assert_eq!((r.downloaded, r.deleted), (5, 0));
@@ -1409,7 +1714,7 @@ mod tests {
         async fn delta_sync_resyncs_after_410() {
             let (base, fake) = fake_graph().await;
             let dir = tempfile::tempdir().unwrap();
-            let mut sync = sync_for(&base, dir.path(), "expired");
+            let mut sync = sync_for(&base, dir.path(), &delta_link(&base, "expired"));
             let r = sync.delta_sync().await.unwrap();
             assert!(r.errors.is_empty(), "{:?}", r.errors);
             assert_eq!(r.downloaded, 4);

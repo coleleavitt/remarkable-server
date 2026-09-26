@@ -2,7 +2,7 @@
 //!
 //! Full read/write access via Dropbox API v2.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Bound;
 
 use async_trait::async_trait;
@@ -187,13 +187,8 @@ impl Dropbox {
         }
     }
 
-    /// `path_lower` of the sync folder (`""` for the whole Dropbox), the prefix of every
-    /// `path_lower` below it. Asked of Dropbox rather than lowercased here: its case folding is
-    /// its own, and the folder may be given as an `id:`.
-    async fn root_lower(&self, path: &str) -> Result<String> {
-        if path.is_empty() {
-            return Ok(String::new());
-        }
+    /// `files/get_metadata` of `path` (a path, in any case, or an `id:`).
+    async fn metadata(&self, path: &str) -> Result<DropboxEntry> {
         #[derive(Serialize)]
         struct GetMetadataArg<'a> {
             path: &'a str,
@@ -201,7 +196,18 @@ impl Dropbox {
         let meta: MetadataResponse = self
             .api_request("files/get_metadata", &GetMetadataArg { path })
             .await?;
-        match (meta.entry.tag.as_str(), meta.entry.path_lower) {
+        Ok(meta.entry)
+    }
+
+    /// `path_lower` of the sync folder (`""` for the whole Dropbox), the prefix of every
+    /// `path_lower` below it. Asked of Dropbox rather than lowercased here: its case folding is
+    /// its own, and the folder may be given as an `id:`.
+    async fn root_lower(&self, path: &str) -> Result<String> {
+        if path.is_empty() {
+            return Ok(String::new());
+        }
+        let meta = self.metadata(path).await?;
+        match (meta.tag.as_str(), meta.path_lower) {
             ("folder", Some(lower)) => Ok(lower),
             _ => Err(IntegrationError::Api(format!(
                 "sync folder {:?} is not a folder",
@@ -209,6 +215,65 @@ impl Dropbox {
             ))),
         }
     }
+
+    /// The name, in its own casing, of every folder between the sync folder (`root`, a
+    /// `path_lower`) and each of `entries`, keyed by `path_lower`. Folders listed in `entries`
+    /// give their own `name`; any other is asked of `files/get_metadata`, once. Full listings
+    /// and change feeds both take folder casing from here, so a file maps to the same local
+    /// directory however it was seen. (`path_display` is no substitute: Dropbox only promises
+    /// the casing of its last component.) A folder that's gone, or is no longer a folder, is
+    /// left out, and [`relative_path`] then skips everything under it.
+    async fn folder_names(
+        &self,
+        entries: &[&DropboxEntry],
+        root: &str,
+    ) -> Result<HashMap<String, String>> {
+        let mut names: HashMap<String, String> = entries
+            .iter()
+            .filter(|e| e.tag == "folder")
+            .filter_map(|e| Some((e.path_lower.clone()?, e.name.clone())))
+            .collect();
+        // Sorted, so lookups happen in a stable order.
+        let mut missing = BTreeSet::new();
+        for e in entries {
+            let Some(parts) = e.path_lower.as_deref().and_then(|l| below(l, root)) else {
+                continue;
+            };
+            if parts.len() > MAX_LIST_DEPTH {
+                continue; // skipped by `relative_path` anyway
+            }
+            let mut key = root.to_string();
+            for part in &parts[..parts.len() - 1] {
+                key.push('/');
+                key.push_str(part);
+                if !names.contains_key(&key) {
+                    missing.insert(key.clone());
+                }
+            }
+        }
+        for key in missing {
+            match self.metadata(&key).await {
+                Ok(meta) if meta.tag == "folder" => {
+                    names.insert(key, meta.name);
+                }
+                Ok(_) | Err(IntegrationError::NotFound(_)) => {
+                    tracing::debug!("dropbox: folder {:?} is gone; skipping what's in it", key);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(names)
+    }
+}
+
+/// The components of `lower` (a `path_lower`) below `root` (`/Sub/b.pdf` under `/notes` gives
+/// `["sub", "b.pdf"]`); `None` for `root` itself and anything outside it.
+fn below<'a>(lower: &'a str, root: &str) -> Option<Vec<&'a str>> {
+    let rest = lower
+        .strip_prefix(root)?
+        .strip_prefix('/')
+        .filter(|r| !r.is_empty())?;
+    Some(rest.split('/').collect())
 }
 
 /// Map a non-success Dropbox response to an error. A missing path (409 `path/not_found`, or a
@@ -353,41 +418,25 @@ fn replay(entries: &[DropboxEntry], keep_deletions: bool) -> Vec<&DropboxEntry> 
     live.into_iter().map(|(_, e)| e).collect()
 }
 
-/// `path_lower` → name of every folder in `entries`, for casing the folders on a path.
-fn folder_names<'a>(entries: &[&'a DropboxEntry]) -> HashMap<&'a str, &'a str> {
-    entries
-        .iter()
-        .filter(|e| e.tag == "folder")
-        .filter_map(|e| Some((e.path_lower.as_deref()?, e.name.as_str())))
-        .collect()
-}
-
 /// `e`'s path relative to the sync folder whose `path_lower` is `root` (`/Sub/b.pdf`), the
-/// same shape as the local scan. `None` for the folder itself, anything outside it, and paths
-/// deeper than [`MAX_LIST_DEPTH`] or with a component that isn't a safe single segment.
+/// same shape as the local scan. `None` for the folder itself, anything outside it, paths
+/// deeper than [`MAX_LIST_DEPTH`], a component that isn't a safe single segment, and a folder
+/// on the way that `folders` doesn't name (gone).
 ///
 /// Membership is decided on `path_lower` (Dropbox is case-insensitive). Casing comes from `name`
-/// for the last component and, for the folders on the way, from their own entry in `folders`
-/// when listed — `path_display` only promises the last component's casing, so two files in
-/// one folder could otherwise land in differently cased local directories — else from
-/// `path_display`.
-fn relative_path(e: &DropboxEntry, root: &str, folders: &HashMap<&str, &str>) -> Option<String> {
+/// for the last component and from `folders` (see [`Dropbox::folder_names`]) for the folders
+/// on the way.
+fn relative_path(
+    e: &DropboxEntry,
+    root: &str,
+    folders: &HashMap<String, String>,
+) -> Option<String> {
     let lower = e.path_lower.as_deref()?;
-    let rest = lower
-        .strip_prefix(root)?
-        .strip_prefix('/')
-        .filter(|r| !r.is_empty())?;
-    let parts: Vec<&str> = rest.split('/').collect();
+    let parts = below(lower, root)?;
     if parts.len() > MAX_LIST_DEPTH {
         tracing::warn!("dropbox: skipping {:?}: too deep", lower);
         return None;
     }
-    let depth_of_root = lower.split('/').count() - parts.len();
-    let display: Option<Vec<&str>> = e
-        .path_display
-        .as_deref()
-        .map(|d| d.split('/').collect::<Vec<_>>())
-        .filter(|d| d.len() == lower.split('/').count());
 
     let mut key = root.to_string();
     let mut path = String::new();
@@ -396,12 +445,11 @@ fn relative_path(e: &DropboxEntry, root: &str, folders: &HashMap<&str, &str>) ->
         key.push_str(part);
         let name = if i + 1 == parts.len() {
             e.name.as_str()
+        } else if let Some(name) = folders.get(&key) {
+            name.as_str()
         } else {
-            folders
-                .get(key.as_str())
-                .copied()
-                .or_else(|| display.as_ref().map(|d| d[depth_of_root + i]))
-                .unwrap_or(part)
+            tracing::debug!("dropbox: skipping {:?}: folder {:?} is gone", lower, key);
+            return None;
         };
         if !is_safe_name(name) {
             tracing::warn!("dropbox: skipping {:?}: unsafe name {:?}", lower, name);
@@ -503,7 +551,7 @@ impl CloudProvider for Dropbox {
         let (entries, _) = self.drain(first).await?;
         let entries = replay(&entries, false);
 
-        let folders = folder_names(&entries);
+        let folders = self.folder_names(&entries, &root).await?;
         let mut seen_paths = HashSet::new();
         let mut out = Vec::new();
         for e in entries {
@@ -532,16 +580,7 @@ impl CloudProvider for Dropbox {
     }
 
     async fn get_file_metadata(&self, file_id: &str) -> Result<CloudFile> {
-        #[derive(Serialize)]
-        struct GetMetadataArg<'a> {
-            path: &'a str,
-        }
-
-        let response: MetadataResponse = self
-            .api_request("files/get_metadata", &GetMetadataArg { path: file_id })
-            .await?;
-
-        Ok(response.entry.to_cloud_file())
+        Ok(self.metadata(file_id).await?.to_cloud_file())
     }
 
     async fn download_file(&self, file_id: &str) -> Result<Vec<u8>> {
@@ -750,7 +789,7 @@ impl CloudProvider for Dropbox {
 
         let root = self.root_lower(path).await?;
         let entries = replay(&entries, true);
-        let folders = folder_names(&entries);
+        let folders = self.folder_names(&entries, &root).await?;
         let mut seen_paths = HashSet::new();
         let mut out = Vec::new();
         for e in entries {
@@ -921,7 +960,11 @@ mod tests {
                     "L1",
                     true,
                 ),
-                "" => page(vec![file("/Top.pdf"), file("/Notes/a.pdf")], "R1", false),
+                "" => page(
+                    vec![file("/Top.pdf"), folder("/Notes"), file("/Notes/a.pdf")],
+                    "R1",
+                    false,
+                ),
                 "/deep" => {
                     let d = "/d".repeat(MAX_LIST_DEPTH - 1);
                     page(
@@ -1014,6 +1057,21 @@ mod tests {
                     false,
                 ),
                 "RC" => page(vec![file("/Top.pdf")], "RC2", false),
+                // Files changed on their own: their folders' entries aren't in the batch.
+                "CASE" => page(
+                    vec![
+                        // `path_display` casing is only reliable for the last component.
+                        json!({ ".tag": "file", "id": "id:b", "name": "b.pdf",
+                                "path_lower": "/notes/sub/b.pdf",
+                                "path_display": "/notes/sub/b.pdf" }),
+                        json!({ ".tag": "file", "id": "id:c2", "name": "c2.pdf",
+                                "path_lower": "/notes/sub/c2.pdf",
+                                "path_display": "/NOTES/SUB/c2.pdf" }),
+                        file("/Notes/Gone/x.pdf"), // its folder was deleted since
+                    ],
+                    "CASE2",
+                    false,
+                ),
                 "empty" => page(vec![], "empty2", false),
                 _ => return None,
             })
@@ -1040,9 +1098,17 @@ mod tests {
                         log(&l, "get_metadata", &b);
                         match b["path"].as_str().unwrap().to_lowercase().as_str() {
                             "/notes" | "id:notes" => Json(folder("/Notes")).into_response(),
+                            "/notes/sub" => Json(folder("/Notes/Sub")).into_response(),
+                            "/notes/sub/deeper" => {
+                                Json(folder("/Notes/Sub/Deeper")).into_response()
+                            }
                             p @ ("/deep" | "/stuck" | "/moving") => {
                                 let display = format!("/{}{}", p[1..2].to_uppercase(), &p[2..]);
                                 Json(folder(&display)).into_response()
+                            }
+                            p if p.starts_with("/deep/") => {
+                                Json(folder(&format!("/Deep{}", &p["/deep".len()..])))
+                                    .into_response()
                             }
                             "/notes/a.pdf" => Json(file("/Notes/a.pdf")).into_response(),
                             _ => (
@@ -1148,11 +1214,16 @@ mod tests {
             let files = d.list_files(Some("/Notes")).await.unwrap();
             // The folder itself, entries outside it, unsafe names (and everything under
             // them), repeats and deletions are dropped; intermediate folders take the casing
-            // of their own entry, else of `path_display`.
+            // of their own entry, or of their own metadata when not listed.
             assert_eq!(
                 paths(&files),
                 vec!["/Sub", "/Sub/Deeper/c.pdf", "/Sub/b.pdf", "/a.pdf"]
             );
+            let looked_up: Vec<Value> = calls(&log, "get_metadata")
+                .iter()
+                .map(|b| b["path"].clone())
+                .collect();
+            assert_eq!(looked_up, vec![json!("/Notes"), json!("/notes/sub/deeper")]);
             let a = files.iter().find(|f| f.path == "/a.pdf").unwrap();
             assert_eq!(
                 (a.id.as_str(), a.size, a.is_folder, a.deleted),
@@ -1181,7 +1252,11 @@ mod tests {
             let d = dropbox(&base);
             for root in [None, Some(""), Some("/")] {
                 let files = d.list_files(root).await.unwrap();
-                assert_eq!(paths(&files), vec!["/Notes/a.pdf", "/Top.pdf"], "{root:?}");
+                assert_eq!(
+                    paths(&files),
+                    vec!["/Notes", "/Notes/a.pdf", "/Top.pdf"],
+                    "{root:?}"
+                );
             }
             assert!(calls(&log, "get_metadata").is_empty());
             assert!(
@@ -1349,6 +1424,34 @@ mod tests {
             assert!(files.is_empty());
             assert_eq!(cursor.as_deref(), Some("empty2"));
             assert!(calls(&log, "get_metadata").is_empty());
+        }
+
+        /// A changed file whose folder isn't in the batch takes that folder's casing from the
+        /// folder's own metadata (looked up once per call), as the full listing does, whatever
+        /// its `path_display` says; so the same file lands in the same local directory however
+        /// it was seen. A file whose folder is gone by then is skipped.
+        #[tokio::test]
+        async fn changes_and_listing_agree_on_folder_casing() {
+            let (base, log) = fake_dropbox().await;
+            let d = dropbox(&base);
+            let listed = d.list_files(Some("/Notes")).await.unwrap();
+            assert!(paths(&listed).contains(&"/Sub/b.pdf"));
+
+            log.lock().unwrap().clear();
+            let (changes, cursor) = d
+                .get_changes_in(Some("/Notes"), Some("CASE"))
+                .await
+                .unwrap();
+            assert_eq!(cursor.as_deref(), Some("CASE2"));
+            assert_eq!(paths(&changes), vec!["/Sub/b.pdf", "/Sub/c2.pdf"]);
+            let looked_up: Vec<Value> = calls(&log, "get_metadata")
+                .iter()
+                .map(|b| b["path"].clone())
+                .collect();
+            assert_eq!(
+                looked_up,
+                vec![json!("/Notes"), json!("/notes/gone"), json!("/notes/sub")]
+            );
         }
 
         #[tokio::test]

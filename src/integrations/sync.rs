@@ -789,7 +789,24 @@ impl<P: CloudProvider> CloudSync<P> {
     /// deletions are reported by the provider but not applied, and local changes wait for a
     /// full [`sync`](Self::sync). Without a usable cursor (none yet, or rejected by the
     /// provider) it runs a [`resync`](Self::resync) instead.
+    ///
+    /// With [`SyncDirection::Upload`] there is nothing to do: the change feed only brings
+    /// remote changes down. The provider isn't asked, and the cursor is neither taken nor
+    /// advanced. It marks how far remote changes have been applied, and none were, so a
+    /// direction widened later still gets them (or a resync, if the cursor has expired by then).
     pub async fn delta_sync(&mut self) -> Result<SyncResult> {
+        if self.config.direction == SyncDirection::Upload {
+            tracing::debug!("cloud sync: upload-only, so a delta sync has nothing to download");
+            return Ok(SyncResult {
+                status: SyncStatus::Success,
+                uploaded: 0,
+                downloaded: 0,
+                deleted: 0,
+                conflicts: Vec::new(),
+                errors: Vec::new(),
+                duration_ms: 0,
+            });
+        }
         let Some(cursor) = self.state.cursor.clone() else {
             // A change feed only lists what changes after its cursor, so the files already
             // there have to come from a full listing first.
@@ -1017,6 +1034,9 @@ mod tests {
         next_cursor: Option<String>,
         stale_cursor: Option<String>,
         list_fails: std::sync::atomic::AtomicBool,
+        /// How often `list_files` and `get_changes` were called.
+        list_calls: std::sync::atomic::AtomicUsize,
+        changes_calls: std::sync::atomic::AtomicUsize,
     }
 
     fn cf(id: &str, path: &str) -> CloudFile {
@@ -1050,6 +1070,8 @@ mod tests {
             Ok(())
         }
         async fn list_files(&self, _: Option<&str>) -> Result<Vec<CloudFile>> {
+            self.list_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.list_fails.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(IntegrationError::Network("listing failed".into()));
             }
@@ -1094,6 +1116,8 @@ mod tests {
             &self,
             cursor: Option<&str>,
         ) -> Result<(Vec<CloudFile>, Option<String>)> {
+            self.changes_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if cursor.is_some() && cursor == self.stale_cursor.as_deref() {
                 return Err(IntegrationError::ResyncRequired("expired".into()));
             }
@@ -1514,6 +1538,55 @@ mod tests {
         assert_eq!((r.downloaded, r.uploaded), (2, 0));
         assert_eq!(std::fs::read(dir.path().join("sub/b.txt")).unwrap(), b"b");
         assert_eq!(sync.state().cursor.as_deref(), Some("c1"));
+    }
+
+    /// Upload-only: a delta sync downloads nothing and doesn't ask the provider for changes or
+    /// a listing, with a cursor, an expired one or none. The cursor stays as it was (a resync
+    /// would store one past remote changes that were never applied), so widening the direction
+    /// later still brings those changes down. Local changes wait for a full sync, which does
+    /// upload them.
+    #[tokio::test]
+    async fn upload_only_delta_sync_downloads_nothing_and_keeps_the_cursor() {
+        use std::sync::atomic::Ordering::SeqCst;
+        for cursor in [Some("c1"), Some("stale"), None] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("local.txt"), "mine").unwrap();
+            let provider = MockProvider {
+                files: vec![cf("r", "/remote.txt")],
+                next_cursor: Some("c2".into()),
+                stale_cursor: Some("stale".into()),
+                ..Default::default()
+            };
+            let state = SyncState {
+                cursor: cursor.map(Into::into),
+                ..Default::default()
+            };
+            let mut sync =
+                CloudSync::with_state(provider, cfg(dir.path(), SyncDirection::Upload), state);
+
+            let r = sync.delta_sync().await.unwrap();
+            assert!(r.errors.is_empty(), "{cursor:?}: {:?}", r.errors);
+            assert_eq!(
+                (r.status, r.downloaded, r.uploaded),
+                (SyncStatus::Success, 0, 0),
+                "{cursor:?}"
+            );
+            assert!(sync.provider.downloads.lock().unwrap().is_empty());
+            assert!(!dir.path().join("remote.txt").exists());
+            assert_eq!(sync.state().cursor.as_deref(), cursor);
+            assert_eq!(sync.provider.changes_calls.load(SeqCst), 0, "{cursor:?}");
+            assert_eq!(sync.provider.list_calls.load(SeqCst), 0, "{cursor:?}");
+
+            sync.sync().await.unwrap();
+            assert_eq!(*sync.provider.uploads.lock().unwrap(), vec!["local.txt"]);
+            assert!(!dir.path().join("remote.txt").exists());
+
+            sync.config.direction = SyncDirection::Download;
+            let r = sync.delta_sync().await.unwrap();
+            assert!(r.errors.is_empty(), "{cursor:?}: {:?}", r.errors);
+            assert_eq!(std::fs::read(dir.path().join("remote.txt")).unwrap(), b"r");
+            assert_eq!(sync.state().cursor.as_deref(), Some("c2"));
+        }
     }
 
     /// Remote files over `max_file_size` are never downloaded, by full or delta sync, and a
