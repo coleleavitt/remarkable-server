@@ -322,6 +322,9 @@ impl DeviceManager {
         self.oauth_bundle(&c.auth0_userid, &c.device_id, &c.device_desc)
     }
 
+    /// Owner of a device (refresh) auth data; lets a paired device approve an OAuth device code.
+    pub fn device_token_user(&self, device: &str) -> Result<String> { Ok(self.decode_device_token(device)?.auth0_userid) }
+
     fn issue_id_token(&self, user_id: &str) -> Result<String> {
         let now = Utc::now();
         let claims = IdTokenClaims {
