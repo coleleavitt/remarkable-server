@@ -20,6 +20,24 @@ use crate::integrations::{
 const API_BASE: &str = "https://api.dropboxapi.com/2";
 const CONTENT_BASE: &str = "https://content.dropboxapi.com/2";
 
+/// Make a JSON `Dropbox-API-Arg` value header-safe: HTTP header values must be visible ASCII,
+/// so Dropbox requires DEL and every non-ASCII character escaped as `\uXXXX` (UTF-16). Without
+/// this, a path like `/Notes/café.pdf` makes the request fail before it is sent.
+fn header_safe_json(json: &str) -> String {
+    let mut out = String::with_capacity(json.len());
+    for c in json.chars() {
+        if c.is_ascii() && c != '\x7f' {
+            out.push(c);
+        } else {
+            let mut buf = [0u16; 2];
+            for unit in c.encode_utf16(&mut buf) {
+                out.push_str(&format!("\\u{:04x}", unit));
+            }
+        }
+    }
+    out
+}
+
 /// Dropbox provider
 pub struct Dropbox {
     config: OAuthConfig,
@@ -362,7 +380,7 @@ impl CloudProvider for Dropbox {
             .client
             .post(format!("{}/files/download", CONTENT_BASE))
             .bearer_auth(token)
-            .header("Dropbox-API-Arg", arg)
+            .header("Dropbox-API-Arg", header_safe_json(&arg))
             .send()
             .await
             .map_err(|e| IntegrationError::Network(e.to_string()))?;
@@ -417,7 +435,7 @@ impl CloudProvider for Dropbox {
             .client
             .post(format!("{}/files/upload", CONTENT_BASE))
             .bearer_auth(token)
-            .header("Dropbox-API-Arg", arg)
+            .header("Dropbox-API-Arg", header_safe_json(&arg))
             .header("Content-Type", "application/octet-stream")
             .body(content.to_vec())
             .send()
@@ -581,5 +599,24 @@ impl CloudProvider for Dropbox {
             total: usage.allocation.allocated,
             trash: None, // Dropbox doesn't report trash size separately
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_arg_header_is_ascii_and_round_trips() {
+        let path = "/Notes/café/😀 \u{7f}.pdf";
+        let json = serde_json::to_string(&serde_json::json!({ "path": path })).unwrap();
+        let safe = header_safe_json(&json);
+        assert!(
+            reqwest::header::HeaderValue::from_str(&safe).is_ok(),
+            "{safe}"
+        );
+        assert!(safe.contains("caf\\u00e9") && safe.contains("\\ud83d\\ude00"));
+        let back: serde_json::Value = serde_json::from_str(&safe).unwrap();
+        assert_eq!(back["path"], path);
     }
 }

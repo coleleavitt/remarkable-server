@@ -19,6 +19,16 @@ use crate::integrations::{
 
 const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 
+/// Percent-encode each segment of a `/`-separated relative path for Graph path addressing
+/// (`items/{id}:/{path}:/content`); raw `#`, `?` or `%` in a name would otherwise truncate or
+/// corrupt the URL. Missing intermediate folders in the path are created by Graph itself.
+fn encode_path(path: &str) -> String {
+    path.split('/')
+        .map(|seg| urlencoding::encode(seg).into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// OneDrive provider
 pub struct OneDrive {
     config: OAuthConfig,
@@ -416,9 +426,18 @@ impl CloudProvider for OneDrive {
         const SIMPLE_UPLOAD_LIMIT: usize = 4 * 1024 * 1024;
 
         let url = if let Some(id) = parent_id {
-            format!("{}/me/drive/items/{}:/{}:/content", GRAPH_BASE, id, name)
+            format!(
+                "{}/me/drive/items/{}:/{}:/content",
+                GRAPH_BASE,
+                id,
+                encode_path(name)
+            )
         } else {
-            format!("{}/me/drive/root:/{}:/content", GRAPH_BASE, name)
+            format!(
+                "{}/me/drive/root:/{}:/content",
+                GRAPH_BASE,
+                encode_path(name)
+            )
         };
 
         if content.len() <= SIMPLE_UPLOAD_LIMIT {
@@ -586,12 +605,15 @@ impl OneDrive {
         let session_url = if let Some(id) = parent_id {
             format!(
                 "{}/me/drive/items/{}:/{}:/createUploadSession",
-                GRAPH_BASE, id, name
+                GRAPH_BASE,
+                id,
+                encode_path(name)
             )
         } else {
             format!(
                 "{}/me/drive/root:/{}:/createUploadSession",
-                GRAPH_BASE, name
+                GRAPH_BASE,
+                encode_path(name)
             )
         };
 
@@ -668,5 +690,19 @@ impl OneDrive {
         last_response.map(|i| i.to_cloud_file()).ok_or_else(|| {
             IntegrationError::Api("Upload completed but no response received".into())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_segments_are_encoded_but_slashes_kept() {
+        assert_eq!(
+            encode_path("My Notes/50% #1?/café.pdf"),
+            "My%20Notes/50%25%20%231%3F/caf%C3%A9.pdf"
+        );
+        assert_eq!(encode_path("a.pdf"), "a.pdf");
     }
 }

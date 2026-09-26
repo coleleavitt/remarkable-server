@@ -73,6 +73,16 @@ pub enum IntegrationError {
     InvalidPath(String),
 }
 
+impl IntegrationError {
+    /// Retrying can never succeed: the remote name is rejected by path validation (traversal,
+    /// symlink escape) or the item no longer exists. Everything else (network, I/O, rate limit,
+    /// auth, API errors) may be transient. Delta sync advances its cursor past permanent
+    /// failures but holds it for transient ones so the change is fetched again next time.
+    pub fn is_permanent(&self) -> bool {
+        matches!(self, Self::InvalidPath(_) | Self::NotFound(_))
+    }
+}
+
 pub type Result<T> = std::result::Result<T, IntegrationError>;
 
 /// Connect timeout for provider / OAuth requests.
@@ -198,8 +208,11 @@ pub trait CloudProvider: Send + Sync {
     ) -> Result<CloudFile>;
 
     /// Upload to a path relative to `parent_id`, given as already-validated components
-    /// (`["dir", "sub", "name.pdf"]`). The default suits path-addressed providers
-    /// (Dropbox, OneDrive), which create intermediate folders from `dir/sub/name.pdf`.
+    /// (`["dir", "sub", "name.pdf"]`). The default suits path-addressed providers, whose
+    /// upload endpoints create missing intermediate folders themselves: Dropbox `files/upload`
+    /// with `path = "{parent}/dir/sub/name.pdf"`, and Graph `PUT
+    /// items/{parent}:/dir/sub/name.pdf:/content` (or `createUploadSession`). ID-addressed
+    /// providers (Google Drive) must override this and create each folder.
     async fn upload_file_at(
         &self,
         parent_id: Option<&str>,
