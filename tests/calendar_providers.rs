@@ -1172,7 +1172,7 @@ async fn caldav_fallback_reports_rules_it_cannot_expand_and_still_prunes() {
     let error = first.error.as_deref().unwrap();
     assert!(
         error.contains("1 recurring event(s) (\"Week rota\")")
-            && error.contains("only their first occurrence was stored"),
+            && error.contains("at most their first occurrence was stored"),
         "{}",
         error
     );

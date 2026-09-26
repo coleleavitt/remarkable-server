@@ -164,6 +164,14 @@ The community's top *concrete* pains. Small, bounded, high-value.
 - 🧪 **Tablet's screenshare broker subscriptions** — all were inside the ACL (no
   denials logged), but the exact filters weren't logged; accepted filters now
   log at debug (`remarkable_server::screenshare=debug`).
+- ⬜ **RDATE-only series on Radicale** *(#39)* — Radicale accepts `expand`
+  but does not expand a series of RDATEs without an RRULE: it sends the master
+  as is (without its moved occurrences) while the master's own DTSTART..DTEND
+  overlaps the window, and empty calendar-data after that. The dates are
+  expanded here while the master comes; once its DTSTART is over 30 days old
+  they are missing, and the stored ones are pruned. Fix: re-fetch resources an
+  `expand` answer leaves empty or unexpanded with a plain `calendar-multiget`
+  and expand them here (or have Radicale expand RDATE).
 
 ---
 

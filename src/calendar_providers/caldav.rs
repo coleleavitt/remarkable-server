@@ -669,7 +669,7 @@ fn read_report(response: &DavResponse, calendar_id: &str, window: SyncWindow) ->
             )
         })
     });
-    // Series stored as their first occurrence only: reported, but the answer is complete
+    // Series stored as their first occurrence at most: reported, but the answer is complete
     // otherwise, so stored events it does not list are still removed.
     let unexpanded = expansion.unexpanded();
     let warnings = match unexpanded.len() {
@@ -684,8 +684,8 @@ fn read_report(response: &DavResponse, calendar_id: &str, window: SyncWindow) ->
             }
             vec![format!(
                 "caldav: REPORT {}: {} recurring event(s) ({}) use a recurrence rule that \
-                 the CalDAV server did not expand and this server cannot, so only their first \
-                 occurrence was stored",
+                 the CalDAV server did not expand and this server cannot, so at most their \
+                 first occurrence was stored",
                 redact(&response.url),
                 count,
                 named.join(", ")
@@ -1049,7 +1049,7 @@ mod tests {
             ]
         );
         // The answer is complete (stored events it does not list are removed), but the
-        // series kept as their first occurrence are named.
+        // series kept as their first occurrence at most are named.
         assert_eq!(fetched.incomplete, None);
         assert_eq!(fetched.warnings.len(), 1);
         let warning = &fetched.warnings[0];
@@ -1059,7 +1059,7 @@ mod tests {
             warning
         );
         assert!(
-            warning.contains("only their first occurrence"),
+            warning.contains("at most their first occurrence was stored"),
             "{}",
             warning
         );

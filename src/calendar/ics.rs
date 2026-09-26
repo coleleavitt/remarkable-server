@@ -10,8 +10,8 @@
 //! expanding it.
 //!
 //! Both are budgeted, so hostile calendar data costs bounded CPU and memory. A time whose
-//! VTIMEZONE rules are too costly to go through is never guessed: its event is left out, and
-//! the caller learns that the result is incomplete.
+//! VTIMEZONE rules are too costly to go through (or whose TZID is too long to look up) is
+//! never guessed: its event is left out, and the caller learns that the result is incomplete.
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -48,6 +48,13 @@ const MAX_EXPANDED_BYTES: usize = 64 << 20;
 /// 40, so this covers some 300,000 converted times; a hostile zone runs out of it instead of
 /// the CPU.
 const MAX_ZONE_STEPS: usize = 12_000_000;
+/// Longest TZID a time is converted in. Real ones (Olson names, Outlook's display names, the
+/// prefixed names of older exporters) are well under 100 bytes. Each conversion looks the
+/// name up, and one without a VTIMEZONE is also noted, which takes time in proportion to its
+/// length; values of one RDATE or EXDATE line share their TZID, so a long name on a long list
+/// would cost hours of CPU without adding to any budget. A time in a longer one is treated as
+/// one whose zone is too costly to go through: left out, and the result marked incomplete.
+const MAX_TZID_BYTES: usize = 255;
 
 /// TZIDs that name UTC itself, for calendar data that uses them without a VTIMEZONE.
 const UTC_NAMES: &[&str] = &[
@@ -69,7 +76,8 @@ const UTC_NAMES: &[&str] = &[
 pub struct IcsEvents {
     pub events: Vec<CalendarEvent>,
     /// Whether events are missing because the text's VTIMEZONE rules were too costly to go
-    /// through, so their `TZID=` times could not be converted (see [`MAX_ZONE_STEPS`]).
+    /// through, or a TZID too long to look up, so their `TZID=` times could not be converted
+    /// (see [`MAX_ZONE_STEPS`] and [`MAX_TZID_BYTES`]).
     pub incomplete: bool,
 }
 
@@ -98,8 +106,8 @@ pub fn parse_ics_str(content: &str, calendar_id: &str) -> IcsEvents {
     let incomplete = doc.zones.exhausted.get();
     if incomplete {
         tracing::warn!(
-            "calendar {}: too many time zone rules to go through; events whose times could \
-             not be converted were left out",
+            "calendar {}: too many time zone rules to go through (or a TZID too long to look \
+             up); events whose times could not be converted were left out",
             calendar_id
         );
     }
@@ -466,7 +474,8 @@ struct Zones {
     unknown: RefCell<BTreeSet<String>>,
     /// What lookups may still cost, see [`MAX_ZONE_STEPS`].
     steps_left: Cell<usize>,
-    /// Whether that ran out, so later times in these zones could not be converted.
+    /// Whether that ran out, so later times in these zones could not be converted, or a time
+    /// was in a zone whose name is too long to look up (see [`MAX_TZID_BYTES`]).
     exhausted: Cell<bool>,
 }
 
@@ -484,11 +493,16 @@ impl Default for Zones {
 impl Zones {
     /// `local` in zone `tzid` as UTC; floating times, and zones without a VTIMEZONE or a
     /// usable observance, are read as UTC. `None` when the zone's rules were too costly to go
-    /// through: the offset is unknown, and reading the time as UTC would store it hours off.
+    /// through, or its name is too long to look up (see [`MAX_TZID_BYTES`]): the offset is
+    /// unknown, and reading the time as UTC would store it hours off.
     fn local_to_utc(&self, local: NaiveDateTime, tzid: Option<&str>) -> Option<NaiveDateTime> {
         let Some(tzid) = tzid else {
             return Some(local);
         };
+        if tzid.len() > MAX_TZID_BYTES {
+            self.exhausted.set(true);
+            return None;
+        }
         if let Some(zone) = self.by_id.get(tzid) {
             let mut budget = self.steps_left.get();
             let converted = zone.to_utc(local, &mut budget);
@@ -502,7 +516,9 @@ impl Zones {
                 }
             }
         }
-        if !UTC_NAMES.iter().any(|n| n.eq_ignore_ascii_case(tzid)) {
+        if !UTC_NAMES.iter().any(|n| n.eq_ignore_ascii_case(tzid))
+            && !self.unknown.borrow().contains(tzid)
+        {
             self.unknown.borrow_mut().insert(tzid.to_string());
         }
         Some(local)
@@ -702,10 +718,12 @@ impl VEventFields {
 
     /// The occurrences of this recurring event that overlap the expansion window: DTSTART,
     /// those `rule` (its RRULE, if it has one) yields and its RDATEs, except those in
-    /// `overridden` (they have a VEVENT of their own) and in EXDATE. Each lasts as long as the
-    /// first, except an RDATE PERIOD, which says how long its occurrence lasts. Occurrences
-    /// whose time cannot be converted are left out, and so is the whole series when an EXDATE
-    /// cannot be; the answer is then marked truncated, and nothing stored is pruned.
+    /// `overridden` (they have a VEVENT of their own) and in EXDATE, with each id once: an
+    /// RDATE at the time of an earlier occurrence (in an all-day series, on its date) adds
+    /// nothing. Each lasts as long as the first, except an RDATE PERIOD, which says how long
+    /// its occurrence lasts. Occurrences whose time cannot be converted are left out, and so is
+    /// the whole series when an EXDATE cannot be; the answer is then marked truncated, and
+    /// nothing stored is pruned.
     fn expand(
         &self,
         rule: Option<&Rule>,
@@ -793,7 +811,14 @@ impl VEventFields {
                 starts.push((first_start, length));
             }
         }
-        let mut seen: HashSet<DateTime<Utc>> = starts.iter().map(|(at, _)| *at).collect();
+        // An occurrence's id holds its key, which is only its date in an all-day series: an
+        // RDATE is left out when an occurrence before it (DTSTART, the rule's or an earlier
+        // RDATE) has the same key, so that no id comes twice, not even from a time on a date
+        // the series already has.
+        let mut seen: HashSet<String> = starts
+            .iter()
+            .map(|(at, _)| occurrence_key(all_day, *at))
+            .collect();
         for rdate in &self.rdates {
             // Not converted, so a long list of past dates costs no zone lookups.
             if rdate.misses(length, window_start, window_end) {
@@ -802,7 +827,7 @@ impl VEventFields {
             let Some((at, length)) = rdate.occurrence(length, zones) else {
                 continue;
             };
-            if !in_window(at, length) || skip(at) || !seen.insert(at) {
+            if !in_window(at, length) || skip(at) || !seen.insert(occurrence_key(all_day, at)) {
                 continue;
             }
             if !expansion.take(bytes) {
@@ -2061,10 +2086,10 @@ mod tests {
     #[test]
     fn rdates_long_outside_the_window_need_no_zone_lookup() {
         let window = (utc("2026-03-01T00:00:00Z"), utc("2026-04-01T00:00:00Z"));
-        let expand = |past: &str| {
+        let expand = |past: &str, future: &str| {
             let ics = format!(
-                "{}BEGIN:VEVENT\nUID:r\nDTSTART;TZID=Europe/Berlin:20260302T090000\nRDATE;TZID=Europe/Berlin:{}20260309T090000,20300101T090000\nEND:VEVENT\n",
-                BERLIN, past
+                "{}BEGIN:VEVENT\nUID:r\nDTSTART;TZID=Europe/Berlin:20260302T090000\nRDATE;TZID=Europe/Berlin:{}20260309T090000,20300101T090000{}\nEND:VEVENT\n",
+                BERLIN, past, future
             );
             let mut expansion = Expansion::new(window.0, window.1);
             let mut ids: Vec<String> = parse_ics_expanded(&ics, "c", None, &mut expansion)
@@ -2075,25 +2100,25 @@ mod tests {
             assert!(!expansion.truncated());
             (ids, MAX_ZONE_STEPS - expansion.zone_steps_left)
         };
-        let (recent, recent_steps) = expand("");
-        // Twenty years of past dates, every ten hours: some 17,500 lookups would be over half
-        // a million steps.
-        let first = NaiveDate::from_ymd_opt(2005, 1, 1)
-            .unwrap()
-            .and_hms_opt(9, 0, 0)
-            .unwrap();
-        let past: String = (0..17_500)
-            .map(|i| {
-                format!(
-                    "{},",
-                    (first + Duration::hours(10 * i)).format("%Y%m%dT%H%M%S")
-                )
-            })
-            .collect();
-        let (old, old_steps) = expand(&past);
+        let (recent, recent_steps) = expand("", "");
+        // Twenty years of dates every ten hours, before the window or after it: some 17,500
+        // lookups would be over half a million steps.
+        let every_ten_hours = |from: i32| {
+            let first = NaiveDate::from_ymd_opt(from, 1, 1)
+                .unwrap()
+                .and_hms_opt(9, 0, 0)
+                .unwrap();
+            (0..17_500).map(move |i| (first + Duration::hours(10 * i)).format("%Y%m%dT%H%M%S"))
+        };
+        let past: String = every_ten_hours(2005).map(|t| format!("{},", t)).collect();
+        let future: String = every_ten_hours(2027).map(|t| format!(",{}", t)).collect();
+        let (old, old_steps) = expand(&past, "");
+        let (late, late_steps) = expand("", &future);
         assert_eq!(recent, ["c:r:20260302T080000Z", "c:r:20260309T080000Z"]);
         assert_eq!(old, recent);
         assert_eq!(old_steps, recent_steps);
+        assert_eq!(late, recent);
+        assert_eq!(late_steps, recent_steps);
     }
 
     #[test]
@@ -2240,6 +2265,125 @@ mod tests {
         assert_eq!(&*rdates[0], zone.as_str());
         assert!(rdates.iter().all(|t| Rc::ptr_eq(t, &rdates[0])));
         assert!(exdates.iter().all(|t| Rc::ptr_eq(t, &exdates[0])));
+    }
+
+    #[test]
+    fn each_occurrence_id_comes_once_in_an_all_day_series() {
+        // An all-day series keys its occurrences by date, so RDATE times on a date it already
+        // has (two on one day, one on DTSTART's day, one on a day of its rule) would give an
+        // id twice, and storing both would keep only the last. The first occurrence with an
+        // id is kept: DTSTART and the rule's before the RDATEs, and RDATEs in their order.
+        let ics = "BEGIN:VEVENT\nUID:m\nSUMMARY:Market\nDTSTART;VALUE=DATE:20260307\nRDATE:20260321T090000Z,20260321T150000Z\nRDATE:20260307T100000Z\nEND:VEVENT\nBEGIN:VEVENT\nUID:w\nDTSTART;VALUE=DATE:20260302\nRRULE:FREQ=WEEKLY;COUNT=3\nRDATE:20260309T120000Z,20260310T120000Z\nEND:VEVENT\n";
+        let mut expansion =
+            Expansion::new(utc("2026-03-01T00:00:00Z"), utc("2026-04-01T00:00:00Z"));
+        let events = parse_ics_expanded(ics, "c", None, &mut expansion);
+        assert!(!expansion.truncated());
+        let ids: HashSet<&str> = events.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids.len(), events.len());
+        let day = Duration::days(1);
+        assert_eq!(
+            occurrences(&events),
+            [
+                occurrence("c:w:20260302", "2026-03-02T00:00", day, UNTITLED_EVENT),
+                occurrence("c:m:20260307", "2026-03-07T00:00", day, "Market"),
+                occurrence("c:w:20260309", "2026-03-09T00:00", day, UNTITLED_EVENT),
+                occurrence("c:w:20260310", "2026-03-10T12:00", day, UNTITLED_EVENT),
+                occurrence("c:w:20260316", "2026-03-16T00:00", day, UNTITLED_EVENT),
+                occurrence("c:m:20260321", "2026-03-21T09:00", day, "Market"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tzid_too_long_to_look_up_is_not_converted() {
+        // Values of one list share their TZID, so a long one costs little memory; converting
+        // each value would still look the name up (and note it, without a VTIMEZONE), so a
+        // name too long for any real zone is refused before that, value by value, rather
+        // than read as UTC. Its occurrences are unknown: left out, and the answer incomplete.
+        let long = "Q".repeat(MAX_TZID_BYTES + 1);
+        let values = vec!["20260105T090000"; 10_000].join(",");
+        let window = (utc("2026-01-01T00:00:00Z"), utc("2027-01-01T00:00:00Z"));
+        let ics = format!(
+            "BEGIN:VEVENT\nUID:a\nDTSTART:20260105T090000Z\nRDATE;TZID={z}:{v}\nEXDATE;TZID={z}:20260106T090000\nEND:VEVENT\nBEGIN:VEVENT\nUID:b\nDTSTART:20260105T090000Z\nRDATE;TZID={z}:{v}\nEND:VEVENT\nBEGIN:VEVENT\nUID:plain\nDTSTART:20260105T100000Z\nEND:VEVENT\n",
+            z = long,
+            v = values
+        );
+        let mut expansion = Expansion::new(window.0, window.1);
+        let events = parse_ics_expanded(&ics, "c", None, &mut expansion);
+        // `a` cannot tell whether its EXDATE cancels anything and is left out; `b` keeps
+        // DTSTART, in UTC.
+        let mut ids: Vec<&str> = events.iter().map(|e| e.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, ["c:b:20260105T090000Z", "c:plain"]);
+        assert!(expansion.truncated());
+        assert_eq!(expansion.unknown_zones().count(), 0);
+        assert_eq!(expansion.zone_steps_left, MAX_ZONE_STEPS);
+
+        // Not even a VTIMEZONE of that name makes it one to convert in, in CalDAV data or in
+        // an ICS file.
+        let zoned = format!(
+            "BEGIN:VTIMEZONE\nTZID:{z}\nBEGIN:STANDARD\nDTSTART:19700101T000000\nTZOFFSETFROM:+0100\nTZOFFSETTO:+0100\nEND:STANDARD\nEND:VTIMEZONE\nBEGIN:VEVENT\nUID:z\nDTSTART;TZID={z}:20260105T090000\nEND:VEVENT\n",
+            z = long
+        );
+        let mut expansion = Expansion::new(window.0, window.1);
+        assert!(parse_ics_expanded(&zoned, "c", None, &mut expansion).is_empty());
+        assert!(expansion.truncated());
+        let file = parse_ics_str(&zoned, "c");
+        assert!(file.events.is_empty());
+        assert!(file.incomplete);
+
+        // One byte shorter is a zone name like any other: converted with its VTIMEZONE, or
+        // read as UTC and reported without one.
+        let longest = "Q".repeat(MAX_TZID_BYTES);
+        let mut expansion = Expansion::new(window.0, window.1);
+        let events = parse_ics_expanded(&zoned.replace(&long, &longest), "c", None, &mut expansion);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].start, utc("2026-01-05T08:00:00Z"));
+        let unknown = format!(
+            "BEGIN:VEVENT\nUID:u\nDTSTART;TZID={z}:20260105T090000\nRDATE;TZID={z}:{v}\nEND:VEVENT\n",
+            z = longest,
+            v = values
+        );
+        let mut expansion = Expansion::new(window.0, window.1);
+        let events = parse_ics_expanded(&unknown, "c", None, &mut expansion);
+        assert!(!expansion.truncated());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].start, utc("2026-01-05T09:00:00Z"));
+        assert_eq!(
+            expansion.unknown_zones().collect::<Vec<_>>(),
+            [longest.as_str()]
+        );
+    }
+
+    #[test]
+    fn an_unexpanded_series_whose_exdate_cannot_be_converted_is_left_out() {
+        // A rule that is not expanded keeps its first occurrence unless an EXDATE cancels it.
+        // When an EXDATE's zone cannot be gone through, whether it does is unknown: the
+        // occurrence is left out rather than shown although it may be cancelled, and the
+        // answer is incomplete, so a stored one is kept.
+        let ics = format!(
+            "{}BEGIN:VEVENT\nUID:cancelled\nDTSTART:20260302T080000Z\nRRULE:FREQ=HOURLY\nEXDATE;TZID=Europe/Berlin:20260302T090000\nEND:VEVENT\nBEGIN:VEVENT\nUID:kept\nDTSTART:20260302T080000Z\nRRULE:FREQ=HOURLY\nEXDATE;TZID=Europe/Berlin:20260303T090000\nEND:VEVENT\n",
+            BERLIN
+        );
+        let window = (utc("2026-03-01T00:00:00Z"), utc("2026-04-01T00:00:00Z"));
+        let mut expansion = Expansion::new(window.0, window.1);
+        let events = parse_ics_expanded(&ics, "c", None, &mut expansion);
+        assert!(!expansion.truncated());
+        assert_eq!(
+            events.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            ["c:kept"]
+        );
+        let mut expansion = Expansion {
+            zone_steps_left: 0,
+            ..Expansion::new(window.0, window.1)
+        };
+        let events = parse_ics_expanded(&ics, "c", None, &mut expansion);
+        assert!(expansion.truncated());
+        assert!(events.is_empty(), "{:?}", events);
+        assert_eq!(
+            expansion.unexpanded().collect::<Vec<_>>(),
+            ["cancelled", "kept"]
+        );
     }
 
     /// Line unfolding as it was done before it became lazy: every line up front.
