@@ -90,7 +90,8 @@ impl From<ReadLaterError> for ServerError {
             ReadLaterError::AuthRequired(_) => ServerError::Unauthorized,
             ReadLaterError::OAuth(msg)
             | ReadLaterError::Api(msg)
-            | ReadLaterError::Conversion(msg) => ServerError::Internal(msg),
+            | ReadLaterError::Conversion(msg)
+            | ReadLaterError::ConverterUnavailable(msg) => ServerError::Internal(msg),
             ReadLaterError::Database(msg) => ServerError::Database(msg),
             ReadLaterError::Network(msg) => ServerError::Internal(format!("Network: {}", msg)),
             ReadLaterError::RateLimited(secs) => {

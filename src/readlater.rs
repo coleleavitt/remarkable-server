@@ -32,6 +32,10 @@ pub enum ReadLaterError {
     RateLimited(u64),
     #[error("Conversion error: {0}")]
     Conversion(String),
+    /// No converter works on this host (none installed, too old, or broken): the host's
+    /// problem, not the article's.
+    #[error("Converter unavailable: {0}")]
+    ConverterUnavailable(String),
     #[error("Database error: {0}")]
     Database(String),
     #[error("Network error: {0}")]
@@ -2196,15 +2200,28 @@ pub struct RenderedArticle {
 pub struct ArticleConverter;
 
 impl ArticleConverter {
+    /// Render `article` as `format`, printing PDFs with the converters on `PATH`.
     pub fn render(
         article: &Article,
         content: &ArticleContent,
         format: ArticleFormat,
     ) -> Result<RenderedArticle> {
+        Self::render_with(article, content, format, &PdfPrograms::default())
+    }
+
+    /// [`render`](Self::render), printing PDFs with `programs`. A PDF no converter printed is
+    /// [`ReadLaterError::ConverterUnavailable`] if none works here at all, else
+    /// [`ReadLaterError::Conversion`] (the article is at fault).
+    pub(crate) fn render_with(
+        article: &Article,
+        content: &ArticleContent,
+        format: ArticleFormat,
+        programs: &PdfPrograms,
+    ) -> Result<RenderedArticle> {
         let (ext, bytes) = match format {
             ArticleFormat::Html => ("html", Self::html_document(article, content).into_bytes()),
             ArticleFormat::Epub => ("epub", Self::epub(article, content)?),
-            ArticleFormat::Pdf => ("pdf", Self::pdf(article, content)?),
+            ArticleFormat::Pdf => ("pdf", Self::pdf(article, content, programs)?),
         };
         Ok(RenderedArticle { ext, bytes })
     }
@@ -2309,92 +2326,150 @@ img {{ max-width: 100%; }}
 
     /// Print the HTML rendering with `weasyprint`, else `wkhtmltopdf` (see [`pdf_printers`]),
     /// in a scratch directory.
-    fn pdf(article: &Article, content: &ArticleContent) -> Result<Vec<u8>> {
-        let dir = tempfile::tempdir()?;
-        let html = dir.path().join("article.html");
-        let pdf = dir.path().join("article.pdf");
-        std::fs::write(&html, Self::html_document(article, content))?;
+    fn pdf(article: &Article, content: &ArticleContent, programs: &PdfPrograms) -> Result<Vec<u8>> {
+        let dir = tempfile::tempdir().map_err(no_scratch_space)?;
         print_pdf(
-            &pdf_printers(dir.path(), &html, &pdf),
-            &pdf,
+            &pdf_printers(programs, dir.path()),
+            dir.path(),
+            &Self::html_document(article, content),
             PDF_PRINT_TIMEOUT,
         )
     }
 }
 
-/// Longest one PDF printer may run on one article before it is killed, so a converter stuck
-/// on a page can't stall the sync (and the scheduler) for good.
+/// Longest one PDF printer may run on one page before it is killed, so a converter stuck on a
+/// page can't stall the sync (and the scheduler) for good.
 const PDF_PRINT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// A PDF converter command line.
+/// A page any working PDF printer prints: a printer that fails on an article but prints this is
+/// failing on the article, not on this host.
+const TEST_PAGE: &str = concat!(
+    "<!DOCTYPE html>\n",
+    "<html><head><meta charset=\"utf-8\"><title>Test page</title></head>",
+    "<body><p>Test page</p></body></html>\n",
+);
+
+/// Without scratch space no converter can run, whatever the article.
+fn no_scratch_space(e: std::io::Error) -> ReadLaterError {
+    ReadLaterError::ConverterUnavailable(format!("scratch directory: {e}"))
+}
+
+/// The PDF converter programs [`ArticleConverter`] runs: `weasyprint` and `wkhtmltopdf`, found
+/// on `PATH`, by default.
+#[derive(Debug, Clone)]
+pub(crate) struct PdfPrograms {
+    pub(crate) weasyprint: std::ffi::OsString,
+    pub(crate) wkhtmltopdf: std::ffi::OsString,
+}
+
+impl Default for PdfPrograms {
+    fn default() -> Self {
+        Self {
+            weasyprint: "weasyprint".into(),
+            wkhtmltopdf: "wkhtmltopdf".into(),
+        }
+    }
+}
+
+/// A PDF converter command line: `program`, `options`, then the input HTML and output PDF.
 #[derive(Debug, Clone)]
 struct PdfPrinter {
     program: std::ffi::OsString,
-    args: Vec<std::ffi::OsString>,
+    options: Vec<std::ffi::OsString>,
 }
 
-/// The printers tried for `html` (inside the scratch directory `dir`), writing `pdf`. The HTML
-/// comes from the provider, i.e. from any web page, so each is confined as far as its options
-/// allow: WeasyPrint may fetch only `http`, `https` and `data:` URLs, never `file:` ones, so no
-/// file from this machine (a TLS key, a database) can be pulled into the PDF, e.g. as an
-/// attachment; this needs a WeasyPrint with `--allowed-protocols`, and an older one just fails.
-/// wkhtmltopdf runs without JavaScript and may read no local file outside `dir`. Both may still
-/// load http(s) resources such as images, as any renderer of the page would.
-fn pdf_printers(dir: &Path, html: &Path, pdf: &Path) -> Vec<PdfPrinter> {
-    let args = |args: &[&std::ffi::OsStr]| args.iter().map(|&a| a.to_owned()).collect();
+/// The printers tried, in order, for HTML inside the scratch directory `dir`. The HTML comes
+/// from the provider, i.e. from any web page, so each is confined as far as its options allow:
+/// WeasyPrint may fetch only `http`, `https` and `data:` URLs, never `file:` ones, so no file
+/// from this machine (a TLS key, a database) can be pulled into the PDF, e.g. as an
+/// attachment; this needs WeasyPrint 67 or later (the first with `--allowed-protocols`), and an
+/// older one just fails. wkhtmltopdf runs without JavaScript and may read no local file outside
+/// `dir`. Both may still load http(s) resources such as images, as any renderer of the page
+/// would.
+fn pdf_printers(programs: &PdfPrograms, dir: &Path) -> Vec<PdfPrinter> {
+    let options = |options: &[&std::ffi::OsStr]| options.iter().map(|&o| o.to_owned()).collect();
     let os = std::ffi::OsStr::new;
     vec![
         PdfPrinter {
-            program: "weasyprint".into(),
-            args: args(&[
-                os("--allowed-protocols"),
-                os("http,https,data"),
-                html.as_os_str(),
-                pdf.as_os_str(),
-            ]),
+            program: programs.weasyprint.clone(),
+            options: options(&[os("--allowed-protocols"), os("http,https,data")]),
         },
         PdfPrinter {
-            program: "wkhtmltopdf".into(),
-            args: args(&[
+            program: programs.wkhtmltopdf.clone(),
+            options: options(&[
                 os("--quiet"),
                 os("--disable-javascript"),
                 os("--disable-local-file-access"),
                 os("--allow"),
                 dir.as_os_str(),
-                html.as_os_str(),
-                pdf.as_os_str(),
             ]),
         },
     ]
 }
 
-/// Run `printers` in turn until one exits successfully, each killed after `limit`, and return
-/// the `pdf` it wrote.
-fn print_pdf(printers: &[PdfPrinter], pdf: &Path, limit: std::time::Duration) -> Result<Vec<u8>> {
+/// Print `html` in the scratch directory `dir` with the first of `printers` that manages, each
+/// killed after `limit`. If none does, the ones that ran are tried on [`TEST_PAGE`]: if one
+/// prints it, the article is at fault ([`ReadLaterError::Conversion`]); if none does (none
+/// installed, too old for its options, or broken), no converter works here
+/// ([`ReadLaterError::ConverterUnavailable`]), whatever the article.
+fn print_pdf(
+    printers: &[PdfPrinter],
+    dir: &Path,
+    html: &str,
+    limit: std::time::Duration,
+) -> Result<Vec<u8>> {
+    let (input, output) = (dir.join("article.html"), dir.join("article.pdf"));
+    std::fs::write(&input, html).map_err(no_scratch_space)?;
     let mut failures = Vec::new();
+    let mut ran = Vec::new();
     for printer in printers {
         let name = printer.program.to_string_lossy();
-        match run_with_deadline(printer, limit) {
-            Ok(true) => return Ok(std::fs::read(pdf)?),
-            Ok(false) => failures.push(format!("{name} failed")),
+        let (failure, started) = match run_with_deadline(printer, &input, &output, limit) {
+            Ok(true) => return Ok(std::fs::read(&output)?),
+            Ok(false) => (format!("{name} failed"), true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                failures.push(format!("{name} not installed"));
+                (format!("{name} not installed"), false)
             }
-            Err(e) => failures.push(format!("{name}: {e}")),
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => (format!("{name}: {e}"), true),
+            // It couldn't be started (e.g. not executable).
+            Err(e) => (format!("{name}: {e}"), false),
+        };
+        failures.push(failure);
+        if started {
+            ran.push(printer);
         }
     }
-    Err(ReadLaterError::Conversion(format!(
-        "no PDF printed ({}); install a weasyprint with --allowed-protocols, or wkhtmltopdf",
-        failures.join(", ")
+    let failures = failures.join(", ");
+
+    let (input, output) = (dir.join("test.html"), dir.join("test.pdf"));
+    std::fs::write(&input, TEST_PAGE).map_err(no_scratch_space)?;
+    for printer in ran {
+        if matches!(run_with_deadline(printer, &input, &output, limit), Ok(true)) {
+            return Err(ReadLaterError::Conversion(format!(
+                "no PDF printed ({failures}), though {} prints a test page",
+                printer.program.to_string_lossy()
+            )));
+        }
+    }
+    Err(ReadLaterError::ConverterUnavailable(format!(
+        "no PDF printed ({failures}), nor a test page; install WeasyPrint 67 or later, or \
+         wkhtmltopdf"
     )))
 }
 
-/// Run `printer` without input or output until it exits, killing it once `limit` has passed.
-/// Returns whether it exited successfully.
-fn run_with_deadline(printer: &PdfPrinter, limit: std::time::Duration) -> std::io::Result<bool> {
+/// Run `printer` on `input`, writing `output`, without stdin, stdout or stderr until it exits,
+/// killing it once `limit` has passed. Returns whether it exited successfully.
+fn run_with_deadline(
+    printer: &PdfPrinter,
+    input: &Path,
+    output: &Path,
+    limit: std::time::Duration,
+) -> std::io::Result<bool> {
     use std::process::{Command, Stdio};
     let mut child = Command::new(&printer.program)
-        .args(&printer.args)
+        .args(&printer.options)
+        .arg(input)
+        .arg(output)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -2945,8 +3020,9 @@ impl ReadLaterManager {
     /// isn't lost before it is pushed; otherwise the provider's status wins and the change is
     /// dropped. A row recorded for no account (from before accounts were recorded) or for a
     /// deleted one is taken over by this account, minus any pending status change, which was
-    /// meant for the old account. A row of another existing account is left alone: articles are
-    /// unique per provider id.
+    /// meant for the old account, and keeps its device state only if it has the same URL (else
+    /// it was another instance's entry, and this article is still to be delivered). A row of
+    /// another existing account is left alone: articles are unique per provider id.
     pub(crate) fn record_fetched(
         &mut self,
         account_id: &str,
@@ -2982,12 +3058,18 @@ impl ReadLaterManager {
                     }
                     owner => {
                         article.id = prev.id.clone();
-                        if article.document_id.is_none() {
-                            article.document_id = prev.document_id.clone();
-                        }
-                        article.synced_to_device |= prev.synced_to_device;
-                        if article.last_sync.is_none() {
-                            article.last_sync = prev.last_sync;
+                        // A row of no account or a deleted one is this article only if it is
+                        // the same page: two instances of a provider (say two Wallabags)
+                        // number their entries alike, and the device state of another
+                        // instance's entry isn't this one's.
+                        if owner == Some(account_id) || prev.url == article.url {
+                            if article.document_id.is_none() {
+                                article.document_id = prev.document_id.clone();
+                            }
+                            article.synced_to_device |= prev.synced_to_device;
+                            if article.last_sync.is_none() {
+                                article.last_sync = prev.last_sync;
+                            }
                         }
                         if prev.read_status_pending
                             && keep_pending_status
@@ -4195,6 +4277,54 @@ mod tests {
         assert_eq!(a("new-p4").account_id.as_deref(), Some("b"));
     }
 
+    /// A row of no account or a deleted one with another URL is another instance's entry that
+    /// has the same id (two Wallabags number theirs alike): it is taken over without its device
+    /// state, so this account's article is still delivered. The account's own row keeps its
+    /// state whatever the URL.
+    #[test]
+    fn record_fetched_takes_over_device_state_only_for_the_same_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rl.db");
+        let mut mgr = ReadLaterManager::new(&db).unwrap();
+        mgr.add_account(pocket_account("b")).unwrap();
+        for (provider_id, owner) in [("p1", Some("gone")), ("p2", None), ("p3", Some("b"))] {
+            let mut a = delivered(provider_id, owner);
+            a.url = "https://old.example/1".into();
+            a.last_sync = Some(Utc::now());
+            mgr.save_article(&a).unwrap();
+        }
+        let fetched = ["p1", "p2", "p3"].map(|p| article(&format!("new-{p}"), p, 0));
+
+        let r = mgr.record_fetched("b", true, fetched.to_vec()).unwrap();
+        let state = |a: &Article| {
+            (
+                a.id.clone(),
+                a.account_id.clone(),
+                a.url.clone(),
+                a.synced_to_device,
+                a.document_id.clone(),
+                a.last_sync.is_some(),
+            )
+        };
+        let new_page = |id: &str| {
+            let b = Some("b".to_owned());
+            let url = "https://example.com/a".to_owned();
+            (id.to_owned(), b, url, false, None, false)
+        };
+        assert_eq!(state(stored(&r[0])), new_page("id-p1"));
+        assert_eq!(state(stored(&r[1])), new_page("id-p2"));
+        let own = stored(&r[2]);
+        assert_eq!(
+            (own.synced_to_device, own.document_id.as_deref()),
+            (true, Some("doc-p3"))
+        );
+
+        drop(mgr);
+        let mgr = ReadLaterManager::new(&db).unwrap();
+        assert_eq!(state(&mgr.get_article("id-p1").unwrap()), new_page("id-p1"));
+        assert_eq!(mgr.articles.read().len(), 3);
+    }
+
     /// Status changes to send are per account, and a sent one is cleared unless the status
     /// was changed again meanwhile.
     #[test]
@@ -4230,26 +4360,46 @@ mod tests {
     /// local file outside the scratch directory.
     #[test]
     fn pdf_printers_are_confined() {
-        let dir = Path::new("/scratch");
-        let printers = pdf_printers(dir, &dir.join("a.html"), &dir.join("a.pdf"));
-        let args = |i: usize| -> Vec<&str> {
+        let printers = pdf_printers(&PdfPrograms::default(), Path::new("/scratch"));
+        let options = |i: usize| -> Vec<&str> {
             printers[i]
-                .args
+                .options
                 .iter()
                 .map(|a| a.to_str().unwrap())
                 .collect()
         };
         assert_eq!(printers[0].program, "weasyprint");
         assert!(
-            args(0)
+            options(0)
                 .windows(2)
                 .any(|w| w == ["--allowed-protocols", "http,https,data"])
         );
         assert_eq!(printers[1].program, "wkhtmltopdf");
-        let wk = args(1);
+        let wk = options(1);
         assert!(wk.contains(&"--disable-javascript"));
         assert!(wk.contains(&"--disable-local-file-access"));
         assert!(wk.windows(2).any(|w| w == ["--allow", "/scratch"]));
+    }
+
+    /// A printer running `script` with `sh -c`, which gets the input HTML as `$0` and the
+    /// output PDF as `$1`.
+    #[cfg(unix)]
+    fn sh(script: &str) -> PdfPrinter {
+        PdfPrinter {
+            program: "sh".into(),
+            options: vec!["-c".into(), script.into()],
+        }
+    }
+
+    #[cfg(unix)]
+    const PRINTS: &str = r#"printf '%%PDF-1.4' > "$1""#;
+
+    #[cfg(unix)]
+    fn not_installed() -> PdfPrinter {
+        PdfPrinter {
+            program: "no-such-pdf-printer".into(),
+            options: Vec::new(),
+        }
     }
 
     /// A printer that doesn't finish in time is killed and the next one is tried; when none
@@ -4258,28 +4408,64 @@ mod tests {
     #[test]
     fn a_stuck_pdf_printer_is_killed() {
         let dir = tempfile::tempdir().unwrap();
-        let pdf = dir.path().join("a.pdf");
-        let sh = |script: String| PdfPrinter {
-            program: "sh".into(),
-            args: vec!["-c".into(), script.into()],
-        };
         let limit = std::time::Duration::from_millis(300);
         let started = std::time::Instant::now();
-        let printers = [
-            sh("exec sleep 30".into()),
-            sh(format!("printf '%%PDF-1.4' > '{}'", pdf.display())),
-        ];
-        assert_eq!(print_pdf(&printers, &pdf, limit).unwrap(), b"%PDF-1.4");
+        let printers = [sh("exec sleep 30"), sh(PRINTS)];
+        let pdf = print_pdf(&printers, dir.path(), "<p>a</p>", limit).unwrap();
+        assert_eq!(pdf, b"%PDF-1.4");
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
 
-        let missing = PdfPrinter {
-            program: "no-such-pdf-printer".into(),
-            args: Vec::new(),
-        };
-        let err = print_pdf(&[sh("exec sleep 30".into()), missing], &pdf, limit)
-            .unwrap_err()
-            .to_string();
+        let err = print_pdf(
+            &[sh("exec sleep 30"), not_installed()],
+            dir.path(),
+            "<p>a</p>",
+            limit,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("sh: killed after"), "{err}");
         assert!(err.contains("no-such-pdf-printer not installed"), "{err}");
+    }
+
+    /// A PDF no printer printed is the article's fault only if a printer that failed on it
+    /// prints a test page. If none does (none installed, one too old for its options, which
+    /// exits with a usage error, or one that fails on everything), or there is no scratch
+    /// space, no converter works here: an error of the host, not of the article.
+    #[cfg(unix)]
+    #[test]
+    fn pdf_failures_tell_the_article_from_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let limit = std::time::Duration::from_secs(30);
+        let print = |printers: &[PdfPrinter]| print_pdf(printers, dir.path(), "<p>a</p>", limit);
+        let fails_on_articles = sh(&format!(r#"grep -q 'Test page' "$0" && {PRINTS}"#));
+
+        let err = print(&[fails_on_articles, not_installed()]).unwrap_err();
+        assert!(matches!(err, ReadLaterError::Conversion(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("(sh failed, no-such-pdf-printer not installed), though sh prints"),
+            "{err}"
+        );
+
+        for printers in [
+            vec![not_installed(), not_installed()],
+            vec![sh("exit 2"), not_installed()],
+            vec![sh("exit 1")],
+            Vec::new(),
+        ] {
+            let err = print(&printers).unwrap_err();
+            assert!(
+                matches!(err, ReadLaterError::ConverterUnavailable(_)),
+                "{printers:?}: {err:?}"
+            );
+            assert!(err.to_string().contains("WeasyPrint 67 or later"), "{err}");
+        }
+
+        let gone = dir.path().join("gone");
+        let err = print_pdf(&[sh(PRINTS)], &gone, "<p>a</p>", limit).unwrap_err();
+        assert!(
+            matches!(&err, ReadLaterError::ConverterUnavailable(m) if m.starts_with("scratch")),
+            "{err:?}"
+        );
     }
 }

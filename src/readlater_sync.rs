@@ -18,9 +18,10 @@
 //!    marked delivered right after its document is committed, on the same blocking thread;
 //! 6. if the root changed, tell connected devices to pull it (SyncComplete);
 //! 7. advance `last_sync` to when the fetch started, unless something is to be retried over the
-//!    same window: the fetch or recording failed, the tree refused a document, the provider
-//!    could not be reached, or an article failed that hasn't yet failed
-//!    [`MAX_ITEM_FAILURES`] syncs in a row. Delivered articles are skipped, never added twice.
+//!    same window: the fetch or recording failed, the tree refused a document, no PDF converter
+//!    works on this host, the provider could not be reached, or an article failed that hasn't
+//!    yet failed [`MAX_ITEM_FAILURES`] syncs in a row. Delivered articles are skipped, never
+//!    added twice.
 //!
 //! Accounts with `convert_format: html` are recorded but not delivered: the tablet opens only
 //! PDF and EPUB.
@@ -28,9 +29,12 @@
 //! At most one sync of an account runs at a time. The scheduler syncs enabled `auto_sync`
 //! accounts every `sync_interval_minutes` (at least [`MIN_INTERVAL_MINUTES`]), one after
 //! another, and backs off an account whose syncs keep failing as a whole (credentials, fetch,
-//! recording, the tree, the provider unreachable). An article or status change the provider or
-//! converter rejects is reported and retried on the next sync as usual, without delaying the
-//! account; after [`MAX_ITEM_FAILURES`] syncs in a row it stops holding the account back.
+//! recording, the tree, no working converter, the provider unreachable). An article or status
+//! change the provider or converter rejects is reported and retried on the next sync as usual,
+//! without delaying the account; after [`MAX_ITEM_FAILURES`] syncs in a row it stops holding
+//! the account back. A converter rejects an article only if it still prints a test page: when
+//! none can (none installed, too old, broken), the sync fails as a whole and keeps `last_sync`,
+//! so the articles are delivered once one works rather than dropped as the articles' fault.
 //! Provider requests time out ([`HttpTimeouts`]) and PDF converters are killed after a
 //! deadline, so nothing a provider does can stall the scheduler.
 
@@ -50,6 +54,7 @@ use crate::readlater::{
     ArticleConverter,
     ArticleFormat,
     HttpTimeouts,
+    PdfPrograms,
     ProviderAccount,
     ReadLaterError,
     ReadLaterManager,
@@ -181,6 +186,7 @@ pub struct ReadLaterSyncer {
     storage: Storage,
     notification_tx: broadcast::Sender<WsMessage>,
     http: HttpTimeouts,
+    pdf: PdfPrograms,
     /// Accounts with a sync in progress.
     running: Mutex<HashSet<String>>,
     attempts: Mutex<HashMap<String, Attempt>>,
@@ -212,6 +218,7 @@ impl ReadLaterSyncer {
             storage,
             notification_tx,
             http: HttpTimeouts::default(),
+            pdf: PdfPrograms::default(),
             running: Mutex::new(HashSet::new()),
             attempts: Mutex::new(HashMap::new()),
             item_failures: Mutex::new(HashMap::new()),
@@ -221,6 +228,13 @@ impl ReadLaterSyncer {
     /// Limit provider requests by `http` rather than the default [`HttpTimeouts`].
     pub fn with_http_timeouts(mut self, http: HttpTimeouts) -> Self {
         self.http = http;
+        self
+    }
+
+    /// Print PDFs with `pdf` rather than the converters on `PATH`.
+    #[cfg(test)]
+    fn with_pdf_programs(mut self, pdf: PdfPrograms) -> Self {
+        self.pdf = pdf;
         self
     }
 
@@ -774,6 +788,7 @@ impl Run<'_> {
                 article,
                 content,
                 format,
+                pdf: self.syncer.pdf.clone(),
             };
             let outcome = match tokio::task::spawn_blocking(move || delivery.run()).await {
                 Ok(outcome) => outcome,
@@ -792,9 +807,11 @@ impl Run<'_> {
                 Some(failure) if failure.stage == Stage::Render => {
                     self.item_rejected(item, failure.message);
                 }
-                // The tree refused the change (e.g. a root index we won't rewrite), and the
-                // rest would be refused the same way; or a delivery couldn't be recorded, and
-                // the next one wouldn't be either (it would be added again).
+                // No converter works here, so none of the rest would render either (they are
+                // delivered once one does); the tree refused the change (e.g. a root index we
+                // won't rewrite), and the rest would be refused the same way; or a delivery
+                // couldn't be recorded, and the next one wouldn't be either (it would be added
+                // again).
                 Some(failure) => {
                     self.fail(failure.message);
                     break;
@@ -860,7 +877,10 @@ fn retry_after(interval: Duration, failures: u32) -> Duration {
 /// The step of a [`Delivery`] that failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
+    /// The article couldn't be rendered (a converter that works failed on it).
     Render,
+    /// No converter works on this host, whatever the article.
+    Converter,
     /// Resolving the folder or committing the document to the sync tree.
     Tree,
     Record,
@@ -896,6 +916,7 @@ struct Delivery {
     article: Article,
     content: ArticleContent,
     format: ArticleFormat,
+    pdf: PdfPrograms,
 }
 
 impl Delivery {
@@ -906,8 +927,16 @@ impl Delivery {
     fn run(self) -> Delivered {
         let mut out = Delivered::default();
         let id = &self.article.id;
-        let rendered = match ArticleConverter::render(&self.article, &self.content, self.format) {
+        let rendered = match ArticleConverter::render_with(
+            &self.article,
+            &self.content,
+            self.format,
+            &self.pdf,
+        ) {
             Ok(rendered) => rendered,
+            Err(e @ ReadLaterError::ConverterUnavailable(_)) => {
+                return out.failed(Stage::Converter, format!("Convert {id}: {e}"));
+            }
             Err(e) => return out.failed(Stage::Render, format!("Convert {id}: {e}")),
         };
         out.converted = true;
@@ -969,7 +998,7 @@ mod tests {
 
     use axum::Json;
     use axum::body::Body;
-    use axum::extract::{Path as UrlPath, State};
+    use axum::extract::{Path as UrlPath, Query, State};
     use axum::http::{HeaderMap, Request, StatusCode};
     use axum::response::Response;
     use axum::routing::{get, post};
@@ -981,12 +1010,14 @@ mod tests {
     use crate::readlater::{ProviderConfig, ReadStatus, SyncSettings};
     use crate::readlater_api::{ReadLaterState, readlater_router};
 
-    /// A Wallabag instance. `/api/entries.json` lists `entries` whatever `since` says, so every
-    /// sync sees them all again; `/api/entries/{id}.json` serves one entry's content (GET) and
-    /// archives or unarchives it (PATCH).
+    /// A Wallabag instance. `/api/entries.json` lists `entries` whatever `since` says (unless
+    /// `honor_since`), so every sync sees them all again; `/api/entries/{id}.json` serves one
+    /// entry's content (GET) and archives or unarchives it (PATCH).
     #[derive(Default)]
     struct MockWallabag {
         entries: Mutex<Vec<Value>>,
+        /// List only the entries updated since `since`, as Wallabag does.
+        honor_since: AtomicBool,
         /// Access token the API accepts, and the token endpoint issues.
         valid_token: String,
         fail_list: AtomicBool,
@@ -1021,6 +1052,7 @@ mod tests {
     async fn list_entries(
         State(m): State<Arc<MockWallabag>>,
         headers: HeaderMap,
+        Query(query): Query<HashMap<String, String>>,
     ) -> Result<Json<Value>, StatusCode> {
         if !m.authorized(&headers) {
             return Err(StatusCode::UNAUTHORIZED);
@@ -1037,7 +1069,14 @@ mod tests {
         if m.fail_list.load(Ordering::SeqCst) {
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
-        let items = m.entries.lock().clone();
+        let mut items = m.entries.lock().clone();
+        let since = query.get("since").and_then(|s| s.parse::<i64>().ok());
+        if let Some(since) = since.filter(|_| m.honor_since.load(Ordering::SeqCst)) {
+            items.retain(|e| {
+                let updated = DateTime::parse_from_rfc3339(e["updated_at"].as_str().unwrap());
+                updated.unwrap().timestamp() >= since
+            });
+        }
         Ok(Json(json!({"_embedded": {"items": items}})))
     }
 
@@ -1144,13 +1183,29 @@ mod tests {
 
         /// A fixture whose syncer limits provider requests by `http`.
         async fn with_timeouts(entries: Vec<Value>, http: HttpTimeouts) -> Self {
+            Self::with_syncer(entries, |s| s.with_http_timeouts(http)).await
+        }
+
+        /// A fixture whose syncer prints PDFs with `pdf`.
+        async fn with_pdf_programs(entries: Vec<Value>, pdf: PdfPrograms) -> Self {
+            Self::with_syncer(entries, |s| s.with_pdf_programs(pdf)).await
+        }
+
+        /// A fixture whose syncer is set up by `configure`.
+        async fn with_syncer(
+            entries: Vec<Value>,
+            configure: impl FnOnce(ReadLaterSyncer) -> ReadLaterSyncer,
+        ) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let db = dir.path().join("rl.db");
             let storage = Storage::new(dir.path().join("storage")).unwrap();
             let (tx, rx) = broadcast::channel(64);
             let manager = Arc::new(Mutex::new(ReadLaterManager::new(&db).unwrap()));
-            let syncer = ReadLaterSyncer::new(Arc::clone(&manager), storage.clone(), tx)
-                .with_http_timeouts(http);
+            let syncer = configure(ReadLaterSyncer::new(
+                Arc::clone(&manager),
+                storage.clone(),
+                tx,
+            ));
             let state = ReadLaterState {
                 manager,
                 syncer: Arc::new(syncer),
@@ -1868,6 +1923,98 @@ mod tests {
         let r = pass(180).await;
         assert!(r.len() == 1 && r[0].errors.is_empty(), "{r:?}");
         assert_eq!(f.document_names(), ["Article 1", "Article 2"]);
+    }
+
+    /// With no working PDF converter (here a WeasyPrint too old for `--allowed-protocols`,
+    /// which exits with a usage error, and no wkhtmltopdf) no article can be rendered: each sync
+    /// fails as a whole at the first one, backing the account off and keeping `last_sync`
+    /// however often it happens, so the articles are delivered once a converter works, even
+    /// though the provider lists only what changed since `last_sync`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn no_working_converter_keeps_the_articles_for_later() {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = tempfile::tempdir().unwrap();
+        let install = |name: &str, script: &str| {
+            let path = bin.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        install("weasyprint", "exit 2");
+        let programs = PdfPrograms {
+            weasyprint: bin.path().join("weasyprint").into(),
+            wkhtmltopdf: bin.path().join("wkhtmltopdf").into(),
+        };
+        let f = Fixture::with_pdf_programs(vec![entry(1), entry(2)], programs).await;
+        f.mock.honor_since.store(true, Ordering::SeqCst);
+        f.add_account("wb", |s| s.convert_format = ArticleFormat::Pdf);
+
+        for failures in 1..=MAX_ITEM_FAILURES + 1 {
+            let r = f.syncer().sync_account("wb").await.unwrap();
+            assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+            assert!(
+                r.errors[0].contains("Converter unavailable")
+                    && r.errors[0].contains("wkhtmltopdf not installed"),
+                "{:?}",
+                r.errors
+            );
+            assert_eq!(
+                (r.articles_fetched, r.articles_synced, r.articles_converted),
+                (2, 0, 0)
+            );
+            assert_eq!(f.account_failures("wb"), Some(failures), "backs off");
+            assert_eq!(f.account("wb").last_sync, None);
+        }
+        assert_eq!(
+            f.mock.content_calls.load(Ordering::SeqCst),
+            usize::try_from(MAX_ITEM_FAILURES + 1).unwrap(),
+            "each sync stops at the first article"
+        );
+        assert!(f.document_names().is_empty());
+
+        // The operator installs wkhtmltopdf; it writes its last argument.
+        install(
+            "wkhtmltopdf",
+            r#"for out; do :; done; printf '%%PDF-1.4' > "$out""#,
+        );
+        let r = f.syncer().sync_account("wb").await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(r.articles_synced, 2);
+        assert_eq!(f.document_names(), ["Article 1", "Article 2"]);
+        assert_eq!(f.account_failures("wb"), Some(0));
+        assert!(f.account("wb").last_sync.is_some());
+    }
+
+    /// Another Wallabag's entry under the id of a deleted account's delivered one is another
+    /// page: the new account takes the row over and delivers its article. An entry with the
+    /// same page isn't delivered twice.
+    #[tokio::test]
+    async fn a_deleted_accounts_rows_keep_their_device_state_only_for_the_same_page() {
+        let f = Fixture::new(vec![entry(1), entry(2)]).await;
+        f.add_account("old", |_| {});
+        f.syncer().sync_account("old").await.unwrap();
+        let old_document = f.article(1).document_id.unwrap();
+        f.state.manager.lock().delete_account("old").unwrap();
+
+        let mut other_entry = entry(1);
+        other_entry["url"] = json!("https://elsewhere.example/1");
+        other_entry["title"] = json!("Another instance's 1");
+        let (_other, other_base) = spawn_mock(vec![other_entry, entry(2)]).await;
+        f.add_account_at("new", &other_base, |_| {});
+        let r = f.syncer().sync_account("new").await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!((r.articles_synced, r.articles_already_synced), (1, 1));
+        assert_eq!(
+            f.document_names(),
+            ["Another instance's 1", "Article 1", "Article 2"]
+        );
+        let a = f.article(1);
+        assert_eq!(
+            (a.account_id.as_deref(), a.synced_to_device),
+            (Some("new"), true)
+        );
+        assert_ne!(a.document_id.unwrap(), old_document);
+        assert_eq!(f.articles().len(), 2);
     }
 
     /// A status changed here (`PUT /articles/{id}`) goes to the provider of the account that
