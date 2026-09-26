@@ -11,9 +11,9 @@ use crate::integrations::{
     CloudProvider, ProviderType,
 };
 use axum::{
-    extract::{Path, Query, State},
+    extract::{OriginalUri, Path, Query, State},
     http::StatusCode,
-    response::Redirect,
+    response::{Html, Redirect},
     Json,
 };
 use parking_lot::RwLock;
@@ -219,6 +219,7 @@ pub async fn get_auth_url(
 /// OAuth callback handler
 pub async fn oauth_callback(
     State(state): State<IntegrationState>,
+    OriginalUri(uri): OriginalUri,
     Query(query): Query<OAuthCallbackQuery>,
 ) -> std::result::Result<Redirect, (StatusCode, String)> {
     // Find and remove the flow
@@ -244,8 +245,25 @@ pub async fn oauth_callback(
     let provider = flow_state.flow.config.provider;
     state.set_token(provider, token);
 
-    // Redirect to success page
-    Ok(Redirect::to(&format!("/integrations/v2/cloud/{}/success", provider)))
+    // Redirect to the success page under whichever mount (/cloud or /storage) served the callback
+    Ok(Redirect::to(&success_redirect_path(uri.path(), provider)))
+}
+
+/// `<mount>/callback` -> `<mount>/providers/{provider}/success` (a routed path).
+fn success_redirect_path(callback_path: &str, provider: ProviderType) -> String {
+    let mount = callback_path.strip_suffix("/callback").unwrap_or("/integrations/v2/cloud");
+    format!("{}/providers/{}/success", mount, provider)
+}
+
+/// Landing page after a completed OAuth flow
+pub async fn oauth_success(
+    Path(provider): Path<String>,
+) -> std::result::Result<Html<String>, (StatusCode, String)> {
+    let provider_type = parse_provider(&provider)?;
+    Ok(Html(format!(
+        "<!doctype html><meta charset=utf-8><title>Connected</title><p>{} connected. You can close this window.</p>",
+        provider_type
+    )))
 }
 
 /// Get token status for a provider
@@ -462,8 +480,17 @@ pub async fn disconnect_provider(
 ) -> std::result::Result<StatusCode, (StatusCode, String)> {
     let provider_type = parse_provider(&provider)?;
 
-    state.inner.tokens.write().remove(&provider_type);
+    // Always forget locally first; provider revocation is best-effort.
+    let token = state.inner.tokens.write().remove(&provider_type);
     state.inner.sync_states.write().remove(&provider_type);
+
+    if let Some(token) = token {
+        match crate::integrations::oauth::revoke_token(provider_type, &token, &state.inner.client).await {
+            Ok(true) => tracing::info!("revoked {} grant at provider", provider_type),
+            Ok(false) => tracing::info!("{} has no revoke endpoint; grant must be removed in the account's app settings", provider_type),
+            Err(e) => tracing::warn!("failed to revoke {} grant at provider (deleted locally): {}", provider_type, e),
+        }
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -491,7 +518,43 @@ pub fn integration_router(state: IntegrationState) -> axum::Router {
         .route("/providers/{provider}/refresh", post(refresh_token))
         .route("/providers/{provider}/quota", get(get_quota))
         .route("/providers/{provider}/disconnect", delete(disconnect_provider))
+        .route("/providers/{provider}/success", get(oauth_success))
         .route("/callback", get(oauth_callback))
         .route("/sync", post(trigger_sync))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn callback_redirect_target_is_routed() {
+        for mount in ["/integrations/v2/cloud", "/integrations/v2/storage"] {
+            let target = success_redirect_path(&format!("{}/callback", mount), ProviderType::Dropbox);
+            assert_eq!(target, format!("{}/providers/dropbox/success", mount));
+            let app = axum::Router::new().nest(mount, integration_router(IntegrationState::new()));
+            let resp = app.oneshot(axum::http::Request::get(&target).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{} not routed", target);
+        }
+        // Every provider's Display name must round-trip through parse_provider.
+        for p in [ProviderType::GoogleDrive, ProviderType::Dropbox, ProviderType::OneDrive] {
+            assert_eq!(parse_provider(&p.to_string()).unwrap(), p);
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnect_deletes_locally_when_revoke_unavailable() {
+        let state = IntegrationState::new();
+        state.set_token(ProviderType::OneDrive, OAuthToken {
+            access_token: "a".into(), refresh_token: Some("r".into()), token_type: "Bearer".into(), expires_at: None, scope: None,
+        });
+        let status = disconnect_provider(State(state.clone()), Path("onedrive".into())).await.unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(state.get_token(ProviderType::OneDrive).is_none());
+        assert!(crate::integrations::oauth::revoke_endpoint(ProviderType::GoogleDrive).is_some());
+        assert!(crate::integrations::oauth::revoke_endpoint(ProviderType::Dropbox).is_some());
+    }
 }

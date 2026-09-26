@@ -63,6 +63,9 @@ pub enum IntegrationError {
 
     #[error("Provider not configured")]
     NotConfigured,
+
+    #[error("Unsafe path rejected: {0}")]
+    InvalidPath(String),
 }
 
 pub type Result<T> = std::result::Result<T, IntegrationError>;
@@ -173,6 +176,19 @@ pub trait CloudProvider: Send + Sync {
         content: &[u8],
         mime_type: Option<&str>,
     ) -> Result<CloudFile>;
+
+    /// Upload to a path relative to `parent_id`, given as already-validated components
+    /// (`["dir", "sub", "name.pdf"]`). The default suits path-addressed providers
+    /// (Dropbox, OneDrive), which create intermediate folders from `dir/sub/name.pdf`.
+    async fn upload_file_at(
+        &self,
+        parent_id: Option<&str>,
+        components: &[&str],
+        content: &[u8],
+        mime_type: Option<&str>,
+    ) -> Result<CloudFile> {
+        self.upload_file(parent_id, &components.join("/"), content, mime_type).await
+    }
 
     /// Create folder
     async fn create_folder(&self, parent_id: Option<&str>, name: &str) -> Result<CloudFolder>;
