@@ -189,7 +189,7 @@ Supported providers: Google Drive, Dropbox, OneDrive
 | `/readlater/v1/articles` | POST | Add article |
 | `/readlater/v1/accounts` | GET | List connected services |
 
-Supported services: Pocket, Instapaper, Wallabag, Omnivore
+Supported services: Pocket, Instapaper, Wallabag (Omnivore was removed after the service shut down in November 2024)
 
 ## Versions API
 
