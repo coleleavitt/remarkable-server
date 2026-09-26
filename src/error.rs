@@ -21,6 +21,8 @@ pub enum ServerError {
     #[error("Email error: {0}")] Email(String),
     #[error("IO error: {0}")] Io(String),
     #[error("Config error: {0}")] Config(String),
+    #[error("Forbidden: {0}")] Forbidden(String),
+    #[error("Bad request: {0}")] BadRequest(String),
 }
 
 impl From<rusqlite::Error> for ServerError {
@@ -49,6 +51,8 @@ impl IntoResponse for ServerError {
             Self::Email(m) => (StatusCode::INTERNAL_SERVER_ERROR, "email_error", Some(m.clone())),
             Self::Io(m) => (StatusCode::INTERNAL_SERVER_ERROR, "io_error", Some(m.clone())),
             Self::Config(m) => (StatusCode::BAD_REQUEST, "config_error", Some(m.clone())),
+            Self::Forbidden(m) => (StatusCode::FORBIDDEN, "forbidden", Some(m.clone())),
+            Self::BadRequest(m) => (StatusCode::BAD_REQUEST, "bad_request", Some(m.clone())),
         };
         (status, Json(ErrorBody { error: err.into(), details: det })).into_response()
     }

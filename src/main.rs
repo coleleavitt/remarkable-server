@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
     // Initialize device manager
     let db_path = PathBuf::from(&config.storage_path).join("devices.db");
     let devices = DeviceManager::new(&db_path, &config.region, &config.host)?;
-    tracing::info!("Devices: {} registered", devices.list_devices()?.len());
+    tracing::info!("Devices: {} registered", devices.list_devices(None)?.len());
 
     // `--pair`: print a one-time code to enter on the tablet (Settings > Account > Connect), then exit.
     if env::args().any(|a| a == "--pair") {

@@ -24,7 +24,7 @@ impl OneDrive {
         Self {
             config,
             token: None,
-            client: Client::new(),
+            client: crate::integrations::http_client(),
         }
     }
 
@@ -32,7 +32,7 @@ impl OneDrive {
         Self {
             config,
             token: Some(token),
-            client: Client::new(),
+            client: crate::integrations::http_client(),
         }
     }
 
