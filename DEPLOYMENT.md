@@ -363,6 +363,11 @@ Routes in the unit:
 - `127.0.0.1:443 → remarkable.unwrap.rs:443` (HTTP API via nginx)
 - `127.0.0.2:443 → remarkable.unwrap.rs:8883` (screenshare message queue)
 
+The `10.11.99.3` lines rewritten to `127.0.0.2` are the screenshare broker names; the one xochitl
+3.3.2 dials is `vernemq-prod.cloud.remarkable.engineering` (SETUP.md, `src/screenshare.rs`). The live
+tablet's `/etc/hosts` is not kept in this repo: its screenshare CONNECTs on :8883 (GAP_ANALYSIS.md,
+"MQTT: what the tablet actually uses") show that its broker name reaches `127.0.0.2`, not which lines it has.
+
 Revert to USB/local server: `cp /home/root/rm-proxy/hosts.usb-backup /etc/hosts; systemctl restart xochitl`.
 Note: `/etc` changes may be lost on a firmware update; re-apply after updates.
 
@@ -373,7 +378,7 @@ Note: `/etc` changes may be lost on a firmware update; re-apply after updates.
    `/etc/remarkable-server/tablet-cert/`. This vhost matches the
    `*.remarkable.com` server names and serves the self-signed cert.
 2. Screenshare: point `SCREENSHARE_CERT/KEY` at the self-signed cert and
-   forward 443→8883 for the vernemq name, or accept that screenshare needs
+   forward 443→8883 for `vernemq-prod.cloud.remarkable.engineering`, or accept that screenshare needs
    option A (443 is taken by nginx; message queue can't share it without the
    nginx `stream` module + `ssl_preread`).
 3. Tablet `/etc/hosts`: every `10.11.99.2`/`10.11.99.3` → `172.232.15.166`.

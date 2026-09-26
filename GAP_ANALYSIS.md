@@ -107,14 +107,17 @@ The firmware references these cloud hosts:
 - *.cloud.remarkable.com
 - webapp-production-*.cloud.remarkable.com
 - errors.cloud.remarkable.com
+- vernemq-prod.cloud.remarkable.engineering (screen share MQTT broker; see "Screen share broker hostname")
 - Internal: dev.internal.cloud.remarkable.com, qa.internal.cloud.remarkable.com
 
 ### MQTT
 Two MQTT endpoints exist:
 - `/mqtt` — MQTT 3.1.1 over WebSocket on the API host, authenticated with a device/user token, for
   sync push. It forwards the same `WsMessage` JSON as `/notifications/ws/json/1` on every concrete
-  topic the client subscribed to. **Off by default**; served only with `MQTT_WS_NOTIFICATIONS=1`
-  (`true`/`on`), because the tablet never uses it (below).
+  topic the client subscribed to; a wildcard filter is refused in the SUBACK (`0x80`). A socket whose
+  first packet is not a well-formed CONNECT, or that sends none within 30 s, is closed without a
+  CONNACK. **Off by default**; served only with `MQTT_WS_NOTIFICATIONS=1` (`true`/`on`), because the
+  tablet never uses it (below).
 - The screenshare broker (`SCREENSHARE_BIND`, MQTT over TLS; :8883 on the Linode). Its sessions
   are not closed when a device is revoked.
 
@@ -212,6 +215,25 @@ Neither remarkable-rs nor the logs above support a WebSocket `/mqtt` on the API 
 
 Action taken: `/mqtt` is opt-in (`MQTT_WS_NOTIFICATIONS=1`), not served by default, which removes
 an authenticated but unused WebSocket endpoint from the public host. Its tests enable it explicitly.
+
+#### Screen share broker hostname
+
+The docs disagreed on the broker's name. What this repository can and cannot settle:
+- `vernemq-prod.cloud.remarkable.engineering` is the name the xochitl 3.3.2 binary dials
+  (`sub_1F1848`, recorded in `src/screenshare.rs`). remarkable-rs at `9fe198a` agrees:
+  `docs/MQTT_NOTES.md` records the pattern `vernemq-%1.cloud.remarkable.engineering` in xochitl
+  3.3.2.1666 and reMarkable's discovery answering `mqttbroker: vernemq-prod.cloud.remarkable.engineering`,
+  and `remarkable-mqtt`'s `DEFAULT_BROKER` is the same name. README and `src/main.rs` already used it;
+  SETUP.md now does too, and its cert covers `*.cloud.remarkable.engineering`.
+- `vernemq-prod.eu.remarkable.engineering` appears only in remarkable-rs's `TRAFFIC_CAPTURE.md`, a
+  capture plan with the region put into the name. The same repository's notes above disagree with it,
+  and nothing here uses it.
+- `vernemq-prod-{1,2,3}.tectonic.remarkable.com`, which SETUP.md's hosts block listed before, has no
+  source in this repository, the firmware notes or remarkable-rs, and does not fit the firmware's
+  pattern. SETUP.md no longer lists it.
+- Not settled: the production tablet's `/etc/hosts` is not in this repository and was not read for
+  this (DEPLOYMENT.md only rewrites its `10.11.99.3` lines to `127.0.0.2`). The 30 screenshare CONNECTs
+  above show that the name xochitl dials reaches `127.0.0.2`, not which lines the file has.
 
 ### Full Sync15 Protocol
 The V3/V4 sync handlers exist but may not fully implement:

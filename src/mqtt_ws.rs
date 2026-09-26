@@ -19,7 +19,10 @@
 //! pins a path (`mqttbroker` in discovery is a bare host; remarkable-rs only
 //! *expects* `wss://vernemq-.../mqtt`, on the broker host, not this API host), so
 //! this uses the conventional MQTT-over-WebSocket path (VerneMQ's and Paho's
-//! default), and publishes on each concrete topic the client subscribed to.
+//! default), and publishes on each concrete topic the client subscribed to. A
+//! wildcard filter has no concrete topic, so its SUBACK says so ([`SUBACK_FAILURE`]).
+
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::State;
@@ -43,6 +46,15 @@ pub const ENABLE_ENV: &str = "MQTT_WS_NOTIFICATIONS";
 
 /// Where the endpoint is served when enabled.
 pub const PATH: &str = "/mqtt";
+
+/// How long a client has, from the WebSocket upgrade, to send its CONNECT. An upgrade
+/// without an `Authorization` header is only authenticated at CONNECT, so without this
+/// such a socket could stay open indefinitely (MQTT 3.1.1 §3.1.4: a server SHOULD close
+/// a connection that sends no CONNECT within a reasonable time).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// SUBACK return code for a filter the server refuses (MQTT 3.1.1 §3.9.3).
+const SUBACK_FAILURE: u8 = 0x80;
 
 /// The [`PATH`] route, to merge into [`crate::create_router`]'s router, when `flag`
 /// (the value of [`ENABLE_ENV`]) is `1`, `true` or `on`; `None` otherwise, including
@@ -133,6 +145,25 @@ fn parse_remaining_length(data: &[u8]) -> Option<(usize, usize)> {
     Some((value, idx))
 }
 
+/// The variable header and payload of the MQTT packet in `frame` (everything after the
+/// fixed header). `None` when its remaining length is malformed or runs past the frame.
+fn packet_body(frame: &[u8]) -> Option<&[u8]> {
+    let (len, n) = parse_remaining_length(frame.get(1..)?)?;
+    frame.get(1 + n..1 + n + len)
+}
+
+/// Append `len` in MQTT's variable-length remaining-length encoding.
+fn push_remaining_length(packet: &mut Vec<u8>, mut len: usize) {
+    loop {
+        let byte = (len % 128) as u8;
+        len /= 128;
+        packet.push(if len > 0 { byte | 0x80 } else { byte });
+        if len == 0 {
+            break;
+        }
+    }
+}
+
 /// Parse MQTT binary data (2-byte length prefix)
 fn parse_mqtt_bytes(data: &[u8]) -> Option<(&[u8], usize)> {
     if data.len() < 2 {
@@ -191,12 +222,9 @@ fn build_connack(session_present: bool, return_code: u8) -> Vec<u8> {
 
 /// Build SUBACK packet
 fn build_suback(packet_id: u16, qos_levels: &[u8]) -> Vec<u8> {
-    let mut packet = vec![
-        0x90,                         // SUBACK packet type
-        (2 + qos_levels.len()) as u8, // Remaining length
-        (packet_id >> 8) as u8,       // Packet ID MSB
-        packet_id as u8,              // Packet ID LSB
-    ];
+    let mut packet = vec![0x90]; // SUBACK packet type
+    push_remaining_length(&mut packet, 2 + qos_levels.len());
+    packet.extend_from_slice(&packet_id.to_be_bytes());
     packet.extend_from_slice(qos_levels);
     packet
 }
@@ -220,20 +248,7 @@ fn build_publish(topic: &str, payload: &[u8], qos: u8, packet_id: Option<u16>) -
     let mut packet = vec![
         0x30 | (qos << 1), // PUBLISH with QoS
     ];
-
-    // Encode remaining length
-    let mut len = remaining_len;
-    loop {
-        let mut byte = (len % 128) as u8;
-        len /= 128;
-        if len > 0 {
-            byte |= 0x80;
-        }
-        packet.push(byte);
-        if len == 0 {
-            break;
-        }
-    }
+    push_remaining_length(&mut packet, remaining_len);
 
     // Topic length + topic
     packet.push((topic_len >> 8) as u8);
@@ -259,8 +274,14 @@ fn build_publish(topic: &str, payload: &[u8], qos: u8, packet_id: Option<u16>) -
 /// `Authorization` header on the upgrade (an invalid one is rejected with 401),
 /// or, when there is no such header, the token as the MQTT CONNECT password (or
 /// username), as the screenshare broker accepts. A CONNECT without a valid token
-/// gets CONNACK "not authorized" and the socket is closed. A connected session is
-/// closed once the device its token belongs to is revoked (deleted or re-paired).
+/// gets CONNACK "not authorized" and the socket is closed. The first packet must be
+/// a well-formed CONNECT, sent within [`CONNECT_TIMEOUT`]: a malformed or truncated
+/// CONNECT, any other packet first, or none in time closes the socket without a
+/// CONNACK (MQTT 3.1.1 §3.1.0, §3.1.4). Each binary frame is read as one whole
+/// packet, as Paho and mqtt.js send them; packets split across frames (which §6.0
+/// allows) are not reassembled, so a split CONNECT counts as truncated. A connected
+/// session is closed once the device its token belongs to is revoked (deleted or
+/// re-paired).
 pub async fn mqtt_notifications_ws(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
@@ -319,12 +340,20 @@ async fn handle_mqtt_socket(
 /// landing in the single shared sync tree); every authenticated user gets those.
 const SERVER_USER: &str = "local-user";
 
+/// Whether notifications can go out on `filter`: a non-empty topic without `+`/`#`.
+/// A wildcard filter names no single topic to publish on, and nothing verified pins
+/// the topic a sync push would use to match it against; such filters are refused in
+/// the SUBACK ([`SUBACK_FAILURE`]) instead of being acknowledged and never served.
+fn is_concrete(filter: &str) -> bool {
+    !filter.is_empty() && !filter.contains(['+', '#'])
+}
+
 /// MQTT PUBLISH packets (QoS 0) carrying `msg` for the session of `user_id`.
 ///
 /// Assumption: nothing pins a topic for sync pushes over MQTT-over-WebSocket
 /// (xochitl does not use this endpoint), so the notification goes out on each
-/// concrete (wildcard-free) topic the client SUBSCRIBEd to. Filters with `+`/`#`
-/// have no single concrete topic and are skipped. The payload is the same
+/// concrete topic the client SUBSCRIBEd to ([`is_concrete`]; the session only
+/// keeps those, and others are skipped here too). The payload is the same
 /// `WsMessage` JSON the `/notifications/ws/json/1` endpoint sends. Only events
 /// for `user_id` (or [`SERVER_USER`]) are forwarded; screenshare events have
 /// their own broker and are never forwarded here.
@@ -345,7 +374,7 @@ fn notification_publishes(
     let mut seen: Vec<&str> = Vec::new();
     subscriptions
         .iter()
-        .filter(|t| !t.is_empty() && !t.contains(['+', '#']))
+        .filter(|t| is_concrete(t))
         .filter(|t| {
             if seen.contains(&t.as_str()) {
                 false
@@ -383,10 +412,17 @@ async fn run_mqtt_session<S, R>(
         Box::pin(std::future::pending());
     let mut subscriptions: Vec<String> = Vec::new();
     let mut notifications_open = true;
+    let connect_deadline = tokio::time::sleep(CONNECT_TIMEOUT);
+    tokio::pin!(connect_deadline);
 
     loop {
         let result = tokio::select! {
             incoming = receiver.next() => match incoming { Some(r) => r, None => break },
+            () = &mut connect_deadline, if !connected => {
+                warn!(session_id = %session_id, "no MQTT CONNECT within {CONNECT_TIMEOUT:?}, closing");
+                let _ = sender.send(Message::Close(None)).await;
+                break;
+            }
             () = &mut revoked => {
                 info!(session_id = %session_id, "device revoked, closing MQTT session");
                 // MQTT 3.1.1 has no server DISCONNECT; closing the connection is how a broker ends it.
@@ -417,17 +453,19 @@ async fn run_mqtt_session<S, R>(
             Ok(Message::Binary(data)) => {
                 debug!(session_id = %session_id, "Received MQTT binary: {} bytes", data.len());
 
-                if data.is_empty() {
-                    continue;
+                let packet_type_byte = data.first().map(|b| b >> 4);
+                let packet_type = packet_type_byte.and_then(|t| PacketType::try_from(t).ok());
+                if !connected && packet_type != Some(PacketType::Connect) {
+                    // [MQTT-3.1.0-1]: the client's first packet MUST be CONNECT.
+                    warn!(session_id = %session_id, "first MQTT packet is not CONNECT, closing");
+                    break;
                 }
-
-                let packet_type_byte = (data[0] >> 4) & 0x0F;
-                let packet_type = match PacketType::try_from(packet_type_byte) {
-                    Ok(t) => t,
-                    Err(_) => {
-                        warn!(session_id = %session_id, "Unknown packet type: {}", packet_type_byte);
-                        continue;
-                    }
+                let Some(packet_type_byte) = packet_type_byte else {
+                    continue;
+                };
+                let Some(packet_type) = packet_type else {
+                    warn!(session_id = %session_id, "Unknown packet type: {}", packet_type_byte);
+                    continue;
                 };
 
                 debug!(session_id = %session_id, "MQTT packet type: {:?}", packet_type);
@@ -438,42 +476,34 @@ async fn run_mqtt_session<S, R>(
                             warn!(session_id = %session_id, "second MQTT CONNECT, closing");
                             break;
                         }
-                        // Parse CONNECT packet
-                        if let Some((remaining_len, len_bytes)) = parse_remaining_length(&data[1..])
-                        {
-                            let payload_start = 1 + len_bytes;
-                            if data.len() >= payload_start + remaining_len {
-                                info!(session_id = %session_id, "MQTT CONNECT received");
-                                let token = connect_token(
-                                    &data[payload_start..payload_start + remaining_len],
-                                );
-                                let Some(auth) = authenticate(token.as_deref()) else {
-                                    warn!(session_id = %session_id, "MQTT CONNECT without a valid token, refusing");
-                                    let _ = sender
-                                        .send(Message::Binary(build_connack(false, 5).into()))
-                                        .await; // not authorized
-                                    break;
-                                };
-                                user_id = auth.user_id;
-                                revoked = auth.revoked;
-                                connected = true;
+                        // [MQTT-3.1.4-1]: a CONNECT that does not parse closes the
+                        // connection without a CONNACK.
+                        let Some(body) = packet_body(&data) else {
+                            warn!(session_id = %session_id, "malformed MQTT CONNECT, closing");
+                            break;
+                        };
+                        info!(session_id = %session_id, "MQTT CONNECT received");
+                        let token = connect_token(body);
+                        let Some(auth) = authenticate(token.as_deref()) else {
+                            warn!(session_id = %session_id, "MQTT CONNECT without a valid token, refusing");
+                            let _ = sender
+                                .send(Message::Binary(build_connack(false, 5).into()))
+                                .await; // not authorized
+                            break;
+                        };
+                        user_id = auth.user_id;
+                        revoked = auth.revoked;
+                        connected = true;
 
-                                // Send CONNACK
-                                let connack = build_connack(false, 0); // Accepted
-                                if sender.send(Message::Binary(connack.into())).await.is_err() {
-                                    break;
-                                }
-                                info!(session_id = %session_id, "MQTT CONNACK sent");
-                            }
+                        // Send CONNACK
+                        let connack = build_connack(false, 0); // Accepted
+                        if sender.send(Message::Binary(connack.into())).await.is_err() {
+                            break;
                         }
+                        info!(session_id = %session_id, "MQTT CONNACK sent");
                     }
 
                     PacketType::Subscribe => {
-                        if !connected {
-                            warn!(session_id = %session_id, "SUBSCRIBE before CONNECT");
-                            continue;
-                        }
-
                         // Parse SUBSCRIBE packet
                         if let Some((remaining_len, len_bytes)) = parse_remaining_length(&data[1..])
                         {
@@ -498,9 +528,14 @@ async fn run_mqtt_session<S, R>(
                                             let qos = data[offset] & 0x03;
                                             offset += 1;
 
-                                            info!(session_id = %session_id, "MQTT SUBSCRIBE to topic: {} (QoS {})", topic, qos);
-                                            subscriptions.push(topic.to_string());
-                                            qos_results.push(qos);
+                                            if is_concrete(topic) {
+                                                info!(session_id = %session_id, "MQTT SUBSCRIBE to topic: {} (QoS {})", topic, qos);
+                                                subscriptions.push(topic.to_string());
+                                                qos_results.push(qos);
+                                            } else {
+                                                info!(session_id = %session_id, "MQTT SUBSCRIBE refused, no concrete topic: {:?}", topic);
+                                                qos_results.push(SUBACK_FAILURE);
+                                            }
                                         }
                                     } else {
                                         break;
@@ -759,10 +794,14 @@ mod tests {
         );
         in_tx.send(subscribe("user/+/wild")).unwrap();
         in_tx.send(subscribe("user/u1/sync")).unwrap();
-        assert_eq!(next(&mut out).await[0], 0x90);
         assert_eq!(
-            next(&mut out).await[0],
-            0x90,
+            next(&mut out).await,
+            build_suback(1, &[SUBACK_FAILURE]),
+            "a wildcard filter is refused, not acknowledged and never served"
+        );
+        assert_eq!(
+            next(&mut out).await,
+            build_suback(1, &[0]),
             "wildcard or repeated subscription gets no catch-up"
         );
 
@@ -869,6 +908,155 @@ mod tests {
             .len(),
             1,
             "server-wide event"
+        );
+    }
+
+    #[test]
+    fn remaining_length_round_trips_and_packet_body_bounds_the_frame() {
+        // Every encoding-width boundary, up to the 4-byte maximum.
+        for len in [
+            0,
+            127,
+            128,
+            16_383,
+            16_384,
+            2_097_151,
+            2_097_152,
+            268_435_455,
+        ] {
+            let mut encoded = Vec::new();
+            push_remaining_length(&mut encoded, len);
+            assert_eq!(
+                parse_remaining_length(&encoded),
+                Some((len, encoded.len())),
+                "{len}"
+            );
+        }
+        assert_eq!(
+            parse_remaining_length(&[0xFF, 0xFF, 0xFF, 0xFF, 0x01]),
+            None,
+            "5 bytes"
+        );
+
+        assert_eq!(packet_body(&[0x10, 2, 7, 8]), Some(&[7, 8][..]));
+        assert_eq!(
+            packet_body(&[0x10, 1, 7, 8]),
+            Some(&[7][..]),
+            "bytes past the packet are not its body"
+        );
+        assert_eq!(packet_body(&[0x10, 3, 7, 8]), None, "truncated");
+        assert_eq!(packet_body(&[0x10, 0x80]), None, "unterminated length");
+        assert_eq!(packet_body(&[0x10]), None, "no length");
+        assert_eq!(packet_body(&[]), None);
+
+        // A SUBACK for more than 125 filters needs a two-byte remaining length.
+        let suback = build_suback(7, &[0; 200]);
+        assert_eq!(&suback[..5], &[0x90, 0xCA, 0x01, 0, 7]);
+        assert_eq!(packet_body(&suback).map(<[u8]>::len), Some(202));
+        assert_eq!(build_suback(1, &[SUBACK_FAILURE]), [0x90, 3, 0, 1, 0x80]);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn remaining_length_round_trips(len in 0usize..=268_435_455) {
+            let mut encoded = Vec::new();
+            push_remaining_length(&mut encoded, len);
+            proptest::prop_assert_eq!(parse_remaining_length(&encoded), Some((len, encoded.len())));
+        }
+
+        #[test]
+        fn packet_parsers_never_panic(frame in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64)) {
+            if let Some(body) = packet_body(&frame) {
+                proptest::prop_assert!(body.len() < frame.len());
+            }
+            let _ = connect_token(&frame);
+        }
+    }
+
+    /// The session ended without writing a single packet (no CONNACK, no PINGRESP).
+    async fn ended_silently(
+        case: &str,
+        mut out: mpsc::UnboundedReceiver<Vec<u8>>,
+        task: tokio::task::JoinHandle<()>,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap_or_else(|_| panic!("{case}: session still open"))
+            .unwrap_or_else(|e| panic!("{case}: {e}"));
+        assert_eq!(out.recv().await, None, "{case}: nothing written");
+    }
+
+    #[tokio::test]
+    async fn anything_but_a_well_formed_connect_first_closes_without_connack() {
+        let cases = [
+            (
+                "truncated CONNECT",
+                vec![0x10, 13, 0, 4, b'M', b'Q', b'T', b'T', 4, 2, 0, 60],
+            ),
+            (
+                "5-byte remaining length",
+                vec![0x10, 0xFF, 0xFF, 0xFF, 0xFF, 0x01],
+            ),
+            ("CONNECT without a remaining length", vec![0x10]),
+            ("SUBSCRIBE first", vec![0x82, 6, 0, 1, 0, 1, b't', 0]),
+            ("PINGREQ first", vec![0xC0, 0x00]),
+            ("reserved packet type first", vec![0xF0, 0x00]),
+            ("empty frame first", vec![]),
+        ];
+        for (case, frame) in cases {
+            let (in_tx, out, _notif, task) =
+                start_with(|_| unreachable!("nothing reaches authentication"));
+            in_tx.send(Message::Binary(frame.into())).unwrap();
+            ended_silently(case, out, task).await;
+        }
+
+        // A well-formed CONNECT with a malformed payload still parses as a CONNECT, so it
+        // gets the usual not-authorized CONNACK.
+        let (in_tx, mut out, _notif, task) = start_with(|t| t.map(|_| "u1".to_string()));
+        in_tx
+            .send(Message::Binary(vec![0x10, 3, 0, 9, b'M'].into()))
+            .unwrap();
+        assert_eq!(next(&mut out).await, build_connack(false, 5));
+        ended_silently("bad CONNECT payload", out, task).await;
+    }
+
+    /// Paused clock: `advance` and the runtime's auto-advance move time, nothing sleeps.
+    #[tokio::test(start_paused = true)]
+    async fn connect_must_arrive_within_the_deadline() {
+        let (_in_tx, mut out, _notif, task) =
+            start_with(|_| unreachable!("nothing reaches authentication"));
+        let opened = tokio::time::Instant::now();
+        tokio::time::timeout(CONNECT_TIMEOUT * 2, task)
+            .await
+            .expect("an idle socket is closed")
+            .unwrap();
+        assert!(
+            opened.elapsed() >= CONNECT_TIMEOUT,
+            "closed at the deadline, not before"
+        );
+        assert_eq!(
+            out.recv().await,
+            None,
+            "idle socket closed, nothing written"
+        );
+
+        let (in_tx, mut out, _notif, _task) = start();
+        tokio::task::yield_now().await; // the session starts its deadline
+        tokio::time::advance(CONNECT_TIMEOUT - Duration::from_secs(1)).await;
+        in_tx.send(connect()).unwrap();
+        assert_eq!(
+            next(&mut out).await,
+            build_connack(false, 0),
+            "a CONNECT just inside the deadline"
+        );
+        tokio::time::advance(CONNECT_TIMEOUT * 2).await;
+        in_tx
+            .send(Message::Binary(vec![0xC0, 0x00].into()))
+            .unwrap(); // PINGREQ
+        assert_eq!(
+            next(&mut out).await,
+            build_pingresp(),
+            "no deadline once connected"
         );
     }
 

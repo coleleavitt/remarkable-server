@@ -227,7 +227,7 @@ The device talks to the server directly over HTTPS on port 443; no proxy runs on
    nmcli con modify "<usb connection>" ipv4.method manual ipv4.addresses 10.11.99.2/29 ipv4.never-default yes
    nmcli con up "<usb connection>"
    ```
-2. Install a local CA on the device (`/usr/local/share/ca-certificates/`, then `update-ca-certificates`) and sign a server cert with it covering `*.remarkable.com`, `*.cloud.remarkable.com`, `*.tectonic.remarkable.com`, `*.internal.cloud.remarkable.com`, `*.appspot.com`. Put it in `certs/server.crt` / `certs/server.key` (git-ignored).
+2. Install a local CA on the device (`/usr/local/share/ca-certificates/`, then `update-ca-certificates`) and sign a server cert with it covering `*.remarkable.com`, `*.cloud.remarkable.com`, `*.tectonic.remarkable.com`, `*.internal.cloud.remarkable.com`, `*.appspot.com`, `*.cloud.remarkable.engineering` (screenshare broker). Put it in `certs/server.crt` / `certs/server.key` (git-ignored).
 3. Map each cloud hostname to the host in the device's `/etc/hosts` (no wildcards — one line per name):
    ```
    10.11.99.2 my.remarkable.com
@@ -308,7 +308,7 @@ No other route checks the admin token; `/debug/files`, for instance, takes an or
 | Variable | Enables |
 |----------|---------|
 | `SMTP_HOST`, `SMTP_PORT` (587), `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM` | Tablet "Send by email" (`POST /share/v1/email`, STARTTLS) |
-| `SCREENSHARE_BIND` (e.g. `10.11.99.3:443`) | Screenshare signaling broker: MQTT 3.1.1 over TLS. Firmware dials `vernemq-prod.cloud.remarkable.engineering:443`, so give it its own address and point that name at it in the tablet's `/etc/hosts`. Screen data itself is peer-to-peer WebRTC. |
+| `SCREENSHARE_BIND` (e.g. `10.11.99.3:443`) | Screenshare signaling broker: MQTT 3.1.1 over TLS. Firmware dials `vernemq-prod.cloud.remarkable.engineering:443`, so give it its own address and point that name at it in the tablet's `/etc/hosts` (GAP_ANALYSIS.md, "Screen share broker hostname"). Screen data itself is peer-to-peer WebRTC. |
 | `MQTT_WS_NOTIFICATIONS=1` (`true`/`on`) | `/mqtt`: the sync push as MQTT 3.1.1 over WebSocket (same tokens as `/notifications/ws/json/1`). Off by default: the tablet (xochitl 3.3.2) only uses `/notifications/ws/json/1`, and its observed MQTT traffic is screen share signalling on the `SCREENSHARE_BIND` broker; whether it also subscribes to sync topics there is unconfirmed (evidence in GAP_ANALYSIS.md, "MQTT: what the tablet actually uses"). Path and topic are unverified; enable only for a client that wants it. |
 | `SCREENSHARE_ICE_SERVERS` | JSON list of ICE servers for `room-joined` (default `[]`; entries use a singular `url` key) |
 | `EMAIL_INBOUND_BIND` (e.g. `127.0.0.1:2525`) | Inbound SMTP: mail PDF/EPUB attachments to `send@{device-id}.remarkable.local` and they appear on the tablet |
