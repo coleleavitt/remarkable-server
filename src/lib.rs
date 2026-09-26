@@ -200,6 +200,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/sync/reports/v1", post(reports::store).layer(DefaultBodyLimit::max(reports::MAX_BODY)))
         .route("/analytics/v2/events", post(reports::store_analytics).layer(DefaultBodyLimit::max(reports::MAX_BODY)))
         .route("/admin/reports", get(reports::list))
+        .route("/admin/storage/unreachable", get(api::unreachable_blobs))
         // Third-party integrations (none configured)
         .route("/integrations/v1/", get(service::list_integrations))
         .route("/integrations/v2/instances", get(service::list_integrations))

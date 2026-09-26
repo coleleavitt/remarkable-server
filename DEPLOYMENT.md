@@ -30,9 +30,11 @@ xochitl ──/etc/hosts──▶ 127.0.0.1:443 / 127.0.0.2:443  (rm-proxy on ta
   local `test-storage/` at generation 21 together with `devices.db` and
   `jwt_secret`, so the tablet's existing pairing kept working (no re-pair).
 - **Do not run the local server against a copy of the same storage while the
-  tablet points at the Linode.** Two servers moving `root.json` independently =
-  split-brain. To go back to local, copy Linode storage back first (reverse
-  rsync), then revert the tablet's hosts file.
+  tablet points at the Linode.** Two servers each advancing the root in their own
+  copy of `sync.db` = split-brain. (Two processes on the *same* storage directory
+  are safe: root commits are a compare-and-swap inside one SQLite transaction.)
+  To go back to local, stop the Linode service and copy its storage back first
+  (reverse rsync, including `sync.db`), then revert the tablet's hosts file.
 - DNS: Cloudflare `remarkable.unwrap.rs` A `172.232.15.166`, AAAA
   `2600:3c06::f03c:95ff:fe86:3ab6`, **DNS-only (grey cloud)**.
 - Cert: Let's Encrypt via certbot `dns-cloudflare`, auto-renews (certbot timer);
@@ -61,12 +63,22 @@ xochitl ──/etc/hosts──▶ 127.0.0.1:443 / 127.0.0.2:443  (rm-proxy on ta
 # health / status
 curl https://remarkable.unwrap.rs/health
 ssh linode 'systemctl status remarkable-server; journalctl -u remarkable-server -n 50 --no-pager'
-ssh linode 'grep generation /var/lib/remarkable-server/root.json'
+ssh linode "sqlite3 /var/lib/remarkable-server/sync.db 'select generation, hash from root'"   # authoritative
+ssh linode 'grep generation /var/lib/remarkable-server/root.json'   # mirror, rewritten after every commit
 ssh root@<tablet> 'systemctl status rm-proxy; journalctl -u rm-proxy -n 30 --no-pager'
 ssh root@<tablet> 'journalctl -u xochitl --since -10min | grep -iE "sync|401|notif"'
 
-# backup Linode storage
+# backup Linode storage: snapshot sync.db first (a live cp/tar of a WAL database
+# plus its sync.db-wal/-shm files can be inconsistent), then archive the dir.
+# Or `systemctl stop remarkable-server` around the tar instead.
+ssh linode "sqlite3 /var/lib/remarkable-server/sync.db \".backup '/var/lib/remarkable-server/sync.db.bak'\""
 ssh linode 'tar -C /var/lib -czf - remarkable-server' > rms-backup-$(date +%F).tgz
+# restore: use sync.db.bak as sync.db and drop any stale sync.db-wal/-shm
+
+# blobs not reachable from the current or previous root nor held by version history,
+# and unused for grace_secs (default 24h); a read-only snapshot that never deletes;
+# 500 with a reason if part of the current tree couldn't be parsed
+curl -H "x-admin-token: $ADMIN_TOKEN" 'https://remarkable.unwrap.rs/admin/storage/unreachable?grace_secs=86400'
 
 # after a tablet software update (/etc may be reset)
 #   re-check /etc/hosts entries and that the local CA is still trusted,
@@ -174,7 +186,11 @@ Layout:
   (Linode is Ubuntu 24.04, glibc 2.39; OpenSSL vendored so only libc is needed).
 - `/etc/remarkable-server/env` — from `contrib/linode/remarkable-server.env.example`
   (`ADMIN_TOKEN` is random 64 hex; never commit).
-- `/var/lib/remarkable-server` — storage (blobs, `root.json`, `devices.db`, `jwt_secret`).
+- `/var/lib/remarkable-server` — storage: blobs as `<2-char prefix>/<sha256>`,
+  `sync.db` (+ `sync.db-wal`/`-shm`; root hash/generation, blob metadata, parsed
+  index; the source of truth), `root.json` (human-readable mirror of the root,
+  kept for rollback), `devices.db`, `jwt_secret`. Legacy `meta/*.meta` files are
+  left in place but no longer written.
 - systemd: `contrib/linode/remarkable-server.service` (runs as `remarkable` user).
 - The HTTP API listens on `127.0.0.1:3100` in plain HTTP; **nginx terminates TLS** on :443.
 - The screenshare message queue broker listens directly on `0.0.0.0:8883` with TLS
@@ -193,9 +209,23 @@ ssh linode systemctl restart remarkable-server
 curl https://remarkable.unwrap.rs/health
 ```
 
+First start of a binary with `sync.db` migrates automatically: it imports
+`root.json` and `meta/*.meta`, and on every start reconciles the blob table
+against the files on disk and re-indexes the current tree. Rolling back to an
+older binary still works (it reads the `root.json` mirror), but it won't know
+the filenames of blobs uploaded after the upgrade. Upgrading again after a
+rollback is also safe: if `root.json` is at a higher generation than `sync.db`,
+the server adopts it (and logs a warning) instead of serving the older tree; if
+both are at the same generation with different hashes it refuses to start until
+one is fixed by hand.
+
 Migrating storage from a local server: stop both, `rsync -a test-storage/ linode:/var/lib/remarkable-server/`,
-`chown -R remarkable:remarkable`, start. `jwt_secret` + `devices.db` must go
-together or the tablet's identifiers stop validating (re-pair with `--pair`).
+`chown -R remarkable:remarkable`, start. `sync.db` (with its `-wal`/`-shm`
+files), `jwt_secret` and `devices.db` must go together with the blobs: without
+`sync.db` the server rebuilds it from `root.json` and legacy `meta/` files and
+loses the filenames of blobs uploaded since the upgrade; without
+`jwt_secret` + `devices.db` the tablet's identifiers stop validating (re-pair
+with `--pair`).
 
 Browser screen share viewer (optional):
 

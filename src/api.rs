@@ -1,4 +1,4 @@
-use axum::{body::Bytes, extract::{Path, State}, http::{header, HeaderMap, StatusCode}, response::{IntoResponse, Response}, Json};
+use axum::{body::Bytes, extract::{Path, Query, State}, http::{header, HeaderMap, StatusCode}, response::{IntoResponse, Response}, Json};
 use crate::{checksum, device::DeviceManager, error::{Result, ServerError}, storage::Storage};
 use crate::types::{DeviceInfo, DeviceRegisterRequest, PairingCodeResponse, SyncRoot, UploadResponse};
 use serde::{Deserialize, Serialize};
@@ -69,7 +69,11 @@ pub struct CheckFilesResponse { #[serde(rename = "missingFiles")] pub missing_fi
 /// Which of the listed blobs the server doesn't have.
 pub async fn check_files(State(state): State<AppState>, headers: HeaderMap, Json(req): Json<CheckFilesRequest>) -> Result<Json<CheckFilesResponse>> {
     state.auth_user(&headers)?;
-    let missing_files = req.files.into_iter().filter(|h| !state.storage.exists(h)).collect();
+    let (present, missing_files): (Vec<String>, Vec<String>) = req.files.into_iter().partition(|h| state.storage.exists(h));
+    // The client won't re-upload these, so keep them out of the unreachable report's grace window.
+    if let Err(e) = state.storage.touch(&present) {
+        tracing::warn!(error = %e, "could not mark checked blobs as recently used");
+    }
     Ok(Json(CheckFilesResponse { missing_files }))
 }
 
@@ -187,6 +191,21 @@ pub async fn clear_storage(State(state): State<AppState>, headers: HeaderMap) ->
     state.auth_user(&headers)?;
     state.storage.clear()?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+pub struct UnreachableQuery { pub grace_secs: Option<u64> }
+
+#[derive(Serialize)]
+pub struct UnreachableResponse { #[serde(rename = "graceSecs")] pub grace_secs: u64, pub hashes: Vec<String> }
+
+/// Admin: blobs no longer reachable from the current root (default grace 24h). Report only;
+/// nothing is deleted. Includes server-side copies outside the tree, e.g. restored versions.
+pub async fn unreachable_blobs(State(state): State<AppState>, headers: HeaderMap, Query(q): Query<UnreachableQuery>) -> Result<Json<UnreachableResponse>> {
+    require_admin(&headers)?;
+    let grace_secs = q.grace_secs.unwrap_or(24 * 60 * 60);
+    let hashes = state.storage.unreachable_blobs(std::time::Duration::from_secs(grace_secs))?;
+    Ok(Json(UnreachableResponse { grace_secs, hashes }))
 }
 
 #[derive(Deserialize)]

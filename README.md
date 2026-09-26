@@ -8,7 +8,7 @@ A local sync server for reMarkable tablets, implementing **all sync protocol ver
 - Full sync v3 API compatibility (current production)
 - Legacy V1/V1.5/V2 support for older firmware
 - Future V4 protocol with extended metadata
-- Hash-based content-addressable storage
+- Hash-based content-addressable storage with a SQLite sync index (atomic root commits)
 - CRC32C checksum validation
 - rm-filename header enforcement
 - Token refresh and device pairing
@@ -31,6 +31,17 @@ cargo build --release
 # Custom options
 ./target/release/remarkable-server --bind 0.0.0.0:8080 --storage ./data
 ```
+
+### Storage layout
+
+Everything lives under `--storage`:
+
+- `<2-char prefix>/<sha256>` — blob bytes, content-addressed, written atomically (temp → fsync → rename). The tablet is always served exactly the bytes it uploaded.
+- `sync.db` — SQLite (WAL, `synchronous=FULL`), the source of truth: the root hash/generation (commits are a compare-and-swap in one transaction, so they are atomic, durable and safe with two processes on one directory), blob filename/size/last-written time, and a parsed projection of the sync index files (root index and `.docSchema`s) used for missing-blob detection and the unreachable-blob report. Index formats it can't parse are recorded as unparsed and never break sync.
+- `root.json` — human-readable mirror of the root, rewritten after every commit (also lets an older binary take over after a rollback).
+- `devices.db`, `jwt_secret` — pairing state.
+
+Upgrading from the file-only layout is automatic: the first start imports `root.json` and `meta/*.meta`; every start reconciles the blob table with the files on disk and indexes the current tree. Old `meta/` files are left in place but no longer written. Back up `sync.db` with `sqlite3 sync.db ".backup '…'"` (or with the server stopped), not a live `cp`.
 
 ## Protocol Versions
 
@@ -251,6 +262,7 @@ Admin endpoints are disabled unless `ADMIN_TOKEN` is set; requests must send it 
 |----------|---------|
 | `POST /admin/create-user` | Mint a user token (testing / desktop clients) |
 | `POST /admin/passcode/resets/{id}/approve` | Approve a tablet's passcode (PIN) reset request; the id is logged when the tablet asks |
+| `GET /admin/storage/unreachable?grace_secs=86400` | Read-only JSON list of blobs not reachable from the current root and older than the grace period (default 24 h). Never deletes; returns 500 with a reason if part of the tree couldn't be parsed |
 
 `JWT_SECRET` sets the token signing key (default is a built-in constant; changing it invalidates paired devices).
 

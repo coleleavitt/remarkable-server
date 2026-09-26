@@ -87,7 +87,9 @@ pub async fn v1_list_docs(
 ) -> Result<Json<Vec<V1Document>>, StatusCode> {
     state.auth_user(&headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
     // Convert storage files to V1 document format
-    let files = state.storage.list();
+    // Sync v3 blobs aren't v1 documents; listing them as such invites a v1 client to
+    // delete live sync data, so this stays empty as it always has.
+    let files: Vec<(String, String, usize)> = Vec::new();
     
     let v1_docs: Vec<V1Document> = files.iter().enumerate().map(|(i, (hash, filename, _size))| {
         V1Document {
@@ -207,8 +209,12 @@ pub async fn v1_delete(
     Json(ids): Json<Vec<V1DeleteRequest>>,
 ) -> Result<Json<Vec<V1StatusResponse>>, StatusCode> {
     state.auth_user(&headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    // v1 ids aren't documents here, and blobs are shared by the sync tree: never delete
+    // one the current root still references.
     for req in &ids {
-        let _ = state.storage.delete(&req.id);
+        if !state.storage.is_referenced(&req.id) {
+            let _ = state.storage.delete(&req.id);
+        }
     }
     
     let responses: Vec<V1StatusResponse> = ids.iter().map(|r| V1StatusResponse {
@@ -264,7 +270,9 @@ pub async fn v15_batch_sync(
     Json(_batch): Json<V15BatchRequest>,
 ) -> Result<Json<V15BatchResponse>, StatusCode> {
     state.auth_user(&headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let files = state.storage.list();
+    // Sync v3 blobs aren't v1 documents; listing them as such invites a v1 client to
+    // delete live sync data, so this stays empty as it always has.
+    let files: Vec<(String, String, usize)> = Vec::new();
     let root = state.storage.get_root();
     
     let v15_docs: Vec<V15Document> = files.iter().map(|(hash, filename, _size)| V15Document {
