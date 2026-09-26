@@ -531,6 +531,11 @@ impl Broker {
         } else {
             connect.client_id.clone()
         };
+        // CONNACK before joining the broker: past the insert, only `remove_client` below may end
+        // the session, so a failed write here can't leave the client registered for good. Packets
+        // the client sends meanwhile wait in `buf` or the socket until the loop below reads them.
+        ConnAck::new(ConnectReturnCode::Success, false).write(&mut out)?;
+        stream.write_all(&out).await?;
         let (tx, mut rx) = mpsc::channel::<Publish>(CLIENT_QUEUE);
         // A reconnect with the same client id replaces the old session.
         let session = self.new_session();
@@ -543,8 +548,6 @@ impl Broker {
                 tx,
             },
         );
-        ConnAck::new(ConnectReturnCode::Success, false).write(&mut out)?;
-        stream.write_all(&out).await?;
         tracing::info!(client = %client_id, user = %user_id, device = %identity.device_id, "mqtt client connected");
 
         // MQTT keepalive: disconnect after 1.5x the negotiated interval with no traffic.
@@ -602,7 +605,17 @@ impl Broker {
                     if !out.is_empty() { stream.write_all(&out).await?; }
                 }
 
+                // Biased so a revocation already known wins over queued deliveries and further
+                // reads: a revoked device gets nothing more once its session could know.
                 tokio::select! {
+                    biased;
+                    () = &mut revoked => {
+                        tracing::info!(client = %client_id, device = %identity.device_id, "device revoked, closing screenshare mqtt session");
+                        // MQTT 3.1.1 has no server DISCONNECT: closing the connection ends the
+                        // session. Leaving the broker and its rooms happens below, as on any exit.
+                        let _ = tokio::time::timeout(REVOKED_SHUTDOWN, stream.shutdown()).await;
+                        return Ok(());
+                    }
                     read = tokio::time::timeout(idle, stream.read_buf(&mut buf)) => {
                         match read {
                             Ok(Ok(0)) => return Ok(()),
@@ -619,13 +632,6 @@ impl Broker {
                         out.clear();
                         p.write(&mut out)?;
                         stream.write_all(&out).await?;
-                    }
-                    () = &mut revoked => {
-                        tracing::info!(client = %client_id, device = %identity.device_id, "device revoked, closing screenshare mqtt session");
-                        // MQTT 3.1.1 has no server DISCONNECT: closing the connection ends the
-                        // session. Leaving the broker and its rooms happens below, as on any exit.
-                        let _ = tokio::time::timeout(REVOKED_SHUTDOWN, stream.shutdown()).await;
-                        return Ok(());
                     }
                 }
             }
@@ -894,6 +900,14 @@ mod tests {
         // ...and another tablet (device token) and an admin-token client are connected too.
         let mut b = Remote::connect(&broker, "tablet-b", &dt_b).await.unwrap();
         let mut adm = Remote::connect(&broker, "admin", &admin).await.unwrap();
+        // Tablet B's routine token churn (user-token refresh, 3.28 OAuth refresh and bundle, a
+        // same-account re-pair) is not a revocation: its session stays up through all of it.
+        dm.refresh_user_token(&dt_b).unwrap();
+        dm.refresh_oauth(&dt_b).unwrap();
+        dm.oauth_bundle(uid, "RM110-2", "remarkable").unwrap();
+        pair(&dm, uid, "RM110-2");
+        tokio::task::yield_now().await;
+        assert!(b.alive().await, "token churn closed the tablet's session");
 
         assert!(dm.delete_device("RM110-1", None).unwrap());
         a.closed().await;
@@ -933,18 +947,21 @@ mod tests {
         assert_eq!(broker.active_room(uid).as_deref(), Some(room.as_str()));
     }
 
-    #[tokio::test]
+    // Paused clock: each sleep below runs every 20 ms re-check tick inside it, however loaded the
+    // machine (the clock only moves once all tasks are idle).
+    #[tokio::test(start_paused = true)]
     async fn db_error_keeps_session_open_and_recheck_catches_silent_revocation() {
         let (broker, dm, tmp) = broker_with_recheck(Duration::from_millis(20));
         let (dt, _) = pair(&dm, "local-user", "RM110-1");
         let mut tablet = Remote::connect(&broker, "tablet", &dt).await.unwrap();
         let side = rusqlite::Connection::open(tmp.path().join("devices.db")).unwrap();
 
-        // Every re-check in this window fails with "no such table": none may drop the tablet.
+        // The ~10 re-checks in this window fail with "no such table": none may drop the tablet.
         side.execute_batch("ALTER TABLE devices RENAME TO devices_gone")
             .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(tablet.alive().await, "a DB error closed the session");
+        // Re-checks that succeed again keep it too.
         side.execute_batch("ALTER TABLE devices_gone RENAME TO devices")
             .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -954,6 +971,51 @@ mod tests {
         side.execute("DELETE FROM devices WHERE device_id = 'RM110-1'", [])
             .unwrap();
         tablet.closed().await;
+        assert!(broker.inner.clients.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn known_revocation_wins_over_queued_deliveries() {
+        let (broker, dm, _tmp) = broker_with_recheck(Duration::from_secs(3600));
+        let (dt, _) = pair(&dm, "local-user", "RM110-1");
+        let mut tablet = Remote::connect(&broker, "tablet", &dt).await.unwrap();
+        tablet.subscribe("user/local-user/signaling").await;
+        // Single-threaded runtime: the session only runs again once this test awaits, and by then
+        // the revocation and a backlog of messages for the device are both waiting.
+        assert!(dm.delete_device("RM110-1", None).unwrap());
+        for i in 0..16 {
+            broker.publish(
+                "user/local-user/signaling",
+                format!("{i}").into_bytes(),
+                QoS::AtMostOnce,
+            );
+        }
+        if let Some(p) = tablet.next().await {
+            panic!("a revoked device was sent {p:?}");
+        }
+        tablet.closed().await;
+        assert!(broker.inner.clients.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_connack_leaves_no_client_behind() {
+        let (broker, dm, _tmp) = broker_with_recheck(Duration::from_secs(3600));
+        let (dt, _) = pair(&dm, "local-user", "RM110-1");
+        let mut a = Remote::connect(&broker, "tablet", &dt).await.unwrap();
+        // A reconnect under the same client id that resets before its CONNACK goes out.
+        let (mut io, server) = tokio::io::duplex(64 * 1024);
+        let mut connect = v4::Connect::new("tablet");
+        connect.set_login("tablet", &dt);
+        let mut out = BytesMut::new();
+        connect.write(&mut out).unwrap();
+        io.write_all(&out).await.unwrap();
+        drop(io);
+        assert!(broker.session(server).await.is_err());
+        // The failed session never joined, so the live one still holds the id and, on leaving,
+        // takes it out of the broker.
+        assert!(a.alive().await);
+        assert!(a.send(|o| v4::Disconnect.write(o).map(drop)).await);
+        a.closed().await;
         assert!(broker.inner.clients.lock().is_empty());
     }
 

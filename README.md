@@ -127,7 +127,7 @@ V4 root response includes capability flags:
 | `/token/json/3/device/delete` | POST | Unregister the calling device (self-revoke) |
 | `/discovery/v1/endpoints` | GET | Service discovery |
 
-Deleting a device (either route above) revokes every device token and every user token it has minted, even if it is paired again later, and closes its open `/notifications/ws` and `/mqtt` sessions (immediately, plus a 60 s re-check). Re-pairing a device to a different user revokes the previous owner's tokens the same way. Admin-minted user tokens (`/admin/create-user`) have no device and are not affected. The screenshare MQTT broker (`SCREENSHARE_BIND`) is not tied to this: its open sessions survive a revocation.
+Deleting a device (either route above) revokes every device token and every user token it has minted, even if it is paired again later, and closes its open `/notifications/ws` and `/mqtt` sessions (immediately, plus a 60 s re-check). Re-pairing a device to a different user revokes the previous owner's tokens the same way. Admin-minted user tokens (`/admin/create-user`) have no device and are not affected. Sessions on the screenshare MQTT broker (`SCREENSHARE_BIND`) are closed the same way (the device also leaves its rooms); the in-process browser viewer is not tied to a device.
 
 ## Search API
 
@@ -359,7 +359,8 @@ verified against a real 3.28 device. They are additive and do not affect 3.3.2 s
 `POST .../messages/broadcast`, `POST .../messages/direct`. Signalling is relayed to the
 user's other clients as `ScreenshareMessage` / `ScreenshareRoomCreated` events on the
 notifications channel (data = base64 inner JSON). ICE servers come from
-`SCREENSHARE_ICE_SERVERS`. Rooms expire 60 s after the last keepalive.
+`SCREENSHARE_ICE_SERVERS`. Rooms expire 60 s after the last keepalive. When a device is
+revoked, rooms it owns close and it is dropped from rooms it joined.
 
 ### gentree/v1 delta sync (rm-sync)
 `POST /gentree/v1/{GetEntries,GetFiles,GetFile,PutFile,DeleteEntry,EntrySession}`

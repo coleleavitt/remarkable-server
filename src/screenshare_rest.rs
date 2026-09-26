@@ -270,8 +270,12 @@ pub fn spawn_revocation_cleanup(
 
 fn on_revoked(devices: &DeviceManager, rooms: &RoomManager, ev: &DeviceRevoked) {
     // Deleted and at once paired again to the same account: rooms it has now may belong to the
-    // new registration, so leave them be.
-    if matches!(devices.get_device(&ev.device_id), Ok(Some(d)) if d.user_id == ev.user_id) {
+    // new registration, so leave them be. The id must match exactly, as in the token checks
+    // (`get_device` ignores case, so it could find another device of the account).
+    let re_paired = devices
+        .list_devices(Some(&ev.user_id))
+        .is_ok_and(|ds| ds.iter().any(|d| d.device_id == ev.device_id));
+    if re_paired {
         return;
     }
     rooms.drop_device(&ev.user_id, &ev.device_id);
@@ -632,7 +636,10 @@ mod tests {
         };
         on_revoked(dm, &state.screenshare, &ev);
         assert!(state.screenshare.exists(&room));
-        // Handled while it is gone, the event does close the room.
+        // Handled while it is gone, the event does close the room, even with a device of the
+        // same account whose id differs only in case (ids are case-sensitive, as in token checks).
+        let code = dm.create_pairing_code("local-user").unwrap();
+        dm.exchange_code(&code, "rm110-1", "remarkable").unwrap();
         assert!(dm.delete_device("RM110-1", None).unwrap());
         on_revoked(dm, &state.screenshare, &ev);
         assert!(!state.screenshare.exists(&room));

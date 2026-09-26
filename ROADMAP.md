@@ -122,9 +122,10 @@ The community's top *concrete* pains. Small, bounded, high-value.
 - ⬜ **Dropbox / OneDrive listings** — full listings are non-recursive, and
   their delta (change feed) ignores the configured sync folder (Drive got both
   fixes in #26).
-- ⬜ **Screenshare MQTT broker vs revocation** — sessions on the `SCREENSHARE_BIND`
-  broker are not closed when their device is revoked (the `/notifications/ws`
-  and `/mqtt` sessions are).
+- ✅ **Screenshare MQTT broker vs revocation** *(#31)* — sessions on the
+  `SCREENSHARE_BIND` broker now close when their device is revoked, like the
+  `/notifications/ws` and `/mqtt` ones, and a revoked device leaves its REST
+  screenshare rooms.
 - ⬜ **Remaining buffered bodies** — gentree `PutFile` (base64 inside JSON),
   handwriting convert and share-by-email still read the whole request into
   memory.
