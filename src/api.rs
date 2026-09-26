@@ -100,11 +100,7 @@ pub async fn put_file(State(state): State<AppState>, Path(hash): Path<String>, h
     let filename = headers.get("rm-filename").and_then(|v| v.to_str().ok()).ok_or_else(|| ServerError::MissingHeader("rm-filename".into()))?;
     // Verify transport integrity via crc32c when the client sends it; the sha256 in
     // the URL can't be checked against the body (index hashes are over child hashes).
-    if let Some(goog) = headers.get("x-goog-hash").and_then(|v| v.to_str().ok()) {
-        if checksum::parse_goog_hash(goog).is_some_and(|crc| crc != checksum::crc32c(&body)) {
-            return Err(ServerError::ChecksumMismatch { expected: goog.to_string(), actual: checksum::format_goog_hash(&body) });
-        }
-    }
+    checksum::verify_goog_hash_header(&headers, &body)?;
     state.storage.put_with_hash(&body, &hash, filename)?;
     Ok(Json(UploadResponse { hash, size: body.len() as u64 }))
 }
