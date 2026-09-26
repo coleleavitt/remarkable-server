@@ -115,7 +115,9 @@ Two MQTT endpoints exist:
 - `/mqtt` — MQTT 3.1.1 over WebSocket on the API host, authenticated with a device/user token, for
   sync push. It forwards the same `WsMessage` JSON as `/notifications/ws/json/1` on every concrete
   topic the client subscribed to (at most 64 distinct topics); a wildcard filter, or one past that
-  cap, is refused in the SUBACK (`0x80`). A socket whose
+  cap, is refused in the SUBACK (`0x80`). Each SUBSCRIBE is one info line with counts (filters,
+  stored, refused as wildcard, refused past the cap) and the newly stored topics, each cut to
+  64 bytes and escaped, however many filters it carries. A socket whose
   first packet is not a well-formed CONNECT (checked field by field before any token, a header one
   included), or that sends none within 30 s, is closed without a CONNACK. A text frame (MQTT is
   binary only; close code 1003, contents not logged) or a message over 256 KiB closes the socket

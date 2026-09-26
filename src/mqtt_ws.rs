@@ -335,7 +335,8 @@ fn build_publish(topic: &str, payload: &[u8], qos: u8, packet_id: Option<u16>) -
 /// such a CONNECT counts as malformed. A text frame, before or after CONNECT, closes the
 /// socket (close code 1003; [MQTT-6.0.0-1]: MQTT is carried only in binary frames), and
 /// its contents are not logged. A message or frame over [`MAX_MESSAGE_SIZE`] closes it
-/// too. A connected
+/// too. A SUBSCRIBE is logged as one line however many filters it carries, with its
+/// topics cut short and escaped ([`loggable`]). A connected
 /// session is closed once the device its token belongs to is revoked (deleted or
 /// re-paired).
 pub async fn mqtt_notifications_ws(
@@ -404,6 +405,23 @@ const SERVER_USER: &str = "local-user";
 /// the SUBACK ([`SUBACK_FAILURE`]) instead of being acknowledged and never served.
 fn is_concrete(filter: &str) -> bool {
     !filter.is_empty() && !filter.contains(['+', '#'])
+}
+
+/// Most bytes of one client-chosen topic that go into a log line.
+const LOGGED_TOPIC_BYTES: usize = 64;
+
+/// `topic` for a log line: cut to at most [`LOGGED_TOPIC_BYTES`] at a character boundary,
+/// with `…` marking a cut. Log it with `?` (Debug), which escapes control characters, so
+/// a topic can neither fill the journal nor start a line of its own.
+fn loggable(topic: &str) -> std::borrow::Cow<'_, str> {
+    if topic.len() <= LOGGED_TOPIC_BYTES {
+        return topic.into();
+    }
+    format!(
+        "{}…",
+        &topic[..topic.floor_char_boundary(LOGGED_TOPIC_BYTES)]
+    )
+    .into()
 }
 
 /// MQTT PUBLISH packets (QoS 0) carrying `msg` for the session of `user_id`.
@@ -588,6 +606,10 @@ async fn run_mqtt_session<S, R>(
                                 let mut offset = payload_start + 2;
                                 let mut qos_results = Vec::new();
                                 let known = subscriptions.len();
+                                // Counted here and logged once below: one SUBSCRIBE of up to
+                                // MAX_MESSAGE_SIZE holds tens of thousands of filters.
+                                let (mut wildcards, mut first_wildcard) = (0usize, None);
+                                let mut refused_cap = 0usize;
 
                                 while offset < payload_start + remaining_len {
                                     if let Some((topic, topic_len)) =
@@ -599,16 +621,16 @@ async fn run_mqtt_session<S, R>(
                                             offset += 1;
 
                                             if !is_concrete(topic) {
-                                                info!(session_id = %session_id, "MQTT SUBSCRIBE refused, no concrete topic: {:?}", topic);
+                                                wildcards += 1;
+                                                first_wildcard.get_or_insert(topic);
                                                 qos_results.push(SUBACK_FAILURE);
                                             } else if subscriptions.iter().any(|t| t == topic) {
                                                 // A repeat replaces the subscription (§3.8.4); it is stored once.
                                                 qos_results.push(qos);
                                             } else if subscriptions.len() >= MAX_SUBSCRIPTIONS {
-                                                warn!(session_id = %session_id, "MQTT SUBSCRIBE refused, {MAX_SUBSCRIPTIONS} topics already");
+                                                refused_cap += 1;
                                                 qos_results.push(SUBACK_FAILURE);
                                             } else {
-                                                info!(session_id = %session_id, "MQTT SUBSCRIBE to topic: {} (QoS {})", topic, qos);
                                                 subscriptions.push(topic.to_string());
                                                 qos_results.push(qos);
                                             }
@@ -618,15 +640,27 @@ async fn run_mqtt_session<S, R>(
                                     }
                                 }
 
+                                let fresh = &subscriptions[known..]; // stored once each
+                                info!(
+                                    session_id = %session_id,
+                                    packet_id,
+                                    filters = qos_results.len(),
+                                    stored = fresh.len(),
+                                    topics = ?fresh.iter().map(|t| loggable(t)).collect::<Vec<_>>(),
+                                    refused_wildcard = wildcards,
+                                    first_wildcard = ?first_wildcard.map(loggable),
+                                    refused_cap,
+                                    "MQTT SUBSCRIBE"
+                                );
+
                                 // Send SUBACK
                                 let suback = build_suback(packet_id, &qos_results);
                                 if sender.send(Message::Binary(suback.into())).await.is_err() {
                                     break;
                                 }
-                                info!(session_id = %session_id, "MQTT SUBACK sent");
+                                debug!(session_id = %session_id, "MQTT SUBACK sent");
                                 // Like /notifications/ws/json/1's initial SyncComplete: anything
                                 // broadcast before this subscription had nowhere to go.
-                                let fresh = &subscriptions[known..]; // stored once each
                                 let catch_up = WsMessage::sync_complete(
                                     generation(),
                                     "local-server",
@@ -1103,6 +1137,159 @@ mod tests {
             build_pingresp(),
             "nothing past the cap was published"
         );
+    }
+
+    /// A SUBSCRIBE (packet id `id`) of `filters`, each at QoS 0.
+    fn subscribe_all<T: AsRef<str>>(id: u16, filters: impl IntoIterator<Item = T>) -> Message {
+        let mut body = id.to_be_bytes().to_vec();
+        for f in filters {
+            let f = f.as_ref().as_bytes();
+            body.extend_from_slice(&(f.len() as u16).to_be_bytes());
+            body.extend_from_slice(f);
+            body.push(0);
+        }
+        let mut packet = vec![0x82];
+        push_remaining_length(&mut packet, body.len());
+        packet.extend_from_slice(&body);
+        Message::Binary(packet.into())
+    }
+
+    /// Runs a session of user `u1` over `frames`, until they run out, and returns every
+    /// packet it wrote and what it logged at info and above (the deployed
+    /// `RUST_LOG=remarkable_server=info`). The subscriber is attached to this session's
+    /// future only, so tests running alongside don't write into it.
+    async fn session_log(frames: Vec<Message>) -> (Vec<Vec<u8>>, String) {
+        use tracing::instrument::WithSubscriber;
+
+        #[derive(Clone, Default)]
+        struct Log(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl std::io::Write for Log {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let log = Log::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let sink = Box::pin(futures_util::sink::unfold(
+            out_tx,
+            |tx, m: Message| async move {
+                if let Message::Binary(b) = m {
+                    let _ = tx.send(b.to_vec());
+                }
+                Ok::<_, std::convert::Infallible>(tx)
+            },
+        ));
+        let (_notif, notif_rx) = broadcast::channel(4);
+        run_mqtt_session(
+            sink,
+            futures_util::stream::iter(frames.into_iter().map(Ok)),
+            notif_rx,
+            || 42,
+            |_| Some(never_revoked("u1".into())),
+        )
+        .with_subscriber(subscriber)
+        .await;
+        let mut written = Vec::new();
+        while let Ok(p) = out_rx.try_recv() {
+            written.push(p);
+        }
+        let log = String::from_utf8(log.0.lock().clone()).unwrap();
+        (written, log)
+    }
+
+    /// Log volume is per SUBSCRIBE packet, not per filter, and a client's topics reach the
+    /// log cut short and escaped. A SUBSCRIBE is up to [`MAX_MESSAGE_SIZE`], room for tens of
+    /// thousands of filters or a few 64 KiB ones; logging each filter let one frame write
+    /// megabytes, enough for journald's per-service rate limit to drop the server's other
+    /// lines (tablet sync included). A raw newline in a topic would forge a log line.
+    #[tokio::test]
+    async fn a_subscribe_is_logged_once_whatever_its_filters() {
+        let mut fill: Vec<String> = (0..MAX_SUBSCRIPTIONS - 2)
+            .map(|i| format!("t{i}"))
+            .collect();
+        fill.push("evil\n2026-01-01T00:00:00Z  INFO forged".into());
+        fill.push("L".repeat(5000)); // concrete, stored, too long to log whole
+        let flood = (MAX_MESSAGE_SIZE - 8) / 4; // "z" repeated, each past the cap
+        let wildcard = format!("#{}", "A".repeat(65_000));
+        let (written, log) = session_log(vec![
+            connect(),
+            subscribe_all(1, &fill),
+            subscribe_all(2, std::iter::repeat_n("z", flood)),
+            subscribe_all(3, [&wildcard, &wildcard, &wildcard]),
+        ])
+        .await;
+
+        // The SUBACKs are unchanged: all 64 stored, then every filter refused.
+        let subacks: Vec<&Vec<u8>> = written.iter().filter(|p| p[0] == 0x90).collect();
+        assert_eq!(
+            subacks,
+            [
+                &build_suback(1, &[0; MAX_SUBSCRIPTIONS]),
+                &build_suback(2, &vec![SUBACK_FAILURE; flood]),
+                &build_suback(3, &[SUBACK_FAILURE; 3]),
+            ]
+        );
+
+        let lines: Vec<&str> = log.lines().collect();
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.contains(" remarkable_server::mqtt_ws: ")),
+            "every line is a whole event of this module, none forged:\n{log}"
+        );
+        let subscribe_lines: Vec<&&str> =
+            lines.iter().filter(|l| l.contains("SUBSCRIBE")).collect();
+        assert_eq!(subscribe_lines.len(), 3, "one line per SUBSCRIBE:\n{log}");
+        assert!(
+            subscribe_lines[0].contains("stored=64") && subscribe_lines[0].contains("\\n2026"),
+            "stored topics are listed, escaped: {}",
+            subscribe_lines[0]
+        );
+        assert!(
+            subscribe_lines[1].contains(&format!("refused_cap={flood}")),
+            "{}",
+            subscribe_lines[1]
+        );
+        assert!(
+            subscribe_lines[2].contains("refused_wildcard=3"),
+            "{}",
+            subscribe_lines[2]
+        );
+        assert!(
+            !log.contains(&"L".repeat(LOGGED_TOPIC_BYTES + 1))
+                && !log.contains(&"A".repeat(LOGGED_TOPIC_BYTES + 1)),
+            "topics are cut to {LOGGED_TOPIC_BYTES} bytes"
+        );
+        assert!(
+            log.len() < 16 * 1024,
+            "{} bytes logged for ~{} KiB of SUBSCRIBEs",
+            log.len(),
+            (MAX_MESSAGE_SIZE + 3 * 65_000) / 1024
+        );
+    }
+
+    #[test]
+    fn loggable_cuts_at_a_char_boundary() {
+        assert_eq!(loggable("user/u1/sync"), "user/u1/sync");
+        let exact = "x".repeat(LOGGED_TOPIC_BYTES);
+        assert_eq!(loggable(&exact), exact, "not cut at exactly the limit");
+        let long = format!("{}é", "x".repeat(LOGGED_TOPIC_BYTES - 1)); // é straddles the limit
+        assert_eq!(
+            loggable(&long),
+            format!("{}…", "x".repeat(LOGGED_TOPIC_BYTES - 1))
+        );
+        assert_eq!(loggable(""), "");
     }
 
     /// The session ended without writing a single packet (no CONNACK, no PINGRESP).
