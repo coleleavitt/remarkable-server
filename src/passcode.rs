@@ -180,6 +180,19 @@ mod tests {
         assert!(state.devices.create_passcode_reset(&stale, "user-1").unwrap());
     }
 
+    #[test]
+    fn expired_reset_purge_uses_an_index() {
+        let (state, tmp) = setup();
+        drop(state);
+        // an existing install's db (table created before the index) also gets it on the next start
+        rusqlite::Connection::open(tmp.path().join("devices.db")).unwrap().execute_batch("DROP INDEX passcode_resets_user_expires").unwrap();
+        DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        let db = rusqlite::Connection::open(tmp.path().join("devices.db")).unwrap();
+        let plan: Vec<String> = db.prepare("EXPLAIN QUERY PLAN DELETE FROM passcode_resets WHERE user_id = ? AND expires < ?").unwrap()
+            .query_map(rusqlite::params!["u", "t"], |r| r.get::<_, String>(3)).unwrap().map(|r| r.unwrap()).collect();
+        assert!(plan.iter().any(|d| d.contains("USING INDEX passcode_resets_user_expires (user_id=? AND expires<?)")), "{plan:?}");
+    }
+
     #[tokio::test]
     async fn admin_approval_still_works_for_the_requesting_device() {
         let (state, _tmp) = setup();
