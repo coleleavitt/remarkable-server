@@ -178,6 +178,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/oauth/device/code", post(oauth::device_code))
         .route("/oauth/token", post(oauth::token))
         .route("/oauth/revoke", post(oauth::revoke))
+        .route("/oauth/verify", get(oauth::verify_page).post(oauth::verify))
+        .route("/admin/oauth/approve", post(oauth::admin_approve))
         .route("/token/json/4/device/exchange", post(oauth::device_exchange))
         // Settings and updates
         .route("/settings/v1/beta", get(service::get_beta).post(service::post_beta).delete(service::delete_beta))
@@ -410,7 +412,8 @@ pub fn feature_routes(state: AppState, storage_path: &Path, email: Option<email:
     let scheduler = tokio::runtime::Handle::try_current().is_ok()
         .then(|| feeds.clone().start_scheduler(FEED_CHECK_SECS));
 
-    let cloud = IntegrationState::new();
+    // Cloud syncs may only touch directories under <storage>/integrations.
+    let cloud = IntegrationState::with_sync_base(storage_path.join("integrations"));
     let mut router = Router::new()
         .nest("/feeds/v1", feeds::feeds_router(feeds::FeedState { manager: feeds, scheduler, notification_tx: state.notification_tx.clone() }))
         .nest("/search/v1", search_routes)
@@ -418,8 +421,8 @@ pub fn feature_routes(state: AppState, storage_path: &Path, email: Option<email:
         .nest("/integrations/v2/calendars", calendar_router(CalendarState::new(init_calendar_manager(storage_path)?)))
         .nest("/integrations/v2/readlater", readlater_router(ReadLaterState::new(init_readlater_manager(storage_path)?)))
         // xochitl 3.29 uses /storage/; older builds use /cloud. Share one state so both see the same accounts.
-        .nest("/integrations/v2/cloud", integration_router(cloud.clone()))
-        .nest("/integrations/v2/storage", integration_router(cloud));
+        .nest("/integrations/v2/cloud", integrations::integration_api_router(cloud.clone()))
+        .nest("/integrations/v2/storage", integrations::integration_api_router(cloud.clone()));
 
     if let Some(server) = email {
         router = router.nest("/email/v1", Router::new()
@@ -439,7 +442,12 @@ pub fn feature_routes(state: AppState, storage_path: &Path, email: Option<email:
         }
     }
 
-    Ok(router.layer(axum::middleware::from_fn_with_state(state, require_auth)))
+    // The OAuth callback/success pages are hit by the user's browser (no device token), so they
+    // are merged after the auth layer; the callback is authenticated by its one-time PKCE state.
+    let oauth = Router::new()
+        .nest("/integrations/v2/cloud", integrations::integration_oauth_router(cloud.clone()))
+        .nest("/integrations/v2/storage", integrations::integration_oauth_router(cloud));
+    Ok(router.layer(axum::middleware::from_fn_with_state(state, require_auth)).merge(oauth))
 }
 
 #[cfg(test)]
@@ -504,5 +512,27 @@ mod router_tests {
         let body: serde_json::Value = serde_json::from_slice(&publish[publish.iter().position(|&b| b == b'{').unwrap()..]).unwrap(); // after topic "t"
         assert_eq!(body["message"]["attributes"]["auth0UserID"], "u1@test", "other user's SyncComplete was not forwarded");
         assert_eq!(body["message"]["attributes"]["event"], "SyncComplete");
+    }
+
+    /// A browser returning from the OAuth provider carries no device token: the callback and
+    /// success page must be reachable through the production auth layer; the API must not.
+    #[tokio::test]
+    async fn oauth_browser_routes_bypass_device_auth() {
+        use tower::ServiceExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        let devices = DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        let state = AppState::new(storage, devices);
+        // Merged exactly as main.rs does, so any route conflict would panic here too.
+        let app = create_router(state.clone()).merge(feature_routes(state, tmp.path(), None).unwrap());
+        let get = |uri: &str| axum::http::Request::get(uri).body(axum::body::Body::empty()).unwrap();
+        for mount in ["/integrations/v2/cloud", "/integrations/v2/storage"] {
+            let status = |uri: String| { let app = app.clone(); async move { app.oneshot(get(&uri)).await.unwrap().status() } };
+            assert_eq!(status(format!("{mount}/providers/dropbox/success")).await, axum::http::StatusCode::OK);
+            // Reaches the handler (unknown PKCE state -> 400), not the auth layer (401).
+            assert_eq!(status(format!("{mount}/callback?code=c&state=bogus")).await, axum::http::StatusCode::BAD_REQUEST);
+            assert_eq!(status(format!("{mount}/providers")).await, axum::http::StatusCode::UNAUTHORIZED);
+            assert_eq!(status(format!("{mount}/providers/dropbox/status")).await, axum::http::StatusCode::UNAUTHORIZED);
+        }
     }
 }

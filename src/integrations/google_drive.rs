@@ -25,7 +25,7 @@ impl GoogleDrive {
         Self {
             config,
             token: None,
-            client: Client::new(),
+            client: crate::integrations::http_client(),
         }
     }
 
@@ -33,7 +33,7 @@ impl GoogleDrive {
         Self {
             config,
             token: Some(token),
-            client: Client::new(),
+            client: crate::integrations::http_client(),
         }
     }
 
@@ -48,6 +48,20 @@ impl GoogleDrive {
     async fn request(&self, method: reqwest::Method, url: &str) -> Result<reqwest::RequestBuilder> {
         let token = self.access_token()?;
         Ok(self.client.request(method, url).bearer_auth(token))
+    }
+
+    /// Find a non-trashed child folder of `parent` named `name`.
+    async fn find_folder(&self, parent: &str, name: &str) -> Result<Option<String>> {
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('\'', "\\'");
+        let query = format!(
+            "name = '{}' and '{}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+            esc(name), esc(parent)
+        );
+        let url = format!("{}/files?q={}&fields=files(id,name,mimeType,parents)", API_BASE, urlencoding::encode(&query));
+        let response = self.request(reqwest::Method::GET, &url).await?.send().await
+            .map_err(|e| IntegrationError::Network(e.to_string()))?;
+        let list: ListFilesResponse = self.handle_response(response).await?;
+        Ok(list.files.into_iter().next().map(|f| f.id))
     }
 
     /// Handle API response, checking for errors
@@ -358,6 +372,27 @@ impl CloudProvider for GoogleDrive {
 
         let file: DriveFile = self.handle_response(response).await?;
         Ok(file.to_cloud_file(format!("/{}", file.name)))
+    }
+
+    async fn upload_file_at(
+        &self,
+        parent_id: Option<&str>,
+        components: &[&str],
+        content: &[u8],
+        mime_type: Option<&str>,
+    ) -> Result<CloudFile> {
+        // Drive addresses folders by ID, not path: walk (find or create) each directory.
+        let (name, dirs) = components.split_last().ok_or_else(|| IntegrationError::InvalidPath("empty path".into()))?;
+        let mut parent = parent_id.unwrap_or("root").to_string();
+        for dir in dirs {
+            parent = match self.find_folder(&parent, dir).await? {
+                Some(id) => id,
+                None => self.create_folder(Some(&parent), dir).await?.id,
+            };
+        }
+        let mut file = self.upload_file(Some(&parent), name, content, mime_type).await?;
+        file.path = format!("/{}", components.join("/")); // full relative path, not just the basename
+        Ok(file)
     }
 
     async fn create_folder(&self, parent_id: Option<&str>, name: &str) -> Result<CloudFolder> {
