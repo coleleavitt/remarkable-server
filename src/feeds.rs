@@ -1399,13 +1399,18 @@ fn strip_html(html: &str) -> String {
 //   its passes: 100 tables each holding a chain of 503 nested `<div>`s (250 KB) took 33 s, 400
 //   of them over two minutes, and 50,000 elements in chains 128 deep took 4 s. The 512-level
 //   depth cap alone allowed all of these.
+// - dom_smoothie compares its whole title with each `<h1>` and `<h2>` until one resembles it, on
+//   each of its passes, and the title can be as long as the page: a 1 MB og:title before 200
+//   short headings took 3 s, and a page within every other limit can hold a title of megabytes
+//   and a hundred thousand headings, hours of work.
 // So a page is read up to a size limit, parsed in chunks with the parser's work counted
-// (`parse_page`), and measured in one pass before dom_smoothie runs (`page_shape`). A page over
-// any limit is answered by `plain_text_article` instead: its title and text, which cost time
-// linear in the page's size whatever its shape. Timings in this section are release builds on
-// one core of a desktop CPU (Core Ultra 9 275HX). The real pages measured to set the limits
-// were 45 news, blog, forum, documentation and Wikipedia pages, Project Gutenberg books and a
-// 6.5 MB LessWrong post.
+// (`parse_page`), and measured in one pass before dom_smoothie runs (`page_shape`), a measure
+// checked again once the title dom_smoothie will use is known. A page over any limit is
+// answered by `plain_text_article` instead: its title and text, which cost time linear in the
+// page's size whatever its shape. Timings in this section are release builds on one core of a
+// desktop CPU (Core Ultra 9 275HX). The real pages measured to set the limits were 45 news,
+// blog, forum, documentation and Wikipedia pages, Project Gutenberg books and a 6.5 MB
+// LessWrong post.
 
 /// Limits on one extraction. The server uses `ARTICLE_LIMITS`; tests use smaller ones.
 #[derive(Clone, Copy, Debug)]
@@ -1542,18 +1547,14 @@ fn extract_page(
     limits: &ExtractLimits,
 ) -> Result<(ExtractedArticle, Option<OverLimit>)> {
     let (doc, over) = parse_page(html, limits);
-    let over = over.or_else(|| {
-        let shape = page_shape(&doc);
-        if shape.deepest > limits.depth {
-            Some(OverLimit::Depth)
-        } else if shape.work > limits.work {
-            Some(OverLimit::Work)
-        } else {
-            None
-        }
-    });
-    if over.is_some() {
-        return Ok((plain_text_article(&doc), over));
+    let shape = match over {
+        None => page_shape(&doc),
+        Some(_) => return Ok((plain_text_article(&doc), over)),
+    };
+    // Checked before anything else reads the page: dom_query's selector matching recurses per
+    // level, and finding the title below reads the text under each heading again.
+    if let Some(limit) = shape.over(limits, 0) {
+        return Ok((plain_text_article(&doc), Some(limit)));
     }
 
     let base = document_base(&doc, page_url);
@@ -1576,6 +1577,13 @@ fn extract_page(
     };
     let mut readability =
         dom_smoothie::Readability::with_document(doc, None, Some(cfg)).map_err(failed)?;
+    // `parse` starts by finding the title this way too (og:title and other meta tags, else the
+    // `<title>`, else the first `<h1>`), in time linear in the page, then compares it with the
+    // headings.
+    let title = readability.get_article_metadata(None).title;
+    if let Some(limit) = shape.over(limits, title.len()) {
+        return Ok((plain_text_article(&readability.doc), Some(limit)));
+    }
     let (title, content_html) = match readability.parse() {
         Ok(article) => {
             // `parse` leaves the cleaned-up article in `readability.doc`, under the root it
@@ -1591,10 +1599,8 @@ fn extract_page(
         }
         // No readable text at all (empty page, empty body). The previous extractor still
         // answered with the page title and a content-free body, so keep answering, with the
-        // title chosen the way `parse` chooses it (og:title and other meta tags first).
-        Err(dom_smoothie::ReadabilityError::GrabFailed) => {
-            (readability.get_article_metadata(None).title, String::new())
-        }
+        // title `parse` found.
+        Err(dom_smoothie::ReadabilityError::GrabFailed) => (title, String::new()),
         Err(e) => return Err(failed(e)),
     };
 
@@ -1618,8 +1624,37 @@ fn extract_page(
 struct PageShape {
     /// How deep the deepest element sits; the document's children are at depth 1.
     deepest: usize,
-    /// dom_smoothie's estimated work, in units of 1 to 13 ns (see `ARTICLE_LIMITS.work`).
+    /// dom_smoothie's estimated work, in units of 1 to 13 ns (see `ARTICLE_LIMITS.work`), except
+    /// for comparing the title with the headings, which `PageShape::over` adds.
     work: u64,
+    /// `<h1>` and `<h2>` elements.
+    headings: u64,
+}
+
+/// Work per byte of the title for each `<h1>` and `<h2>`. Until a heading resembles the title,
+/// dom_smoothie lowercases the whole title for each one, searches it for the heading's text and
+/// splits it into words, and it does this on each of its passes (up to four, when it finds
+/// little text). Of the titles built to test this, distinct Chinese characters, each a word,
+/// cost the most: up to 90 ns per title byte per heading over four passes, in a run where
+/// chains of `<div>`s took 10 ns per unit, so under 6 ns per unit. Real titles are under 200
+/// bytes; on the real pages measured, this adds at most 0.06% of `ARTICLE_LIMITS.work`.
+const TITLE_WORK: u64 = 16;
+
+impl PageShape {
+    /// The limit the page is over, if any, when dom_smoothie's title is `title_bytes` long.
+    fn over(&self, limits: &ExtractLimits, title_bytes: usize) -> Option<OverLimit> {
+        let title_work = self
+            .headings
+            .saturating_mul(title_bytes as u64)
+            .saturating_mul(TITLE_WORK);
+        if self.deepest > limits.depth {
+            Some(OverLimit::Depth)
+        } else if self.work.saturating_add(title_work) > limits.work {
+            Some(OverLimit::Work)
+        } else {
+            None
+        }
+    }
 }
 
 /// Measures `doc` in one pass, to estimate dom_smoothie's work before running it. For each node
@@ -1634,6 +1669,9 @@ struct PageShape {
 ///   byte: 16 MB of text took 0.7 s at depth 4 and 3.7 s at depth 500, and each `<h1>` or
 ///   `<h2>` above text compares that text with the title (4 MB under 250 of them took 8 s).
 ///
+/// It also counts the `<h1>` and `<h2>` elements, for `PageShape::over` to add the work of
+/// comparing each with the title.
+///
 /// Iterative, because it has to handle pages too deep for recursive tree walks. `<template>`
 /// contents are a separate fragment, which neither this walk nor dom_smoothie visits
 /// (`parse_page` counts them).
@@ -1643,6 +1681,7 @@ fn page_shape(doc: &dom_query::Document) -> PageShape {
     let mut shape = PageShape {
         deepest: 0,
         work: 0,
+        headings: 0,
     };
     // `depth` is the depth of `next`; the document's children are at depth 1.
     let (mut next, mut depth) = (doc.root().first_child(), 1usize);
@@ -1663,6 +1702,9 @@ fn page_shape(doc: &dom_query::Document) -> PageShape {
             .saturating_add(300 + d * d + 40 * attrs + text_work);
         if node.is_element() {
             shape.deepest = shape.deepest.max(depth);
+            if node.has_name("h1") || node.has_name("h2") {
+                shape.headings += 1;
+            }
         }
         next = if let Some(child) = node.first_child() {
             depth += 1;
@@ -3109,6 +3151,92 @@ today. The last evening sailing moves from 11:15 p.m. to 10:30 p.m.</p>
         assert_eq!(over, Some(OverLimit::Work));
         assert_eq!(a.title, "T");
         assert_eq!(a.content_text, vec!["Hi there."; 40].join("\n\n"));
+    }
+
+    /// Until a heading resembles the title, dom_smoothie compares the whole title with each
+    /// `<h1>` and `<h2>`, on each of its passes. In a release build, a 1 MB og:title before 200
+    /// short headings took 3 s, and a page within every other limit could hold a 12 MB title
+    /// before 185,000 headings. Wherever dom_smoothie takes the title from, a long one before
+    /// many headings sends the page to its plain text.
+    #[test]
+    fn long_titles_before_many_headings_are_over_the_work_limit() {
+        let long = "lorem ipsum dolor sit amet ".repeat(800);
+        let long = long.trim();
+        let sections: String = (0..600)
+            .map(|i| format!("<h2>Part {i}</h2><p>Text of part {i}.</p>"))
+            .collect();
+        let page = |head: &str, h1: &str| {
+            format!("<html><head>{head}</head><body>{sections}{h1}</body></html>")
+        };
+        for (head, h1, title) in [
+            // og:title and other title meta tags come first.
+            (
+                format!(r#"<meta property="og:title" content="{long}"><title>Short</title>"#),
+                String::new(),
+                long,
+            ),
+            // Then the <title>, here with no separators to cut it at, and no <h1>.
+            (format!("<title>{long}</title>"), String::new(), long),
+            // A <title> under 15 characters gives way to the first <h1>, here after the others.
+            (
+                "<title>Hello</title>".to_string(),
+                format!("<h1>{long}</h1>"),
+                "Hello",
+            ),
+        ] {
+            let (a, over) = extract_under(&page(&head, &h1), &ARTICLE_LIMITS);
+            assert_eq!(over, Some(OverLimit::Work), "{head:.40} {h1:.40}");
+            assert_eq!(a.title, title);
+            assert!(
+                a.content_text
+                    .starts_with("Part 0\n\nText of part 0.\n\nPart 1\n\n"),
+                "{:.100}",
+                a.content_text
+            );
+        }
+
+        // A real title before the same headings, or the long one before a few, is extracted.
+        let og = |title: &str| format!(r#"<meta property="og:title" content="{title}">"#);
+        let title = "Harbor council adopts a new ferry timetable";
+        let (a, over) = extract_under(&page(&og(title), ""), &ARTICLE_LIMITS);
+        assert_eq!((over, a.title.as_str()), (None, title));
+        assert!(a.content_text.contains("Text of part 599."));
+        let few = format!(
+            "<html><head>{}</head><body><h2>Part 0</h2><p>Text of part 0.</p></body></html>",
+            og(long)
+        );
+        let (a, over) = extract_under(&few, &ARTICLE_LIMITS);
+        assert_eq!((over, a.title.as_str()), (None, long));
+        assert!(
+            a.content_html
+                .starts_with(r#"<div id="readability-page-1""#),
+            "{}",
+            a.content_html
+        );
+    }
+
+    /// The estimate counts each `<h1>` and `<h2>`, nested or not, for the title comparisons: a
+    /// page with 2,000 headings stays well within the limit with a real title.
+    #[test]
+    fn headings_are_counted_for_the_title_comparisons() {
+        let shape = |body: &str| {
+            page_shape(&dom_query::Document::from(
+                format!("<html><body>{body}</body></html>").as_str(),
+            ))
+        };
+        let nested = shape("<h1>a</h1><h2>b<div><h2>c</h2></div></h2><h3>d</h3><p>e</p>");
+        assert_eq!(nested.headings, 3);
+
+        let sections: String = (0..2_000)
+            .map(|i| format!("<h2>Part {i}</h2><p>Text of part {i}.</p>"))
+            .collect();
+        let page = shape(&sections);
+        assert_eq!(page.headings, 2_000);
+        // Real titles are under 200 bytes.
+        assert_eq!(page.over(&ARTICLE_LIMITS, 0), None);
+        assert_eq!(page.over(&ARTICLE_LIMITS, 200), None);
+        assert_eq!(page.over(&ARTICLE_LIMITS, 1_000), None);
+        assert_eq!(page.over(&ARTICLE_LIMITS, 5_000), Some(OverLimit::Work));
     }
 
     /// Each limit, set low, sends a page to the plain-text answer, made from what was parsed
