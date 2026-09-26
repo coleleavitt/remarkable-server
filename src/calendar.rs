@@ -208,12 +208,25 @@ pub fn parse_ics_file(path: &Path, calendar_id: &str) -> Result<Vec<CalendarEven
     Ok(parse_ics_str(&std::fs::read_to_string(path)?, calendar_id))
 }
 
+/// Undo RFC 5545 section 3.1 line folding: a line starting with a space or tab continues the
+/// previous line, minus that one leading whitespace character.
+fn unfold_ics_lines(content: &str) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for raw in content.lines() {
+        match (raw.strip_prefix(' ').or_else(|| raw.strip_prefix('\t')), lines.last_mut()) {
+            (Some(rest), Some(prev)) => prev.push_str(rest),
+            _ => lines.push(raw.to_string()),
+        }
+    }
+    lines
+}
+
 /// Parse VEVENTs from ICS text. A DTSTART with `VALUE=DATE` or a bare 8-digit date marks an all-day event.
 pub fn parse_ics_str(content: &str, calendar_id: &str) -> Vec<CalendarEvent> {
     let mut events = Vec::new();
     let mut in_vevent = false;
     let (mut uid, mut summary, mut dtstart, mut dtend, mut all_day) = (None, None, None, None, false);
-    for line in content.lines() {
+    for line in unfold_ics_lines(content) {
         let line = line.trim();
         if line == "BEGIN:VEVENT" { in_vevent = true; uid = None; summary = None; dtstart = None; dtend = None; all_day = false; }
         else if line == "END:VEVENT" && in_vevent {
@@ -281,5 +294,14 @@ mod tests {
         assert!(!by_uid("c").all_day);
         assert_eq!(by_uid("c").end - by_uid("c").start, Duration::hours(1));
         assert!(!by_uid("d").all_day);
+    }
+
+    #[test]
+    fn folded_lines_are_unfolded() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:long-\r\n uid@example.com\r\nSUMMARY:Quarterly planning\r\n\t review: part 2\r\nDTSTART:20250801T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let events = parse_ics_str(ics, "cal");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].uid, "long-uid@example.com");
+        assert_eq!(events[0].summary, "Quarterly planning review: part 2");
     }
 }

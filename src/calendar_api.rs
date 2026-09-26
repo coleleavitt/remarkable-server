@@ -145,10 +145,13 @@ pub async fn sync_calendar_endpoint(State(state): State<CalendarState>, Path(id)
             for event in events { mgr.upsert_event(&event)?; }
             count
         }
-        _ => 0,
+        _ => return Ok(Json(SyncResponse { calendar_id: id, events_synced: 0, success: false, error: Some(unsupported_sync(&calendar.provider)) })),
     };
     Ok(Json(SyncResponse { calendar_id: id, events_synced: count, success: true, error: None }))
 }
+
+/// Only ICS calendars can be synced so far; other providers report that instead of a fake success.
+fn unsupported_sync(provider: &CalendarProvider) -> String { format!("sync is not implemented for {} calendars", provider) }
 
 pub async fn sync_all_calendars(State(state): State<CalendarState>) -> Result<Json<Vec<SyncResponse>>> {
     let calendars = state.manager.lock().list_calendars();
@@ -169,7 +172,7 @@ pub async fn sync_all_calendars(State(state): State<CalendarState>) -> Result<Js
                     Err(e) => (0, Some(format!("ICS load failed: {}", e))),
                 }
             }
-            _ => (0, None),
+            _ => (0, Some(unsupported_sync(&calendar.provider))),
         };
         if let Some(err) = &error { tracing::warn!("calendar {} sync failed: {}", calendar.id, err); }
         results.push(SyncResponse { calendar_id: calendar.id, events_synced: count, success: error.is_none(), error });
@@ -208,6 +211,7 @@ mod tests {
         let mut mgr = CalendarManager::new(&dir.path().join("cal.db")).unwrap();
         mgr.add_calendar(ics_calendar("good", good)).unwrap();
         mgr.add_calendar(ics_calendar("missing", dir.path().join("nope.ics"))).unwrap();
+        mgr.add_calendar(Calendar { id: "o365".into(), name: "o365".into(), color: None, provider: CalendarProvider::Office365, primary: false, read_only: false, sync_token: None, last_sync: None, config: CalendarConfig::Office365 { tenant_id: "t".into(), access_token: None, refresh_token: None } }).unwrap();
         let Json(results) = sync_all_calendars(State(CalendarState::new(mgr))).await.unwrap();
         let good = results.iter().find(|r| r.calendar_id == "good").unwrap();
         assert!(good.success && good.error.is_none());
@@ -215,6 +219,9 @@ mod tests {
         let missing = results.iter().find(|r| r.calendar_id == "missing").unwrap();
         assert!(!missing.success);
         assert!(missing.error.as_deref().unwrap().contains("ICS load failed"));
+        let o365 = results.iter().find(|r| r.calendar_id == "o365").unwrap();
+        assert!(!o365.success && o365.events_synced == 0);
+        assert!(o365.error.as_deref().unwrap().contains("not implemented for office365"), "{:?}", o365.error);
         // Backward-compatible shape: existing fields still present, `error` only when set.
         let json = serde_json::to_value(good).unwrap();
         assert_eq!(json, serde_json::json!({"calendar_id": "good", "events_synced": 1, "success": true}));

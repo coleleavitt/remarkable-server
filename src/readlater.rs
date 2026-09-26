@@ -1059,7 +1059,7 @@ impl WallabagProvider {
             return Err(ReadLaterError::Api("Invalid config".into()));
         };
         
-        if !wallabag_token_needs_refresh(access_token.as_deref(), *token_expires_at, Utc::now()) {
+        if !wallabag_token_needs_refresh(access_token.as_deref(), *token_expires_at, refresh_token.is_some(), Utc::now()) {
             return Ok(config.clone());
         }
         
@@ -1107,11 +1107,12 @@ impl WallabagProvider {
 }
 
 /// Refresh only when there is no access token, or it has an expiry that is past or within
-/// five minutes. A token with no recorded expiry is used as-is (the server rejects it if stale).
-fn wallabag_token_needs_refresh(access_token: Option<&str>, expires_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+/// five minutes. A token with no recorded expiry is refreshed when a refresh token exists (the
+/// refresh records an expiry, so this happens once) and otherwise used as-is.
+fn wallabag_token_needs_refresh(access_token: Option<&str>, expires_at: Option<DateTime<Utc>>, has_refresh_token: bool, now: DateTime<Utc>) -> bool {
     match (access_token, expires_at) {
         (None, _) => true,
-        (Some(_), None) => false,
+        (Some(_), None) => has_refresh_token,
         (Some(_), Some(exp)) => exp <= now + Duration::minutes(5),
     }
 }
@@ -2684,16 +2685,25 @@ impl ReadLaterManager {
         
         // Refresh credentials once per sync (a no-op unless expired/near expiry) so the
         // individual API calls below don't each trigger their own refresh.
+        // A failed refresh aborts the sync without touching `last_sync`, so the failure stays
+        // visible and the next sync retries the same window.
         let mut account = account;
         match provider.refresh_auth(&account.config).await {
             Ok(config) => account.config = config,
-            Err(e) => result.errors.push(format!("Auth refresh: {}", e)),
+            Err(e) => {
+                result.errors.push(format!("Auth refresh: {}", e));
+                result.duration_ms = start.elapsed().as_millis() as u64;
+                result.completed_at = Utc::now();
+                return Ok(result);
+            }
         }
         
         // Fetch articles
         let since = account.last_sync;
+        let mut fetched = false;
         match provider.fetch_articles(&account.config, since).await {
             Ok(articles) => {
+                fetched = true;
                 result.articles_fetched = articles.len() as u32;
                 
                 for article in select_articles_for_sync(articles, &account.sync_settings) {
@@ -2757,9 +2767,10 @@ impl ReadLaterManager {
             }
         }
         
-        // Update last sync time
+        // Persist refreshed credentials; advance `last_sync` only after a successful fetch so a
+        // failed fetch doesn't make the next incremental sync skip this window.
         let mut updated_account = account;
-        updated_account.last_sync = Some(Utc::now());
+        if fetched { updated_account.last_sync = Some(Utc::now()); }
         let _ = self.update_account(updated_account);
         
         result.duration_ms = start.elapsed().as_millis() as u64;
@@ -2860,16 +2871,16 @@ impl ReadLaterManager {
 }
 
 /// Apply the account's sync filters (tags, favorites, archived) and cap the result at
-/// `max_articles` (0 = unlimited), keeping the most recently added articles.
+/// `max_articles` (0 = unlimited), keeping the most recently added articles. The cap is per
+/// sync: articles it drops are older than everything kept and are not revisited later.
+/// Tag filters: an article must carry none of the exclude tags and, when any include
+/// filters exist, at least one include tag.
 fn select_articles_for_sync(articles: Vec<Article>, settings: &SyncSettings) -> Vec<Article> {
     let mut selected: Vec<Article> = articles.into_iter().filter(|article| {
-        if !settings.tag_filters.is_empty() {
-            let matches = settings.tag_filters.iter().any(|f| {
-                let has_tag = article.tags.iter().any(|t| t.eq_ignore_ascii_case(&f.tag));
-                if f.include { has_tag } else { !has_tag }
-            });
-            if !matches { return false; }
-        }
+        let has_tag = |tag: &str| article.tags.iter().any(|t| t.eq_ignore_ascii_case(tag));
+        if settings.tag_filters.iter().any(|f| !f.include && has_tag(&f.tag)) { return false; }
+        let mut includes = settings.tag_filters.iter().filter(|f| f.include).peekable();
+        if includes.peek().is_some() && !includes.any(|f| has_tag(&f.tag)) { return false; }
         if settings.include_favorites_only && !article.favorite { return false; }
         if !settings.include_archived && article.status == ReadStatus::Archived { return false; }
         true
@@ -2950,12 +2961,14 @@ mod tests {
     #[test]
     fn wallabag_refreshes_only_when_needed() {
         let now = Utc::now();
-        assert!(wallabag_token_needs_refresh(None, None, now));
-        assert!(wallabag_token_needs_refresh(None, Some(now + Duration::hours(1)), now));
-        assert!(!wallabag_token_needs_refresh(Some("t"), None, now));
-        assert!(!wallabag_token_needs_refresh(Some("t"), Some(now + Duration::hours(1)), now));
-        assert!(wallabag_token_needs_refresh(Some("t"), Some(now + Duration::minutes(2)), now));
-        assert!(wallabag_token_needs_refresh(Some("t"), Some(now - Duration::minutes(1)), now));
+        assert!(wallabag_token_needs_refresh(None, None, true, now));
+        assert!(wallabag_token_needs_refresh(None, Some(now + Duration::hours(1)), true, now));
+        // Unknown expiry: refresh once if we can (the refresh records an expiry), else use as-is.
+        assert!(wallabag_token_needs_refresh(Some("t"), None, true, now));
+        assert!(!wallabag_token_needs_refresh(Some("t"), None, false, now));
+        assert!(!wallabag_token_needs_refresh(Some("t"), Some(now + Duration::hours(1)), true, now));
+        assert!(wallabag_token_needs_refresh(Some("t"), Some(now + Duration::minutes(2)), true, now));
+        assert!(wallabag_token_needs_refresh(Some("t"), Some(now - Duration::minutes(1)), true, now));
     }
 
     #[test]
@@ -3044,6 +3057,44 @@ mod tests {
         favs[3].favorite = true;
         let picked = select_articles_for_sync(favs, &settings);
         assert_eq!(picked.iter().map(|a| a.provider_id.as_str()).collect::<Vec<_>>(), ["p3", "p2"]);
+    }
+
+    #[test]
+    fn select_articles_tag_filters_require_include_and_honor_exclude() {
+        let tagged = |p: &str, tags: &[&str]| { let mut a = article(p, p, 0); a.tags = tags.iter().map(|t| t.to_string()).collect(); a };
+        let articles = vec![tagged("none", &[]), tagged("inc", &["Rust"]), tagged("both", &["rust", "skip"]), tagged("exc", &["skip"]), tagged("other", &["go"])];
+        let filter = |tag: &str, include: bool| TagFilter { tag: tag.into(), include };
+        let ids = |settings: &SyncSettings| { let mut v: Vec<String> = select_articles_for_sync(articles.clone(), settings).into_iter().map(|a| a.provider_id).collect(); v.sort(); v };
+        let mut settings = SyncSettings { max_articles: 0, tag_filters: vec![filter("rust", true), filter("skip", false)], ..SyncSettings::default() };
+        assert_eq!(ids(&settings), ["inc"]);
+        settings.tag_filters = vec![filter("skip", false)];
+        assert_eq!(ids(&settings), ["inc", "none", "other"]);
+        settings.tag_filters = vec![filter("rust", true), filter("go", true)];
+        assert_eq!(ids(&settings), ["both", "inc", "other"]);
+    }
+
+    fn test_account(id: &str, provider: ReadLaterProvider, config: ProviderConfig, last_sync: Option<DateTime<Utc>>) -> ProviderAccount {
+        ProviderAccount { id: id.into(), name: id.into(), provider, enabled: true, config, sync_settings: SyncSettings::default(), last_sync, created_at: Utc::now() }
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_or_fetch_does_not_advance_last_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = ReadLaterManager::new(&dir.path().join("rl.db"), dir.path()).unwrap();
+        let last = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        // Wallabag with no tokens: refresh fails, so the sync aborts before fetching.
+        let wb = ProviderConfig::Wallabag { instance_url: "http://127.0.0.1:9".into(), client_id: "c".into(), client_secret: None, access_token: None, refresh_token: None, token_expires_at: None };
+        mgr.add_account(test_account("wb", ReadLaterProvider::Wallabag, wb, Some(last))).unwrap();
+        let r = mgr.sync_account("wb").await.unwrap();
+        assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+        assert!(r.errors[0].starts_with("Auth refresh"));
+        assert_eq!(mgr.get_account("wb").unwrap().last_sync, Some(last));
+        // Hosted Omnivore: refresh is a no-op but the fetch fails.
+        let om = ProviderConfig::Omnivore { api_key: Some("k".into()), api_url: None };
+        mgr.add_account(test_account("om", ReadLaterProvider::Omnivore, om, Some(last))).unwrap();
+        let r = mgr.sync_account("om").await.unwrap();
+        assert!(r.errors.iter().any(|e| e.starts_with("Fetch")), "{:?}", r.errors);
+        assert_eq!(mgr.get_account("om").unwrap().last_sync, Some(last));
     }
 
     #[tokio::test]
