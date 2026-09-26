@@ -423,7 +423,9 @@ impl SearchIndex {
         Ok(indexed)
     }
     
-    /// Delete rows whose blob is no longer in storage or no longer mapped to a filename. The
+    /// Delete rows whose blob is no longer in storage or no longer mapped to a filename, and
+    /// repoint rows whose own filename moved on to another blob while a different filename
+    /// still currently maps their hash (so an unreadable blob can't keep a stale name). The
     /// listing and mapping lookups happen while holding the DB lock, so every row already
     /// written refers to a blob and mapping they can see. The row's own filename is checked
     /// first (O(1)); only on a mismatch is the hash reverse-looked-up.
@@ -431,16 +433,26 @@ impl SearchIndex {
         let db = |e: rusqlite::Error| ServerError::Database(e.to_string());
         let mut conn = self.inner.conn.lock();
         let live: std::collections::HashSet<String> = storage.list_hashes()?.into_iter().collect();
-        let mapped = |h: &str, f: &str| is_current(storage, h, f) || storage.filename_for_hash(h).is_some_and(|g| is_current(storage, h, &g));
         let tx = conn.transaction().map_err(db)?;
-        let stale: Vec<String> = {
+        let (mut stale, mut renamed) = (Vec::new(), Vec::new());
+        {
             let mut stmt = tx.prepare("SELECT hash, filename FROM documents").map_err(db)?;
             let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).map_err(db)?
                 .collect::<rusqlite::Result<Vec<_>>>().map_err(db)?;
-            rows.into_iter().filter(|(h, f)| !live.contains(h) || !mapped(h, f)).map(|(h, _)| h).collect()
-        };
+            for (h, f) in rows {
+                if live.contains(&h) && is_current(storage, &h, &f) { continue }
+                match storage.filename_for_hash(&h).filter(|g| live.contains(&h) && is_current(storage, &h, g)) {
+                    Some(g) => renamed.push((h, g)),
+                    None => stale.push(h),
+                }
+            }
+        }
         for hash in &stale {
             tx.execute("DELETE FROM documents WHERE hash = ?1", params![hash]).map_err(db)?;
+        }
+        for (hash, filename) in &renamed {
+            tx.execute("UPDATE documents SET filename = ?2, doc_type = ?3 WHERE hash = ?1",
+                params![hash, filename, DocumentType::from_filename(filename).as_str()]).map_err(db)?;
         }
         tx.commit().map_err(db)?;
         Ok(stale.len())
@@ -630,6 +642,27 @@ mod tests {
         assert!(!index.is_indexed(&old), "unmapped blob's row must be pruned");
         assert!(index.is_indexed(&new));
         assert_eq!(q("notes").iter().map(|r| r.hash.clone()).collect::<Vec<_>>(), vec![new]);
+    }
+
+    #[test]
+    fn test_prune_repoints_row_to_other_current_filename() {
+        let tmp = TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path().join("store")).unwrap();
+        let index = SearchIndex::new(tmp.path()).unwrap();
+        let q = |q: &str| index.search(&SearchQuery { q: q.into(), limit: 10, offset: 0, doc_type: None }).unwrap();
+        // Two filenames share one blob; the row was written under alpha (e.g. its last readable indexing).
+        let old = storage.put(b"{\"v\":1}", "alpha.metadata").unwrap();
+        assert_eq!(storage.put(b"{\"v\":1}", "beta.metadata").unwrap(), old);
+        index.index_document(&old, "alpha.metadata", Some("zanzibar")).unwrap();
+
+        // alpha moves to new content; beta still maps the old blob, so its row is repointed, not kept stale.
+        let new = storage.put(b"{\"v\":2}", "alpha.metadata").unwrap();
+        index.index_document(&new, "alpha.metadata", None).unwrap();
+        assert_eq!(index.prune_missing(&storage).unwrap(), 0);
+        let hits = q("zanzibar");
+        assert_eq!(hits.iter().map(|r| (r.hash.clone(), r.filename.clone())).collect::<Vec<_>>(), vec![(old.clone(), "beta.metadata".into())]);
+        assert!(q("alpha").iter().all(|r| r.hash == new), "no row may keep alpha's stale name");
+        assert_eq!(q("beta").iter().map(|r| r.hash.clone()).collect::<Vec<_>>(), vec![old]);
     }
 
     #[test]
