@@ -114,7 +114,8 @@ The firmware references these cloud hosts:
 Two MQTT endpoints exist:
 - `/mqtt` — MQTT 3.1.1 over WebSocket on the API host, authenticated with a device/user token, for
   sync push. It forwards the same `WsMessage` JSON as `/notifications/ws/json/1` on every concrete
-  topic the client subscribed to; a wildcard filter is refused in the SUBACK (`0x80`). A socket whose
+  topic the client subscribed to (at most 64 distinct topics); a wildcard filter, or one past that
+  cap, is refused in the SUBACK (`0x80`). A socket whose
   first packet is not a well-formed CONNECT (checked field by field before any token, a header one
   included), or that sends none within 30 s, is closed without a CONNACK. **Off by default**; served
   only with `MQTT_WS_NOTIFICATIONS=1` (`true`/`on`), because the tablet never uses it (below).

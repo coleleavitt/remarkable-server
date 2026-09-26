@@ -56,6 +56,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// SUBACK return code for a filter the server refuses (MQTT 3.1.1 §3.9.3).
 const SUBACK_FAILURE: u8 = 0x80;
 
+/// Distinct topics one session may subscribe to; filters past it are refused in the
+/// SUBACK. Every notification is published once per topic, so this bounds both the
+/// session's state and what one event costs to fan out.
+const MAX_SUBSCRIPTIONS: usize = 64;
+
 /// The [`PATH`] route, to merge into [`crate::create_router`]'s router, when `flag`
 /// (the value of [`ENABLE_ENV`]) is `1`, `true` or `on`; `None` otherwise, including
 /// when it is unset. No tablet uses it (see the module docs), so it stays off the
@@ -580,13 +585,19 @@ async fn run_mqtt_session<S, R>(
                                             let qos = data[offset] & 0x03;
                                             offset += 1;
 
-                                            if is_concrete(topic) {
+                                            if !is_concrete(topic) {
+                                                info!(session_id = %session_id, "MQTT SUBSCRIBE refused, no concrete topic: {:?}", topic);
+                                                qos_results.push(SUBACK_FAILURE);
+                                            } else if subscriptions.iter().any(|t| t == topic) {
+                                                // A repeat replaces the subscription (§3.8.4); it is stored once.
+                                                qos_results.push(qos);
+                                            } else if subscriptions.len() >= MAX_SUBSCRIPTIONS {
+                                                warn!(session_id = %session_id, "MQTT SUBSCRIBE refused, {MAX_SUBSCRIPTIONS} topics already");
+                                                qos_results.push(SUBACK_FAILURE);
+                                            } else {
                                                 info!(session_id = %session_id, "MQTT SUBSCRIBE to topic: {} (QoS {})", topic, qos);
                                                 subscriptions.push(topic.to_string());
                                                 qos_results.push(qos);
-                                            } else {
-                                                info!(session_id = %session_id, "MQTT SUBSCRIBE refused, no concrete topic: {:?}", topic);
-                                                qos_results.push(SUBACK_FAILURE);
                                             }
                                         }
                                     } else {
@@ -602,17 +613,13 @@ async fn run_mqtt_session<S, R>(
                                 info!(session_id = %session_id, "MQTT SUBACK sent");
                                 // Like /notifications/ws/json/1's initial SyncComplete: anything
                                 // broadcast before this subscription had nowhere to go.
-                                let fresh: Vec<String> = subscriptions[known..]
-                                    .iter()
-                                    .filter(|t| !subscriptions[..known].contains(t))
-                                    .cloned()
-                                    .collect();
+                                let fresh = &subscriptions[known..]; // stored once each
                                 let catch_up = WsMessage::sync_complete(
                                     generation(),
                                     "local-server",
                                     &user_id,
                                 );
-                                for packet in notification_publishes(&catch_up, &fresh, &user_id) {
+                                for packet in notification_publishes(&catch_up, fresh, &user_id) {
                                     if sender.send(Message::Binary(packet.into())).await.is_err() {
                                         return;
                                     }
@@ -1023,6 +1030,57 @@ mod tests {
             }
             let _ = connect_token(&frame);
         }
+    }
+
+    /// A session's topics are stored once each and capped at [`MAX_SUBSCRIPTIONS`]; a
+    /// notification goes out once per stored topic.
+    #[tokio::test]
+    async fn subscriptions_are_distinct_and_capped() {
+        let (in_tx, mut out, notif, _task) = start();
+        in_tx.send(connect()).unwrap();
+        assert_eq!(next(&mut out).await, build_connack(false, 0));
+        // One SUBSCRIBE: "t0" twice, then enough new topics to pass the cap by one.
+        let topics: Vec<String> = std::iter::once("t0".to_string())
+            .chain((0..=MAX_SUBSCRIPTIONS).map(|i| format!("t{i}")))
+            .collect();
+        let mut body = vec![0, 9]; // packet id 9
+        for t in &topics {
+            body.extend_from_slice(&(t.len() as u16).to_be_bytes());
+            body.extend_from_slice(t.as_bytes());
+            body.push(0);
+        }
+        let mut packet = vec![0x82];
+        push_remaining_length(&mut packet, body.len());
+        packet.extend_from_slice(&body);
+        in_tx.send(Message::Binary(packet.into())).unwrap();
+
+        let mut codes = vec![0; MAX_SUBSCRIPTIONS + 1]; // t0, t0 again, t1..
+        codes.push(SUBACK_FAILURE); // one past the cap
+        assert_eq!(next(&mut out).await, build_suback(9, &codes));
+        let mut catch_up = Vec::new();
+        for _ in 0..MAX_SUBSCRIPTIONS {
+            catch_up.push(parse_publish(&next(&mut out).await).0);
+        }
+        assert_eq!(
+            catch_up,
+            topics[1..=MAX_SUBSCRIPTIONS],
+            "one catch-up per stored topic"
+        );
+
+        notif
+            .send(WsMessage::sync_complete(3, "local-server", "u1"))
+            .unwrap();
+        for _ in 0..MAX_SUBSCRIPTIONS {
+            parse_publish(&next(&mut out).await);
+        }
+        in_tx
+            .send(Message::Binary(vec![0xC0, 0x00].into()))
+            .unwrap(); // PINGREQ
+        assert_eq!(
+            next(&mut out).await,
+            build_pingresp(),
+            "nothing past the cap was published"
+        );
     }
 
     /// The session ended without writing a single packet (no CONNACK, no PINGRESP).
