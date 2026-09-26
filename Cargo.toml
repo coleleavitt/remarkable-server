@@ -43,6 +43,9 @@ feed-rs = "2"
 # its own). Replaces `readability` 0.3, whose default reqwest 0.11 feature pulled h2 0.3
 # (RUSTSEC-2026-0258) and rustls-pemfile 1 (unmaintained).
 dom_smoothie = "0.18.2"
+# dom_smoothie's DOM (same version it uses, no new crate): feeds.rs checks nesting depth and
+# resolves URLs on it before and after extraction.
+dom_query = "0.28"
 epub-builder = "0.7"
 imap = "3.0.0-alpha.15"
 native-tls = "0.2"

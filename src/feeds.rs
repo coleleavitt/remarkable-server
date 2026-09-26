@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
+use reqwest::Url;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -613,14 +614,18 @@ impl FeedManager {
             .await
             .map_err(|e| ServerError::Internal(format!("Failed to fetch article: {}", e)))?;
         // Relative links in the page are relative to where it was served from, after redirects.
-        let page_url = response.url().to_string();
+        let page_url = response.url().clone();
 
         let html = response
             .text()
             .await
             .map_err(|e| ServerError::Internal(format!("Failed to read article: {}", e)))?;
 
-        extract_readable(&html, &page_url)
+        // Parsing and scoring are CPU-bound, so keep them off the async workers that serve the
+        // tablet.
+        tokio::task::spawn_blocking(move || extract_readable(&html, &page_url))
+            .await
+            .map_err(|e| ServerError::Internal(format!("Failed to extract article: {e}")))?
     }
 
     // ========================================================================
@@ -1371,10 +1376,39 @@ fn strip_html(html: &str) -> String {
         .replace("&#39;", "'")
 }
 
+/// Pages whose elements nest deeper than this are refused rather than extracted. dom_smoothie
+/// measures the text under every ancestor again on each of its passes, so its cost grows about
+/// with the cube of the nesting depth (1,000 nested `<div>`s take 2 s of CPU, 2,000 take 16 s),
+/// and dom_query matches some selectors recursively, which overflows a 2 MiB thread stack and
+/// aborts the process at around 27,000 levels. Chromium and WebKit stop nesting at 512
+/// levels (deeper elements go to the nearest allowed ancestor), so pages written for browsers
+/// stay within this.
+const MAX_ARTICLE_DEPTH: usize = 512;
+
 /// Readability (Mozilla Readability.js algorithm) over already-fetched HTML; no network. Keeps
-/// the main content and drops page furniture (navigation, ads, sidebars, comments, scripts);
-/// relative links and images are made absolute against `page_url`, which must be absolute.
-fn extract_readable(html: &str, page_url: &str) -> Result<ExtractedArticle> {
+/// the main content and drops page furniture (navigation, ads, sidebars, comments, scripts).
+/// Relative URLs in the result are resolved the way a browser resolves them, against the page's
+/// `<base href>` if that is an http(s) URL and against `page_url` otherwise. CPU-bound: run it
+/// off the async runtime.
+fn extract_readable(html: &str, page_url: &Url) -> Result<ExtractedArticle> {
+    // Parsing does not recurse, so it copes with any depth. It is not always cheap: html5ever's
+    // tree builder is quadratic in nesting depth too (servo/html5ever#788), one more reason
+    // this runs off the async runtime.
+    let doc = dom_query::Document::from(html);
+    if nested_deeper_than(&doc, MAX_ARTICLE_DEPTH) {
+        return Err(ServerError::BadRequest(format!(
+            "The page nests elements more than {MAX_ARTICLE_DEPTH} levels deep, too deep to \
+             extract"
+        )));
+    }
+    let base = document_base(&doc, page_url);
+    // dom_smoothie gets neither a URL nor a <base>, so it leaves every URL as written, and they
+    // are resolved below with `Url::join`. Its own resolver leaves relative links that start
+    // with "http" (`http2-explained/`) relative, applies `..` inside query strings, drops the
+    // trailing slash of `..` and `.`, does not percent-encode, and takes any <base>, even a
+    // `javascript:` one.
+    doc.select("base").remove();
+
     let failed = |e: dom_smoothie::ReadabilityError| {
         ServerError::Internal(format!("Failed to extract article: {e}"))
     };
@@ -1386,13 +1420,25 @@ fn extract_readable(html: &str, page_url: &str) -> Result<ExtractedArticle> {
         ..Default::default()
     };
     let mut readability =
-        dom_smoothie::Readability::new(html, Some(page_url), Some(cfg)).map_err(failed)?;
+        dom_smoothie::Readability::with_document(doc, None, Some(cfg)).map_err(failed)?;
     let (title, content_html) = match readability.parse() {
-        Ok(article) => (article.title, article.content.to_string()),
+        Ok(article) => {
+            // `parse` leaves the cleaned-up article in `readability.doc`, under the root it
+            // serialized into `article.content`. Resolve the URLs there and serialize it again.
+            let root = readability.doc.select_single("#readability-page-1");
+            let content = if root.exists() {
+                absolutize_urls(&root, &base, base == *page_url);
+                root.html().to_string()
+            } else {
+                article.content.to_string()
+            };
+            (article.title, content)
+        }
         // No readable text at all (empty page, empty body). The previous extractor still
-        // answered with the page title and a content-free body, so keep answering.
+        // answered with the page title and a content-free body, so keep answering, with the
+        // title chosen the way `parse` chooses it (og:title and other meta tags first).
         Err(dom_smoothie::ReadabilityError::GrabFailed) => {
-            (readability.get_article_title().to_string(), String::new())
+            (readability.get_article_metadata(None).title, String::new())
         }
         Err(e) => return Err(failed(e)),
     };
@@ -1407,6 +1453,138 @@ fn extract_readable(html: &str, page_url: &str) -> Result<ExtractedArticle> {
         word_count,
         reading_time_mins: (word_count / 200).max(1),
     })
+}
+
+/// Whether any element of `doc` sits more than `limit` levels below the document node.
+/// Iterative, because it has to handle the pages that are too deep for recursive tree walks.
+/// `<template>` contents are a separate fragment, which neither this walk nor dom_smoothie's
+/// visits.
+fn nested_deeper_than(doc: &dom_query::Document, limit: usize) -> bool {
+    // `depth` is the depth of `next`; the document's children are at depth 1.
+    let (mut next, mut depth) = (doc.root().first_child(), 1);
+    while let Some(node) = next {
+        if depth > limit && node.is_element() {
+            return true;
+        }
+        next = if let Some(child) = node.first_child() {
+            depth += 1;
+            Some(child)
+        } else {
+            // The next node in document order: the next sibling of `node`, or of its nearest
+            // ancestor that has one.
+            let mut cur = node;
+            loop {
+                if let Some(sibling) = cur.next_sibling() {
+                    break Some(sibling);
+                }
+                match cur.parent() {
+                    Some(parent) if depth > 1 => {
+                        depth -= 1;
+                        cur = parent;
+                    }
+                    _ => break None,
+                }
+            }
+        };
+    }
+    false
+}
+
+/// The URL that relative references in the page resolve against: the first `<base href>`,
+/// itself resolved against `page_url`, when that gives an http(s) URL; otherwise `page_url`. A
+/// `javascript:` or `data:` base would turn every relative link and image into script or inline
+/// data.
+fn document_base(doc: &dom_query::Document, page_url: &Url) -> Url {
+    doc.select_single("base[href]")
+        .attr("href")
+        .and_then(|href| page_url.join(&href).ok())
+        .filter(|base| matches!(base.scheme(), "http" | "https"))
+        .unwrap_or_else(|| page_url.clone())
+}
+
+/// Makes the URLs under `root` absolute against `base` with WHATWG `Url::join`, as a browser
+/// would: `a`/`area` link targets, every `src` and `poster`, and each `srcset` candidate. URLs
+/// that are already absolute (any scheme, such as `mailto:` or `data:`) are left as written.
+/// With `keep_fragments`, a bare `#anchor` link stays pointing into the article, as Readability.js
+/// leaves it when the base is the page itself.
+fn absolutize_urls(root: &dom_query::Selection, base: &Url, keep_fragments: bool) {
+    let resolve = |value: &str| resolve_url(base, value);
+    for node in root.select("a[href], area[href]").nodes() {
+        let Some(href) = node.attr("href") else {
+            continue;
+        };
+        if keep_fragments && href.trim_start().starts_with('#') {
+            continue;
+        }
+        if let Some(abs) = resolve(&href) {
+            node.set_attr("href", &abs);
+        }
+    }
+    for attr in ["src", "poster"] {
+        for node in root.select(&format!("[{attr}]")).nodes() {
+            if let Some(abs) = node.attr(attr).and_then(|value| resolve(&value)) {
+                node.set_attr(attr, &abs);
+            }
+        }
+    }
+    for node in root.select("[srcset]").nodes() {
+        if let Some(srcset) = node.attr("srcset") {
+            node.set_attr("srcset", &absolutize_srcset(&srcset, resolve));
+        }
+    }
+}
+
+/// `value` resolved against `base`, or `None` when it is already absolute or cannot be resolved
+/// (it is then kept as written).
+fn resolve_url(base: &Url, value: &str) -> Option<String> {
+    if Url::parse(value).is_ok() {
+        return None;
+    }
+    base.join(value).ok().map(String::from)
+}
+
+/// Resolves each candidate URL of a `srcset` and keeps its descriptors as written. As in HTML's
+/// srcset parsing, a candidate's URL runs to the next whitespace (so it may contain commas, as
+/// image CDN URLs often do) and its descriptors run to the next comma outside parentheses.
+fn absolutize_srcset(srcset: &str, resolve: impl Fn(&str) -> Option<String>) -> String {
+    let mut candidates = Vec::new();
+    let mut rest = srcset;
+    loop {
+        rest = rest.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ',');
+        if rest.is_empty() {
+            break;
+        }
+        let (url, after) = rest.split_at(
+            rest.find(|c: char| c.is_ascii_whitespace())
+                .unwrap_or(rest.len()),
+        );
+        let (url, descriptors, after) = if let Some(url) = url.strip_suffix(',') {
+            (url.trim_end_matches(','), "", after)
+        } else {
+            let mut in_parens = false;
+            let end = after
+                .char_indices()
+                .find(|&(_, c)| {
+                    match c {
+                        '(' => in_parens = true,
+                        ')' => in_parens = false,
+                        ',' => return !in_parens,
+                        _ => {}
+                    }
+                    false
+                })
+                .map_or(after.len(), |(i, _)| i);
+            (url, after[..end].trim(), &after[end..])
+        };
+        let url = resolve(url).unwrap_or_else(|| url.to_string());
+        candidates.push(if descriptors.is_empty() {
+            url
+        } else {
+            format!("{url} {descriptors}")
+        });
+        rest = after;
+    }
+    candidates.join(", ")
 }
 
 fn html_escape(s: &str) -> String {
@@ -1907,6 +2085,10 @@ mod folder_sync_tests {
 mod readability_tests {
     use super::*;
 
+    fn extract(html: &str, page_url: &str) -> Result<ExtractedArticle> {
+        extract_readable(html, &Url::parse(page_url).unwrap())
+    }
+
     const BLOG: &str = include_str!("../tests/fixtures/articles/engineering_blog.html");
     const BLOG_URL: &str = "https://blog.northwind.example/2026/03/ci-build-times/";
     const NEWS: &str = include_str!("../tests/fixtures/articles/news_div_soup.html");
@@ -1923,7 +2105,7 @@ mod readability_tests {
 
     #[test]
     fn blog_post_keeps_the_article_and_drops_page_furniture() {
-        let a = extract_readable(BLOG, BLOG_URL).unwrap();
+        let a = extract(BLOG, BLOG_URL).unwrap();
         assert_eq!(a.title, "How We Cut Our CI Build Times in Half");
         for kept in [
             "Twelve months ago, a clean build",
@@ -1984,7 +2166,7 @@ mod readability_tests {
 
     #[test]
     fn div_soup_news_story_is_extracted() {
-        let a = extract_readable(NEWS, NEWS_URL).unwrap();
+        let a = extract(NEWS, NEWS_URL).unwrap();
         assert_eq!(a.title, "Harbor Council Approves New Ferry Schedule");
         for kept in [
             "voted five to two on Tuesday night",
@@ -2027,7 +2209,7 @@ mod readability_tests {
 
     #[test]
     fn page_without_readable_text_still_answers_with_its_title() {
-        let a = extract_readable(
+        let a = extract(
             "<html><head><title>Nothing here</title></head><body></body></html>",
             "https://example.com/empty",
         )
@@ -2036,12 +2218,12 @@ mod readability_tests {
         assert_eq!(a.content_html, "");
         assert_eq!((a.word_count, a.reading_time_mins), (0, 1));
 
-        let a = extract_readable("", "https://example.com/blank").unwrap();
+        let a = extract("", "https://example.com/blank").unwrap();
         assert_eq!((a.title.as_str(), a.content_html.as_str()), ("", ""));
 
         // No article, only navigation: like the old extractor (which fell back to the whole
         // document), answer with what is there instead of failing, links made absolute.
-        let a = extract_readable(
+        let a = extract(
             include_str!("../tests/fixtures/articles/link_farm.html"),
             "https://example.com/sitemap",
         )
@@ -2063,11 +2245,269 @@ that adds early-morning crossings on weekdays and cuts two of the least-used eve
 <p>Commuters who work on the mainland have asked for an earlier departure for years, and the first
 boat will now leave the island terminal twenty minutes earlier than it does today.</p>
 </article></body></html>"#;
-        let a = extract_readable(html, "https://gazette.example/ferry").unwrap();
+        let a = extract(html, "https://gazette.example/ferry").unwrap();
         assert_eq!(a.title, "Ferry schedule approved");
         for s in [&a.title, &a.content_html, &a.content_text] {
             assert!(std::str::from_utf8(s.as_bytes()).is_ok());
         }
         assert!(a.content_html.contains("voted five to two"));
+    }
+
+    const FERRY: &str = r##"<html><head><title>Ferry schedule approved</title></head><body><article>
+<p>The Port Ellis harbor council voted five to two on Tuesday night to adopt a new ferry timetable
+that adds early-morning crossings on weekdays and cuts two of the least-used evening sailings.</p>
+<p>Background: <a href="httpd-notes.html">server notes</a>, <a href="https-migration/">the
+migration</a>, <a href="a.php?next=/../b">the form</a>, <a href="..">the archive</a>,
+<a href=".">this month</a>, <a href="#timetable">the timetable</a>,
+<a href="//cdn.example/map.pdf">the map</a>, <a href="mailto:desk@gazette.example">the desk</a>
+and <a href="https://ferries.example/schedule">the operator</a>.</p>
+<p><img src="img/terminal at dawn.jpg" srcset="img/t-1x.jpg 1x, /img/w_600,h_400/t.jpg 2x"
+alt="The island terminal"></p>
+<p id="timetable">Commuters who work on the mainland have asked for an earlier departure for
+years, and the first boat will now leave the island terminal twenty minutes earlier than it does
+today. The last evening sailing moves from 11:15 p.m. to 10:30 p.m.</p>
+</article></body></html>"##;
+
+    fn assert_contains_all(content: &str, wanted: &[&str]) {
+        for w in wanted {
+            assert!(content.contains(w), "missing {w:?}:\n{content}");
+        }
+    }
+
+    /// Resolution follows WHATWG `Url::join`, as the old extractor and browsers do, including
+    /// the cases dom_smoothie's own resolver gets wrong.
+    #[test]
+    fn relative_urls_resolve_like_a_browser() {
+        let a = extract(FERRY, "https://gazette.example/news/2026/ferry.html?id=7").unwrap();
+        assert_contains_all(
+            &a.content_html,
+            &[
+                // Relative, though they start with "http".
+                r#"href="https://gazette.example/news/2026/httpd-notes.html""#,
+                r#"href="https://gazette.example/news/2026/https-migration/""#,
+                // `/../` in the query string is not a path segment.
+                r#"href="https://gazette.example/news/2026/a.php?next=/../b""#,
+                // `..` and `.` name directories, so they keep the trailing slash.
+                r#"href="https://gazette.example/news/""#,
+                r#"href="https://gazette.example/news/2026/""#,
+                // An in-page anchor stays in-page, as in Readability.js.
+                r##"href="#timetable""##,
+                r#"href="https://cdn.example/map.pdf""#,
+                r#"href="mailto:desk@gazette.example""#,
+                r#"href="https://ferries.example/schedule""#,
+                // Percent-encoded, like a browser request.
+                r#"src="https://gazette.example/news/2026/img/terminal%20at%20dawn.jpg""#,
+                // Each candidate, commas inside a URL included.
+                "srcset=\"https://gazette.example/news/2026/img/t-1x.jpg 1x, \
+                 https://gazette.example/img/w_600,h_400/t.jpg 2x\"",
+            ],
+        );
+    }
+
+    #[test]
+    fn base_href_sets_the_base_unless_it_is_not_http() {
+        let page =
+            |base: &str| FERRY.replace("</title>", &format!("</title><base href=\"{base}\">"));
+        let url = "https://gazette.example/news/2026/ferry.html";
+
+        let a = extract(&page("/archive/2026/"), url).unwrap();
+        assert_contains_all(
+            &a.content_html,
+            &[
+                r#"href="https://gazette.example/archive/2026/httpd-notes.html""#,
+                r#"href="https://gazette.example/archive/""#,
+                // With a base, a bare anchor points at the base, as in a browser.
+                r##"href="https://gazette.example/archive/2026/#timetable""##,
+                r#"src="https://gazette.example/archive/2026/img/terminal%20at%20dawn.jpg""#,
+            ],
+        );
+
+        // A `javascript:` or `data:` base is ignored, and URLs resolve against the page.
+        for hostile in ["javascript:alert(5)//", "data:text/html,x/"] {
+            let a = extract(&page(hostile), url).unwrap();
+            assert_contains_all(
+                &a.content_html,
+                &[
+                    r#"href="https://gazette.example/news/2026/httpd-notes.html""#,
+                    r#"src="https://gazette.example/news/2026/img/terminal%20at%20dawn.jpg""#,
+                    r##"href="#timetable""##,
+                ],
+            );
+            assert_absent(&a.content_html, &["javascript:", "data:text"]);
+        }
+    }
+
+    #[test]
+    fn srcset_candidates_are_resolved_one_by_one() {
+        let base = Url::parse("https://img.example/posts/1/").unwrap();
+        let resolve = |srcset: &str| absolutize_srcset(srcset, |u: &str| resolve_url(&base, u));
+        assert_eq!(resolve(""), "");
+        assert_eq!(resolve("a.jpg"), "https://img.example/posts/1/a.jpg");
+        assert_eq!(
+            resolve(" a.jpg 1x,b.jpg  2x ,"),
+            "https://img.example/posts/1/a.jpg 1x, https://img.example/posts/1/b.jpg 2x"
+        );
+        // A URL runs to whitespace, so commas inside it stay; a trailing comma ends it.
+        assert_eq!(
+            resolve("/w_300,h_200/a.jpg 300w, b.jpg,, c.jpg 2x"),
+            "https://img.example/w_300,h_200/a.jpg 300w, https://img.example/posts/1/b.jpg, \
+             https://img.example/posts/1/c.jpg 2x"
+        );
+        // Absolute and data: URLs are kept; a comma inside parentheses is part of the descriptor.
+        assert_eq!(
+            resolve("https://cdn.example/x.jpg 1x, data:image/png;base64,AAAA 2x, d.jpg (a, b) 3x"),
+            "https://cdn.example/x.jpg 1x, data:image/png;base64,AAAA 2x, \
+             https://img.example/posts/1/d.jpg (a, b) 3x"
+        );
+    }
+
+    proptest::proptest! {
+        /// Any list of candidates, however separated, comes back as the same candidates in
+        /// order, each URL resolved with `Url::join`, and resolving again changes nothing.
+        #[test]
+        fn srcset_resolution_keeps_every_candidate(
+            candidates in proptest::collection::vec(
+                (
+                    "[a-z0-9_][a-z0-9_,]{0,6}(/[a-z0-9_,]{1,6}){0,2}\\.jpg",
+                    proptest::option::of("[1-4]x|[1-9][0-9]{1,3}w"),
+                ),
+                0..6,
+            ),
+            separators in proptest::collection::vec(
+                proptest::sample::select(vec![", ", " , ", " ,", ",\t", "\n,  "]),
+                6,
+            ),
+            leading in "[ ,]{0,3}",
+        ) {
+            let base = Url::parse("https://img.example/posts/1/").unwrap();
+            let resolve = |srcset: &str| absolutize_srcset(srcset, |u: &str| resolve_url(&base, u));
+            let mut srcset = leading;
+            let mut expected = Vec::new();
+            for (i, (url, descriptor)) in candidates.iter().enumerate() {
+                if i > 0 {
+                    srcset.push_str(separators[i]);
+                }
+                srcset.push_str(url);
+                let abs = base.join(url).unwrap().to_string();
+                match descriptor {
+                    Some(d) => {
+                        srcset.push_str(&format!(" {d}"));
+                        expected.push(format!("{abs} {d}"));
+                    }
+                    None => expected.push(abs),
+                }
+            }
+            let resolved = resolve(&srcset);
+            proptest::prop_assert_eq!(&resolved, &expected.join(", "));
+            proptest::prop_assert_eq!(resolve(&resolved), resolved);
+        }
+    }
+
+    /// dom_smoothie's cost grows about with the cube of the nesting depth and its selector
+    /// matching recurses per level, so a deep page is refused before it runs. The answer does
+    /// not depend on timing: an unguarded run takes minutes, or aborts the test process.
+    #[test]
+    fn deeply_nested_pages_are_refused_before_extraction() {
+        let page = |open: &str, n: usize| {
+            format!(
+                "<html><head><title>T</title></head><body>{}<p>Some article text, with commas, \
+                 and a few more words.</p></body></html>",
+                open.repeat(n)
+            )
+        };
+        // html and body are two levels, the paragraph one more.
+        assert!(extract(&page("<span>", MAX_ARTICLE_DEPTH - 3), "https://e.example/").is_ok());
+        for (open, n) in [
+            ("<span>", MAX_ARTICLE_DEPTH - 2),
+            // 16 s of CPU in a release build if extracted.
+            ("<div>", 2_000),
+            // About 30,000 levels: dom_query's recursive matching overflowed the stack here.
+            ("<b><i><u>", 10_000),
+        ] {
+            match extract(&page(open, n), "https://e.example/") {
+                Err(ServerError::BadRequest(msg)) => {
+                    assert!(
+                        msg.contains(&format!("{MAX_ARTICLE_DEPTH} levels")),
+                        "{msg}"
+                    )
+                }
+                other => panic!("{open} x {n}: {:?}", other.map(|a| a.word_count)),
+            }
+        }
+
+        let depth_of = |html: &str| {
+            let doc = dom_query::Document::from(html);
+            (0..40).find(|&limit| !nested_deeper_than(&doc, limit))
+        };
+        assert_eq!(depth_of(""), Some(2)); // html > body (head is a sibling)
+        assert_eq!(depth_of("<p>x"), Some(3));
+        assert_eq!(depth_of("<div><p>x</p></div><p>y</p>"), Some(4));
+        assert_eq!(depth_of("<ul><li><ul><li>x</ul></ul><p>y"), Some(6));
+        // Implied end tags close each <p>, so these are siblings.
+        assert_eq!(depth_of("<p>a<p>b<p>c"), Some(3));
+    }
+
+    /// Both paths take the title from the same place, og:title before <title>.
+    #[test]
+    fn fallback_title_is_chosen_like_the_article_title() {
+        let head = r#"<head><title>Raw title - Site</title>
+<meta property="og:title" content="OG Title"></head>"#;
+        let url = "https://e.example/post";
+        let empty = extract(&format!("<html>{head}<body></body></html>"), url).unwrap();
+        let text = extract(
+            &format!("<html>{head}<body><p>Some text here.</p></body></html>"),
+            url,
+        )
+        .unwrap();
+        assert_eq!(empty.content_html, "");
+        assert_eq!(text.word_count, 3);
+        assert_eq!(
+            (empty.title.as_str(), text.title.as_str()),
+            ("OG Title", "OG Title")
+        );
+    }
+
+    /// Links resolve against where the page was served from after redirects, not against the
+    /// URL that was asked for.
+    #[tokio::test]
+    async fn extract_article_resolves_links_against_the_redirect_target() {
+        use axum::http::{StatusCode, header};
+        use axum::response::Html;
+        use axum::routing::get;
+
+        let app = axum::Router::new()
+            .route(
+                "/s/ferry",
+                get(|| async {
+                    (
+                        StatusCode::FOUND,
+                        [(header::LOCATION, "/news/2026/ferry.html")],
+                    )
+                }),
+            )
+            .route("/news/2026/ferry.html", get(|| async { Html(FERRY) }));
+        let origin = crate::readlater::test_support::spawn_server(app).await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path().join("storage")).unwrap();
+        let manager = FeedManager::new(
+            &tmp.path().join("feeds.db"),
+            storage,
+            &tmp.path().join("epub"),
+        )
+        .unwrap();
+        let a = manager
+            .extract_article(&format!("{origin}/s/ferry"))
+            .await
+            .unwrap();
+        assert_eq!(a.title, "Ferry schedule approved");
+        assert_contains_all(
+            &a.content_html,
+            &[
+                &format!(r#"href="{origin}/news/2026/httpd-notes.html""#),
+                &format!(r#"src="{origin}/news/2026/img/terminal%20at%20dawn.jpg""#),
+            ],
+        );
+        assert!(!a.content_html.contains("/s/"), "{}", a.content_html);
     }
 }

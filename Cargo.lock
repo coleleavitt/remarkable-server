@@ -2803,6 +2803,7 @@ dependencies = [
  "chrono",
  "crc32c",
  "diffy",
+ "dom_query",
  "dom_smoothie",
  "epub-builder",
  "feed-rs",
