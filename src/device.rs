@@ -225,19 +225,29 @@ impl DeviceManager {
         Ok((c.sub, c.device_id, c.device_desc))
     }
 
-    /// Record a passcode (PIN) reset request from a device. Idempotent per request id.
-    /// Returns true if a new request was stored, false if `request_id` already existed.
+    /// Record a passcode (PIN) reset request from a device. Idempotent per request id while it is live:
+    /// expired rows (this user's, and any stale row holding `request_id`) are purged in the same
+    /// transaction, so a tablet re-POSTing an expired id starts a fresh pending request instead of 404ing forever.
+    /// Returns true if a new request was stored, false if a live `request_id` already existed.
     pub fn create_passcode_reset(&self, reset: &PasscodeReset, user_id: &str) -> Result<bool> {
-        let inserted = self.inner.conn.lock().execute(
+        let mut conn = self.inner.conn.lock();
+        let tx = conn.transaction()?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute("DELETE FROM passcode_resets WHERE user_id = ? AND expires < ?", params![user_id, now])?;
+        tx.execute("DELETE FROM passcode_resets WHERE request_id = ? AND expires < ?", params![reset.request_id, now])?;
+        let inserted = tx.execute(
             "INSERT OR IGNORE INTO passcode_resets (request_id, user_id, device_id, device_name, created, expires, approved) VALUES (?, ?, ?, ?, ?, ?, 0)",
             params![reset.request_id, user_id, reset.device_id, reset.device_name, reset.created.to_rfc3339(), reset.expires.to_rfc3339()],
         )?;
+        tx.commit()?;
         Ok(inserted > 0)
     }
 
     /// Look up a reset request owned by `user_id` (expired ones count as missing).
     pub fn get_passcode_reset(&self, request_id: &str, user_id: &str) -> Result<PasscodeReset> {
-        let conn = self.inner.conn.lock();
+        Self::read_passcode_reset(&self.inner.conn.lock(), request_id, user_id)
+    }
+    fn read_passcode_reset(conn: &Connection, request_id: &str, user_id: &str) -> Result<PasscodeReset> {
         let row = conn.query_row(
             "SELECT device_id, device_name, created, expires, approved FROM passcode_resets WHERE request_id = ? AND user_id = ?",
             params![request_id, user_id],
@@ -249,18 +259,34 @@ impl DeviceManager {
         Ok(reset)
     }
 
+    /// Why a guarded approve/deny touched no row: 403 if the (live) request is the caller's own,
+    /// else 404. Only picks the status; the security decision is the guarded statement itself.
+    fn passcode_reset_miss(conn: &Connection, request_id: &str, user_id: &str, caller_device: Option<&str>) -> ServerError {
+        match Self::read_passcode_reset(conn, request_id, user_id) {
+            Ok(r) if caller_device == Some(r.device_id.as_str()) => {
+                tracing::warn!(%request_id, device = %r.device_id, "passcode reset self-approval/denial rejected");
+                ServerError::Forbidden("a device cannot approve or deny its own passcode reset".into())
+            }
+            _ => ServerError::NotFound(request_id.into()),
+        }
+    }
+
     /// Approve a pending reset; returns (user id, reset) so the caller can notify the device.
-    pub fn approve_passcode_reset(&self, request_id: &str, owner: Option<&str>) -> Result<(String, PasscodeReset)> {
-        let user_id: String = self.inner.conn.lock()
+    /// `owner`/`caller_device` are the approving device's user and id (None for the admin endpoint):
+    /// the UPDATE itself requires `device_id != caller_device`, so a device can never approve its own request.
+    pub fn approve_passcode_reset(&self, request_id: &str, owner: Option<&str>, caller_device: Option<&str>) -> Result<(String, PasscodeReset)> {
+        let conn = self.inner.conn.lock();
+        let user_id: String = conn
             .query_row("SELECT user_id FROM passcode_resets WHERE request_id = ?", params![request_id], |r| r.get(0))
             .map_err(|_| ServerError::NotFound(request_id.into()))?;
         if owner.is_some_and(|o| o != user_id) { return Err(ServerError::NotFound(request_id.into())); }
-        let reset = self.get_passcode_reset(request_id, &user_id)?;
-        // A concurrent deny may have deleted the row since the lookup: don't report (or notify) an approval.
-        if self.inner.conn.lock().execute("UPDATE passcode_resets SET approved = 1 WHERE request_id = ? AND user_id = ?", params![request_id, user_id])? == 0 {
-            return Err(ServerError::NotFound(request_id.into()));
-        }
-        Ok((user_id, PasscodeReset { approved: true, ..reset }))
+        let updated = conn.execute(
+            "UPDATE passcode_resets SET approved = 1 WHERE request_id = ?1 AND user_id = ?2 AND expires >= ?3 AND (?4 IS NULL OR device_id != ?4)",
+            params![request_id, user_id, Utc::now().to_rfc3339(), caller_device],
+        )?;
+        if updated == 0 { return Err(Self::passcode_reset_miss(&conn, request_id, &user_id, caller_device)); }
+        let reset = Self::read_passcode_reset(&conn, request_id, &user_id)?;
+        Ok((user_id, reset))
     }
 
     /// Drop `user_id`'s expired reset requests (lookups already treat them as missing).
@@ -269,9 +295,14 @@ impl DeviceManager {
         Ok(self.inner.conn.lock().execute("DELETE FROM passcode_resets WHERE user_id = ? AND expires < ?", params![user_id, Utc::now().to_rfc3339()])?)
     }
 
-    /// Drop a reset request owned by `user_id` (deny). Returns whether one existed.
-    pub fn delete_passcode_reset(&self, request_id: &str, user_id: &str) -> Result<bool> {
-        Ok(self.inner.conn.lock().execute("DELETE FROM passcode_resets WHERE request_id = ? AND user_id = ?", params![request_id, user_id])? > 0)
+    /// Deny: drop `user_id`'s reset request unless it is `caller_device`'s own (checked in the DELETE itself).
+    /// 403 for the caller's own request, 404 if there is no such live request.
+    pub fn deny_passcode_reset(&self, request_id: &str, user_id: &str, caller_device: &str) -> Result<()> {
+        let conn = self.inner.conn.lock();
+        if conn.execute("DELETE FROM passcode_resets WHERE request_id = ? AND user_id = ? AND device_id != ?", params![request_id, user_id, caller_device])? == 0 {
+            return Err(Self::passcode_reset_miss(&conn, request_id, user_id, Some(caller_device)));
+        }
+        Ok(())
     }
 
     /// Get the endpoint URL for this server

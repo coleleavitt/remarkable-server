@@ -109,20 +109,29 @@ pub async fn put_file(State(state): State<AppState>, Path(hash): Path<String>, h
     Ok(Json(UploadResponse { hash, size: body.len() as u64 }))
 }
 
-/// The single local account, as `--pair` (main.rs `PAIRING_USER`) issues codes for.
+/// Default account for pairing codes: the single local account, as `--pair` (main.rs `PAIRING_USER`) issues codes for.
 const PAIRING_USER: &str = "local-user";
 
-/// `POST /devices/v1` -> a one-time pairing code. Owner only (`x-admin-token`): a code registers a
-/// new device, and a second device of the same user can approve the first one's passcode reset,
-/// so an ordinary device/user token must not be able to mint one. `--pair` on the CLI is the other way.
-pub async fn create_pairing_code(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<PairingCodeResponse>> {
-    pairing_code_with(&state, &headers, admin_token().as_deref())
+#[derive(Deserialize, Default)]
+pub struct PairingQuery { user: Option<String> }
+
+/// A user id we're willing to bind a pairing code to: 1..=128 chars of `[A-Za-z0-9._@|-]` (covers `local-user` and auth0-style `auth0|...`).
+fn valid_user_id(u: &str) -> bool { !u.is_empty() && u.len() <= 128 && u.bytes().all(|b| b.is_ascii_alphanumeric() || b"._@|-".contains(&b)) }
+
+/// `POST /devices/v1[?user=<id>]` -> a one-time pairing code for `user` (default `local-user`, same as `--pair`).
+/// Owner only (`x-admin-token`): a code registers a new device, and a second device of the same user can
+/// approve the first one's passcode reset, so an ordinary device/user token must not be able to mint one.
+/// `--pair` on the CLI is the other way.
+pub async fn create_pairing_code(State(state): State<AppState>, headers: HeaderMap, axum::extract::Query(q): axum::extract::Query<PairingQuery>) -> Result<Json<PairingCodeResponse>> {
+    pairing_code_with(&state, &headers, admin_token().as_deref(), q.user.as_deref())
 }
 
-fn pairing_code_with(state: &AppState, headers: &HeaderMap, admin: Option<&str>) -> Result<Json<PairingCodeResponse>> {
+fn pairing_code_with(state: &AppState, headers: &HeaderMap, admin: Option<&str>, user: Option<&str>) -> Result<Json<PairingCodeResponse>> {
     check_admin(admin, headers)?;
-    let code = state.devices.create_pairing_code(PAIRING_USER)?;
-    tracing::info!("pairing code issued via admin endpoint");
+    let user = user.unwrap_or(PAIRING_USER);
+    if !valid_user_id(user) { return Err(ServerError::BadRequest("user must be 1-128 chars of [A-Za-z0-9._@|-]".into())); }
+    let code = state.devices.create_pairing_code(user)?;
+    tracing::info!(%user, "pairing code issued via admin endpoint");
     Ok(Json(PairingCodeResponse { code, expires_in: 600 }))
 }
 
@@ -291,7 +300,7 @@ mod pairing_tests {
         for tok in [dev.as_str(), user.as_str()] {
             let h = hdr("authorization", &format!("Bearer {tok}"));
             // even with admin enabled, a Bearer token is not the admin credential
-            assert_eq!(status_of(pairing_code_with(&state, &h, Some(ADMIN))), StatusCode::UNAUTHORIZED);
+            assert_eq!(status_of(pairing_code_with(&state, &h, Some(ADMIN), None)), StatusCode::UNAUTHORIZED);
             // and through the real route (public handler + router, as mounted in main.rs)
             let req = axum::http::Request::post("/devices/v1").header(header::AUTHORIZATION, format!("Bearer {tok}")).body(axum::body::Body::empty()).unwrap();
             assert_eq!(crate::create_router(state.clone()).oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
@@ -299,18 +308,43 @@ mod pairing_tests {
         let req = axum::http::Request::post("/devices/v1").body(axum::body::Body::empty()).unwrap();
         assert_eq!(crate::create_router(state.clone()).oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
         // wrong admin token, or admin disabled (no ADMIN_TOKEN configured)
-        assert_eq!(status_of(pairing_code_with(&state, &hdr("x-admin-token", "wrong"), Some(ADMIN))), StatusCode::UNAUTHORIZED);
-        assert_eq!(status_of(pairing_code_with(&state, &hdr("x-admin-token", ADMIN), None)), StatusCode::UNAUTHORIZED);
-        assert_eq!(status_of(pairing_code_with(&state, &hdr("x-admin-token", ""), Some(""))), StatusCode::UNAUTHORIZED);
+        assert_eq!(status_of(pairing_code_with(&state, &hdr("x-admin-token", "wrong"), Some(ADMIN), None)), StatusCode::UNAUTHORIZED);
+        assert_eq!(status_of(pairing_code_with(&state, &hdr("x-admin-token", ADMIN), None, None)), StatusCode::UNAUTHORIZED);
+        assert_eq!(status_of(pairing_code_with(&state, &hdr("x-admin-token", ""), Some(""), None)), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     async fn admin_token_issues_a_code_that_pairs_the_local_user() {
         let (state, _tmp) = setup();
-        let Json(r) = pairing_code_with(&state, &hdr("x-admin-token", ADMIN), Some(ADMIN)).unwrap();
+        let Json(r) = pairing_code_with(&state, &hdr("x-admin-token", ADMIN), Some(ADMIN), None).unwrap();
         assert_eq!((r.code.len(), r.expires_in), (8, 600));
         let (dev, _) = state.devices.exchange_code(&r.code, "tablet-b", "remarkable").unwrap();
         assert_eq!(state.devices.validate_token(&format!("Bearer {dev}")).unwrap(), PAIRING_USER);
         assert!(state.devices.exchange_code(&r.code, "tablet-c", "remarkable").is_err(), "single use");
+    }
+
+    #[tokio::test]
+    async fn admin_can_pair_an_explicit_user() {
+        let (state, _tmp) = setup();
+        let admin = hdr("x-admin-token", ADMIN);
+        let Json(r) = pairing_code_with(&state, &admin, Some(ADMIN), Some("auth0|alice-2")).unwrap();
+        let (dev, _) = state.devices.exchange_code(&r.code, "tablet-d", "remarkable").unwrap();
+        assert_eq!(state.devices.validate_token(&format!("Bearer {dev}")).unwrap(), "auth0|alice-2");
+        for bad in ["", "a b", "x/y", &"u".repeat(129)] {
+            assert_eq!(status_of(pairing_code_with(&state, &admin, Some(ADMIN), Some(bad))), StatusCode::BAD_REQUEST, "{bad:?}");
+        }
+        // auth is checked before the user id: a bad id without the admin token is still 401
+        assert_eq!(status_of(pairing_code_with(&state, &HeaderMap::new(), Some(ADMIN), Some(""))), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn user_query_through_the_router_still_needs_admin() {
+        use tower::ServiceExt;
+        let (state, _tmp) = setup();
+        // `?user=` parses through the real router; without an admin token it's still 401 (ADMIN_TOKEN is never set in tests)
+        for uri in ["/devices/v1?user=bob", "/devices/v1?user=", "/devices/v1?other=1"] {
+            let req = axum::http::Request::post(uri).body(axum::body::Body::empty()).unwrap();
+            assert_eq!(crate::create_router(state.clone()).oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
     }
 }

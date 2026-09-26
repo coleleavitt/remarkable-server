@@ -50,41 +50,31 @@ pub async fn approve(State(state): State<AppState>, Path(request_id): Path<Strin
     approve_and_notify(&state, &request_id, None)
 }
 
-fn approve_and_notify(state: &AppState, request_id: &str, owner: Option<&str>) -> Result<Json<PasscodeReset>> {
-    let (user_id, reset) = state.devices.approve_passcode_reset(request_id, owner)?;
+fn approve_and_notify(state: &AppState, request_id: &str, caller: Option<(&str, &str)>) -> Result<Json<PasscodeReset>> {
+    let (user_id, reset) = state.devices.approve_passcode_reset(request_id, caller.map(|c| c.0), caller.map(|c| c.1))?;
     let _ = state.notification_tx.send(WsMessage::passcode_reset_approved(&user_id, &reset.device_id, &reset.device_name, &reset.request_id));
     tracing::info!(%request_id, "passcode reset approved");
     Ok(Json(reset))
 }
 
-/// A device can't vouch for its own reset: approve/deny must come from a *different* device of the
-/// requesting user. Other users' requests (and unknown/expired ids) are 404, same device is 403.
-/// Expired rows are swept here since the lookup 404s them before deny could delete them.
-fn require_other_device(state: &AppState, request_id: &str, user_id: &str, device_id: &str) -> Result<()> {
-    state.devices.purge_expired_passcode_resets(user_id)?;
-    let reset = state.devices.get_passcode_reset(request_id, user_id)?;
-    if reset.device_id == device_id {
-        tracing::warn!(%request_id, device = %device_id, "passcode reset self-approval/denial rejected");
-        return Err(ServerError::Forbidden("a device cannot approve or deny its own passcode reset".into()));
-    }
-    Ok(())
-}
+// A device can't vouch for its own reset: approve/deny must come from a *different* device of the
+// requesting user. Other users' requests (and unknown/expired ids) are 404, same device is 403.
+// The device check is part of the UPDATE/DELETE itself (no read-then-write race). Expired rows are
+// swept first so deny can't delete (and report 204 for) a request lookups already treat as missing.
 
 /// `POST /passcode/v1/reset/{uuid}/approve`: another of the owner's devices approves
 /// (firmware sub_484934; POST per the method enum in sub_1A4264).
 pub async fn device_approve(State(state): State<AppState>, Path(request_id): Path<String>, headers: HeaderMap) -> Result<Json<PasscodeReset>> {
     let (user_id, device_id, _) = state.devices.caller(auth(&headers)?)?;
-    require_other_device(&state, &request_id, &user_id, &device_id)?;
-    approve_and_notify(&state, &request_id, Some(&user_id))
+    state.devices.purge_expired_passcode_resets(&user_id)?;
+    approve_and_notify(&state, &request_id, Some((&user_id, &device_id)))
 }
 
 /// `POST /passcode/v1/reset/{uuid}/deny` (firmware sub_485124).
 pub async fn device_deny(State(state): State<AppState>, Path(request_id): Path<String>, headers: HeaderMap) -> Result<StatusCode> {
     let (user_id, device_id, _) = state.devices.caller(auth(&headers)?)?;
-    require_other_device(&state, &request_id, &user_id, &device_id)?;
-    if !state.devices.delete_passcode_reset(&request_id, &user_id)? {
-        return Err(ServerError::NotFound(request_id));
-    }
+    state.devices.purge_expired_passcode_resets(&user_id)?;
+    state.devices.deny_passcode_reset(&request_id, &user_id, &device_id)?;
     let _ = state.notification_tx.send(WsMessage::passcode_reset_denied(&user_id, &request_id));
     tracing::info!(%request_id, "passcode reset denied");
     Ok(StatusCode::NO_CONTENT)
@@ -191,6 +181,52 @@ mod tests {
         let plan: Vec<String> = db.prepare("EXPLAIN QUERY PLAN DELETE FROM passcode_resets WHERE user_id = ? AND expires < ?").unwrap()
             .query_map(rusqlite::params!["u", "t"], |r| r.get::<_, String>(3)).unwrap().map(|r| r.unwrap()).collect();
         assert!(plan.iter().any(|d| d.contains("USING INDEX passcode_resets_user_expires (user_id=? AND expires<?)")), "{plan:?}");
+    }
+
+    #[tokio::test]
+    async fn device_check_is_part_of_the_write() {
+        // The storage layer alone (no handler-side pre-check) refuses the requester's own device.
+        let (state, _tmp) = setup();
+        let a = device(&state, "user-1", "tablet-a");
+        request_reset(&state, &a).await;
+        assert_eq!(status_of(state.devices.approve_passcode_reset(REQ, Some("user-1"), Some("tablet-a"))), StatusCode::FORBIDDEN);
+        assert_eq!(status_of(state.devices.deny_passcode_reset(REQ, "user-1", "tablet-a")), StatusCode::FORBIDDEN);
+        let r = state.devices.get_passcode_reset(REQ, "user-1").unwrap();
+        assert!(!r.approved, "self-approval updated nothing");
+        // wrong user / unknown id stay 404, even when the device id matches
+        assert_eq!(status_of(state.devices.approve_passcode_reset(REQ, Some("user-2"), Some("tablet-a"))), StatusCode::NOT_FOUND);
+        assert_eq!(status_of(state.devices.approve_passcode_reset("nope", Some("user-1"), Some("tablet-b"))), StatusCode::NOT_FOUND);
+        assert_eq!(status_of(state.devices.deny_passcode_reset(REQ, "user-2", "tablet-a")), StatusCode::NOT_FOUND);
+        // a different device of the same user can
+        let (user, r) = state.devices.approve_passcode_reset(REQ, Some("user-1"), Some("tablet-b")).unwrap();
+        assert_eq!((user.as_str(), r.approved, r.device_id.as_str()), ("user-1", true, "tablet-a"));
+    }
+
+    #[tokio::test]
+    async fn expired_request_can_be_recreated_with_the_same_id() {
+        let (state, tmp) = setup();
+        let a = device(&state, "user-1", "tablet-a");
+        request_reset(&state, &a).await;
+        // force-expire it (and mark it approved, so a stale approval can't leak into the new request)
+        let past = (Utc::now() - Duration::hours(1)).to_rfc3339();
+        rusqlite::Connection::open(tmp.path().join("devices.db")).unwrap()
+            .execute("UPDATE passcode_resets SET expires = ?, approved = 1 WHERE request_id = ?", rusqlite::params![past, REQ]).unwrap();
+        assert_eq!(status_of(get(State(state.clone()), Path(REQ.into()), a.clone()).await), StatusCode::NOT_FOUND);
+        // the tablet re-POSTs the saved id: a fresh pending request, not 404
+        request_reset(&state, &a).await;
+        let r = get(State(state.clone()), Path(REQ.into()), a.clone()).await.unwrap().0;
+        assert!(!r.approved && r.expires > Utc::now());
+        // and it's idempotent again while live
+        assert_eq!(create(State(state.clone()), Path(REQ.into()), a).await.unwrap().0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn expired_row_of_another_user_does_not_block_the_id() {
+        let (state, _tmp) = setup();
+        let now = Utc::now();
+        let stale = PasscodeReset { device_id: "tablet-x".into(), device_name: "reMarkable".into(), request_id: REQ.into(), created: now - Duration::hours(48), expires: now - Duration::hours(24), approved: false };
+        assert!(state.devices.create_passcode_reset(&stale, "user-2").unwrap());
+        request_reset(&state, &device(&state, "user-1", "tablet-a")).await;
     }
 
     #[tokio::test]

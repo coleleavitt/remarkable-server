@@ -104,7 +104,7 @@ V4 root response includes capability flags:
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/devices/v1` | POST | Create pairing code (admin only: `x-admin-token`; see "Pairing a device") |
+| `/devices/v1` | POST | Create pairing code (admin only: `x-admin-token`; optional `?user=`, default `local-user`; see "Pairing a device") |
 | `/devices/v1` | GET | List registered devices |
 | `/devices/v1/{id}` | DELETE | Remove device |
 | `/token/json/2/user/new` | POST | Refresh user token |
@@ -244,7 +244,8 @@ remarkable-server --storage ./remarkable-storage --pair   # prints a one-time co
 Enter the code on the tablet under Settings → General → Account → Connect.
 
 Without shell access, the owner can get a code from `POST /devices/v1` with `x-admin-token`
-(see Admin endpoints). Device and user tokens cannot mint pairing codes: a second paired device
+(see Admin endpoints). The code pairs `local-user` (like `--pair`) unless `?user=<id>` names another
+account (1-128 chars of `A-Za-z0-9._@|-`; anything else is 400). Device and user tokens cannot mint pairing codes: a second paired device
 could otherwise approve the first one's passcode reset.
 
 ### Admin endpoints
@@ -254,7 +255,7 @@ Admin endpoints are disabled unless `ADMIN_TOKEN` is set; requests must send it 
 | Endpoint | Purpose |
 |----------|---------|
 | `POST /admin/create-user` | Mint a user token (testing / desktop clients) |
-| `POST /devices/v1` | Mint a one-time pairing code for the local account (same as `--pair`) |
+| `POST /devices/v1[?user=<id>]` | Mint a one-time pairing code for `local-user` (same as `--pair`), or for `<id>` |
 | `POST /admin/passcode/resets/{id}/approve` | Approve a tablet's passcode (PIN) reset request; the id is logged when the tablet asks |
 
 `JWT_SECRET` sets the token signing key (default is a built-in constant; changing it invalidates paired devices).
