@@ -3219,10 +3219,12 @@ impl ReadLaterManager {
     /// not yet sent (`read_status_pending`), that status is kept over the provider's when
     /// `keep_pending_status` (the account sends status changes), so the change isn't lost before
     /// it is pushed; otherwise the provider's status wins and the change is dropped. Otherwise a
-    /// row of the same provider id recorded for no account (from before accounts were recorded)
-    /// or for a deleted one is taken over, minus any pending status change, which was meant for
-    /// the old account, and keeps its device state only if it has the same URL (else it was
-    /// another instance's entry, and this article is still to be delivered).
+    /// row of the same provider id and URL recorded for no account (from before accounts were
+    /// recorded) or for a deleted one is taken over with its device state, minus any pending
+    /// status change, which was meant for the old account. Such a row of another URL was another
+    /// instance's entry: it is left alone, still recording that its page is on the device (for
+    /// that instance, if added back, to take over), and this article is recorded as a new one,
+    /// still to be delivered.
     pub(crate) fn record_fetched(
         &mut self,
         account_id: &str,
@@ -3273,14 +3275,13 @@ impl ReadLaterManager {
                     article.read_at = prev.read_at;
                     article.read_status_pending = true;
                 }
-            } else if let Some(rows) = orphans.get_mut(&key).filter(|rows| !rows.is_empty()) {
-                // The same page if there is one; each row is taken over once.
-                let at = rows.iter().position(|r| r.url == article.url).unwrap_or(0);
-                let prev = rows.remove(at);
-                article.id = prev.id.clone();
-                // Another instance's entry with the same id (a different page) isn't this one,
-                // so its device state isn't this article's.
-                if prev.url == article.url {
+            } else if let Some(rows) = orphans.get_mut(&key) {
+                // Only a row of the same page, each taken over once. One of another page (another
+                // instance's entry with this id) is left alone: it is the record that its page
+                // is on the device, for the account that lists that page to take over.
+                if let Some(at) = rows.iter().position(|r| r.url == article.url) {
+                    let prev = rows.remove(at);
+                    article.id = prev.id.clone();
                     keep_device_state(&mut article, &prev);
                 }
             }
@@ -4585,23 +4586,35 @@ mod tests {
         assert_eq!(mgr.articles.read().len(), 2);
     }
 
-    /// A row of no account or a deleted one with another URL is another instance's entry that
-    /// has the same id (two Wallabags number theirs alike): it is taken over without its device
-    /// state, so this account's article is still delivered. The account's own row keeps its
-    /// state whatever the URL.
+    /// A row of no account or a deleted one is taken over, with its device state, only if it has
+    /// the same URL. One of another URL is another instance's entry with the same id (two
+    /// Wallabags number theirs alike): it is left as it is, still recording that its page is on
+    /// the device, and this account's article is recorded as a new one, still to be delivered.
+    /// The account's own row keeps its state whatever the URL.
     #[test]
     fn record_fetched_takes_over_device_state_only_for_the_same_page() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("rl.db");
         let mut mgr = ReadLaterManager::new(&db).unwrap();
         mgr.add_account(pocket_account("b")).unwrap();
-        for (provider_id, owner) in [("p1", Some("gone")), ("p2", None), ("p3", Some("b"))] {
+        let other_page = "https://old.example/1";
+        let rows = [
+            ("id-p1", "p1", Some("gone"), other_page),
+            ("id-p2", "p2", None, other_page),
+            ("id-p3", "p3", Some("b"), other_page),
+            // Of two deleted accounts' rows of p4, the one of this page is taken over.
+            ("id-p4-else", "p4", Some("gone"), other_page),
+            ("id-p4-same", "p4", Some("gone2"), "https://example.com/a"),
+        ];
+        for (id, provider_id, owner, url) in rows {
             let mut a = delivered(provider_id, owner);
-            a.url = "https://old.example/1".into();
+            a.id = id.into();
+            a.url = url.into();
+            a.document_id = Some(format!("doc-{id}"));
             a.last_sync = Some(Utc::now());
             mgr.save_article(&a).unwrap();
         }
-        let fetched = ["p1", "p2", "p3"].map(|p| article(&format!("new-{p}"), p, 0));
+        let fetched = ["p1", "p2", "p3", "p4"].map(|p| article(&format!("new-{p}"), p, 0));
 
         let r = mgr.record_fetched("b", true, fetched.to_vec()).unwrap();
         let state = |a: &Article| {
@@ -4612,25 +4625,58 @@ mod tests {
                 a.synced_to_device,
                 a.document_id.clone(),
                 a.last_sync.is_some(),
+                (a.status, a.read_status_pending),
             )
         };
+        let unread = (ReadStatus::Unread, false);
         let new_page = |id: &str| {
             let b = Some("b".to_owned());
             let url = "https://example.com/a".to_owned();
-            (id.to_owned(), b, url, false, None, false)
+            (id.to_owned(), b, url, false, None, false, unread)
         };
-        assert_eq!(state(&r[0]), new_page("id-p1"));
-        assert_eq!(state(&r[1]), new_page("id-p2"));
+        let left_alone = |id: &str, owner: Option<&str>| {
+            let doc = Some(format!("doc-{id}"));
+            let pending = (ReadStatus::Archived, true);
+            let owner = owner.map(str::to_owned);
+            (
+                id.to_owned(),
+                owner,
+                other_page.to_owned(),
+                true,
+                doc,
+                true,
+                pending,
+            )
+        };
+        assert_eq!(state(&r[0]), new_page("new-p1"));
+        assert_eq!(state(&r[1]), new_page("new-p2"));
         let own = &r[2];
         assert_eq!(
-            (own.synced_to_device, own.document_id.as_deref()),
-            (true, Some("doc-p3"))
+            (
+                own.id.as_str(),
+                own.synced_to_device,
+                own.document_id.as_deref()
+            ),
+            ("id-p3", true, Some("doc-id-p3"))
+        );
+        let url = "https://example.com/a".to_owned();
+        let doc = Some("doc-id-p4-same".to_owned());
+        let b = Some("b".to_owned());
+        assert_eq!(
+            state(&r[3]),
+            ("id-p4-same".to_owned(), b, url, true, doc, true, unread),
+            "the same page, taken over with its device state but not its pending change"
         );
 
         drop(mgr);
         let mgr = ReadLaterManager::new(&db).unwrap();
-        assert_eq!(state(&mgr.get_article("id-p1").unwrap()), new_page("id-p1"));
-        assert_eq!(mgr.articles.read().len(), 3);
+        let get = |id: &str| state(&mgr.get_article(id).unwrap());
+        assert_eq!(get("new-p1"), new_page("new-p1"));
+        assert_eq!(get("id-p1"), left_alone("id-p1", Some("gone")));
+        assert_eq!(get("id-p2"), left_alone("id-p2", None));
+        assert_eq!(get("id-p4-else"), left_alone("id-p4-else", Some("gone")));
+        assert_eq!(get("id-p4-same").1.as_deref(), Some("b"));
+        assert_eq!(mgr.articles.read().len(), 7);
     }
 
     /// Status changes to send are per account, and a sent one is cleared unless the status

@@ -2450,35 +2450,59 @@ mod tests {
     }
 
     /// Another Wallabag's entry under the id of a deleted account's delivered one is another
-    /// page: the new account takes the row over and delivers its article. An entry with the
-    /// same page isn't delivered twice.
+    /// page: the new account records and delivers it as its own article and leaves the deleted
+    /// account's row, the record that that page is on the device, alone. So when the deleted
+    /// account's Wallabag is added back, it takes its rows over (same pages) and delivers
+    /// nothing twice.
     #[tokio::test]
     async fn a_deleted_accounts_rows_keep_their_device_state_only_for_the_same_page() {
         let f = Fixture::new(vec![entry(1), entry(2)]).await;
         f.add_account("old", |_| {});
         f.syncer().sync_account("old").await.unwrap();
-        let old_document = f.article(1).document_id.unwrap();
+        let old_rows = [f.article(1), f.article(2)];
         f.state.manager.lock().delete_account("old").unwrap();
 
         let mut other_entry = entry(1);
         other_entry["url"] = json!("https://elsewhere.example/1");
         other_entry["title"] = json!("Another instance's 1");
-        let (_other, other_base) = spawn_mock(vec![other_entry, entry(2)]).await;
+        let (_other, other_base) = spawn_mock(vec![other_entry]).await;
         f.add_account_at("new", &other_base, |_| {});
         let r = f.syncer().sync_account("new").await.unwrap();
         assert!(r.errors.is_empty(), "{:?}", r.errors);
-        assert_eq!((r.articles_synced, r.articles_already_synced), (1, 1));
+        assert_eq!((r.articles_synced, r.articles_already_synced), (1, 0));
         assert_eq!(
             f.document_names(),
             ["Another instance's 1", "Article 1", "Article 2"]
         );
-        let a = f.article(1);
+        let theirs = f.article_of("new", 1);
+        assert!(theirs.synced_to_device);
+        assert_ne!(theirs.id, old_rows[0].id);
+        assert_ne!(theirs.document_id, old_rows[0].document_id);
+        let kept = f.article_of("old", 1);
         assert_eq!(
-            (a.account_id.as_deref(), a.synced_to_device),
-            (Some("new"), true)
+            (kept.id.as_str(), kept.synced_to_device, &kept.document_id),
+            (old_rows[0].id.as_str(), true, &old_rows[0].document_id),
+            "the deleted account's row keeps its device state"
         );
-        assert_ne!(a.document_id.unwrap(), old_document);
-        assert_eq!(f.articles().len(), 2);
+        assert_eq!(f.articles().len(), 3);
+
+        // The deleted account's Wallabag, added back: its pages are on the device already.
+        f.add_account("old2", |_| {});
+        let r = f.syncer().sync_account("old2").await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!((r.articles_synced, r.articles_already_synced), (0, 2));
+        assert_eq!(
+            f.document_names(),
+            ["Another instance's 1", "Article 1", "Article 2"]
+        );
+        for (entry_id, old) in [1, 2].into_iter().zip(&old_rows) {
+            let a = f.article_of("old2", entry_id);
+            assert_eq!(
+                (&a.id, a.synced_to_device, &a.document_id),
+                (&old.id, true, &old.document_id)
+            );
+        }
+        assert_eq!(f.articles().len(), 3);
     }
 
     /// A status changed here (`PUT /articles/{id}`) goes to the provider of the account that
