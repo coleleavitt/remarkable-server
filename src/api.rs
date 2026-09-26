@@ -24,6 +24,11 @@ pub struct AppState {
     pub notification_tx: tokio::sync::broadcast::Sender<crate::notifications::WsMessage>,
     pub screenshare: crate::screenshare_rest::RoomManager,
     pub ice_servers: std::sync::Arc<serde_json::Value>,
+    /// Public base URL (`PUBLIC_URL`, e.g. `https://remarkable.unwrap.rs`) for links shown to a
+    /// person, such as the OAuth `verification_uri`. `None` falls back to `https://<--host>`.
+    pub public_url: Option<std::sync::Arc<str>>,
+    /// Per-client-IP and global limits on unauthenticated `POST /oauth/device/code`.
+    pub(crate) device_code_limiter: std::sync::Arc<crate::oauth::DeviceCodeLimiter>,
 }
 
 impl AppState {
@@ -35,7 +40,17 @@ impl AppState {
             notification_tx,
             screenshare: crate::screenshare_rest::RoomManager::new(),
             ice_servers: std::sync::Arc::new(serde_json::json!([])),
+            public_url: None,
+            device_code_limiter: std::sync::Arc::default(),
         }
+    }
+    /// Set the public base URL used for links a person opens (blank values are ignored).
+    pub fn with_public_url(mut self, url: Option<&str>) -> Self {
+        self.public_url = url
+            .map(|u| u.trim().trim_end_matches('/'))
+            .filter(|u| !u.is_empty())
+            .map(std::sync::Arc::from);
+        self
     }
     /// Set the ICE server list handed out to screenshare clients.
     pub fn with_ice_servers(mut self, ice: serde_json::Value) -> Self {

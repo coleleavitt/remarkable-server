@@ -14,6 +14,7 @@ use crate::error::{Result, ServerError};
 use crate::readlater::{
     ArticleQuery,
     OAuthCallback,
+    OMNIVORE_DISCONTINUED,
     ProviderAccount,
     ProviderConfig,
     ReadLaterError,
@@ -21,6 +22,7 @@ use crate::readlater::{
     ReadLaterProvider,
     ReadStatus,
     SyncSettings,
+    provider_for,
 };
 
 // ============================================================================
@@ -61,6 +63,7 @@ impl From<ReadLaterError> for ServerError {
             }
             ReadLaterError::Io(e) => ServerError::Storage(e),
             ReadLaterError::Json(e) => ServerError::Json(e),
+            ReadLaterError::Discontinued(msg) => ServerError::BadRequest(msg),
         }
     }
 }
@@ -115,6 +118,8 @@ pub struct UpdateArticleRequest {
     pub synced_to_device: Option<bool>,
 }
 
+/// Client-facing view of an account. Deliberately carries no `ProviderConfig`, so stored
+/// credentials are never returned to clients.
 #[derive(Debug, Serialize)]
 pub struct AccountResponse {
     pub id: String,
@@ -124,6 +129,20 @@ pub struct AccountResponse {
     pub authenticated: bool,
     pub sync_settings: SyncSettings,
     pub last_sync: Option<String>,
+}
+
+impl From<ProviderAccount> for AccountResponse {
+    fn from(a: ProviderAccount) -> Self {
+        Self {
+            authenticated: a.config.is_authenticated(),
+            id: a.id,
+            name: a.name,
+            provider: a.provider,
+            enabled: a.enabled,
+            sync_settings: a.sync_settings,
+            last_sync: a.last_sync.map(|d| d.to_rfc3339()),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -155,20 +174,7 @@ pub async fn list_accounts(
     let accounts: Vec<AccountResponse> = manager
         .list_accounts()
         .into_iter()
-        .map(|a| AccountResponse {
-            id: a.id,
-            name: a.name,
-            provider: a.provider,
-            enabled: a.enabled,
-            authenticated: match &a.config {
-                ProviderConfig::Pocket { access_token, .. } => access_token.is_some(),
-                ProviderConfig::Instapaper { oauth_token, .. } => oauth_token.is_some(),
-                ProviderConfig::Wallabag { access_token, .. } => access_token.is_some(),
-                ProviderConfig::Omnivore { api_key, .. } => api_key.is_some(),
-            },
-            sync_settings: a.sync_settings,
-            last_sync: a.last_sync.map(|d| d.to_rfc3339()),
-        })
+        .map(AccountResponse::from)
         .collect();
 
     Ok(Json(AccountListResponse { accounts }))
@@ -204,20 +210,7 @@ pub async fn get_account(
         .get_account(&id)
         .ok_or_else(|| ServerError::NotFound(id))?;
 
-    Ok(Json(AccountResponse {
-        id: account.id,
-        name: account.name,
-        provider: account.provider,
-        enabled: account.enabled,
-        authenticated: match &account.config {
-            ProviderConfig::Pocket { access_token, .. } => access_token.is_some(),
-            ProviderConfig::Instapaper { oauth_token, .. } => oauth_token.is_some(),
-            ProviderConfig::Wallabag { access_token, .. } => access_token.is_some(),
-            ProviderConfig::Omnivore { api_key, .. } => api_key.is_some(),
-        },
-        sync_settings: account.sync_settings,
-        last_sync: account.last_sync.map(|d| d.to_rfc3339()),
-    }))
+    Ok(Json(AccountResponse::from(account)))
 }
 
 pub async fn update_account(
@@ -261,24 +254,7 @@ pub async fn start_oauth(
     State(state): State<ReadLaterState>,
     Json(req): Json<StartOAuthRequest>,
 ) -> Result<Json<OAuthResponse>> {
-    use crate::readlater::{
-        InstapaperProvider,
-        OmnivoreProvider,
-        PocketProvider,
-        ReadLaterProviderTrait,
-        WallabagProvider,
-    };
-
-    let provider: Box<dyn ReadLaterProviderTrait> = match req.provider {
-        ReadLaterProvider::Pocket => Box::new(PocketProvider::new()),
-        ReadLaterProvider::Instapaper => {
-            let key = std::env::var("INSTAPAPER_CONSUMER_KEY").unwrap_or_default();
-            let secret = std::env::var("INSTAPAPER_CONSUMER_SECRET").unwrap_or_default();
-            Box::new(InstapaperProvider::new(key, secret))
-        }
-        ReadLaterProvider::Wallabag => Box::new(WallabagProvider::new()),
-        ReadLaterProvider::Omnivore => Box::new(OmnivoreProvider::new()),
-    };
+    let provider = provider_for(req.provider)?;
 
     let oauth_state = provider.start_oauth(&req.redirect_uri).await?;
     let state_id = state.manager.lock().save_oauth_state(&oauth_state)?;
@@ -311,7 +287,9 @@ pub async fn start_oauth(
             }
         }
         ReadLaterProvider::Instapaper => "xauth://instapaper".to_string(),
-        ReadLaterProvider::Omnivore => "apikey://omnivore".to_string(),
+        ReadLaterProvider::Omnivore => {
+            return Err(ReadLaterError::Discontinued(OMNIVORE_DISCONTINUED.into()).into());
+        }
     };
 
     Ok(Json(OAuthResponse { state_id, auth_url }))
@@ -321,14 +299,6 @@ pub async fn complete_oauth(
     State(state): State<ReadLaterState>,
     Json(req): Json<CompleteOAuthRequest>,
 ) -> Result<impl IntoResponse> {
-    use crate::readlater::{
-        InstapaperProvider,
-        OmnivoreProvider,
-        PocketProvider,
-        ReadLaterProviderTrait,
-        WallabagProvider,
-    };
-
     let oauth_state = {
         let manager = state.manager.lock();
         manager
@@ -336,16 +306,7 @@ pub async fn complete_oauth(
             .ok_or_else(|| ServerError::Internal("Invalid OAuth state".into()))?
     };
 
-    let provider: Box<dyn ReadLaterProviderTrait> = match oauth_state.provider {
-        ReadLaterProvider::Pocket => Box::new(PocketProvider::new()),
-        ReadLaterProvider::Instapaper => {
-            let key = std::env::var("INSTAPAPER_CONSUMER_KEY").unwrap_or_default();
-            let secret = std::env::var("INSTAPAPER_CONSUMER_SECRET").unwrap_or_default();
-            Box::new(InstapaperProvider::new(key, secret))
-        }
-        ReadLaterProvider::Wallabag => Box::new(WallabagProvider::new()),
-        ReadLaterProvider::Omnivore => Box::new(OmnivoreProvider::new()),
-    };
+    let provider = provider_for(oauth_state.provider)?;
 
     let config = provider.complete_oauth(&req.callback, &oauth_state).await?;
 
@@ -508,4 +469,73 @@ pub fn readlater_router(state: ReadLaterState) -> Router {
         // Sync
         .route("/sync", post(sync_all))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn account_responses_never_include_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = ReadLaterManager::new(&dir.path().join("rl.db"), dir.path()).unwrap();
+        let state = ReadLaterState::new(mgr);
+        let req: AddAccountRequest = serde_json::from_value(serde_json::json!({
+            "name": "wb",
+            "provider": "wallabag",
+            "config": {
+                "type": "wallabag",
+                "instance_url": "https://wb.example",
+                "client_id": "cid",
+                "client_secret": "SECRET-1",
+                "access_token": "SECRET-2",
+                "refresh_token": "SECRET-3",
+                "token_expires_at": null,
+                "username": "alice",
+                "password": "SECRET-4"
+            }
+        }))
+        .unwrap();
+        add_account(State(state.clone()), Json(req)).await.unwrap();
+
+        let Json(list) = list_accounts(State(state.clone())).await.unwrap();
+        assert_eq!(list.accounts.len(), 1);
+        assert!(list.accounts[0].authenticated);
+        let id = list.accounts[0].id.clone();
+        let Json(one) = get_account(State(state.clone()), Path(id.clone()))
+            .await
+            .unwrap();
+        for json in [
+            serde_json::to_string(&list).unwrap(),
+            serde_json::to_string(&one).unwrap(),
+            serde_json::to_string(&state.manager.lock().get_account(&id).unwrap()).unwrap(),
+        ] {
+            assert!(!json.contains("SECRET"), "{json}");
+        }
+    }
+
+    #[tokio::test]
+    async fn omnivore_is_rejected_as_discontinued() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = ReadLaterManager::new(&dir.path().join("rl.db"), dir.path()).unwrap();
+        let state = ReadLaterState::new(mgr);
+        let req: AddAccountRequest = serde_json::from_value(serde_json::json!({
+            "name": "om",
+            "provider": "omnivore",
+            "config": {"type": "omnivore", "api_key": "k"}
+        }))
+        .unwrap();
+        let err = add_account(State(state.clone()), Json(req))
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, ServerError::BadRequest(ref m) if m.contains("Omnivore")));
+        let req: StartOAuthRequest = serde_json::from_value(serde_json::json!({
+            "provider": "omnivore",
+            "redirect_uri": "http://cb"
+        }))
+        .unwrap();
+        let err = start_oauth(State(state), Json(req)).await.err().unwrap();
+        assert!(matches!(err, ServerError::BadRequest(_)));
+    }
 }
