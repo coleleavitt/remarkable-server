@@ -100,11 +100,7 @@ pub fn create_document_in(storage: &Storage, name: &str, ext: &str, data: &[u8],
 
     for _ in 0..ROOT_RETRIES {
         let root = storage.get_root();
-        let mut entries: Vec<Entry> = if root.hash.is_empty() {
-            Vec::new()
-        } else {
-            String::from_utf8_lossy(&storage.get(&root.hash)?).lines().skip(1).filter_map(Entry::parse).collect()
-        };
+        let mut entries = root_entries(storage, &root.hash)?;
         entries.push(doc_entry());
         let root_hash = index_hash(&mut entries)?;
         storage.put_with_hash(&render_index(&entries), &root_hash, "root.docSchema")?;
@@ -171,7 +167,21 @@ fn root_entries(storage: &Storage, root_hash: &str) -> Result<Vec<Entry>> {
     if root_hash.is_empty() {
         return Ok(Vec::new());
     }
-    Ok(String::from_utf8_lossy(&storage.get(root_hash)?).lines().skip(1).filter_map(Entry::parse).collect())
+    // Refuse a root we don't fully understand: rewriting it with lines dropped would
+    // delete those documents from the tablet on its next sync (same rule as PR #19).
+    let data = storage.get(root_hash)?;
+    let text = std::str::from_utf8(&data).map_err(|_| ServerError::Internal("root index is not UTF-8".into()))?;
+    let mut lines = text.lines();
+    if lines.next() != Some(SCHEMA) {
+        tracing::error!(%root_hash, "refusing to rewrite a root index with an unsupported schema");
+        return Err(ServerError::Internal("unsupported root index schema".into()));
+    }
+    lines.filter(|l| !l.trim().is_empty())
+        .map(|l| Entry::parse(l).ok_or_else(|| {
+            tracing::error!(%root_hash, line = l, "refusing to rewrite a root index with an unparseable line");
+            ServerError::Internal(format!("unparseable root index line {l:?}"))
+        }))
+        .collect()
 }
 
 /// A node's parsed `<id>.metadata`, if its index and metadata blob are readable.
@@ -230,6 +240,21 @@ mod tests {
         let root = storage.get_root();
         let node = root_entries(storage, &root.hash).unwrap().into_iter().find(|e| e.name == id).expect("node in root");
         node_metadata(storage, &node).expect("metadata")
+    }
+
+    #[test]
+    fn unparseable_root_is_never_rewritten() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path()).unwrap();
+        let index = b"3\nnot a valid entry\n";
+        let hash = "a".repeat(64);
+        storage.put_with_hash(index, &hash, "root.docSchema").unwrap();
+        let before = storage.set_root(hash.clone()).unwrap();
+
+        assert!(create_document(&storage, "a", "pdf", b"%PDF").is_err());
+        assert!(ensure_folder(&storage, "News").is_err());
+        let after = storage.get_root();
+        assert_eq!((after.hash, after.generation), (hash, before.generation));
     }
 
     #[test]
