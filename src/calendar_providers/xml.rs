@@ -9,6 +9,12 @@ pub(super) const CALDAV: &str = "urn:ietf:params:xml:ns:caldav";
 
 /// Nesting deeper than any WebDAV response needs is rejected rather than parsed.
 const MAX_DEPTH: usize = 64;
+/// Elements plus attributes kept per document. Each one costs well over a hundred bytes in
+/// the tree for as few as four bytes of body (`<a/>`), so the response size cap alone would
+/// still let a server make the tree some 40 times larger than the body (1.3 GB from 32 MiB).
+/// A `calendar-query` REPORT answer takes about seven elements per returned event, so this
+/// still admits some 70,000 events in one answer, at under 100 MB of tree.
+const MAX_NODES: usize = 500_000;
 
 #[derive(Debug, Default)]
 pub(super) struct Element {
@@ -53,30 +59,52 @@ fn namespace(res: &ResolveResult<'_>) -> String {
     }
 }
 
-fn element(ns: String, e: &quick_xml::events::BytesStart<'_>) -> Element {
-    let attrs = e
-        .attributes()
-        .flatten()
-        .map(|a| {
-            (
-                String::from_utf8_lossy(a.key.local_name().as_ref()).into_owned(),
-                String::from_utf8_lossy(&a.value).into_owned(),
-            )
-        })
-        .collect();
-    Element {
+/// Take one node from `budget`, failing once it is spent.
+fn take_node(budget: &mut usize, limit: usize) -> Result<(), String> {
+    *budget = budget.checked_sub(1).ok_or_else(|| {
+        format!(
+            "XML document has more than {} elements and attributes",
+            limit
+        )
+    })?;
+    Ok(())
+}
+
+/// The element `e` opens, its attributes included, charged to `budget` as it is built.
+fn element(
+    ns: String,
+    e: &quick_xml::events::BytesStart<'_>,
+    budget: &mut usize,
+    limit: usize,
+) -> Result<Element, String> {
+    take_node(budget, limit)?;
+    let mut attrs = Vec::new();
+    for a in e.attributes().flatten() {
+        take_node(budget, limit)?;
+        attrs.push((
+            String::from_utf8_lossy(a.key.local_name().as_ref()).into_owned(),
+            String::from_utf8_lossy(&a.value).into_owned(),
+        ));
+    }
+    Ok(Element {
         ns,
         name: String::from_utf8_lossy(e.local_name().as_ref()).into_owned(),
         attrs,
         ..Default::default()
-    }
+    })
 }
 
 /// Parse a document into its root element.
 pub(super) fn parse(xml: &str) -> Result<Element, String> {
+    parse_limited(xml, MAX_NODES)
+}
+
+/// [`parse`], failing once the document has more than `max_nodes` elements and attributes.
+fn parse_limited(xml: &str, max_nodes: usize) -> Result<Element, String> {
     let mut reader = NsReader::from_str(xml);
     let mut stack: Vec<Element> = Vec::new();
     let mut root: Option<Element> = None;
+    let mut budget = max_nodes;
     loop {
         let (res, event) = reader.read_resolved_event().map_err(|e| e.to_string())?;
         match event {
@@ -84,10 +112,10 @@ pub(super) fn parse(xml: &str) -> Result<Element, String> {
                 if stack.len() >= MAX_DEPTH {
                     return Err("XML nested too deeply".into());
                 }
-                stack.push(element(namespace(&res), &e));
+                stack.push(element(namespace(&res), &e, &mut budget, max_nodes)?);
             }
             Event::Empty(e) => {
-                let el = element(namespace(&res), &e);
+                let el = element(namespace(&res), &e, &mut budget, max_nodes)?;
                 match stack.last_mut() {
                     Some(parent) => parent.children.push(el),
                     None => root = root.or(Some(el)),
@@ -169,6 +197,43 @@ mod tests {
         assert!(parse("<a>").is_err());
         assert!(parse("").is_err());
         assert!(parse("<a>&bogus;</a>").is_err());
+    }
+
+    #[test]
+    fn counts_elements_and_attributes_against_the_limit() {
+        // Three elements with one attribute each (the root's is its namespace declaration).
+        let doc = r#"<d:m xmlns:d="DAV:"><d:a x="1"/><d:b y="2">t</d:b></d:m>"#;
+        assert_eq!(parse_limited(doc, 6).unwrap().children.len(), 2);
+        let err = parse_limited(doc, 5).unwrap_err();
+        assert!(
+            err.contains("more than 5 elements and attributes"),
+            "{}",
+            err
+        );
+        // Attributes alone exhaust it too, before they are all collected.
+        let many_attrs = format!(
+            "<a {}/>",
+            (0..10)
+                .map(|i| format!("k{}=''", i))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        assert!(parse_limited(&many_attrs, 11).is_ok());
+        assert!(parse_limited(&many_attrs, 10).is_err());
+    }
+
+    #[test]
+    fn rejects_a_flood_of_elements_at_the_real_limit() {
+        let flood = |n: usize| {
+            format!(
+                "<d:multistatus xmlns:d=\"DAV:\">{}</d:multistatus>",
+                "<a/>".repeat(n)
+            )
+        };
+        // Root and its namespace declaration are two of the nodes.
+        assert!(parse(&flood(MAX_NODES - 2)).is_ok());
+        let err = parse(&flood(MAX_NODES - 1)).unwrap_err();
+        assert!(err.contains("elements and attributes"), "{}", err);
     }
 
     proptest::proptest! {

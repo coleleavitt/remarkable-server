@@ -1363,34 +1363,87 @@ async fn graph_refuses_a_next_link_to_another_origin() {
 }
 
 #[tokio::test]
-async fn concurrent_syncs_of_one_calendar_do_not_overlap() {
-    let log = Arc::new(Mutex::new(GraphLog::default()));
+async fn requests_for_a_calendar_that_is_syncing_share_that_sync() {
+    let tokens = Arc::new(Mutex::new(0));
+    let views = Arc::new(Mutex::new(0));
+    // calendarView answers only once the test lets it.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let today = Utc::now().date_naive();
     let base = serve({
-        let log = log.clone();
-        move |base| graph_mock(base, log, today)
+        let (tokens, views, gate) = (tokens.clone(), views.clone(), gate.clone());
+        move |_| {
+            rotating_token_route(tokens).route(
+                "/v1.0/me/calendar/calendarView",
+                get(move || async move {
+                    *views.lock() += 1;
+                    gate.acquire().await.unwrap().forget();
+                    let at =
+                        |h: u32| format!("{}T{:02}:00:00.0000000", today + Duration::days(1), h);
+                    Json(json!({"value": [{
+                        "id": "AAMk-1", "subject": "Standup", "isAllDay": false,
+                        "start": {"dateTime": at(9), "timeZone": "UTC"},
+                        "end": {"dateTime": at(10), "timeZone": "UTC"}
+                    }]}))
+                }),
+            )
+        }
     })
     .await;
     let dir = tempfile::tempdir().unwrap();
     let mut mgr = CalendarManager::new(&dir.path().join("calendars.db")).unwrap();
-    let mut cal = office365(Some("ms-refresh-1"), None);
-    if let CalendarConfig::Office365 { calendar_id, .. } = &mut cal.config {
-        *calendar_id = Some("AAMkWork=".into());
-    }
-    mgr.add_calendar(cal).unwrap();
+    mgr.add_calendar(office365(Some("ms-refresh-1"), None))
+        .unwrap();
     let state = CalendarState::new(mgr).with_endpoints(graph_endpoints(&base));
-    let (one, all) = tokio::join!(
-        sync_calendar_endpoint(State(state.clone()), Path("m".into())),
-        sync_all_calendars(State(state.clone())),
+    let sync_one = || {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let axum::Json(r) = sync_calendar_endpoint(State(state), Path("m".into()))
+                .await
+                .unwrap();
+            r
+        })
+    };
+    let sync_all = || {
+        let state = state.clone();
+        tokio::spawn(async move { sync_all_calendars(State(state)).await.unwrap().0 })
+    };
+
+    let first = sync_one();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while *views.lock() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first sync reaches calendarView");
+    // While it waits at the provider, more requests for the calendar come in, as a client
+    // retrying after its timeout would send them.
+    let (second, all, all_again) = (sync_one(), sync_all(), sync_all());
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !first.is_finished(),
+        "the sync cannot finish before the gate opens"
     );
-    let (axum::Json(one), axum::Json(all)) = (one.unwrap(), all.unwrap());
-    assert!(one.success, "{:?}", one.error);
-    assert!(all[0].success, "{:?}", all[0].error);
-    let log = log.lock();
-    // The second sync waited and started from the token the first one refreshed, instead of
-    // refreshing again with the refresh token the first one had already rotated away.
-    assert_eq!(log.token_requests.len(), 1);
-    assert_eq!(log.views.len(), 4);
+    // Enough for every request to have made its own fetch: they must not use it.
+    gate.add_permits(4);
+    let (first, second) = (first.await.unwrap(), second.await.unwrap());
+    let (all, all_again) = (all.await.unwrap(), all_again.await.unwrap());
+    assert!(first.success, "{:?}", first.error);
+    assert_eq!(first.events_synced, 1);
+    for other in [&second, &all[0], &all_again[0]] {
+        assert_eq!(
+            serde_json::to_value(other).unwrap(),
+            serde_json::to_value(&first).unwrap()
+        );
+    }
+    assert_eq!(all.len(), 1);
+    // One sync did the work: one token refresh, one calendarView.
+    assert_eq!((*tokens.lock(), *views.lock()), (1, 1));
+
+    // Once it is over, a new request starts a new sync (with the rotated tokens).
+    let again = sync_one().await.unwrap();
+    assert!(again.success, "{:?}", again.error);
+    assert_eq!((*tokens.lock(), *views.lock()), (1, 2));
 }
 
 #[tokio::test]

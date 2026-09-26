@@ -1,6 +1,8 @@
 //! Calendar API endpoints
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::hash::Hash;
 use std::sync::Arc;
 
 use axum::Json;
@@ -8,9 +10,9 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use chrono::Utc;
+use futures_util::future::{BoxFuture, FutureExt, Shared};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex as AsyncMutex;
 
 use crate::calendar::{
     Calendar,
@@ -34,10 +36,13 @@ pub struct CalendarState {
     pub sync_config: SyncConfig,
     /// HTTP client and API endpoints for CalDAV / Google / Microsoft Graph calendars.
     pub remote: RemoteSync,
-    /// One lock per remote calendar being synced, so two syncs of the same calendar never
-    /// overlap: each would refresh the OAuth token from, and save back, its own copy of the
-    /// credentials.
-    sync_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    /// The remote calendar syncs running, by calendar id. Two syncs of one calendar never
+    /// overlap (each would refresh the OAuth token from, and save back, its own copy of the
+    /// credentials), and a request for a calendar that is already syncing gets that sync's
+    /// result instead of queueing another full sync behind it.
+    syncs: SingleFlight<String, SyncResponse>,
+    /// The `/sync-all` run in progress, if any; later requests share its result.
+    sync_all: SingleFlight<(), Vec<SyncResponse>>,
 }
 
 impl CalendarState {
@@ -46,23 +51,8 @@ impl CalendarState {
             manager: Arc::new(Mutex::new(manager)),
             sync_config: SyncConfig::default(),
             remote: RemoteSync::default(),
-            sync_locks: Arc::default(),
-        }
-    }
-
-    fn sync_lock(&self, id: &str) -> Arc<AsyncMutex<()>> {
-        self.sync_locks
-            .lock()
-            .entry(id.to_string())
-            .or_default()
-            .clone()
-    }
-
-    fn release_sync_lock(&self, id: &str, lock: Arc<AsyncMutex<()>>) {
-        let mut locks = self.sync_locks.lock();
-        // Only the map and `lock` hold it: no other sync of this calendar is waiting.
-        if Arc::strong_count(&lock) == 2 {
-            locks.remove(id);
+            syncs: SingleFlight::default(),
+            sync_all: SingleFlight::default(),
         }
     }
 
@@ -70,6 +60,79 @@ impl CalendarState {
     pub fn with_endpoints(mut self, endpoints: ProviderEndpoints) -> Self {
         self.remote = RemoteSync::new(endpoints);
         self
+    }
+}
+
+/// A running task's result, shared by everyone awaiting it; `Err` when the task panicked.
+type Flight<V> = Shared<BoxFuture<'static, std::result::Result<V, String>>>;
+
+/// Runs at most one task per key at a time: a caller arriving while one runs awaits that
+/// task's result instead of starting (or queueing) another. Each task runs on a task of its
+/// own, so it finishes, and saves what it fetched, even when every caller has gone away.
+struct SingleFlight<K, V> {
+    running: Arc<Mutex<HashMap<K, Flight<V>>>>,
+}
+
+impl<K, V> Clone for SingleFlight<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            running: self.running.clone(),
+        }
+    }
+}
+
+impl<K, V> Default for SingleFlight<K, V> {
+    fn default() -> Self {
+        Self {
+            running: Arc::default(),
+        }
+    }
+}
+
+/// Takes a finished task's entry out of the map, also when the task panics.
+struct Landed<K: Eq + Hash, V> {
+    running: Arc<Mutex<HashMap<K, Flight<V>>>>,
+    key: K,
+}
+
+impl<K: Eq + Hash, V> Drop for Landed<K, V> {
+    fn drop(&mut self) {
+        self.running.lock().remove(&self.key);
+    }
+}
+
+impl<K, V> SingleFlight<K, V>
+where
+    K: Eq + Hash + Clone + Send + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    /// The running task for `key`, or a new one running `task()`.
+    fn join_or_start<F>(&self, key: K, task: impl FnOnce() -> F) -> Flight<V>
+    where
+        F: Future<Output = V> + Send + 'static,
+    {
+        let mut running = self.running.lock();
+        if let Some(flight) = running.get(&key) {
+            return flight.clone();
+        }
+        let task = task();
+        let (map, landed_key) = (self.running.clone(), key.clone());
+        let handle = tokio::spawn(async move {
+            // Made inside the task, not captured by it: a future tokio drops unpolled (spawned
+            // during shutdown) must not take the map lock held below. Its drop waits for that
+            // lock, so the entry is in the map before it is removed; only this task removes
+            // it, and no other task for the key starts while it is there.
+            let _landed = Landed {
+                running: map,
+                key: landed_key,
+            };
+            task.await
+        });
+        let flight = async move { handle.await.map_err(|e| e.to_string()) }
+            .boxed()
+            .shared();
+        running.insert(key, flight.clone());
+        flight
     }
 }
 
@@ -459,7 +522,7 @@ pub async fn list_meeting_notes(
     ))
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct SyncResponse {
     pub calendar_id: String,
     pub events_synced: usize,
@@ -511,7 +574,7 @@ pub async fn sync_calendar_endpoint(
         _ => {
             // Provider problems (including rejected credentials) are reported in the body, never
             // as an HTTP error status of this server.
-            let result = sync_remote_detached(&state, id).await;
+            let result = sync_remote(&state, &id).await;
             if let Some(err) = &result.error {
                 tracing::warn!("calendar {} sync failed: {}", result.calendar_id, err);
             }
@@ -521,36 +584,29 @@ pub async fn sync_calendar_endpoint(
     Ok(Json(SyncResponse::new(id, count, None)))
 }
 
-/// Sync a remote calendar on a task of its own and wait for it. The task outlives the request:
-/// when the client (or nginx, after its read timeout) gives up, the handler's future is
-/// dropped, and tokens refreshed or rotated by then, a discovered collection and the fetched
-/// events must still be saved.
-async fn sync_remote_detached(state: &CalendarState, id: String) -> SyncResponse {
-    let task = tokio::spawn({
-        let state = state.clone();
-        let id = id.clone();
-        async move { sync_remote(&state, &id).await }
-    });
-    task.await
-        .unwrap_or_else(|e| SyncResponse::new(id, 0, Some(format!("sync task failed: {}", e))))
-}
-
-/// Sync one remote calendar, never alongside another sync of the same calendar.
+/// Sync one remote calendar, or wait for the sync of it already running and share its result.
+///
+/// The sync runs on a task of its own that outlives the request: when the client (or nginx,
+/// after its read timeout) gives up, the handler's future is dropped, and tokens refreshed or
+/// rotated by then, a discovered collection and the fetched events must still be saved.
+/// Requests that keep coming while a slow provider holds one sync up join it rather than
+/// piling up full syncs to run one after another.
 async fn sync_remote(state: &CalendarState, id: &str) -> SyncResponse {
-    let lock = state.sync_lock(id);
-    let result = {
-        let _running = lock.lock().await;
-        fetch_and_store(state, id).await
-    };
-    state.release_sync_lock(id, lock);
-    result
+    let flight = state.syncs.join_or_start(id.to_string(), || {
+        let state = state.clone();
+        let id = id.to_string();
+        async move { fetch_and_store(&state, &id).await }
+    });
+    flight.await.unwrap_or_else(|e| {
+        SyncResponse::new(id.to_string(), 0, Some(format!("sync task failed: {}", e)))
+    })
 }
 
 /// Fetch a remote (CalDAV / Google / Microsoft Graph) calendar and store what it returned in
 /// the sync window. Every failure is reported in the response rather than returned.
 async fn fetch_and_store(state: &CalendarState, id: &str) -> SyncResponse {
-    // The stored calendar, not a copy taken before waiting for the lock: a sync that just
-    // finished may have refreshed its tokens or found its collection.
+    // The stored calendar, not a copy taken before the request joined or started this sync:
+    // a sync that just finished may have refreshed its tokens or found its collection.
     let Some(calendar) = state.manager.lock().get_calendar(id) else {
         return SyncResponse::new(
             id.to_string(),
@@ -652,8 +708,13 @@ pub async fn sync_all_calendars(
     State(state): State<CalendarState>,
 ) -> Result<Json<Vec<SyncResponse>>> {
     // On a task of its own, like a single remote sync: the remaining calendars still sync (and
-    // save refreshed tokens) when the client stops waiting.
-    let results = tokio::spawn(sync_all(state))
+    // save refreshed tokens) when the client stops waiting. At most one runs; a request made
+    // while it does gets its results.
+    let flight = state.sync_all.join_or_start((), {
+        let state = state.clone();
+        move || sync_all(state)
+    });
+    let results = flight
         .await
         .map_err(|e| ServerError::Internal(format!("calendar sync task failed: {}", e)))?;
     Ok(Json(results))
@@ -714,7 +775,47 @@ pub async fn calendar_webhook(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    #[tokio::test]
+    async fn single_flight_shares_a_run_and_forgets_it_when_it_lands() {
+        let flights = SingleFlight::<&'static str, usize>::default();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let run = || {
+            let (runs, gate) = (runs.clone(), gate.clone());
+            move || async move {
+                gate.acquire().await.unwrap().forget();
+                runs.fetch_add(1, Ordering::SeqCst) + 1
+            }
+        };
+        let a = flights.join_or_start("k", run());
+        let b = flights.join_or_start("k", run());
+        let other = flights.join_or_start("j", run());
+        gate.add_permits(3);
+        let (a, b, other) = (a.await.unwrap(), b.await.unwrap(), other.await.unwrap());
+        assert_eq!(a, b);
+        assert_ne!(a, other);
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        // Removed before the result was handed out: the next call runs again.
+        assert!(flights.running.lock().is_empty());
+        gate.add_permits(1);
+        assert_eq!(flights.join_or_start("k", run()).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn single_flight_recovers_from_a_panicking_run() {
+        let flights = SingleFlight::<(), u8>::default();
+        let err = flights
+            .join_or_start((), || async { panic!("provider exploded") })
+            .await
+            .unwrap_err();
+        assert!(err.contains("panic"), "{}", err);
+        assert!(flights.running.lock().is_empty());
+        assert_eq!(flights.join_or_start((), || async { 7 }).await, Ok(7));
+    }
 
     fn ics_calendar(id: &str, path: std::path::PathBuf) -> Calendar {
         Calendar {
