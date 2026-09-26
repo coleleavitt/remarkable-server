@@ -7,11 +7,12 @@ use serde::Deserialize;
 
 use super::oauth::{self, Session};
 use super::{
+    MAX_BODY_BYTES,
     MAX_PAGES,
     SyncWindow,
     date_at_midnight,
     end_or_default,
-    network_error,
+    read_body,
     redact,
     rfc3339_z,
 };
@@ -26,8 +27,10 @@ use crate::calendar::{
     UNTITLED_EVENT,
 };
 
-/// Delegated permissions requested on refresh (a subset of what the grant was issued for).
-pub(super) const SCOPE: &str = "https://graph.microsoft.com/Calendars.Read offline_access";
+/// Scope requested on refresh: `.default` asks for every Microsoft Graph permission already
+/// consented for this app (Calendars.Read, Calendars.ReadWrite, ...), so the refresh never
+/// asks for one the grant lacks (AADSTS65001); `offline_access` keeps a refresh token coming.
+pub(super) const SCOPE: &str = "https://graph.microsoft.com/.default offline_access";
 
 /// Events per page.
 const PAGE_SIZE: &str = "100";
@@ -177,10 +180,7 @@ pub(super) async fn fetch(
             })
             .await?;
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| network_error(context, e))?;
+        let body = read_body(response, MAX_BODY_BYTES, context).await?;
         if status != StatusCode::OK {
             return Err(oauth::api_error(context, status, &body));
         }

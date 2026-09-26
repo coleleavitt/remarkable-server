@@ -9,7 +9,7 @@ use chrono::{DateTime, Duration, Utc};
 use reqwest::StatusCode;
 use serde::Deserialize;
 
-use super::{network_error, snippet};
+use super::{MAX_TOKEN_BODY_BYTES, network_error, read_body, snippet};
 use crate::calendar::{CalendarError, Result};
 
 /// Refresh this long before the recorded expiry, so a token does not lapse mid-sync.
@@ -127,10 +127,7 @@ impl<'a> Session<'a> {
             .await
             .map_err(|e| network_error(&context, e))?;
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| network_error(&context, e))?;
+        let body = read_body(response, MAX_TOKEN_BODY_BYTES, &context).await?;
         if !status.is_success() {
             let reason = match serde_json::from_str::<TokenError>(&body) {
                 Ok(e) => match e.error_description {

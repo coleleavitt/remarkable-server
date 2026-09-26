@@ -1,5 +1,6 @@
 //! Calendar API endpoints
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::Json;
@@ -9,6 +10,7 @@ use axum::response::IntoResponse;
 use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::calendar::{
     Calendar,
@@ -23,7 +25,7 @@ use crate::calendar::{
     SyncConfig,
     parse_ics_file,
 };
-use crate::calendar_providers::{ProviderEndpoints, RemoteSync, SyncWindow};
+use crate::calendar_providers::{Fetched, ProviderEndpoints, RemoteSync, SyncWindow};
 use crate::error::{Result, ServerError};
 
 #[derive(Clone)]
@@ -32,6 +34,10 @@ pub struct CalendarState {
     pub sync_config: SyncConfig,
     /// HTTP client and API endpoints for CalDAV / Google / Microsoft Graph calendars.
     pub remote: RemoteSync,
+    /// One lock per remote calendar being synced, so two syncs of the same calendar never
+    /// overlap: each would refresh the OAuth token from, and save back, its own copy of the
+    /// credentials.
+    sync_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
 }
 
 impl CalendarState {
@@ -40,6 +46,23 @@ impl CalendarState {
             manager: Arc::new(Mutex::new(manager)),
             sync_config: SyncConfig::default(),
             remote: RemoteSync::default(),
+            sync_locks: Arc::default(),
+        }
+    }
+
+    fn sync_lock(&self, id: &str) -> Arc<AsyncMutex<()>> {
+        self.sync_locks
+            .lock()
+            .entry(id.to_string())
+            .or_default()
+            .clone()
+    }
+
+    fn release_sync_lock(&self, id: &str, lock: Arc<AsyncMutex<()>>) {
+        let mut locks = self.sync_locks.lock();
+        // Only the map and `lock` hold it: no other sync of this calendar is waiting.
+        if Arc::strong_count(&lock) == 2 {
+            locks.remove(id);
         }
     }
 
@@ -488,7 +511,7 @@ pub async fn sync_calendar_endpoint(
         _ => {
             // Provider problems (including rejected credentials) are reported in the body, never
             // as an HTTP error status of this server.
-            let result = sync_remote(&state, calendar).await;
+            let result = sync_remote_detached(&state, id).await;
             if let Some(err) = &result.error {
                 tracing::warn!("calendar {} sync failed: {}", result.calendar_id, err);
             }
@@ -498,9 +521,43 @@ pub async fn sync_calendar_endpoint(
     Ok(Json(SyncResponse::new(id, count, None)))
 }
 
+/// Sync a remote calendar on a task of its own and wait for it. The task outlives the request:
+/// when the client (or nginx, after its read timeout) gives up, the handler's future is
+/// dropped, and tokens refreshed or rotated by then, a discovered collection and the fetched
+/// events must still be saved.
+async fn sync_remote_detached(state: &CalendarState, id: String) -> SyncResponse {
+    let task = tokio::spawn({
+        let state = state.clone();
+        let id = id.clone();
+        async move { sync_remote(&state, &id).await }
+    });
+    task.await
+        .unwrap_or_else(|e| SyncResponse::new(id, 0, Some(format!("sync task failed: {}", e))))
+}
+
+/// Sync one remote calendar, never alongside another sync of the same calendar.
+async fn sync_remote(state: &CalendarState, id: &str) -> SyncResponse {
+    let lock = state.sync_lock(id);
+    let result = {
+        let _running = lock.lock().await;
+        fetch_and_store(state, id).await
+    };
+    state.release_sync_lock(id, lock);
+    result
+}
+
 /// Fetch a remote (CalDAV / Google / Microsoft Graph) calendar and store what it returned in
 /// the sync window. Every failure is reported in the response rather than returned.
-async fn sync_remote(state: &CalendarState, calendar: Calendar) -> SyncResponse {
+async fn fetch_and_store(state: &CalendarState, id: &str) -> SyncResponse {
+    // The stored calendar, not a copy taken before waiting for the lock: a sync that just
+    // finished may have refreshed its tokens or found its collection.
+    let Some(calendar) = state.manager.lock().get_calendar(id) else {
+        return SyncResponse::new(
+            id.to_string(),
+            0,
+            Some(format!("calendar {} no longer exists", id)),
+        );
+    };
     let window = SyncWindow::around(Utc::now());
     let mut config = calendar.config.clone();
     let fetched = state
@@ -516,12 +573,29 @@ async fn sync_remote(state: &CalendarState, calendar: Calendar) -> SyncResponse 
         }
     }
     let (stored, removed) = match fetched {
-        Ok(events) => mgr
+        Ok(Fetched {
+            events,
+            incomplete: None,
+        }) => mgr
             .replace_events_in_range(&calendar.id, window.start, window.end, &events)
             .unwrap_or_else(|e| {
                 errors.push(format!("saving events failed: {}", e));
                 (0, 0)
             }),
+        // Store what came, but an event missing from a partial answer was not deleted.
+        Ok(Fetched {
+            events,
+            incomplete: Some(reason),
+        }) => {
+            errors.insert(0, reason);
+            match mgr.upsert_events(&calendar.id, &events) {
+                Ok(stored) => (stored, 0),
+                Err(e) => {
+                    errors.push(format!("saving events failed: {}", e));
+                    (0, 0)
+                }
+            }
+        }
         Err(e) => {
             errors.insert(0, e.to_string());
             (0, 0)
@@ -577,6 +651,15 @@ fn sync_ics(state: &CalendarState, calendar: &Calendar, path: &std::path::Path) 
 pub async fn sync_all_calendars(
     State(state): State<CalendarState>,
 ) -> Result<Json<Vec<SyncResponse>>> {
+    // On a task of its own, like a single remote sync: the remaining calendars still sync (and
+    // save refreshed tokens) when the client stops waiting.
+    let results = tokio::spawn(sync_all(state))
+        .await
+        .map_err(|e| ServerError::Internal(format!("calendar sync task failed: {}", e)))?;
+    Ok(Json(results))
+}
+
+async fn sync_all(state: CalendarState) -> Vec<SyncResponse> {
     let calendars = state.manager.lock().list_calendars();
     let mut results = Vec::new();
     for calendar in calendars {
@@ -584,14 +667,14 @@ pub async fn sync_all_calendars(
         // instead of being swallowed; the rest still sync.
         let result = match &calendar.config {
             CalendarConfig::Ics { path, .. } => sync_ics(&state, &calendar, path),
-            _ => sync_remote(&state, calendar).await,
+            _ => sync_remote(&state, &calendar.id).await,
         };
         if let Some(err) = &result.error {
             tracing::warn!("calendar {} sync failed: {}", result.calendar_id, err);
         }
         results.push(result);
     }
-    Ok(Json(results))
+    results
 }
 
 pub async fn get_upcoming_events(

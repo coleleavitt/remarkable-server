@@ -351,6 +351,7 @@ impl CalendarManager {
     pub fn new(db_path: &Path) -> Result<Self> {
         let db = Connection::open(db_path).map_err(|e| CalendarError::Database(e.to_string()))?;
         Self::init_schema(&db)?;
+        restrict_to_owner(db_path);
         let mut mgr = Self {
             db,
             calendars: Arc::new(RwLock::new(HashMap::new())),
@@ -531,6 +532,25 @@ impl CalendarManager {
         Ok((keep.len(), stale.len()))
     }
 
+    /// Upsert `events` in one transaction without removing anything: for a provider answer
+    /// that may be missing events. Returns how many distinct events were stored.
+    pub fn upsert_events(&mut self, calendar_id: &str, events: &[CalendarEvent]) -> Result<usize> {
+        if !self.calendars.read().contains_key(calendar_id) {
+            return Err(CalendarError::NotFound(calendar_id.to_string()));
+        }
+        let db_err = |e: rusqlite::Error| CalendarError::Database(e.to_string());
+        let tx = self.db.transaction().map_err(db_err)?;
+        for event in events {
+            upsert_event_in(&tx, event)?;
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(events
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len())
+    }
+
     pub fn remove_calendar(&mut self, id: &str) -> Result<bool> {
         let deleted = self
             .db
@@ -689,6 +709,28 @@ impl CalendarManager {
         })
     }
 }
+
+/// Make the database file readable and writable by its owner only: it holds provider
+/// passwords and OAuth tokens. SQLite creates its journal files with the same mode. A failure
+/// is logged rather than fatal, since this runs while the server starts.
+#[cfg(unix)]
+fn restrict_to_owner(db_path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    // Nothing to protect for an in-memory database.
+    if !db_path.is_file() {
+        return;
+    }
+    if let Err(e) = std::fs::set_permissions(db_path, std::fs::Permissions::from_mode(0o600)) {
+        tracing::warn!(
+            "calendar database {}: cannot restrict its permissions: {}",
+            db_path.display(),
+            e
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_db_path: &Path) {}
 
 fn upsert_event_in(db: &Connection, event: &CalendarEvent) -> Result<()> {
     let attendees_json = serde_json::to_string(&event.attendees).ok();
@@ -1128,6 +1170,21 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn database_is_private_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("calendars.db");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        drop(CalendarManager::new(&db).unwrap());
+        assert_eq!(mode(&db), 0o600);
+        // A database created before (with the umask's mode) is tightened on the next start.
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(CalendarManager::new(&db).unwrap());
+        assert_eq!(mode(&db), 0o600);
+    }
+
     #[test]
     fn replace_events_in_range_prunes_only_inside_the_range() {
         let dir = tempfile::tempdir().unwrap();
@@ -1181,6 +1238,25 @@ mod tests {
         assert_eq!(uids, ["kept", "new", "outside"]);
         assert!(matches!(
             mgr.replace_events_in_range("deleted", base, base, &[]),
+            Err(CalendarError::NotFound(_))
+        ));
+        // Upserting alone removes nothing.
+        assert_eq!(mgr.upsert_events("c", &[event("later", 4)]).unwrap(), 1);
+        let count = |mgr: &CalendarManager| {
+            mgr.get_events(
+                "c",
+                &EventQuery {
+                    start: Some(base - Duration::days(1)),
+                    end: Some(base + Duration::days(365)),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .len()
+        };
+        assert_eq!(count(&mgr), 4);
+        assert!(matches!(
+            mgr.upsert_events("deleted", &[]),
             Err(CalendarError::NotFound(_))
         ));
     }

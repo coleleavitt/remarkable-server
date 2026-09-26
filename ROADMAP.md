@@ -57,9 +57,10 @@ These are done and, in several cases, ahead of rmfakecloud:
   discovery, `calendar-query` REPORT with recurrence expansion), Google Calendar
   API v3 and Microsoft Graph (Exchange Online / Microsoft 365) sync a
   -30d..+365d window, removing events deleted upstream. Credentials persist in
-  `calendars.db` apart from the config and never reach API responses; OAuth
-  tokens refresh on expiry or 401 and are saved at once. On-premises Exchange
-  (EWS) is not supported and says so.
+  `calendars.db` (mode 0600) apart from the config and never reach API
+  responses; OAuth tokens refresh on expiry or 401 and are saved even when the
+  sync fails or the client disconnects. On-premises Exchange (EWS) is not
+  supported and says so.
 - ✅ **Security hardening (Sept 2026 review)** — OAuth device-code sign-ins need
   owner approval (#18); deleting or re-pairing a device revokes its tokens, and
   users only see and delete their own devices (#17); pairing codes are

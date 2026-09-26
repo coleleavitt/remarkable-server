@@ -6,7 +6,15 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 
 use super::oauth::{self, Session};
-use super::{MAX_PAGES, SyncWindow, date_at_midnight, end_or_default, network_error, rfc3339_z};
+use super::{
+    MAX_BODY_BYTES,
+    MAX_PAGES,
+    SyncWindow,
+    date_at_midnight,
+    end_or_default,
+    read_body,
+    rfc3339_z,
+};
 use crate::calendar::{
     Attendee,
     AttendeeRole,
@@ -138,10 +146,7 @@ pub(super) async fn fetch(
             })
             .await?;
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| network_error(context, e))?;
+        let body = read_body(response, MAX_BODY_BYTES, context).await?;
         if status != StatusCode::OK {
             return Err(oauth::api_error(context, status, &body));
         }

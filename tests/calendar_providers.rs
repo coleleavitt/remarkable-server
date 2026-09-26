@@ -12,6 +12,8 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use parking_lot::Mutex;
 use remarkable_server::calendar::{
@@ -102,7 +104,14 @@ struct GoogleLog {
     calendar_ids: Vec<String>,
 }
 
-fn google_mock(log: Arc<Mutex<GoogleLog>>, day: NaiveDate) -> Router {
+/// Google mock: events.list only accepts `Bearer fresh-token`; the token endpoint answers a
+/// valid refresh with `issued` as the new access token, valid for `expires_in` seconds.
+fn google_mock(
+    log: Arc<Mutex<GoogleLog>>,
+    day: NaiveDate,
+    issued: &'static str,
+    expires_in: i64,
+) -> Router {
     let token_log = log.clone();
     Router::new()
         .route(
@@ -114,7 +123,7 @@ fn google_mock(log: Arc<Mutex<GoogleLog>>, day: NaiveDate) -> Router {
                     && form.get("client_secret").map(String::as_str) == Some("csecret");
                 token_log.lock().token_forms.push(form);
                 if ok {
-                    Json(json!({"access_token": "fresh-token", "expires_in": 3599, "token_type": "Bearer"}))
+                    Json(json!({"access_token": issued, "expires_in": expires_in, "token_type": "Bearer"}))
                         .into_response()
                 } else {
                     (
@@ -196,7 +205,7 @@ async fn google_refreshes_rejected_token_follows_pages_and_persists_it() {
     let today = Utc::now().date_naive();
     let base = serve({
         let log = log.clone();
-        move |_| google_mock(log, today)
+        move |_| google_mock(log, today, "fresh-token", 3599)
     })
     .await;
 
@@ -457,8 +466,10 @@ async fn graph_refreshes_missing_token_follows_next_link_and_persists_rotation()
         assert_eq!(form["grant_type"], "refresh_token");
         assert_eq!(form["refresh_token"], "ms-refresh-1");
         assert_eq!(form["client_id"], "app-id");
-        assert!(
-            form["scope"].contains("Calendars.Read") && form["scope"].contains("offline_access")
+        // `.default`: whatever Graph permissions were consented, never one that was not.
+        assert_eq!(
+            form["scope"],
+            "https://graph.microsoft.com/.default offline_access"
         );
         assert!(!form.contains_key("client_secret"));
         // Token fetched up front (none stored), then two pages, both with the UTC preference.
@@ -518,6 +529,11 @@ async fn graph_refreshes_missing_token_follows_next_link_and_persists_rotation()
 struct DavLog {
     /// (method, path, Depth, Authorization, body)
     requests: Vec<(String, String, Option<String>, Option<String>, String)>,
+    /// Answer REPORTs with this status instead of the events.
+    report_status: Option<StatusCode>,
+    /// Answer REPORTs with the holiday only, plus a 507 for the collection: the server
+    /// truncated its results.
+    truncate_report: bool,
 }
 
 fn multistatus(inner: &str) -> Response {
@@ -539,26 +555,40 @@ fn ics_escape_xml(s: &str) -> String {
         .replace('\r', "&#13;")
 }
 
-/// Server with discovery: `/` is not DAV, `/.well-known/caldav` redirects to `/dav/`, which
-/// names the principal, whose calendar home holds a "Work" event calendar and a task list.
+/// Server with discovery: `/` is a web page (a PHP front end, say), `/.well-known/caldav`
+/// redirects to `/dav/`, which names the principal, whose calendar home holds a "Work" event
+/// calendar and a task list. `/dav/calendars/alice/old/` is a calendar that no longer exists.
 fn discovery_dav(state: Arc<Mutex<DavLog>>, day: NaiveDate) -> Router {
     Router::new().fallback(
         move |method: Method, uri: Uri, headers: HeaderMap, body: String| async move {
             let auth = header(&headers, "authorization");
-            state.lock().requests.push((
-                method.to_string(),
-                uri.path().to_string(),
-                header(&headers, "depth"),
-                auth.clone(),
-                body.clone(),
-            ));
-            // "alice:s3cret"
-            if auth.as_deref() != Some("Basic YWxpY2U6czNjcmV0") {
+            let (report_status, truncate_report) = {
+                let mut state = state.lock();
+                state.requests.push((
+                    method.to_string(),
+                    uri.path().to_string(),
+                    header(&headers, "depth"),
+                    auth.clone(),
+                    body.clone(),
+                ));
+                (state.report_status, state.truncate_report)
+            };
+            // Built at run time, so no credential-looking literal sits in the source.
+            let expected = format!("Basic {}", BASE64.encode("alice:s3cret"));
+            if auth.as_deref() != Some(expected.as_str()) {
                 return (StatusCode::UNAUTHORIZED, "who are you").into_response();
             }
             let d = |n: i64| (day + Duration::days(n)).format("%Y%m%d").to_string();
             match (method.as_str(), uri.path()) {
-                ("PROPFIND", "/") => StatusCode::NOT_FOUND.into_response(),
+                ("PROPFIND", "/") => (
+                    [("content-type", "text/html")],
+                    "<html><body>Welcome</body></html>",
+                )
+                    .into_response(),
+                ("REPORT", "/dav/calendars/alice/old/") => StatusCode::NOT_FOUND.into_response(),
+                ("REPORT", _) if report_status.is_some() => {
+                    (report_status.unwrap(), "server trouble").into_response()
+                }
                 ("PROPFIND", "/.well-known/caldav") => {
                     (StatusCode::MOVED_PERMANENTLY, [("location", "/dav/")]).into_response()
                 }
@@ -596,6 +626,17 @@ fn discovery_dav(state: Arc<Mutex<DavLog>>, day: NaiveDate) -> Router {
                         d(3),
                         d(4)
                     );
+                    if truncate_report {
+                        return multistatus(&format!(
+                            r#"<d:response><d:href>/dav/calendars/alice/work/holiday.ics</d:href><d:propstat><d:prop>
+                                  <d:getetag>"h1"</d:getetag>
+                                  <cal:calendar-data><![CDATA[{}]]></cal:calendar-data>
+                                  </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+                               <d:response><d:href>/dav/calendars/alice/work/</d:href>
+                                  <d:status>HTTP/1.1 507 Insufficient Storage</d:status></d:response>"#,
+                            holiday
+                        ));
+                    }
                     let standup = format!(
                         "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:standup@dav\r\nRECURRENCE-ID:{a}T090000Z\r\nSUMMARY:Standup\\, team <A&B>\r\nDTSTART:{a}T090000Z\r\nDTEND:{a}T091500Z\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:standup@dav\r\nRECURRENCE-ID:{b}T090000Z\r\nSUMMARY:Standup\\, team <A&B>\r\nDTSTART:{b}T090000Z\r\nDURATION:PT15M\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
                         a = d(1),
@@ -663,10 +704,10 @@ async fn caldav_discovers_collection_with_basic_auth_and_parses_report() {
             .iter()
             .map(|(m, p, depth, ..)| format!("{} {} {}", m, p, depth.as_deref().unwrap_or("-")))
             .collect();
+        // RFC 6764: the well-known location first; the root (a web page here) is not needed.
         assert_eq!(
             steps,
             [
-                "PROPFIND / 0",
                 "PROPFIND /.well-known/caldav 0",
                 "PROPFIND /dav/ 0",
                 "PROPFIND /dav/principals/alice/ 0",
@@ -704,7 +745,7 @@ async fn caldav_discovers_collection_with_basic_auth_and_parses_report() {
         .await
         .unwrap();
     assert!(again.success && again.events_synced == 3 && again.events_removed == 0);
-    assert_eq!(log.lock().requests.len(), 7);
+    assert_eq!(log.lock().requests.len(), 6);
     drop(state);
     match reopen(&db, "d1") {
         CalendarConfig::Caldav {
@@ -1086,4 +1127,631 @@ async fn caldav_picks_calendar_by_name_when_home_has_several() {
         "{}",
         err
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// Review round 1: token refresh edge cases, persistence on failure, concurrency,
+// cancellation, CalDAV recovery and safety
+// ---------------------------------------------------------------------------------------
+
+fn google_calendar(access_token: Option<&str>, expires: Option<DateTime<Utc>>) -> Calendar {
+    calendar(
+        "g",
+        "Team",
+        CalendarProvider::Google,
+        CalendarConfig::Google {
+            calendar_id: "primary".into(),
+            access_token: access_token.map(str::to_string),
+            refresh_token: Some("refresh-1".into()),
+            client_id: Some("cid".into()),
+            client_secret: Some("csecret".into()),
+            token_expires_at: expires,
+        },
+    )
+}
+
+/// Sync `cal` once against a Google mock issuing `issued` tokens valid for `expires_in`
+/// seconds.
+async fn google_sync(
+    issued: &'static str,
+    expires_in: i64,
+    cal: Calendar,
+) -> (calendar_api::SyncResponse, GoogleLog) {
+    let log = Arc::new(Mutex::new(GoogleLog::default()));
+    let today = Utc::now().date_naive();
+    let base = serve({
+        let log = log.clone();
+        move |_| google_mock(log, today, issued, expires_in)
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut mgr = CalendarManager::new(&dir.path().join("calendars.db")).unwrap();
+    mgr.add_calendar(cal).unwrap();
+    let state = CalendarState::new(mgr).with_endpoints(ProviderEndpoints {
+        google_api: format!("{}/calendar/v3", base),
+        google_token_url: format!("{}/token", base),
+        ..Default::default()
+    });
+    let axum::Json(result) = sync_calendar_endpoint(State(state), Path("g".into()))
+        .await
+        .unwrap();
+    let log = std::mem::take(&mut *log.lock());
+    (result, log)
+}
+
+fn authorizations(log: &GoogleLog) -> Vec<String> {
+    log.lists.iter().map(|(a, _)| a.clone().unwrap()).collect()
+}
+
+#[tokio::test]
+async fn google_refreshes_an_expiring_token_before_using_it() {
+    let expired = Utc::now() - Duration::minutes(1);
+    let (result, log) = google_sync(
+        "fresh-token",
+        3599,
+        google_calendar(Some("old"), Some(expired)),
+    )
+    .await;
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(log.token_forms.len(), 1);
+    // No round trip with the expired token: both pages go out with the refreshed one.
+    assert_eq!(
+        authorizations(&log),
+        ["Bearer fresh-token", "Bearer fresh-token"]
+    );
+}
+
+#[tokio::test]
+async fn google_refreshes_at_most_once_per_sync() {
+    // A refreshed token that is already inside the expiry margin is still used for the
+    // second page rather than refreshed again.
+    let (result, log) = google_sync(
+        "fresh-token",
+        30,
+        google_calendar(Some("stale-token"), None),
+    )
+    .await;
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(log.token_forms.len(), 1);
+    assert_eq!(
+        authorizations(&log),
+        [
+            "Bearer stale-token",
+            "Bearer fresh-token",
+            "Bearer fresh-token"
+        ]
+    );
+
+    // A refreshed token the API rejects as well: one refresh, then a clean failure.
+    let (result, log) = google_sync(
+        "still-rejected",
+        3599,
+        google_calendar(Some("stale-token"), None),
+    )
+    .await;
+    assert!(!result.success);
+    let err = result.error.unwrap();
+    assert!(err.contains("HTTP 401"), "{}", err);
+    assert_eq!(log.token_forms.len(), 1);
+    assert_eq!(
+        authorizations(&log),
+        ["Bearer stale-token", "Bearer still-rejected"]
+    );
+}
+
+fn office365(refresh_token: Option<&str>, access_token: Option<&str>) -> Calendar {
+    calendar(
+        "m",
+        "Work",
+        CalendarProvider::Office365,
+        CalendarConfig::Office365 {
+            tenant_id: "contoso".into(),
+            access_token: access_token.map(str::to_string),
+            refresh_token: refresh_token.map(str::to_string),
+            client_id: Some("app-id".into()),
+            client_secret: None,
+            calendar_id: None,
+            token_expires_at: None,
+        },
+    )
+}
+
+/// Token endpoint that always rotates to `ms-access-2` / `ms-refresh-2`.
+fn rotating_token_route(count: Arc<Mutex<usize>>) -> Router {
+    Router::new().route(
+        "/login/{tenant}/oauth2/v2.0/token",
+        post(move || async move {
+            *count.lock() += 1;
+            Json(json!({
+                "token_type": "Bearer",
+                "access_token": "ms-access-2",
+                "refresh_token": "ms-refresh-2",
+                "expires_in": 3600
+            }))
+        }),
+    )
+}
+
+fn graph_endpoints(base: &str) -> ProviderEndpoints {
+    ProviderEndpoints {
+        graph_api: format!("{}/v1.0", base),
+        microsoft_login: format!("{}/login", base),
+        ..Default::default()
+    }
+}
+
+fn assert_rotated_tokens(config: CalendarConfig) {
+    match config {
+        CalendarConfig::Office365 {
+            access_token,
+            refresh_token,
+            token_expires_at,
+            ..
+        } => {
+            assert_eq!(access_token.as_deref(), Some("ms-access-2"));
+            assert_eq!(refresh_token.as_deref(), Some("ms-refresh-2"));
+            assert!(token_expires_at.unwrap() > Utc::now() + Duration::minutes(55));
+        }
+        other => panic!("{:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn graph_saves_rotated_tokens_when_the_fetch_then_fails() {
+    let tokens = Arc::new(Mutex::new(0));
+    let base = serve({
+        let tokens = tokens.clone();
+        move |_| {
+            rotating_token_route(tokens).route(
+                "/v1.0/me/calendar/calendarView",
+                get(|| async { (StatusCode::SERVICE_UNAVAILABLE, "try later") }),
+            )
+        }
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("calendars.db");
+    let mut mgr = CalendarManager::new(&db).unwrap();
+    mgr.add_calendar(office365(Some("ms-refresh-1"), None))
+        .unwrap();
+    let state = CalendarState::new(mgr).with_endpoints(graph_endpoints(&base));
+    let axum::Json(result) = sync_calendar_endpoint(State(state.clone()), Path("m".into()))
+        .await
+        .unwrap();
+    assert!(!result.success);
+    let err = result.error.unwrap();
+    assert!(err.contains("HTTP 503"), "{}", err);
+    assert_eq!(*tokens.lock(), 1);
+    drop(state);
+    // The rotated refresh token is not lost with the failed fetch.
+    assert_rotated_tokens(reopen(&db, "m"));
+}
+
+#[tokio::test]
+async fn graph_refuses_a_next_link_to_another_origin() {
+    let views = Arc::new(Mutex::new(0));
+    let base = serve({
+        let views = views.clone();
+        move |_| {
+            Router::new().route(
+                "/v1.0/me/calendar/calendarView",
+                get(move || async move {
+                    *views.lock() += 1;
+                    Json(json!({
+                        "value": [],
+                        "@odata.nextLink": "http://other.invalid/v1.0/me/calendarView?$skiptoken=x"
+                    }))
+                }),
+            )
+        }
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut mgr = CalendarManager::new(&dir.path().join("calendars.db")).unwrap();
+    mgr.add_calendar(office365(None, Some("graph-token")))
+        .unwrap();
+    let state = CalendarState::new(mgr).with_endpoints(graph_endpoints(&base));
+    let axum::Json(result) = sync_calendar_endpoint(State(state), Path("m".into()))
+        .await
+        .unwrap();
+    assert!(!result.success);
+    let err = result.error.unwrap();
+    assert!(err.contains("points outside the Graph API"), "{}", err);
+    assert!(!err.contains("graph-token"), "{}", err);
+    // Refused before any request carrying the token left for the other host.
+    assert_eq!(*views.lock(), 1);
+}
+
+#[tokio::test]
+async fn concurrent_syncs_of_one_calendar_do_not_overlap() {
+    let log = Arc::new(Mutex::new(GraphLog::default()));
+    let today = Utc::now().date_naive();
+    let base = serve({
+        let log = log.clone();
+        move |base| graph_mock(base, log, today)
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut mgr = CalendarManager::new(&dir.path().join("calendars.db")).unwrap();
+    let mut cal = office365(Some("ms-refresh-1"), None);
+    if let CalendarConfig::Office365 { calendar_id, .. } = &mut cal.config {
+        *calendar_id = Some("AAMkWork=".into());
+    }
+    mgr.add_calendar(cal).unwrap();
+    let state = CalendarState::new(mgr).with_endpoints(graph_endpoints(&base));
+    let (one, all) = tokio::join!(
+        sync_calendar_endpoint(State(state.clone()), Path("m".into())),
+        sync_all_calendars(State(state.clone())),
+    );
+    let (axum::Json(one), axum::Json(all)) = (one.unwrap(), all.unwrap());
+    assert!(one.success, "{:?}", one.error);
+    assert!(all[0].success, "{:?}", all[0].error);
+    let log = log.lock();
+    // The second sync waited and started from the token the first one refreshed, instead of
+    // refreshing again with the refresh token the first one had already rotated away.
+    assert_eq!(log.token_requests.len(), 1);
+    assert_eq!(log.views.len(), 4);
+}
+
+#[tokio::test]
+async fn sync_finishes_and_saves_tokens_when_the_client_goes_away() {
+    let tokens = Arc::new(Mutex::new(0));
+    let views = Arc::new(Mutex::new(0));
+    // calendarView answers only once the test lets it.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let base = serve({
+        let (tokens, views, gate) = (tokens.clone(), views.clone(), gate.clone());
+        move |_| {
+            rotating_token_route(tokens).route(
+                "/v1.0/me/calendar/calendarView",
+                get(move || async move {
+                    *views.lock() += 1;
+                    gate.acquire().await.unwrap().forget();
+                    Json(json!({"value": []}))
+                }),
+            )
+        }
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("calendars.db");
+    let mut mgr = CalendarManager::new(&db).unwrap();
+    mgr.add_calendar(office365(Some("ms-refresh-1"), None))
+        .unwrap();
+    let state = CalendarState::new(mgr).with_endpoints(graph_endpoints(&base));
+
+    let wait_until = |what: &'static str, cond: Box<dyn Fn() -> bool + Send>| async move {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !cond() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {}", what));
+    };
+    // The client disconnects while calendarView is pending: its handler future is dropped.
+    tokio::select! {
+        _ = sync_calendar_endpoint(State(state.clone()), Path("m".into())) => {
+            panic!("the sync cannot finish before the gate opens")
+        }
+        _ = wait_until("calendarView", Box::new({
+            let views = views.clone();
+            move || *views.lock() == 1
+        })) => {}
+    }
+    gate.add_permits(1);
+    wait_until(
+        "the detached sync",
+        Box::new({
+            let state = state.clone();
+            move || {
+                state
+                    .manager
+                    .lock()
+                    .get_calendar("m")
+                    .unwrap()
+                    .last_sync
+                    .is_some()
+            }
+        }),
+    )
+    .await;
+    assert_eq!(*tokens.lock(), 1);
+    drop(state);
+    assert_rotated_tokens(reopen(&db, "m"));
+}
+
+fn work_dav(base: &str, collection_url: Option<&str>) -> Calendar {
+    calendar(
+        "d",
+        "Work",
+        CalendarProvider::Caldav,
+        CalendarConfig::Caldav {
+            url: format!("{}/", base),
+            username: "alice".into(),
+            password: Some("s3cret".into()),
+            bearer_token: None,
+            collection_url: collection_url.map(|p| format!("{}{}", base, p)),
+        },
+    )
+}
+
+fn collection_url(config: CalendarConfig) -> Option<String> {
+    match config {
+        CalendarConfig::Caldav { collection_url, .. } => collection_url,
+        other => panic!("{:?}", other),
+    }
+}
+
+async fn dav_sync(state: &CalendarState) -> calendar_api::SyncResponse {
+    let axum::Json(result) = sync_calendar_endpoint(State(state.clone()), Path("d".into()))
+        .await
+        .unwrap();
+    result
+}
+
+fn reports(log: &Mutex<DavLog>) -> usize {
+    log.lock()
+        .requests
+        .iter()
+        .filter(|r| r.0 == "REPORT")
+        .count()
+}
+
+#[tokio::test]
+async fn caldav_keeps_the_discovered_collection_when_the_report_fails() {
+    let log = Arc::new(Mutex::new(DavLog {
+        // A transient server error: not a reason to retry without `expand`.
+        report_status: Some(StatusCode::INTERNAL_SERVER_ERROR),
+        ..Default::default()
+    }));
+    let today = Utc::now().date_naive();
+    let base = serve({
+        let log = log.clone();
+        move |_| discovery_dav(log, today)
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("calendars.db");
+    let mut mgr = CalendarManager::new(&db).unwrap();
+    mgr.add_calendar(work_dav(&base, None)).unwrap();
+    let state = CalendarState::new(mgr);
+
+    let failed = dav_sync(&state).await;
+    assert!(!failed.success);
+    let err = failed.error.unwrap();
+    assert!(err.contains("HTTP 500"), "{}", err);
+    assert_eq!(reports(&log), 1, "no fallback REPORT after a 500");
+    let work = format!("{}/dav/calendars/alice/work/", base);
+    assert_eq!(collection_url(reopen(&db, "d")), Some(work.clone()));
+
+    // The next sync goes straight to the remembered collection.
+    log.lock().report_status = None;
+    let before = log.lock().requests.len();
+    let ok = dav_sync(&state).await;
+    assert!(ok.success && ok.events_synced == 3, "{:?}", ok.error);
+    assert_eq!(log.lock().requests.len(), before + 1);
+}
+
+#[tokio::test]
+async fn caldav_rediscovers_a_collection_that_disappeared() {
+    let log = Arc::new(Mutex::new(DavLog::default()));
+    let today = Utc::now().date_naive();
+    let base = serve({
+        let log = log.clone();
+        move |_| discovery_dav(log, today)
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("calendars.db");
+    let mut mgr = CalendarManager::new(&db).unwrap();
+    mgr.add_calendar(work_dav(&base, Some("/dav/calendars/alice/old/")))
+        .unwrap();
+    let state = CalendarState::new(mgr);
+
+    let gone = dav_sync(&state).await;
+    assert!(!gone.success);
+    assert!(
+        gone.error.as_deref().unwrap().contains("HTTP 404"),
+        "{:?}",
+        gone.error
+    );
+    assert_eq!(collection_url(reopen(&db, "d")), None);
+
+    let found = dav_sync(&state).await;
+    assert!(
+        found.success && found.events_synced == 3,
+        "{:?}",
+        found.error
+    );
+    assert_eq!(
+        collection_url(reopen(&db, "d")),
+        Some(format!("{}/dav/calendars/alice/work/", base))
+    );
+}
+
+#[tokio::test]
+async fn caldav_truncated_report_keeps_events_it_did_not_list() {
+    let log = Arc::new(Mutex::new(DavLog::default()));
+    let today = Utc::now().date_naive();
+    let base = serve({
+        let log = log.clone();
+        move |_| discovery_dav(log, today)
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut mgr = CalendarManager::new(&dir.path().join("calendars.db")).unwrap();
+    mgr.add_calendar(work_dav(&base, None)).unwrap();
+    let state = CalendarState::new(mgr);
+    let full = dav_sync(&state).await;
+    assert!(full.success && full.events_synced == 3, "{:?}", full.error);
+
+    log.lock().truncate_report = true;
+    let partial = dav_sync(&state).await;
+    assert!(!partial.success);
+    let err = partial.error.unwrap();
+    assert!(
+        err.contains("HTTP 507") && err.contains("incomplete"),
+        "{}",
+        err
+    );
+    assert_eq!((partial.events_synced, partial.events_removed), (1, 0));
+    // Both standup occurrences are still there although the answer did not list them.
+    assert_eq!(all_events(&state, "d").len(), 3);
+}
+
+#[tokio::test]
+async fn caldav_bare_server_url_falls_back_to_the_root() {
+    // DAV at the root, no well-known location.
+    let log = Arc::new(Mutex::new(DavLog::default()));
+    let rooted = serve({
+        let log = log.clone();
+        move |_| {
+            Router::new().fallback(move |method: Method, uri: Uri| async move {
+                log.lock().requests.push((
+                    method.to_string(),
+                    uri.path().to_string(),
+                    None,
+                    None,
+                    String::new(),
+                ));
+                match (method.as_str(), uri.path()) {
+                    ("PROPFIND", "/") => multistatus(
+                        r#"<d:response><d:href>/</d:href><d:propstat><d:prop>
+                              <cal:calendar-home-set><d:href>/cals/</d:href></cal:calendar-home-set>
+                              </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"#,
+                    ),
+                    ("PROPFIND", "/cals/") => multistatus(
+                        r#"<d:response><d:href>/cals/main/</d:href><d:propstat><d:prop>
+                              <d:resourcetype><d:collection/><cal:calendar/></d:resourcetype>
+                              </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"#,
+                    ),
+                    ("REPORT", "/cals/main/") => multistatus(""),
+                    _ => StatusCode::NOT_FOUND.into_response(),
+                }
+            })
+        }
+    })
+    .await;
+    // A plain web site: nothing is DAV.
+    let website = serve(|_| {
+        Router::new().fallback(|| async { ([("content-type", "text/html")], "<html>hi</html>") })
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut mgr = CalendarManager::new(&dir.path().join("calendars.db")).unwrap();
+    for (id, base) in [("rooted", &rooted), ("website", &website)] {
+        mgr.add_calendar(calendar(
+            id,
+            id,
+            CalendarProvider::Caldav,
+            CalendarConfig::Caldav {
+                url: format!("{}/", base),
+                username: String::new(),
+                password: None,
+                bearer_token: None,
+                collection_url: None,
+            },
+        ))
+        .unwrap();
+    }
+    let state = CalendarState::new(mgr);
+    let axum::Json(ok) = sync_calendar_endpoint(State(state.clone()), Path("rooted".into()))
+        .await
+        .unwrap();
+    assert!(ok.success, "{:?}", ok.error);
+    let steps: Vec<_> = log
+        .lock()
+        .requests
+        .iter()
+        .map(|(m, p, ..)| format!("{} {}", m, p))
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            "PROPFIND /.well-known/caldav",
+            "PROPFIND /",
+            "PROPFIND /cals/",
+            "REPORT /cals/main/"
+        ]
+    );
+    let axum::Json(none) = sync_calendar_endpoint(State(state), Path("website".into()))
+        .await
+        .unwrap();
+    assert!(!none.success);
+    let err = none.error.unwrap();
+    assert!(
+        err.contains("configure the calendar collection URL"),
+        "{}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn caldav_credentials_stay_with_the_configured_site() {
+    let log = Arc::new(Mutex::new(DavLog::default()));
+    let base = serve({
+        let log = log.clone();
+        move |_| {
+            Router::new().fallback(move |method: Method, uri: Uri| async move {
+                log.lock().requests.push((
+                    method.to_string(),
+                    uri.path().to_string(),
+                    None,
+                    None,
+                    String::new(),
+                ));
+                match uri.path() {
+                    // A calendar home on a host of another site.
+                    "/principal/" => multistatus(
+                        r#"<d:response><d:href>/principal/</d:href><d:propstat><d:prop>
+                              <cal:calendar-home-set><d:href>https://collector.invalid/home/</d:href></cal:calendar-home-set>
+                              </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"#,
+                    ),
+                    // A redirect into the cloud metadata service.
+                    _ => (
+                        StatusCode::FOUND,
+                        [("location", "https://169.254.169.254/latest/meta-data/")],
+                    )
+                        .into_response(),
+                }
+            })
+        }
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut mgr = CalendarManager::new(&dir.path().join("calendars.db")).unwrap();
+    for (id, path) in [("elsewhere", "/principal/"), ("internal", "/redirect/")] {
+        mgr.add_calendar(calendar(
+            id,
+            id,
+            CalendarProvider::Caldav,
+            CalendarConfig::Caldav {
+                url: format!("{}{}", base, path),
+                username: "alice".into(),
+                password: Some("s3cret".into()),
+                bearer_token: None,
+                collection_url: None,
+            },
+        ))
+        .unwrap();
+    }
+    let state = CalendarState::new(mgr);
+    let sync = |id: &'static str| {
+        let state = state.clone();
+        async move {
+            let axum::Json(r) = sync_calendar_endpoint(State(state), Path(id.into()))
+                .await
+                .unwrap();
+            assert!(!r.success, "{}", id);
+            r.error.unwrap()
+        }
+    };
+    let err = sync("elsewhere").await;
+    assert!(err.contains("not sending the credentials"), "{}", err);
+    let err = sync("internal").await;
+    assert!(err.contains("internal address"), "{}", err);
+    assert!(!err.contains("s3cret"));
+    // Only the configured server was ever asked.
+    assert_eq!(log.lock().requests.len(), 2);
 }

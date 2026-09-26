@@ -3,16 +3,24 @@
 //!
 //! Discovery (RFC 4791 section 7 / RFC 6764) starts at the configured URL: a calendar
 //! collection is used as is; otherwise its `calendar-home-set` (directly or through
-//! `current-user-principal`, falling back to `/.well-known/caldav` for a bare server URL)
-//! is listed and the calendar holding events is chosen, by display name when there are
-//! several. The collection found is stored in the config so later syncs skip discovery.
+//! `current-user-principal`) is listed and the calendar holding events is chosen, by display
+//! name when there are several. A bare server URL is tried at `/.well-known/caldav` first and
+//! at its root second. The collection found is stored in the config so later syncs skip
+//! discovery.
+//!
+//! Redirects and hrefs are followed, but credentials only go to the configured host and hosts
+//! of the same site (iCloud serves calendar homes from per-user hosts), a hop to another
+//! origin must stay on HTTPS, and it may not lead to another host's loopback or private
+//! address.
+
+use std::net::{IpAddr, Ipv4Addr};
 
 use reqwest::header::{CONTENT_TYPE, LOCATION};
 use reqwest::{Method, StatusCode, Url};
 
 use super::xml::{self, CALDAV, DAV, Element};
-use super::{SyncWindow, network_error, redact, snippet};
-use crate::calendar::{Calendar, CalendarError, CalendarEvent, Result, parse_ics_str};
+use super::{Fetched, MAX_BODY_BYTES, SyncWindow, network_error, read_body, redact, snippet};
+use crate::calendar::{Calendar, CalendarError, Result, parse_ics_str};
 
 /// Redirect hops followed per request (e.g. `/.well-known/caldav` to the DAV root).
 const MAX_REDIRECTS: usize = 5;
@@ -28,6 +36,8 @@ pub(super) struct Account<'a> {
 struct Dav<'a> {
     http: &'a reqwest::Client,
     account: &'a Account<'a>,
+    /// The configured URL; the credentials belong to its host.
+    configured: &'a Url,
 }
 
 struct DavResponse {
@@ -38,6 +48,13 @@ struct DavResponse {
 }
 
 impl Dav<'_> {
+    /// Whether [`Dav::authorize`] adds an `Authorization` header.
+    fn has_credentials(&self) -> bool {
+        self.account.bearer_token.is_some()
+            || self.account.password.is_some()
+            || !self.account.username.is_empty()
+    }
+
     fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match (self.account.bearer_token, self.account.password) {
             (Some(token), _) => request.bearer_auth(token),
@@ -57,6 +74,13 @@ impl Dav<'_> {
         let mut url = url.clone();
         for _ in 0..=MAX_REDIRECTS {
             let context = format!("caldav: {} {}", method, redact(&url));
+            if self.has_credentials() && !may_send_credentials(self.configured, &url) {
+                return Err(CalendarError::Backend(format!(
+                    "{}: not sending the credentials for {} to another site",
+                    context,
+                    self.configured.host_str().unwrap_or("")
+                )));
+            }
             let request = self
                 .http
                 .request(method.clone(), url.clone())
@@ -84,10 +108,7 @@ impl Dav<'_> {
                 url = follow(&url, location)?;
                 continue;
             }
-            let body = response
-                .text()
-                .await
-                .map_err(|e| network_error(&context, e))?;
+            let body = read_body(response, MAX_BODY_BYTES, &context).await?;
             return Ok(DavResponse { url, status, body });
         }
         Err(CalendarError::Backend(format!(
@@ -121,10 +142,31 @@ impl Dav<'_> {
             )),
         }
     }
+
+    /// PROPFIND a URL that only might be a DAV resource (a bare server's well-known location
+    /// or root): any answer but a multistatus means "not here" (a web page, a login redirect,
+    /// a refusal), except 401, which says the credentials are wrong.
+    async fn probe(&self, url: &Url) -> Result<Option<(Url, Vec<Resource>)>> {
+        let response = self.send("PROPFIND", url, "0", PROPFIND_SELF).await?;
+        match response.status {
+            StatusCode::MULTI_STATUS => {
+                let resources = parse_resources(&response.url, &response.body)?;
+                Ok(Some((response.url, resources)))
+            }
+            StatusCode::UNAUTHORIZED => Err(dav_error(
+                &format!("caldav: PROPFIND {}", redact(&response.url)),
+                response.status,
+                &response.body,
+            )),
+            _ => Ok(None),
+        }
+    }
 }
 
-/// Resolve a redirect or href. Credentials go with the request, so a hop may only leave the
-/// current origin for HTTPS (e.g. iCloud serves calendar homes from per-user hosts).
+/// Resolve a redirect or href. A hop may only leave the current origin for HTTPS (e.g. iCloud
+/// serves calendar homes from per-user hosts), and never for another host's loopback, private
+/// or link-local address: the server must not be able to aim this process at internal
+/// services.
 fn follow(from: &Url, target: &str) -> Result<Url> {
     let next = from.join(target).map_err(|e| {
         CalendarError::Backend(format!(
@@ -134,14 +176,94 @@ fn follow(from: &Url, target: &str) -> Result<Url> {
             e
         ))
     })?;
-    if next.origin() != from.origin() && next.scheme() != "https" {
-        return Err(CalendarError::Backend(format!(
-            "caldav: refusing to follow {} to non-HTTPS {}",
-            redact(from),
-            redact(&next)
-        )));
+    if next.origin() != from.origin() {
+        if next.scheme() != "https" {
+            return Err(CalendarError::Backend(format!(
+                "caldav: refusing to follow {} to non-HTTPS {}",
+                redact(from),
+                redact(&next)
+            )));
+        }
+        if next.host_str() != from.host_str() && is_internal(&next) {
+            return Err(CalendarError::Backend(format!(
+                "caldav: refusing to follow {} to internal address {}",
+                redact(from),
+                redact(&next)
+            )));
+        }
     }
     Ok(next)
+}
+
+/// `localhost`, or an IP literal that is not a public unicast address.
+fn is_internal(url: &Url) -> bool {
+    if let Some(domain) = url.domain() {
+        let domain = domain.trim_end_matches('.');
+        return domain.eq_ignore_ascii_case("localhost") || domain.ends_with(".localhost");
+    }
+    let host = url.host_str().unwrap_or("");
+    let Ok(ip) = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+    else {
+        return true;
+    };
+    let internal_v4 = |v4: Ipv4Addr| {
+        let [a, b, ..] = v4.octets();
+        v4.is_loopback()
+            || v4.is_private()
+            || v4.is_link_local()
+            || v4.is_unspecified()
+            || v4.is_broadcast()
+            || a == 0
+            // 100.64.0.0/10, carrier-grade NAT.
+            || (a == 100 && b & 0xc0 == 64)
+    };
+    match ip {
+        IpAddr::V4(v4) => internal_v4(v4),
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || v6.to_ipv4_mapped().is_some_and(internal_v4)
+        }
+    }
+}
+
+/// Whether the credentials configured for `configured` may go to `target`: always to the same
+/// host, otherwise only over HTTPS to a host of the same [`site`].
+fn may_send_credentials(configured: &Url, target: &Url) -> bool {
+    if configured.host_str() == target.host_str() {
+        return true;
+    }
+    match (configured.domain(), target.domain()) {
+        (Some(a), Some(b)) => {
+            target.scheme() == "https" && site(a).is_some_and(|s| site(b) == Some(s))
+        }
+        _ => false,
+    }
+}
+
+/// The registrable domain of a DNS name, approximated without a public-suffix list: its last
+/// two labels, or three under a two-letter country code with a short second level
+/// (`example.co.uk`, `example.com.au`). Single-label names (`localhost`) have none. Where the
+/// guess is too narrow, credentials are withheld rather than sent too widely.
+fn site(domain: &str) -> Option<&str> {
+    let domain = domain.trim_end_matches('.');
+    let mut labels = domain.rsplit('.');
+    let (tld, second) = (labels.next()?, labels.next()?);
+    let keep = if tld.len() == 2 && second.len() <= 3 && labels.next().is_some() {
+        3
+    } else {
+        2
+    };
+    let cut = domain
+        .rmatch_indices('.')
+        .nth(keep - 1)
+        .map_or(0, |(i, _)| i + 1);
+    Some(&domain[cut..])
 }
 
 fn dav_error(context: &str, status: StatusCode, body: &str) -> CalendarError {
@@ -161,6 +283,9 @@ fn dav_error(context: &str, status: StatusCode, body: &str) -> CalendarError {
 /// Properties of one `DAV:response`, from its `200 OK` propstats.
 #[derive(Debug, Default)]
 struct Resource {
+    /// A non-2xx response-level `DAV:status` (e.g. 507 when a server truncates a REPORT's
+    /// results, RFC 4918 section 14.28) or a 5xx propstat: the server could not answer fully.
+    failure: Option<u16>,
     href: Option<Url>,
     is_calendar: bool,
     display_name: Option<String>,
@@ -182,11 +307,16 @@ impl Resource {
     }
 }
 
-fn is_ok_status(propstat: &Element) -> bool {
-    // "HTTP/1.1 200 OK"; a propstat without status is taken as OK.
-    propstat
-        .child(DAV, "status")
-        .is_none_or(|s| s.text.split_whitespace().nth(1) == Some("200"))
+/// The code of a `DAV:status` child ("HTTP/1.1 200 OK"); `None` without one.
+fn status_code(el: &Element) -> Option<Option<u16>> {
+    let status = el.child(DAV, "status")?;
+    Some(
+        status
+            .text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok()),
+    )
 }
 
 fn href_in(el: Option<&Element>, base: &Url) -> Option<Url> {
@@ -215,11 +345,23 @@ fn parse_resources(base: &Url, body: &str) -> Result<Vec<Resource>> {
             href: response
                 .child(DAV, "href")
                 .and_then(|h| follow(base, h.text.trim()).ok()),
+            failure: match status_code(response) {
+                Some(Some(code)) if (200..300).contains(&code) => None,
+                // Unparseable status: treat it as a failure too.
+                Some(code) => Some(code.unwrap_or(0)),
+                None => None,
+            },
             ..Default::default()
         };
         for propstat in response.children_named(DAV, "propstat") {
-            if !is_ok_status(propstat) {
-                continue;
+            // A propstat without status is taken as OK.
+            match status_code(propstat) {
+                None | Some(Some(200)) => {}
+                Some(Some(code)) if code >= 500 => {
+                    resource.failure.get_or_insert(code);
+                    continue;
+                }
+                Some(_) => continue,
             }
             let Some(prop) = propstat.child(DAV, "prop") else {
                 continue;
@@ -325,8 +467,15 @@ async fn pick_calendar(dav: &Dav<'_>, home: &Url, name: &str) -> Result<Url> {
 }
 
 /// Find the calendar collection starting from `start`; `Ok(None)` when `start` leads nowhere.
-async fn discover_from(dav: &Dav<'_>, start: &Url, name: &str) -> Result<Option<Url>> {
-    let Some((url, resources)) = dav.propfind(start, "0", PROPFIND_SELF).await? else {
+/// A `guess` (a bare server's well-known location or root) that is not a DAV resource leads
+/// nowhere whatever it answers, see [`Dav::probe`].
+async fn discover_from(dav: &Dav<'_>, start: &Url, name: &str, guess: bool) -> Result<Option<Url>> {
+    let found = if guess {
+        dav.probe(start).await?
+    } else {
+        dav.propfind(start, "0", PROPFIND_SELF).await?
+    };
+    let Some((url, resources)) = found else {
         return Ok(None);
     };
     let Some(this) = resources.into_iter().next() else {
@@ -355,21 +504,34 @@ async fn discover_from(dav: &Dav<'_>, start: &Url, name: &str) -> Result<Option<
 }
 
 async fn discover(dav: &Dav<'_>, start: &Url, name: &str) -> Result<Url> {
-    if let Some(found) = discover_from(dav, start, name).await? {
-        return Ok(found);
+    let nowhere = || {
+        CalendarError::NotFound(format!(
+            "caldav: {} is not a calendar collection and names no calendar home or principal \
+             (nor does its /.well-known/caldav for a bare server URL); configure the calendar \
+             collection URL",
+            redact(start)
+        ))
+    };
+    if !matches!(start.path(), "" | "/") {
+        return discover_from(dav, start, name, false)
+            .await?
+            .ok_or_else(nowhere);
     }
-    // RFC 6764: a bare server URL may only answer at its well-known location.
-    if matches!(start.path(), "" | "/") {
-        let well_known = follow(start, "/.well-known/caldav")?;
-        if let Some(found) = discover_from(dav, &well_known, name).await? {
-            return Ok(found);
-        }
+    // RFC 6764 section 6: a bare server URL is bootstrapped through its well-known location.
+    // The root comes second, for servers mounted there without one; it is often a web page.
+    let well_known = follow(start, "/.well-known/caldav")?;
+    let from_well_known = match discover_from(dav, &well_known, name, true).await {
+        Ok(Some(found)) => return Ok(found),
+        other => other,
+    };
+    match discover_from(dav, start, name, true).await {
+        Ok(Some(found)) => Ok(found),
+        // The well-known location is the more telling failure when both fail.
+        from_root => Err(from_well_known
+            .err()
+            .or(from_root.err())
+            .unwrap_or_else(nowhere)),
     }
-    Err(CalendarError::NotFound(format!(
-        "caldav: {} is not a calendar collection and names no calendar home or principal; \
-         configure the calendar collection URL",
-        redact(start)
-    )))
 }
 
 fn calendar_query(window: SyncWindow, expand: bool) -> String {
@@ -412,18 +574,20 @@ async fn report(
     collection: &Url,
     calendar_id: &str,
     window: SyncWindow,
-) -> Result<Vec<CalendarEvent>> {
+) -> Result<Fetched> {
     let mut response = dav
         .send("REPORT", collection, "1", &calendar_query(window, true))
         .await?;
-    // Servers without `expand` support reject the query; ask for the plain data instead.
+    // Servers without `expand` support reject the query; ask for the plain data instead. Not
+    // after a 5xx, which is usually transient: the plain data stores a recurring event as one
+    // master instead of one event per occurrence, so the occurrences would be dropped until
+    // the next sync.
     if matches!(
         response.status,
         StatusCode::BAD_REQUEST
             | StatusCode::FORBIDDEN
             | StatusCode::UNSUPPORTED_MEDIA_TYPE
             | StatusCode::UNPROCESSABLE_ENTITY
-            | StatusCode::INTERNAL_SERVER_ERROR
             | StatusCode::NOT_IMPLEMENTED
     ) {
         response = dav
@@ -437,8 +601,18 @@ async fn report(
             &response.body,
         ));
     }
+    let resources = parse_resources(&response.url, &response.body)?;
+    let incomplete = resources.iter().find_map(|r| {
+        Some(format!(
+            "caldav: REPORT {} answered HTTP {} for {}: results are incomplete, so stored \
+             events it did not list were kept",
+            redact(&response.url),
+            r.failure?,
+            r.href.as_ref().map_or_else(|| "a resource".into(), redact)
+        ))
+    });
     let mut events = Vec::new();
-    for resource in parse_resources(&response.url, &response.body)? {
+    for resource in resources {
         let Some(data) = resource.calendar_data else {
             continue;
         };
@@ -447,7 +621,7 @@ async fn report(
             events.push(event);
         }
     }
-    Ok(events)
+    Ok(Fetched { events, incomplete })
 }
 
 pub(super) async fn fetch(
@@ -456,11 +630,15 @@ pub(super) async fn fetch(
     collection_url: &mut Option<String>,
     calendar: &Calendar,
     window: SyncWindow,
-) -> Result<Vec<CalendarEvent>> {
+) -> Result<Fetched> {
     let start = Url::parse(account.url.trim()).map_err(|e| {
         CalendarError::Backend(format!("caldav: invalid url {:?}: {}", account.url, e))
     })?;
-    let dav = Dav { http, account };
+    let dav = Dav {
+        http,
+        account,
+        configured: &start,
+    };
     let remembered = collection_url.as_deref().and_then(|u| Url::parse(u).ok());
     let collection = match remembered.clone() {
         Some(url) => url,
@@ -521,6 +699,102 @@ mod tests {
         assert!(follow(&from, "/other/").is_ok());
         assert!(follow(&from, "https://p42-caldav.example.net/1/calendars/").is_ok());
         assert!(follow(&from, "http://169.254.169.254/latest/").is_err());
+    }
+
+    #[test]
+    fn follow_refuses_other_hosts_internal_addresses() {
+        let from = Url::parse("https://dav.example/cal/").unwrap();
+        for internal in [
+            "https://127.0.0.1/",
+            "https://10.0.0.5/",
+            "https://192.168.1.2:8443/",
+            "https://169.254.169.254/latest/",
+            "https://100.64.0.1/",
+            "https://0.0.0.0/",
+            "https://[::1]/",
+            "https://[fd00::1]/",
+            "https://[fe80::1]/",
+            "https://[::ffff:127.0.0.1]/",
+            "https://localhost/",
+            "https://api.localhost/",
+        ] {
+            let err = follow(&from, internal).unwrap_err().to_string();
+            assert!(err.contains("internal address"), "{}: {}", internal, err);
+        }
+        assert!(follow(&from, "https://203.0.113.9/").is_ok());
+        // A server configured on a private address may still move between its own ports.
+        let lan = Url::parse("http://192.168.1.2:5232/").unwrap();
+        assert!(follow(&lan, "/user/calendar/").is_ok());
+        assert!(follow(&lan, "https://192.168.1.2:8443/user/").is_ok());
+        assert!(follow(&lan, "https://192.168.1.3/user/").is_err());
+    }
+
+    #[test]
+    fn site_approximates_the_registrable_domain() {
+        assert_eq!(site("p42-caldav.icloud.com"), Some("icloud.com"));
+        assert_eq!(site("icloud.com"), Some("icloud.com"));
+        assert_eq!(site("dav.example.de."), Some("example.de"));
+        assert_eq!(site("a.b.example.co.uk"), Some("example.co.uk"));
+        assert_eq!(site("example.com.au"), Some("example.com.au"));
+        assert_eq!(site("localhost"), None);
+    }
+
+    #[test]
+    fn credentials_stay_with_the_configured_site() {
+        let url = |s: &str| Url::parse(s).unwrap();
+        let icloud = url("https://caldav.icloud.com/");
+        assert!(may_send_credentials(
+            &icloud,
+            &url("https://p42-caldav.icloud.com/1/")
+        ));
+        assert!(may_send_credentials(
+            &icloud,
+            &url("https://caldav.icloud.com:8443/")
+        ));
+        assert!(!may_send_credentials(
+            &icloud,
+            &url("http://p42-caldav.icloud.com/")
+        ));
+        assert!(!may_send_credentials(
+            &icloud,
+            &url("https://evil.example/")
+        ));
+        assert!(!may_send_credentials(
+            &icloud,
+            &url("https://icloud.com.evil.example/")
+        ));
+        // Sibling registrations under a country-code second level are different sites.
+        let uk = url("https://example.co.uk/dav/");
+        assert!(!may_send_credentials(&uk, &url("https://evil.co.uk/")));
+        let ip = url("http://127.0.0.1:5232/");
+        assert!(may_send_credentials(
+            &ip,
+            &url("http://127.0.0.1:5232/user/")
+        ));
+        assert!(!may_send_credentials(&ip, &url("https://127.0.0.2/")));
+    }
+
+    #[test]
+    fn multistatus_failures_are_flagged() {
+        let base = Url::parse("https://dav.example/cal/").unwrap();
+        let body = r#"<d:multistatus xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">
+          <d:response><d:href>/cal/a.ics</d:href>
+            <d:propstat><d:prop><d:getetag>"a"</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+            <d:propstat><d:prop><cal:calendar-data/></d:prop><d:status>HTTP/1.1 403 Forbidden</d:status></d:propstat>
+          </d:response>
+          <d:response><d:href>/cal/b.ics</d:href>
+            <d:propstat><d:prop><cal:calendar-data/></d:prop><d:status>HTTP/1.1 503 Service Unavailable</d:status></d:propstat>
+          </d:response>
+          <d:response><d:href>/cal/</d:href><d:status>HTTP/1.1 507 Insufficient Storage</d:status></d:response>
+          <d:response><d:href>/cal/c.ics</d:href><d:status>HTTP/1.1 200 OK</d:status></d:response>
+        </d:multistatus>"#;
+        let failures: Vec<_> = parse_resources(&base, body)
+            .unwrap()
+            .iter()
+            .map(|r| r.failure)
+            .collect();
+        // An unreadable (403) resource is skipped, not a sign of a partial answer.
+        assert_eq!(failures, [None, Some(503), Some(507), None]);
     }
 
     #[test]

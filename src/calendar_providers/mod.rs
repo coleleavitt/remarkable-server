@@ -6,6 +6,9 @@
 //! [`CalendarConfig`] they were given, so the caller can persist it even when the fetch
 //! itself fails afterwards.
 //!
+//! Response bodies are read with a size cap: this process also serves the tablets, so a
+//! broken or hostile provider must not be able to exhaust its memory.
+//!
 //! Provider URLs (CalDAV servers) are admin-provided through the authenticated calendar API,
 //! the same trust level as ICS file paths.
 
@@ -76,6 +79,29 @@ const CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(60);
 /// Upper bound on followed pages per sync, in case a provider keeps returning page links.
 const MAX_PAGES: usize = 200;
+/// Largest provider response body read (a CalDAV REPORT or one API page); a year of calendar
+/// data is far below this.
+const MAX_BODY_BYTES: usize = 32 << 20;
+/// Largest OAuth token endpoint response read.
+const MAX_TOKEN_BODY_BYTES: usize = 1 << 20;
+
+/// Events a provider returned for a [`SyncWindow`].
+#[derive(Debug)]
+pub struct Fetched {
+    pub events: Vec<CalendarEvent>,
+    /// Why the answer may be missing events (a CalDAV server truncating its results, say).
+    /// Stored events it does not list are then kept rather than removed as deleted upstream.
+    pub incomplete: Option<String>,
+}
+
+impl Fetched {
+    fn complete(events: Vec<CalendarEvent>) -> Self {
+        Self {
+            events,
+            incomplete: None,
+        }
+    }
+}
 
 /// Shared HTTP client and endpoints for remote calendar syncs.
 #[derive(Clone)]
@@ -120,7 +146,7 @@ impl RemoteSync {
         calendar: &Calendar,
         config: &mut CalendarConfig,
         window: SyncWindow,
-    ) -> Result<Vec<CalendarEvent>> {
+    ) -> Result<Fetched> {
         match config {
             CalendarConfig::Ics { .. } => Err(CalendarError::Backend(
                 "ICS calendars are read from a local file, not a remote provider".into(),
@@ -171,6 +197,7 @@ impl RemoteSync {
                     window,
                 )
                 .await
+                .map(Fetched::complete)
             }
             CalendarConfig::Office365 {
                 tenant_id,
@@ -212,6 +239,7 @@ impl RemoteSync {
                     window,
                 )
                 .await
+                .map(Fetched::complete)
             }
             CalendarConfig::Exchange { .. } => {
                 Err(CalendarError::Backend(EXCHANGE_UNSUPPORTED.into()))
@@ -251,6 +279,36 @@ fn network_error(context: &str, err: reqwest::Error) -> CalendarError {
         source = cause.source();
     }
     CalendarError::Network(message)
+}
+
+/// `response`'s body as UTF-8 (invalid sequences replaced), or an error once it grows past
+/// `limit` bytes.
+async fn read_body(mut response: reqwest::Response, limit: usize, context: &str) -> Result<String> {
+    let too_large = || {
+        CalendarError::Backend(format!(
+            "{}: response body larger than {} bytes",
+            context, limit
+        ))
+    };
+    if response
+        .content_length()
+        .is_some_and(|len| len > limit as u64)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| network_error(context, e))?
+    {
+        if body.len() + chunk.len() > limit {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8(body)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
 }
 
 /// First few hundred characters of a response body, whitespace-collapsed, for error messages.
@@ -305,6 +363,41 @@ mod tests {
     fn redact_drops_credentials_and_query() {
         let url = reqwest::Url::parse("https://user:pw@dav.example:8443/cal/?token=x").unwrap();
         assert_eq!(redact(&url), "https://dav.example:8443/cal/");
+    }
+
+    #[tokio::test]
+    async fn read_body_stops_at_the_limit() {
+        use axum::body::Body;
+        use axum::routing::get;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new()
+            // Content-Length announced up front.
+            .route("/sized", get(|| async { "x".repeat(100) }))
+            // Chunked, no length: only counting the chunks catches it.
+            .route(
+                "/streamed",
+                get(|| async {
+                    let chunks =
+                        (0..4).map(|_| Ok::<_, std::io::Error>(bytes::Bytes::from("y".repeat(25))));
+                    Body::from_stream(futures_util::stream::iter(chunks))
+                }),
+            );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let http = reqwest::Client::new();
+        for path in ["/sized", "/streamed"] {
+            let get = || http.get(format!("{}{}", base, path)).send();
+            let body = read_body(get().await.unwrap(), 100, "t").await.unwrap();
+            assert_eq!(body.len(), 100, "{}", path);
+            let err = read_body(get().await.unwrap(), 99, "t").await.unwrap_err();
+            assert!(
+                err.to_string().contains("larger than 99 bytes"),
+                "{}: {}",
+                path,
+                err
+            );
+        }
     }
 
     #[test]
