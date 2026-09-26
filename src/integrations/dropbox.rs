@@ -295,7 +295,16 @@ fn below<'a>(lower: &'a str, root: &str) -> Option<Vec<&'a str>> {
 async fn response_error(response: reqwest::Response) -> IntegrationError {
     let status = response.status();
     match status.as_u16() {
-        401 => IntegrationError::TokenExpired,
+        // A token without a scope the endpoint needs is no expired token: refreshing it keeps
+        // the scopes it was granted.
+        401 => {
+            let body = response.text().await.unwrap_or_default();
+            if error_summary(&body).is_some_and(|s| s.starts_with("missing_scope/")) {
+                IntegrationError::MissingScope(body)
+            } else {
+                IntegrationError::TokenExpired
+            }
+        }
         429 => IntegrationError::RateLimited {
             retry_after_secs: response
                 .headers()
@@ -597,7 +606,11 @@ impl CloudProvider for Dropbox {
         Ok(parts.iter().all(|p| is_safe_name(p)).then_some(parts))
     }
 
-    /// `users/get_current_account`'s `account_id` (`dbid:…`).
+    /// `users/get_current_account`'s `account_id` (`dbid:…`). That endpoint needs the
+    /// `account_info.read` scope, which tokens authorized before it was requested (see
+    /// [`OAuthConfig::dropbox`]) don't carry: for those the account is unknown (`None`) rather
+    /// than the sync failing. Connecting Dropbox again grants the scope; the account is then
+    /// known, and its first sync infers no deletions.
     async fn account_id(&self) -> Result<Option<String>> {
         #[derive(Serialize)]
         struct Null;
@@ -605,8 +618,21 @@ impl CloudProvider for Dropbox {
         struct Account {
             account_id: String,
         }
-        let account: Account = self.api_request("users/get_current_account", &Null).await?;
-        Ok(Some(account.account_id))
+        match self
+            .api_request::<_, Account>("users/get_current_account", &Null)
+            .await
+        {
+            Ok(account) => Ok(Some(account.account_id)),
+            Err(IntegrationError::MissingScope(why)) => {
+                tracing::warn!(
+                    "dropbox: the token can't read the account ({}); keeping the sync state \
+                     without it. Connect Dropbox again to grant account_info.read",
+                    why
+                );
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Compares `content_hash` with the [Dropbox content hash](content_hash) of `content`.
@@ -1724,12 +1750,21 @@ mod tests {
         use serde_json::{Value, json};
 
         use super::*;
-        use crate::integrations::sync::{CloudSync, SyncConfig, SyncDirection, SyncResult};
+        use crate::integrations::sync::{
+            CloudSync,
+            SyncConfig,
+            SyncDirection,
+            SyncResult,
+            SyncStatus,
+        };
 
         #[derive(Default)]
         struct Remote {
             /// What `users/get_current_account` answers.
             account: String,
+            /// `users/get_current_account` answers `401 missing_scope`, as for a token without
+            /// `account_info.read`.
+            missing_scope: bool,
             /// By `path_lower`: the entry and the file's content.
             entries: BTreeMap<String, (Value, Vec<u8>)>,
             /// Paths uploaded to, in order.
@@ -1807,7 +1842,15 @@ mod tests {
                     .route(
                         "/users/get_current_account",
                         post(|State(r): State<Shared>| async move {
-                            Json(json!({ "account_id": r.lock().unwrap().account }))
+                            let r = r.lock().unwrap();
+                            if r.missing_scope {
+                                return (
+                                    StatusCode::UNAUTHORIZED,
+                                    r#"{"error_summary":"missing_scope/..","error":{".tag":"missing_scope","required_scope":"account_info.read"}}"#,
+                                )
+                                    .into_response();
+                            }
+                            Json(json!({ "account_id": r.account })).into_response()
                         }),
                     )
                     .route(
@@ -2027,6 +2070,93 @@ mod tests {
                     .unwrap();
             assert_eq!(state["syncs"][0]["account"], "dbid:alice");
             assert_eq!(state["syncs"][0]["cloud_folder"], "/Notes");
+        }
+
+        /// A token authorized without `account_info.read` (every one before it was asked for)
+        /// can't read the account: the sync still runs, keeping its state for an unknown
+        /// account, and deletions are kept deleted as with a known one. Any other failure of
+        /// the account lookup stops the sync before anything is listed or written.
+        #[tokio::test]
+        async fn a_token_that_cant_read_the_account_still_syncs() {
+            let remote = Shared::default();
+            {
+                let mut r = remote.lock().unwrap();
+                r.missing_scope = true;
+                put(&mut r, "/Notes/a.pdf", b"A");
+                put(&mut r, "/Notes/b.pdf", b"B");
+            }
+            let base = fake(remote.clone()).await;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let r = sync_kept(&base, root, "/Notes").await;
+            assert_eq!((r.status, r.downloaded), (SyncStatus::Success, 2));
+            let state: Value =
+                serde_json::from_slice(&std::fs::read(root.join(".rms-sync-state.json")).unwrap())
+                    .unwrap();
+            assert_eq!(state["syncs"][0]["account"], "");
+
+            remote.lock().unwrap().entries.remove("/notes/b.pdf");
+            let r = sync_kept(&base, root, "/Notes").await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 0, 1));
+            assert!(uploads(&remote).is_empty());
+        }
+
+        /// `401 missing_scope` is its own error, not an expired token (which refreshing would
+        /// fix); any other 401 still is one.
+        #[tokio::test]
+        async fn missing_scope_is_not_an_expired_token() {
+            let app = axum::Router::new()
+                .route(
+                    "/users/get_space_usage",
+                    post(|| async {
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            r#"{"error_summary":"missing_scope/..","error":{".tag":"missing_scope"}}"#,
+                        )
+                    }),
+                )
+                .route(
+                    "/users/get_current_account",
+                    post(|| async {
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            r#"{"error_summary":"expired_access_token/..","error":{".tag":"expired_access_token"}}"#,
+                        )
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let config = OAuthConfig::dropbox("id".into(), None, "http://localhost/cb".into());
+            let token = OAuthToken {
+                access_token: "t".into(),
+                refresh_token: None,
+                token_type: "Bearer".into(),
+                expires_at: None,
+                scope: None,
+            };
+            let d = Dropbox::with_token(config, token).with_base_urls(&base, &base);
+            let err = d.get_quota().await.unwrap_err();
+            assert!(matches!(err, IntegrationError::MissingScope(_)), "{err}");
+            let err = d.account_id().await.unwrap_err();
+            assert!(matches!(err, IntegrationError::TokenExpired), "{err}");
+
+            // An expired token fails the sync as a whole: nothing is listed, written or saved.
+            let dir = tempfile::tempdir().unwrap();
+            let config = SyncConfig {
+                local_path: dir.path().to_path_buf(),
+                cloud_folder: Some("/Notes".into()),
+                persist_state: true,
+                ..Default::default()
+            };
+            let r = CloudSync::new(d, config).sync().await.unwrap();
+            assert_eq!(r.status, SyncStatus::Failed);
+            assert!(
+                r.errors[0].starts_with("Failed to load the sync state: Token expired"),
+                "{:?}",
+                r.errors
+            );
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
         }
 
         /// A tree that hasn't changed isn't sent again by the next sync, however deep; an edit

@@ -39,7 +39,10 @@ impl OAuthConfig {
         }
     }
 
-    /// Dropbox OAuth config
+    /// Dropbox OAuth config. A token carries only the scopes asked for here (the `scope`
+    /// parameter picks a subset of the app's), so `account_info.read` is asked for too, for
+    /// `users/get_current_account` (the account full sync keeps its state for) and
+    /// `users/get_space_usage` (quota).
     pub fn dropbox(client_id: String, client_secret: Option<String>, redirect_uri: String) -> Self {
         Self {
             provider: ProviderType::Dropbox,
@@ -47,6 +50,7 @@ impl OAuthConfig {
             client_secret,
             redirect_uri,
             scopes: vec![
+                "account_info.read".into(),
                 "files.content.read".into(),
                 "files.content.write".into(),
                 "files.metadata.read".into(),
@@ -407,6 +411,34 @@ mod tests {
         // Verify challenge is S256 of verifier
         let expected = PkceFlow::generate_challenge(flow.code_verifier());
         assert_eq!(flow.code_challenge, expected);
+    }
+
+    /// A Dropbox token carries only the scopes the authorize URL asks for, so it asks for
+    /// `account_info.read`: without it `users/get_current_account` (the account a sync's state
+    /// is kept for) answers `401 missing_scope`.
+    #[test]
+    fn dropbox_asks_for_account_info() {
+        let flow = PkceFlow::new(OAuthConfig::dropbox(
+            "id".into(),
+            None,
+            "http://localhost/cb".into(),
+        ));
+        let url = reqwest::Url::parse(&flow.authorization_url()).unwrap();
+        let scope = url
+            .query_pairs()
+            .find(|(k, _)| k == "scope")
+            .map(|(_, v)| v.into_owned())
+            .unwrap();
+        let scopes: Vec<&str> = scope.split(' ').collect();
+        for want in [
+            "account_info.read",
+            "files.content.read",
+            "files.content.write",
+            "files.metadata.read",
+            "files.metadata.write",
+        ] {
+            assert!(scopes.contains(&want), "{want} not in {scope:?}");
+        }
     }
 
     #[test]

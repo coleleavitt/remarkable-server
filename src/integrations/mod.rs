@@ -39,6 +39,12 @@ pub enum IntegrationError {
     #[error("Token expired")]
     TokenExpired,
 
+    /// The token wasn't granted a scope the request needs (Dropbox `401 missing_scope`, e.g. a
+    /// token authorized before the scope was requested). Refreshing it doesn't help;
+    /// connecting the provider again grants what is requested now.
+    #[error("Token lacks a required scope: {0}")]
+    MissingScope(String),
+
     #[error("Token refresh failed: {0}")]
     TokenRefreshFailed(String),
 

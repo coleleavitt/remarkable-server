@@ -742,9 +742,12 @@ mod tests {
     }
 
     /// Every `POST /sync` is a new `CloudSync`, so the state of the last sync must be kept on
-    /// disk, or each sync would upload again what was deleted remotely.
+    /// disk, or each sync would upload again what was deleted remotely. This checks the config
+    /// `trigger_sync` builds each sync from (`sync_config`, its only source of one); that a
+    /// config with `persist_state` keeps the state from one `CloudSync` to the next is tested
+    /// in `sync` and against the providers' fakes.
     #[test]
-    fn syncs_keep_their_state_between_requests() {
+    fn sync_requests_are_configured_to_keep_state() {
         use crate::integrations::sync::SyncDirection;
         for (direction, expected) in [
             (Some("upload"), SyncDirection::Upload),

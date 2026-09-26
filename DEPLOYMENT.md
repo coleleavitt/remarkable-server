@@ -299,13 +299,35 @@ since from their local copies. The first sync after deploying this is such a fir
 sync (as every sync was before), so a file deleted remotely before then comes back
 that one last time. Local copies of files deleted remotely are moved to
 `.rms-remote-deleted/<UTC time>/` in the same directory, never deleted: look
-through it now and then and delete what isn't needed, as nothing else does. A state
+through it now and then and delete what isn't needed, as nothing else does. A sync
+whose listing comes back empty moves nothing aside and reports an error listing the
+local files it left in place: check that the folder still exists and is shared with
+the account, and if its files really were deleted, delete the local copies. A state
 file the server can't read (not JSON, or written by a newer version) fails the sync
 with an error naming it; delete it to start over with a first sync. Rolling back to
 an older binary is safe: it ignores both (hidden entries). Upgrading again after
-syncs by the older binary is safe too: the state they didn't update costs at most
-transfers of unchanged content, or for Google Drive a conflict-strategy decision, as
-before this change.
+syncs by the older binary is safe too: files changed while it synced are compared
+by content, and otherwise go through the conflict strategy, as before this change.
+
+Google Drive after deploying this: earlier versions uploaded every changed file as
+a new file next to the old one (Drive allows several files of one name in a
+folder), and a sync only ever sees the oldest of them. Uploads now update that
+oldest file in place. The first sync after deploying compares Drive's MD5 with the
+local files, so files already the same on both sides are left alone; a file edited
+locally since its download still goes through the conflict strategy (newer wins,
+so the local edit replaces the listed copy). The duplicates earlier versions made
+stay in Drive, never seen by sync: look for same-named files in the synced folders
+and delete the newer copies once the oldest holds what you want. A Google Drive
+`cloud_folder` in the trash, deleted or no longer shared now fails the sync with an
+error instead of listing as empty.
+
+Dropbox after deploying this: full sync keeps its state per Dropbox account, read
+with the `account_info.read` scope, which the authorize URL now requests. A token
+connected before lacks it: syncs work, keeping their state for an unknown account
+(the log warns), and `GET /providers/dropbox/quota` answers "Token lacks a required
+scope" rather than "Token expired". Connecting Dropbox again (the OAuth flow) grants
+the scope; the next sync is then a first sync for that account (no deletions
+inferred), and later ones use its own state.
 
 Migrating storage from a local server: stop both, `rsync -a test-storage/ linode:/var/lib/remarkable-server/`,
 `chown -R remarkable:remarkable`, start. `sync.db` (with its `-wal`/`-shm`

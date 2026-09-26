@@ -145,10 +145,24 @@ The community's top *concrete* pains. Small, bounded, high-value.
   `<local_path>/.rms-sync-state.json` and reconciles three ways against it: a
   file deleted remotely is no longer uploaded again (its unchanged local copy is
   moved to `.rms-remote-deleted/`), one deleted locally is no longer downloaded
-  again (nor deleted remotely), and files unchanged on both sides, Google Drive's
-  included, skip the conflict strategy. A folder's first sync still goes without
-  state, so on Google Drive its files on both sides go through the conflict
-  strategy that once.
+  again (nor deleted remotely), and files unchanged on both sides skip the
+  conflict strategy. Google Drive uploads now update the listed file in place
+  instead of adding a same-named duplicate the listing hides, and its MD5 is
+  compared, so its files already the same on both sides skip the strategy on the
+  first sync too.
+- ⬜ **Cloud sync: limit what one sync moves aside** — an empty listing moves
+  nothing aside, but a partial one (a subfolder unshared, a provider bug) still
+  moves every unchanged local copy it no longer shows into
+  `.rms-remote-deleted/`. Refuse, or require an explicit flag, when more than a
+  set share of the tracked files would be moved in one sync. *Effort: S.*
+- ⬜ **Cloud sync housekeeping** — `.rms-remote-deleted/` is never cleaned up,
+  and `.rms-sync-state.json` keeps a manifest for every provider, account and
+  folder ever synced into a directory. Add a retention period for the first and
+  pruning of manifests not synced for a long time. *Effort: S.*
+- ⬜ **Google Drive duplicates left by earlier versions** — before in-place
+  updates, every upload of a changed file added a same-named file next to the
+  old one; sync only sees the oldest. Report same-named siblings in a synced
+  folder (a notice), so they can be cleaned up in Drive. *Effort: S.*
 - ✅ **Screenshare MQTT broker vs revocation** *(#31)* — sessions on the
   `SCREENSHARE_BIND` broker now close when their device is revoked, like the
   `/notifications/ws` and (when enabled) `/mqtt` ones, and a revoked device leaves its REST

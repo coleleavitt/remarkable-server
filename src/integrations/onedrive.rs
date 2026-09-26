@@ -1328,6 +1328,8 @@ mod tests {
             /// Base of another server, for links that point away from this one.
             foreign: Arc<Mutex<String>>,
             log: Arc<Mutex<Vec<String>>>,
+            /// Ids of items deleted since: left out of `children`.
+            deleted: Arc<Mutex<Vec<String>>>,
         }
 
         impl Fake {
@@ -1360,7 +1362,9 @@ mod tests {
                 let next = format!("{}/me/drive/items/F/children", foreign);
                 return Json(json!({ "value": [], "@odata.nextLink": next }));
             }
-            let (value, next) = children(&id, page);
+            let (mut value, next) = children(&id, page);
+            let deleted = fake.deleted.lock().unwrap().clone();
+            value.retain(|v| !deleted.iter().any(|d| v["id"] == **d));
             let base = fake.base.lock().unwrap().clone();
             let mut body = json!({ "value": value });
             if let Some(next) = next {
@@ -1434,7 +1438,16 @@ mod tests {
                 .route("/me/drive/items/{id}", get(item_route))
                 .route(
                     "/me/drive/items/{id}/content",
-                    get(|Path(id): Path<String>| async move { id }),
+                    get(
+                        |State(fake): State<Fake>, Path(id): Path<String>| async move {
+                            fake.log(format!("content {}", id));
+                            id
+                        },
+                    ),
+                )
+                .route(
+                    "/me/drive",
+                    get(|| async { Json(json!({ "id": "b!drive" })) }),
                 )
                 .route("/me/drive/root/delta", get(delta_route))
                 .with_state(fake.clone());
@@ -1729,6 +1742,49 @@ mod tests {
                     "PUT /me/drive/root:/x.pdf:/content"
                 ]
             );
+        }
+
+        /// With the state kept between syncs, as `POST /sync` keeps it, against Graph listings
+        /// (no hash here, so ids and times tell a change): files unchanged on both sides aren't
+        /// transferred again, a file deleted here isn't downloaded again, and the local copy of
+        /// one deleted in OneDrive is moved aside rather than uploaded again. The state is the
+        /// signed-in user's drive's.
+        #[tokio::test]
+        async fn kept_state_keeps_deletions_deleted() {
+            let (base, fake) = fake_graph().await;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let config = SyncConfig {
+                local_path: root.to_path_buf(),
+                cloud_folder: Some("F".into()),
+                persist_state: true,
+                ..Default::default()
+            };
+            let sync = || async {
+                let r = CloudSync::new(onedrive(&base), config.clone())
+                    .sync()
+                    .await
+                    .unwrap();
+                assert!(r.errors.is_empty(), "{:?}", r.errors);
+                (r.uploaded, r.downloaded, r.deleted)
+            };
+            assert_eq!(sync().await, (0, 4, 0));
+            assert_eq!(fake.calls("content").len(), 4);
+
+            std::fs::remove_file(root.join("a.pdf")).unwrap();
+            fake.deleted.lock().unwrap().push("B".into());
+            assert_eq!(sync().await, (0, 0, 1));
+            assert!(!root.join("a.pdf").exists() && !root.join("b.pdf").exists());
+            assert_eq!(std::fs::read(root.join("Sub/c.pdf")).unwrap(), b"C");
+            assert!(root.join(".rms-remote-deleted").is_dir());
+
+            assert_eq!(sync().await, (0, 0, 0));
+            assert_eq!(fake.calls("content").len(), 4);
+            let state: Value =
+                serde_json::from_slice(&std::fs::read(root.join(".rms-sync-state.json")).unwrap())
+                    .unwrap();
+            assert_eq!(state["syncs"][0]["account"], "b!drive");
+            assert_eq!(state["syncs"][0]["cloud_folder"], "F");
         }
 
         /// A folder other than the drive root was kept under its own path from the drive root
