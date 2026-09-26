@@ -74,7 +74,7 @@
 ### Integrations
 - /integrations/v1/ - List integrations ✓
 - /integrations/v2/instances - Integration instances ✓
-- /integrations/v2/calendars/* - Calendar integration ✓ (only ICS files sync; CalDAV/Google/Office 365 sync answers "not implemented")
+- /integrations/v2/calendars/* - Calendar integration ✓ (ICS files, CalDAV, Google Calendar, Microsoft Graph sync; on-prem Exchange/EWS answers "not supported")
 - /integrations/v2/readlater/* - Read-it-later accounts/articles ✓ (credentials persisted; the sync endpoints are placeholders that don't sync)
 - /integrations/v2/cloud/* - Cloud storage OAuth (Google Drive, Dropbox, OneDrive) ✓ (sync confined to `<storage>/integrations`)
 

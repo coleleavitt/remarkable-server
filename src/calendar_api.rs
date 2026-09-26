@@ -6,6 +6,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
@@ -22,12 +23,15 @@ use crate::calendar::{
     SyncConfig,
     parse_ics_file,
 };
+use crate::calendar_providers::{ProviderEndpoints, RemoteSync, SyncWindow};
 use crate::error::{Result, ServerError};
 
 #[derive(Clone)]
 pub struct CalendarState {
     pub manager: Arc<Mutex<CalendarManager>>,
     pub sync_config: SyncConfig,
+    /// HTTP client and API endpoints for CalDAV / Google / Microsoft Graph calendars.
+    pub remote: RemoteSync,
 }
 
 impl CalendarState {
@@ -35,7 +39,14 @@ impl CalendarState {
         Self {
             manager: Arc::new(Mutex::new(manager)),
             sync_config: SyncConfig::default(),
+            remote: RemoteSync::default(),
         }
+    }
+
+    /// Use other Google / Microsoft API endpoints (tests, sovereign clouds).
+    pub fn with_endpoints(mut self, endpoints: ProviderEndpoints) -> Self {
+        self.remote = RemoteSync::new(endpoints);
+        self
     }
 }
 
@@ -147,16 +158,28 @@ pub enum CalendarConfigRequest {
         #[serde(default)]
         watch: bool,
     },
+    /// `url` is the calendar collection or a URL to discover it from (server root, principal
+    /// or calendar home). Basic auth with `username`/`password`, or `bearer_token`.
     Caldav {
         url: String,
+        #[serde(default)]
         username: String,
         password: Option<String>,
+        #[serde(default)]
+        bearer_token: Option<String>,
     },
+    /// Google Calendar API v3. `refresh_token` plus `client_id` (and usually `client_secret`)
+    /// let the server renew the access token by itself.
     Google {
         calendar_id: String,
         access_token: Option<String>,
         refresh_token: Option<String>,
+        #[serde(default)]
+        client_id: Option<String>,
+        #[serde(default)]
+        client_secret: Option<String>,
     },
+    /// On-premises Exchange (EWS); stored but not synced.
     Exchange {
         server: String,
         username: String,
@@ -164,10 +187,18 @@ pub enum CalendarConfigRequest {
         #[serde(default)]
         use_ews: bool,
     },
+    /// Microsoft Graph (Exchange Online / Microsoft 365). `calendar_id` defaults to the
+    /// user's default calendar.
     Office365 {
         tenant_id: String,
         access_token: Option<String>,
         refresh_token: Option<String>,
+        #[serde(default)]
+        client_id: Option<String>,
+        #[serde(default)]
+        client_secret: Option<String>,
+        #[serde(default)]
+        calendar_id: Option<String>,
     },
 }
 
@@ -182,19 +213,27 @@ impl From<CalendarConfigRequest> for CalendarConfig {
                 url,
                 username,
                 password,
+                bearer_token,
             } => CalendarConfig::Caldav {
                 url,
                 username,
                 password,
+                bearer_token,
+                collection_url: None,
             },
             CalendarConfigRequest::Google {
                 calendar_id,
                 access_token,
                 refresh_token,
+                client_id,
+                client_secret,
             } => CalendarConfig::Google {
                 calendar_id,
                 access_token,
                 refresh_token,
+                client_id,
+                client_secret,
+                token_expires_at: None,
             },
             CalendarConfigRequest::Exchange {
                 server,
@@ -211,10 +250,17 @@ impl From<CalendarConfigRequest> for CalendarConfig {
                 tenant_id,
                 access_token,
                 refresh_token,
+                client_id,
+                client_secret,
+                calendar_id,
             } => CalendarConfig::Office365 {
                 tenant_id,
                 access_token,
                 refresh_token,
+                client_id,
+                client_secret,
+                calendar_id,
+                token_expires_at: None,
             },
         }
     }
@@ -305,6 +351,16 @@ pub async fn add_calendar(
             )));
         }
     };
+    if let CalendarConfigRequest::Caldav { url, .. } = &request.config {
+        let valid = reqwest::Url::parse(url.trim())
+            .is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.has_host());
+        if !valid {
+            return Err(ServerError::BadRequest(format!(
+                "caldav url must be an http(s) URL: {:?}",
+                url
+            )));
+        }
+    }
     let calendar = Calendar {
         id: uuid::Uuid::new_v4().to_string(),
         name: request.name,
@@ -384,9 +440,29 @@ pub async fn list_meeting_notes(
 pub struct SyncResponse {
     pub calendar_id: String,
     pub events_synced: usize,
+    /// Stored events in the sync window that the provider no longer returns (deleted or
+    /// moved upstream) and were removed. Omitted when zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub events_removed: usize,
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+impl SyncResponse {
+    fn new(calendar_id: String, events_synced: usize, error: Option<String>) -> Self {
+        Self {
+            calendar_id,
+            events_synced,
+            events_removed: 0,
+            success: error.is_none(),
+            error,
+        }
+    }
 }
 
 pub async fn sync_calendar_endpoint(
@@ -406,28 +482,96 @@ pub async fn sync_calendar_endpoint(
             for event in events {
                 mgr.upsert_event(&event)?;
             }
+            mgr.set_last_sync(&id, Utc::now())?;
             count
         }
         _ => {
-            return Ok(Json(SyncResponse {
-                calendar_id: id,
-                events_synced: 0,
-                success: false,
-                error: Some(unsupported_sync(&calendar.provider)),
-            }));
+            // Provider problems (including rejected credentials) are reported in the body, never
+            // as an HTTP error status of this server.
+            let result = sync_remote(&state, calendar).await;
+            if let Some(err) = &result.error {
+                tracing::warn!("calendar {} sync failed: {}", result.calendar_id, err);
+            }
+            return Ok(Json(result));
         }
     };
-    Ok(Json(SyncResponse {
-        calendar_id: id,
-        events_synced: count,
-        success: true,
-        error: None,
-    }))
+    Ok(Json(SyncResponse::new(id, count, None)))
 }
 
-/// Only ICS calendars can be synced so far; other providers report that instead of a fake success.
-fn unsupported_sync(provider: &CalendarProvider) -> String {
-    format!("sync is not implemented for {} calendars", provider)
+/// Fetch a remote (CalDAV / Google / Microsoft Graph) calendar and store what it returned in
+/// the sync window. Every failure is reported in the response rather than returned.
+async fn sync_remote(state: &CalendarState, calendar: Calendar) -> SyncResponse {
+    let window = SyncWindow::around(Utc::now());
+    let mut config = calendar.config.clone();
+    let fetched = state
+        .remote
+        .fetch_events(&calendar, &mut config, window)
+        .await;
+    let mut errors = Vec::new();
+    let mut mgr = state.manager.lock();
+    // Refreshed/rotated tokens and discovered URLs are saved even when the fetch failed later.
+    if config != calendar.config {
+        if let Err(e) = mgr.update_config(&calendar.id, config) {
+            errors.push(format!("saving updated credentials failed: {}", e));
+        }
+    }
+    let (stored, removed) = match fetched {
+        Ok(events) => mgr
+            .replace_events_in_range(&calendar.id, window.start, window.end, &events)
+            .unwrap_or_else(|e| {
+                errors.push(format!("saving events failed: {}", e));
+                (0, 0)
+            }),
+        Err(e) => {
+            errors.insert(0, e.to_string());
+            (0, 0)
+        }
+    };
+    if errors.is_empty() {
+        if let Err(e) = mgr.set_last_sync(&calendar.id, Utc::now()) {
+            errors.push(format!("saving sync time failed: {}", e));
+        }
+    }
+    drop(mgr);
+    let error = (!errors.is_empty()).then(|| errors.join("; "));
+    SyncResponse {
+        events_removed: removed,
+        ..SyncResponse::new(calendar.id, stored, error)
+    }
+}
+
+/// Load an ICS calendar's file; failures are reported in the result.
+fn sync_ics(state: &CalendarState, calendar: &Calendar, path: &std::path::Path) -> SyncResponse {
+    let (count, error) = match parse_ics_file(path, &calendar.id) {
+        Ok(events) => {
+            let total = events.len();
+            let mut mgr = state.manager.lock();
+            let failures: Vec<String> = events
+                .iter()
+                .filter_map(|e| {
+                    mgr.upsert_event(e)
+                        .err()
+                        .map(|err| format!("{}: {}", e.uid, err))
+                })
+                .collect();
+            let error = (!failures.is_empty()).then(|| {
+                format!(
+                    "{} of {} events failed to save: {}",
+                    failures.len(),
+                    total,
+                    failures.join("; ")
+                )
+            });
+            if error.is_none() {
+                if let Err(e) = mgr.set_last_sync(&calendar.id, Utc::now()) {
+                    tracing::warn!("calendar {}: saving sync time failed: {}", calendar.id, e);
+                }
+            }
+            (total - failures.len(), error)
+        }
+        Err(e) => (0, Some(format!("ICS load failed: {}", e))),
+    };
+    SyncResponse::new(calendar.id.clone(), count, error)
 }
 
 pub async fn sync_all_calendars(
@@ -438,42 +582,14 @@ pub async fn sync_all_calendars(
     for calendar in calendars {
         // Per-calendar failures are reported in that calendar's entry (success=false + error)
         // instead of being swallowed; the rest still sync.
-        let (count, error) = match &calendar.config {
-            CalendarConfig::Ics { path, .. } => match parse_ics_file(path, &calendar.id) {
-                Ok(events) => {
-                    let total = events.len();
-                    let mut mgr = state.manager.lock();
-                    let failures: Vec<String> = events
-                        .iter()
-                        .filter_map(|e| {
-                            mgr.upsert_event(e)
-                                .err()
-                                .map(|err| format!("{}: {}", e.uid, err))
-                        })
-                        .collect();
-                    let error = (!failures.is_empty()).then(|| {
-                        format!(
-                            "{} of {} events failed to save: {}",
-                            failures.len(),
-                            total,
-                            failures.join("; ")
-                        )
-                    });
-                    (total - failures.len(), error)
-                }
-                Err(e) => (0, Some(format!("ICS load failed: {}", e))),
-            },
-            _ => (0, Some(unsupported_sync(&calendar.provider))),
+        let result = match &calendar.config {
+            CalendarConfig::Ics { path, .. } => sync_ics(&state, &calendar, path),
+            _ => sync_remote(&state, calendar).await,
         };
-        if let Some(err) = &error {
-            tracing::warn!("calendar {} sync failed: {}", calendar.id, err);
+        if let Some(err) = &result.error {
+            tracing::warn!("calendar {} sync failed: {}", result.calendar_id, err);
         }
-        results.push(SyncResponse {
-            calendar_id: calendar.id,
-            events_synced: count,
-            success: error.is_none(),
-            error,
-        });
+        results.push(result);
     }
     Ok(Json(results))
 }
@@ -553,6 +669,10 @@ mod tests {
                 tenant_id: "t".into(),
                 access_token: None,
                 refresh_token: None,
+                client_id: None,
+                client_secret: None,
+                calendar_id: None,
+                token_expires_at: None,
             },
         })
         .unwrap();
@@ -577,7 +697,7 @@ mod tests {
             o365.error
                 .as_deref()
                 .unwrap()
-                .contains("not implemented for office365"),
+                .contains("no usable access token"),
             "{:?}",
             o365.error
         );

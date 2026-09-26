@@ -1,6 +1,7 @@
 pub mod api;
 pub mod calendar;
 pub mod calendar_api;
+pub mod calendar_providers;
 pub mod checksum;
 pub mod crash;
 pub mod device;

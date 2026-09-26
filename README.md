@@ -13,7 +13,7 @@ A local sync server for reMarkable tablets, implementing **all sync protocol ver
 - rm-filename header enforcement
 - Token refresh and device pairing
 - **FTS5 full-text search** (document names, folders, PDF content)
-- **Calendar sync** (local ICS files; CalDAV/Google/Office 365 calendars can be added but their sync answers "not implemented")
+- **Calendar sync** (local ICS files, CalDAV, Google Calendar and Microsoft 365 via Graph; credentials persisted server-side)
 - **Cloud integrations** (Google Drive, Dropbox, OneDrive)
 - **Read-it-later** (Pocket, Instapaper, Wallabag accounts; credentials persisted server-side)
 - **Push notifications**: JSON WebSocket (`/notifications/ws/json/1`) and MQTT 3.1.1 over WebSocket (`/mqtt`)
@@ -173,10 +173,22 @@ Prefix `/integrations/v2/calendars`.
 | `/{id}` | GET | Get calendar |
 | `/{id}` | DELETE | Delete calendar |
 | `/{id}/events` | GET | Get events |
-| `/{id}/sync` | POST | Sync calendar (ICS files only; other providers answer `success: false`, "not implemented") |
+| `/{id}/sync` | POST | Sync calendar (provider failures answer `success: false` with an `error`) |
 | `/upcoming` | GET | Upcoming events |
 | `/sync-all` | POST | Sync all calendars |
 | `/{id}/meeting-notes`, `/{id}/events/{event_id}/meeting-notes` | GET, POST | Meeting notes |
+
+Calendar sources (`config.type` when adding a calendar):
+
+| Type | Fields | Sync |
+|------|--------|------|
+| `ics` | `path` | Local `.ics` file |
+| `caldav` | `url`, `username` + `password`, or `bearer_token` | `url` may be the calendar collection or a server/principal/home URL to discover it from (the calendar is picked by display name when there are several; the result is remembered). REPORT `calendar-query` with server-side recurrence expansion |
+| `google` | `calendar_id`, `access_token` and/or `refresh_token` + `client_id` (+ `client_secret`) | Google Calendar API v3 `events.list`, recurring events expanded |
+| `office365` | `tenant_id`, `access_token` and/or `refresh_token` + `client_id` (+ `client_secret` for confidential apps), optional `calendar_id` | Microsoft Graph `calendarView` (default calendar when `calendar_id` is unset); use it for Exchange Online too |
+| `exchange` | `server`, `username`, `password` | Not synced: on-premises EWS is not supported (answers `success: false`) |
+
+Remote calendars sync the window from 30 days back to 365 days ahead: events are upserted and stored events in that window the provider no longer returns are removed (`events_removed`). OAuth tokens are obtained out of band; the server refreshes them itself (on expiry or a 401) and saves refreshed or rotated tokens immediately. Passwords, tokens and client secrets live in the `secrets` column of `calendars.db`, never in API responses. Times without a UTC offset in CalDAV data (`TZID=` local times, only when the server cannot expand recurrences) are read as UTC.
 
 ## Integrations API
 

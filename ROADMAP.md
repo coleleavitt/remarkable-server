@@ -53,6 +53,13 @@ These are done and, in several cases, ahead of rmfakecloud:
   Wallabag password) are stored in `readlater.db` apart from the config, survive
   restarts, refreshed tokens are saved at once, never returned by the API;
   Wallabag refreshes on 401, Instapaper xAuth login; Omnivore removed (#27).
+- ✅ **Remote calendar providers** — CalDAV (basic/bearer auth, collection
+  discovery, `calendar-query` REPORT with recurrence expansion), Google Calendar
+  API v3 and Microsoft Graph (Exchange Online / Microsoft 365) sync a
+  -30d..+365d window, removing events deleted upstream. Credentials persist in
+  `calendars.db` apart from the config and never reach API responses; OAuth
+  tokens refresh on expiry or 401 and are saved at once. On-premises Exchange
+  (EWS) is not supported and says so.
 - ✅ **Security hardening (Sept 2026 review)** — OAuth device-code sign-ins need
   owner approval (#18); deleting or re-pairing a device revokes its tokens, and
   users only see and delete their own devices (#17); pairing codes are
@@ -128,8 +135,6 @@ The community's top *concrete* pains. Small, bounded, high-value.
 - ⬜ **Remaining buffered bodies** — gentree `PutFile` (base64 inside JSON),
   handwriting convert and share-by-email still read the whole request into
   memory.
-- ⬜ **Remote calendar providers** — only local ICS files sync; CalDAV, Google
-  and Office 365 calendars answer "not implemented".
 - 🧪 **`/mqtt` topic** — MQTT-over-WebSocket push publishes on whatever concrete
   topics the client subscribes to; not yet verified against a real tablet.
 

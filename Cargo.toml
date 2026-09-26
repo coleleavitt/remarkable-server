@@ -61,6 +61,8 @@ png = "0.17"
 regex = "1.13.1"
 tokio-util = { version = "0.7.19", features = ["io"] }
 diffy = "0.5.2"
+# CalDAV multistatus parsing (already in the tree via feed-rs, so no new crate)
+quick-xml = "0.41"
 
 [dev-dependencies]
 tokio-test = "0.4"
