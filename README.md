@@ -43,7 +43,7 @@ Everything lives under `--storage`:
 - `root.json` — human-readable mirror of the root, rewritten after every commit (also lets an older binary take over after a rollback).
 - `devices.db`, `jwt_secret` — pairing state.
 - `.uploads/` — staging for streamed uploads. Request bodies are written here as they arrive (checksummed on the way, never held whole in memory) and moved into the store once verified; failed uploads are removed, and leftovers older than 24 h are swept.
-- `readlater.db` (+ `articles/`), `calendars.db`, `feeds.db`, `versions/`, `integrations/` — feature state; see below.
+- `readlater.db`, `calendars.db`, `feeds.db`, `versions/`, `integrations/` — feature state; see below.
 
 Upgrading from the file-only layout is automatic: the first start imports `root.json` and `meta/*.meta`; every start reconciles the blob table with the files on disk and indexes the current tree. Old `meta/` files are left in place but no longer written. Back up `sync.db` with `sqlite3 sync.db ".backup '…'"` (or with the server stopped), not a live `cp`.
 
@@ -204,9 +204,14 @@ Prefix `/integrations/v2/readlater`.
 | `/accounts/{id}` | GET, PUT, DELETE | Get / update / remove a service |
 | `/oauth/start`, `/oauth/complete` | POST | Provider OAuth |
 | `/articles`, `/articles/{id}` | GET, PUT, DELETE | Articles |
-| `/accounts/{id}/sync`, `/sync` | POST | Placeholders: they answer `queued` / zero counts and do not run a sync yet |
+| `/accounts/{id}/sync` | POST | Sync one account now; answers its result (counts and per-step `errors`), 404 if unknown, 409 while it is already syncing |
+| `/sync` | POST | Sync every enabled account in turn; answers `total_fetched`, `total_synced`, `total_errors`, per-account `results` and `already_running` |
 
 Supported services: Pocket, Instapaper, Wallabag (Omnivore was removed after the service shut down in November 2024; adding one is 400). Credentials (tokens, Wallabag password) are stored in `readlater.db` separately from the account config, survive restarts (refreshed tokens are saved right away), and are never returned by the API.
+
+A sync fetches the articles changed since the account's last successful sync, applies its `sync_settings` filters and `max_articles` (newest first, per sync), and puts each article not yet on the tablet into the sync tree as an EPUB (or PDF, which needs `weasyprint` or `wkhtmltopdf` installed) document, the same way uploads are added: at the top level, or in the folder named (or identified) by `folder_id`, created if missing. A root index the server doesn't fully understand is never rewritten; those syncs fail instead. Devices get a SyncComplete when the tree changed. Articles already delivered are never added again, and `last_sync` only moves forward once the fetch and every delivery succeeded, so failures are retried on the next sync. `convert_format: "html"` records articles without delivering them (the tablet opens only PDF and EPUB). With `sync_read_status`, articles marked read/archived here are marked so at the provider.
+
+The scheduler syncs each enabled account with `auto_sync` every `sync_interval_minutes` (at least 5), one account at a time, never two syncs of one account at once; an account whose syncs keep failing is retried at doubling intervals, up to a day. It first looks one tick after startup and does nothing while there are no accounts. A sync request waits for the sync, which runs to completion even if the client disconnects.
 
 ## Versions API
 
@@ -315,6 +320,7 @@ No other route checks the admin token; `/debug/files`, for instance, takes an or
 | `HWR_COMMAND` | Replace `tesseract` with another recogniser (e.g. `contrib/hwr/trocr_hwr.py`) |
 | `CRASH_DIR` (`./crash-dumps`, relative to the working directory), `CRASH_MAX_TOTAL_BYTES` (512 MiB), `CRASH_MAX_REPORTS` (200) | Crash-report sink storage and quota (see below) |
 | `PUBLIC_URL` (e.g. `https://remarkable.unwrap.rs`) | Public base URL for links a person opens: the OAuth `verification_uri`/`verification_uri_complete` (default `https://<--host>`) and firmware archive downloads |
+| `READLATER_AUTO_SYNC` (on), `READLATER_SYNC_TICK_SECS` (60) | Scheduled read-later syncs (`0`/`false`/`off` turns them off; `POST .../sync` still works) and how often due accounts are looked for |
 
 Handwriting conversion (`POST /convert/v1/handwriting`) and handwriting search (`/handwriting/v1/search`) run the
 local `tesseract` binary, which must be installed (`apt install tesseract-ocr`); without it both fail. Fine for neat

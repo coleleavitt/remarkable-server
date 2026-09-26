@@ -3,7 +3,7 @@
 //! as a discontinued marker so existing database rows still load.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
@@ -11,7 +11,6 @@ use parking_lot::RwLock;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::mpsc;
 
 // ============================================================================
 // Error Types
@@ -357,26 +356,25 @@ pub struct OAuthCallback {
 // Sync Types
 // ============================================================================
 
+/// Outcome of one account's sync (see [`crate::readlater_sync`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncResult {
+    #[serde(default)]
+    pub account_id: String,
     pub provider: ReadLaterProvider,
+    /// Articles the provider returned (changed since the account's last sync).
     pub articles_fetched: u32,
+    /// Articles put on the device in this sync, each as a new document.
     pub articles_synced: u32,
+    /// Articles rendered to the account's format in this sync.
     pub articles_converted: u32,
+    /// Selected articles skipped because they are already on the device.
+    #[serde(default)]
+    pub articles_already_synced: u32,
     pub read_status_synced: u32,
     pub errors: Vec<String>,
     pub duration_ms: u64,
     pub completed_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone)]
-pub enum SyncCommand {
-    SyncAll,
-    SyncProvider(String),
-    SyncArticle(String),
-    ConvertArticle(String, ArticleFormat),
-    SyncReadStatus(String),
-    Stop,
 }
 
 // ============================================================================
@@ -2102,33 +2100,35 @@ fn safe_href(url: &str) -> String {
     }
 }
 
-pub struct ArticleConverter {
-    output_dir: PathBuf,
+/// An article rendered for the device.
+#[derive(Debug, Clone)]
+pub struct RenderedArticle {
+    /// File extension, which is also the reMarkable `fileType`: `epub`, `pdf` or `html`.
+    pub ext: &'static str,
+    pub bytes: Vec<u8>,
 }
 
-impl ArticleConverter {
-    pub fn new(output_dir: PathBuf) -> Self {
-        Self { output_dir }
-    }
+/// Renders articles into the format an account delivers. Blocking: the EPUB is built in memory
+/// and the PDF by running `weasyprint` or `wkhtmltopdf`, so async callers run it on a blocking
+/// thread.
+pub struct ArticleConverter;
 
-    pub async fn convert(
-        &self,
+impl ArticleConverter {
+    pub fn render(
         article: &Article,
         content: &ArticleContent,
         format: ArticleFormat,
-    ) -> Result<PathBuf> {
-        match format {
-            ArticleFormat::Html => self.save_html(article, content).await,
-            ArticleFormat::Epub => self.convert_to_epub(article, content).await,
-            ArticleFormat::Pdf => self.convert_to_pdf(article, content).await,
-        }
+    ) -> Result<RenderedArticle> {
+        let (ext, bytes) = match format {
+            ArticleFormat::Html => ("html", Self::html_document(article, content).into_bytes()),
+            ArticleFormat::Epub => ("epub", Self::epub(article, content)?),
+            ArticleFormat::Pdf => ("pdf", Self::pdf(article, content)?),
+        };
+        Ok(RenderedArticle { ext, bytes })
     }
 
-    async fn save_html(&self, article: &Article, content: &ArticleContent) -> Result<PathBuf> {
-        let filename = self.sanitize_filename(&article.title);
-        let path = self.output_dir.join(format!("{}.html", filename));
-
-        let html = format!(
+    fn html_document(article: &Article, content: &ArticleContent) -> String {
+        format!(
             r#"<!DOCTYPE html>
 <html>
 <head>
@@ -2161,117 +2161,39 @@ impl ArticleConverter {
                 .unwrap_or_default(),
             escape_html(&safe_href(&article.url)),
             content.html
-        );
-
-        tokio::fs::write(&path, html).await?;
-        Ok(path)
+        )
     }
 
-    async fn convert_to_epub(
-        &self,
-        article: &Article,
-        content: &ArticleContent,
-    ) -> Result<PathBuf> {
-        let filename = self.sanitize_filename(&article.title);
-        let path = self.output_dir.join(format!("{}.epub", filename));
-
-        // Create a minimal EPUB structure
-        let temp_dir = tempfile::tempdir()?;
-        let temp_path = temp_dir.path();
-
-        // mimetype file
-        tokio::fs::write(temp_path.join("mimetype"), "application/epub+zip").await?;
-
-        // META-INF/container.xml
-        tokio::fs::create_dir_all(temp_path.join("META-INF")).await?;
-        tokio::fs::write(
-            temp_path.join("META-INF/container.xml"),
-            r#"<?xml version="1.0"?>
-<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
-  <rootfiles>
-    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
-  </rootfiles>
-</container>"#,
-        )
-        .await?;
-
-        // OEBPS directory
-        tokio::fs::create_dir_all(temp_path.join("OEBPS")).await?;
-
-        // content.opf
-        let opf = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
-  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-    <dc:identifier id="uid">{}</dc:identifier>
-    <dc:title>{}</dc:title>
-    <dc:creator>{}</dc:creator>
-    <dc:language>en</dc:language>
-    <meta property="dcterms:modified">{}</meta>
-  </metadata>
-  <manifest>
-    <item id="content" href="content.xhtml" media-type="application/xhtml+xml"/>
-    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
-  </manifest>
-  <spine>
-    <itemref idref="content"/>
-  </spine>
-</package>"#,
-            escape_html(&article.id),
-            escape_html(&article.title),
-            escape_html(article.author.as_deref().unwrap_or("Unknown")),
-            Utc::now().format("%Y-%m-%dT%H:%M:%SZ")
-        );
-        tokio::fs::write(temp_path.join("OEBPS/content.opf"), opf).await?;
-
-        // nav.xhtml
-        let nav = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
-<head><title>Navigation</title></head>
-<body>
-<nav epub:type="toc">
-  <ol><li><a href="content.xhtml">{}</a></li></ol>
-</nav>
-</body>
-</html>"#,
-            escape_html(&article.title)
-        );
-        tokio::fs::write(temp_path.join("OEBPS/nav.xhtml"), nav).await?;
-
-        // content.xhtml
-        let content_xhtml = Self::epub_content_xhtml(article, content);
-        tokio::fs::write(temp_path.join("OEBPS/content.xhtml"), content_xhtml).await?;
-
-        // Create ZIP (EPUB is just a ZIP)
-        use std::process::Command;
-
-        let output = Command::new("zip")
-            .args(["-X0", path.to_str().unwrap(), "mimetype"])
-            .current_dir(temp_path)
-            .output()
-            .map_err(|e| ReadLaterError::Conversion(format!("zip mimetype: {}", e)))?;
-
-        if !output.status.success() {
-            return Err(ReadLaterError::Conversion(
-                "Failed to create EPUB mimetype".into(),
-            ));
+    /// Build the EPUB in memory (the same library the feed EPUBs use), so no `zip` binary or
+    /// scratch files are needed.
+    fn epub(article: &Article, content: &ArticleContent) -> Result<Vec<u8>> {
+        fn epub_err(e: impl std::fmt::Display) -> ReadLaterError {
+            ReadLaterError::Conversion(format!("EPUB: {e}"))
         }
-
-        let output = Command::new("zip")
-            .args(["-Xr9D", path.to_str().unwrap(), "META-INF", "OEBPS"])
-            .current_dir(temp_path)
-            .output()
-            .map_err(|e| ReadLaterError::Conversion(format!("zip content: {}", e)))?;
-
-        if !output.status.success() {
-            return Err(ReadLaterError::Conversion(
-                "Failed to create EPUB content".into(),
-            ));
+        let mut builder =
+            epub_builder::EpubBuilder::new(epub_builder::ZipLibrary::new().map_err(epub_err)?)
+                .map_err(epub_err)?;
+        builder
+            .metadata("title", article.title.as_str())
+            .map_err(epub_err)?;
+        if let Some(author) = &article.author {
+            builder
+                .metadata("author", author.as_str())
+                .map_err(epub_err)?;
         }
-
-        Ok(path)
+        builder
+            .metadata("generator", "remarkable-server")
+            .map_err(epub_err)?;
+        let xhtml = Self::epub_content_xhtml(article, content);
+        builder
+            .add_content(
+                epub_builder::EpubContent::new("content.xhtml", xhtml.as_bytes())
+                    .title(article.title.as_str()),
+            )
+            .map_err(epub_err)?;
+        let mut out = Vec::new();
+        builder.generate(&mut out).map_err(epub_err)?;
+        Ok(out)
     }
 
     fn epub_content_xhtml(article: &Article, content: &ArticleContent) -> String {
@@ -2303,56 +2225,38 @@ img {{ max-width: 100%; }}
         )
     }
 
-    async fn convert_to_pdf(&self, article: &Article, content: &ArticleContent) -> Result<PathBuf> {
-        let filename = self.sanitize_filename(&article.title);
-        let pdf_path = self.output_dir.join(format!("{}.pdf", filename));
-
-        // Save HTML first
-        let html_path = self.save_html(article, content).await?;
-
-        // Use wkhtmltopdf or weasyprint if available
+    /// Print the HTML rendering with `weasyprint`, else `wkhtmltopdf`, in a scratch directory.
+    fn pdf(article: &Article, content: &ArticleContent) -> Result<Vec<u8>> {
         use std::process::Command;
 
-        // Try weasyprint first
-        let result = Command::new("weasyprint")
-            .args([html_path.to_str().unwrap(), pdf_path.to_str().unwrap()])
-            .output();
+        let dir = tempfile::tempdir()?;
+        let html_path = dir.path().join("article.html");
+        let pdf_path = dir.path().join("article.pdf");
+        std::fs::write(&html_path, Self::html_document(article, content))?;
 
-        if let Ok(output) = result {
-            if output.status.success() {
-                return Ok(pdf_path);
+        let converters: [(&str, &[&std::ffi::OsStr]); 2] = [
+            ("weasyprint", &[html_path.as_os_str(), pdf_path.as_os_str()]),
+            (
+                "wkhtmltopdf",
+                &[
+                    std::ffi::OsStr::new("--quiet"),
+                    html_path.as_os_str(),
+                    pdf_path.as_os_str(),
+                ],
+            ),
+        ];
+        for (program, args) in converters {
+            let printed = Command::new(program)
+                .args(args)
+                .output()
+                .is_ok_and(|o| o.status.success());
+            if printed {
+                return Ok(std::fs::read(&pdf_path)?);
             }
         }
-
-        // Try wkhtmltopdf
-        let result = Command::new("wkhtmltopdf")
-            .args([
-                "--quiet",
-                html_path.to_str().unwrap(),
-                pdf_path.to_str().unwrap(),
-            ])
-            .output();
-
-        if let Ok(output) = result {
-            if output.status.success() {
-                return Ok(pdf_path);
-            }
-        }
-
         Err(ReadLaterError::Conversion(
             "No PDF converter available (install weasyprint or wkhtmltopdf)".into(),
         ))
-    }
-
-    fn sanitize_filename(&self, name: &str) -> String {
-        name.chars()
-            .map(|c| match c {
-                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-                c if c.is_control() => '_',
-                c => c,
-            })
-            .take(200)
-            .collect()
     }
 }
 
@@ -2360,30 +2264,24 @@ img {{ max-width: 100%; }}
 // Read Later Manager
 // ============================================================================
 
+/// Read-later accounts and articles, persisted in `readlater.db`. Syncing them to the device is
+/// [`crate::readlater_sync::ReadLaterSyncer`]'s job.
 pub struct ReadLaterManager {
     db: Connection,
     accounts: Arc<RwLock<HashMap<String, ProviderAccount>>>,
     articles: Arc<RwLock<HashMap<String, Article>>>,
-    converter: ArticleConverter,
-    storage_path: PathBuf,
-    sync_tx: Option<mpsc::Sender<SyncCommand>>,
 }
 
 impl ReadLaterManager {
-    pub fn new(db_path: &Path, storage_path: &Path) -> Result<Self> {
+    pub fn new(db_path: &Path) -> Result<Self> {
         let db = Connection::open(db_path).map_err(|e| ReadLaterError::Database(e.to_string()))?;
 
         Self::init_schema(&db)?;
-
-        let converter = ArticleConverter::new(storage_path.join("articles"));
 
         let mut mgr = Self {
             db,
             accounts: Arc::new(RwLock::new(HashMap::new())),
             articles: Arc::new(RwLock::new(HashMap::new())),
-            converter,
-            storage_path: storage_path.to_path_buf(),
-            sync_tx: None,
         };
 
         mgr.load_accounts()?;
@@ -2762,20 +2660,23 @@ impl ReadLaterManager {
         Ok(())
     }
 
-    /// Pick up a token refresh the provider did inside its last call: adopt the new config
-    /// for the rest of the sync and persist it right away, so rotated tokens aren't lost.
-    fn absorb_refreshed_config(
-        &mut self,
-        provider: &dyn ReadLaterProviderTrait,
-        account: &mut ProviderAccount,
-        errors: &mut Vec<String>,
-    ) {
-        if let Some(config) = provider.take_refreshed_config() {
-            account.config = config;
-            if let Err(e) = self.update_account_config(&account.id, &account.config) {
-                errors.push(format!("Persist refreshed credentials: {}", e));
-            }
+    /// Record the start of the last fully synced window, touching only `last_sync` so
+    /// concurrent edits to name/settings are not overwritten.
+    pub fn set_last_sync(&mut self, id: &str, at: DateTime<Utc>) -> Result<()> {
+        let changed = self
+            .db
+            .execute(
+                "UPDATE readlater_accounts SET last_sync=?2 WHERE id=?1",
+                params![id, at.to_rfc3339()],
+            )
+            .map_err(|e| ReadLaterError::Database(e.to_string()))?;
+        if changed == 0 {
+            return Err(ReadLaterError::ProviderNotFound(id.into()));
         }
+        if let Some(account) = self.accounts.write().get_mut(id) {
+            account.last_sync = Some(at);
+        }
+        Ok(())
     }
 
     pub fn delete_account(&mut self, id: &str) -> Result<()> {
@@ -2806,7 +2707,7 @@ impl ReadLaterManager {
     /// device-side state (document_id / synced_to_device / last_sync) the provider can't
     /// know about, so the DB row and the in-memory map stay one entry per article.
     /// Returns the article as stored.
-    fn upsert_article(&mut self, article: &Article) -> Result<Article> {
+    pub(crate) fn upsert_article(&mut self, article: &Article) -> Result<Article> {
         let mut article = article.clone();
         let existing_id: Option<String> = self
             .db
@@ -2867,6 +2768,33 @@ impl ReadLaterManager {
 
     pub fn get_article(&self, id: &str) -> Option<Article> {
         self.articles.read().get(id).cloned()
+    }
+
+    /// Record that `article_id` is on the device as document `document_id`, so later syncs
+    /// never add it again.
+    pub fn mark_delivered(&mut self, article_id: &str, document_id: &str) -> Result<Article> {
+        let mut article = self
+            .get_article(article_id)
+            .ok_or_else(|| ReadLaterError::ArticleNotFound(article_id.into()))?;
+        article.synced_to_device = true;
+        article.document_id = Some(document_id.into());
+        article.last_sync = Some(Utc::now());
+        self.upsert_article(&article)
+    }
+
+    /// Articles of `provider` on the device whose read/archived status goes back to the
+    /// provider when an account has `sync_read_status`.
+    pub(crate) fn read_status_candidates(&self, provider: ReadLaterProvider) -> Vec<Article> {
+        self.articles
+            .read()
+            .values()
+            .filter(|a| {
+                a.provider == provider
+                    && a.synced_to_device
+                    && matches!(a.status, ReadStatus::Read | ReadStatus::Archived)
+            })
+            .cloned()
+            .collect()
     }
 
     pub fn query_articles(&self, query: &ArticleQuery) -> Vec<Article> {
@@ -3007,262 +2935,6 @@ impl ReadLaterManager {
             .map_err(|e| ReadLaterError::Database(e.to_string()))?;
         Ok(())
     }
-
-    // Sync operations
-
-    pub async fn sync_account(&mut self, account_id: &str) -> Result<SyncResult> {
-        let start = std::time::Instant::now();
-        let mut result = SyncResult {
-            provider: ReadLaterProvider::Pocket,
-            articles_fetched: 0,
-            articles_synced: 0,
-            articles_converted: 0,
-            read_status_synced: 0,
-            errors: Vec::new(),
-            duration_ms: 0,
-            completed_at: Utc::now(),
-        };
-
-        let account = self
-            .get_account(account_id)
-            .ok_or_else(|| ReadLaterError::ProviderNotFound(account_id.into()))?;
-
-        result.provider = account.provider;
-
-        // Create provider instance. A discontinued provider (Omnivore) is reported as a sync
-        // error rather than failing `sync_all` for every other account.
-        let provider = match provider_for(account.provider) {
-            Ok(p) => p,
-            Err(e) => {
-                result.errors.push(e.to_string());
-                result.duration_ms = start.elapsed().as_millis() as u64;
-                result.completed_at = Utc::now();
-                return Ok(result);
-            }
-        };
-        let provider = provider.as_ref();
-
-        // Refresh credentials once per sync (a no-op unless expired/near expiry) so the
-        // individual API calls below don't each trigger their own refresh. A refreshed token is
-        // persisted immediately.
-        // A failed refresh aborts the sync without touching `last_sync`, so the failure stays
-        // visible and the next sync retries the same window.
-        let mut account = account;
-        match provider.refresh_auth(&account.config).await {
-            Ok(config) => {
-                account.config = config;
-                if provider.take_refreshed_config().is_some() {
-                    if let Err(e) = self.update_account_config(&account.id, &account.config) {
-                        result
-                            .errors
-                            .push(format!("Persist refreshed credentials: {}", e));
-                    }
-                }
-            }
-            Err(e) => {
-                result.errors.push(format!("Auth refresh: {}", e));
-                result.duration_ms = start.elapsed().as_millis() as u64;
-                result.completed_at = Utc::now();
-                return Ok(result);
-            }
-        }
-
-        // Fetch articles
-        let since = account.last_sync;
-        let mut fetched = false;
-        let fetch_result = provider.fetch_articles(&account.config, since).await;
-        self.absorb_refreshed_config(provider, &mut account, &mut result.errors);
-        match fetch_result {
-            Ok(articles) => {
-                fetched = true;
-                result.articles_fetched = articles.len() as u32;
-
-                for article in select_articles_for_sync(articles, &account.sync_settings) {
-                    // Save article (keeps the existing id if we've seen it before)
-                    let article = match self.upsert_article(&article) {
-                        Ok(stored) => stored,
-                        Err(e) => {
-                            result.errors.push(format!("Save {}: {}", article.id, e));
-                            continue;
-                        }
-                    };
-
-                    result.articles_synced += 1;
-
-                    // Convert to device format
-                    if account.sync_settings.convert_format != ArticleFormat::Html {
-                        let content = provider
-                            .fetch_article_content(&account.config, &article)
-                            .await;
-                        self.absorb_refreshed_config(provider, &mut account, &mut result.errors);
-                        match content {
-                            Ok(content) => {
-                                match self
-                                    .converter
-                                    .convert(
-                                        &article,
-                                        &content,
-                                        account.sync_settings.convert_format,
-                                    )
-                                    .await
-                                {
-                                    Ok(_path) => {
-                                        result.articles_converted += 1;
-                                    }
-                                    Err(e) => {
-                                        result
-                                            .errors
-                                            .push(format!("Convert {}: {}", article.id, e));
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                result.errors.push(format!("Content {}: {}", article.id, e));
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                result.errors.push(format!("Fetch: {}", e));
-            }
-        }
-
-        // Sync read status back
-        if account.sync_settings.sync_read_status {
-            let articles_to_sync: Vec<Article> = self
-                .articles
-                .read()
-                .values()
-                .filter(|a| {
-                    a.provider == account.provider
-                        && a.synced_to_device
-                        && (a.status == ReadStatus::Read || a.status == ReadStatus::Archived)
-                })
-                .cloned()
-                .collect();
-
-            for article in articles_to_sync {
-                let updated = provider
-                    .update_read_status(&account.config, &article.provider_id, article.status)
-                    .await;
-                self.absorb_refreshed_config(provider, &mut account, &mut result.errors);
-                match updated {
-                    Ok(()) => {
-                        result.read_status_synced += 1;
-                    }
-                    Err(e) => {
-                        result.errors.push(format!("Status {}: {}", article.id, e));
-                    }
-                }
-            }
-        }
-
-        // Persist refreshed credentials; advance `last_sync` only after a successful fetch so a
-        // failed fetch doesn't make the next incremental sync skip this window.
-        let mut updated_account = account;
-        if fetched {
-            updated_account.last_sync = Some(Utc::now());
-        }
-        let _ = self.update_account(updated_account);
-
-        result.duration_ms = start.elapsed().as_millis() as u64;
-        result.completed_at = Utc::now();
-
-        Ok(result)
-    }
-
-    pub async fn sync_all(&mut self) -> Vec<SyncResult> {
-        let account_ids: Vec<String> = self
-            .accounts
-            .read()
-            .values()
-            .filter(|a| a.enabled)
-            .map(|a| a.id.clone())
-            .collect();
-
-        let mut results = Vec::new();
-
-        for id in account_ids {
-            match self.sync_account(&id).await {
-                Ok(result) => results.push(result),
-                Err(e) => {
-                    results.push(SyncResult {
-                        provider: ReadLaterProvider::Pocket,
-                        articles_fetched: 0,
-                        articles_synced: 0,
-                        articles_converted: 0,
-                        read_status_synced: 0,
-                        errors: vec![e.to_string()],
-                        duration_ms: 0,
-                        completed_at: Utc::now(),
-                    });
-                }
-            }
-        }
-
-        results
-    }
-
-    // Scheduler
-
-    pub fn start_scheduler(&mut self) -> mpsc::Sender<SyncCommand> {
-        let (tx, mut rx) = mpsc::channel::<SyncCommand>(32);
-        self.sync_tx = Some(tx.clone());
-
-        let accounts = Arc::clone(&self.accounts);
-        let _articles = Arc::clone(&self.articles);
-        let _storage_path = self.storage_path.clone();
-
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
-
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        // Check for accounts that need sync
-                        let accounts_to_sync: Vec<ProviderAccount> = {
-                            let accounts = accounts.read();
-                            accounts.values()
-                                .filter(|a| {
-                                    if !a.enabled || !a.sync_settings.auto_sync { return false; }
-
-                                    let interval = Duration::minutes(a.sync_settings.sync_interval_minutes as i64);
-                                    match a.last_sync {
-                                        Some(last) => Utc::now() - last > interval,
-                                        None => true,
-                                    }
-                                })
-                                .cloned()
-                                .collect()
-                        };
-
-                        for account in accounts_to_sync {
-                            tracing::info!("Scheduled sync for {} ({})", account.name, account.provider);
-                            // Would trigger sync here - need to refactor to share manager
-                        }
-                    }
-
-                    Some(cmd) = rx.recv() => {
-                        match cmd {
-                            SyncCommand::Stop => break,
-                            _ => {
-                                // Handle other commands
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        tx
-    }
-
-    pub fn stop_scheduler(&mut self) {
-        if let Some(tx) = self.sync_tx.take() {
-            let _ = tx.try_send(SyncCommand::Stop);
-        }
-    }
 }
 
 /// Apply the account's sync filters (tags, favorites, archived) and cap the result at
@@ -3270,7 +2942,10 @@ impl ReadLaterManager {
 /// sync: articles it drops are older than everything kept and are not revisited later.
 /// Tag filters: an article must carry none of the exclude tags and, when any include
 /// filters exist, at least one include tag.
-fn select_articles_for_sync(articles: Vec<Article>, settings: &SyncSettings) -> Vec<Article> {
+pub(crate) fn select_articles_for_sync(
+    articles: Vec<Article>,
+    settings: &SyncSettings,
+) -> Vec<Article> {
     let mut selected: Vec<Article> = articles
         .into_iter()
         .filter(|article| {
@@ -3315,8 +2990,59 @@ impl Default for WallabagProvider {
     }
 }
 
+/// Fixtures shared by the read-later test modules.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) fn test_account(
+        id: &str,
+        provider: ReadLaterProvider,
+        config: ProviderConfig,
+        last_sync: Option<DateTime<Utc>>,
+    ) -> ProviderAccount {
+        ProviderAccount {
+            id: id.into(),
+            name: id.into(),
+            provider,
+            enabled: true,
+            config,
+            sync_settings: SyncSettings::default(),
+            last_sync,
+            created_at: Utc::now(),
+        }
+    }
+
+    pub(crate) fn wallabag_config(
+        instance_url: &str,
+        access_token: Option<&str>,
+        refresh_token: Option<&str>,
+        token_expires_at: Option<DateTime<Utc>>,
+    ) -> ProviderConfig {
+        ProviderConfig::Wallabag {
+            instance_url: instance_url.into(),
+            client_id: "cid".into(),
+            client_secret: Some("csecret".into()),
+            access_token: access_token.map(Into::into),
+            refresh_token: refresh_token.map(Into::into),
+            token_expires_at,
+            username: None,
+            password: None,
+        }
+    }
+
+    /// Serve `app` on an ephemeral local port; returns its base URL.
+    pub(crate) async fn spawn_server(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{}", addr)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::*;
     use super::*;
 
     fn article(id: &str, provider_id: &str, added_secs: i64) -> Article {
@@ -3474,20 +3200,17 @@ mod tests {
         a
     }
 
-    #[tokio::test]
-    async fn html_export_escapes_metadata() {
-        let dir = tempfile::tempdir().unwrap();
-        let conv = ArticleConverter::new(dir.path().to_path_buf());
+    #[test]
+    fn html_export_escapes_metadata() {
         let content = ArticleContent {
             html: "<p>body</p>".into(),
             images: Vec::new(),
             styles: None,
         };
-        let path = conv
-            .convert(&hostile_article(), &content, ArticleFormat::Html)
-            .await
-            .unwrap();
-        let html = std::fs::read_to_string(path).unwrap();
+        let rendered =
+            ArticleConverter::render(&hostile_article(), &content, ArticleFormat::Html).unwrap();
+        assert_eq!(rendered.ext, "html");
+        let html = String::from_utf8(rendered.bytes).unwrap();
         assert!(!html.contains("<script>"));
         assert!(
             html.contains("<title>&lt;/title&gt;&lt;script&gt;alert(1)&lt;/script&gt;</title>")
@@ -3510,10 +3233,31 @@ mod tests {
         assert!(xhtml.contains("max-width: 100%;"));
     }
 
+    /// EPUBs are built in memory (no `zip` binary): a ZIP whose first entry is the stored
+    /// `mimetype`, as EPUB readers require, with the article as `OEBPS/content.xhtml`.
+    #[test]
+    fn epub_is_rendered_in_memory() {
+        let content = ArticleContent {
+            html: "<p>body text</p>".into(),
+            images: Vec::new(),
+            styles: None,
+        };
+        let rendered =
+            ArticleConverter::render(&hostile_article(), &content, ArticleFormat::Epub).unwrap();
+        assert_eq!(rendered.ext, "epub");
+        let b = &rendered.bytes;
+        assert_eq!(&b[..4], b"PK\x03\x04");
+        assert_eq!(&b[30..38], b"mimetype");
+        assert_eq!(&b[38..58], b"application/epub+zip");
+        let find = |needle: &[u8]| b.windows(needle.len()).any(|w| w == needle);
+        assert!(find(b"OEBPS/content.xhtml"));
+        assert!(find(b"META-INF/container.xml"));
+    }
+
     #[test]
     fn save_article_upserts_by_provider_id() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = ReadLaterManager::new(&dir.path().join("rl.db"), dir.path()).unwrap();
+        let mut mgr = ReadLaterManager::new(&dir.path().join("rl.db")).unwrap();
         let mut first = article("id-1", "p1", 0);
         first.synced_to_device = true;
         first.document_id = Some("doc".into());
@@ -3538,7 +3282,7 @@ mod tests {
 
         // Reloading from disk yields the same single article.
         drop(mgr);
-        let mgr = ReadLaterManager::new(&dir.path().join("rl.db"), dir.path()).unwrap();
+        let mgr = ReadLaterManager::new(&dir.path().join("rl.db")).unwrap();
         assert_eq!(mgr.articles.read().len(), 1);
         assert_eq!(mgr.get_article("id-1").unwrap().title, "Updated");
     }
@@ -3620,104 +3364,11 @@ mod tests {
         assert_eq!(ids(&settings), ["both", "inc", "other"]);
     }
 
-    fn test_account(
-        id: &str,
-        provider: ReadLaterProvider,
-        config: ProviderConfig,
-        last_sync: Option<DateTime<Utc>>,
-    ) -> ProviderAccount {
-        ProviderAccount {
-            id: id.into(),
-            name: id.into(),
-            provider,
-            enabled: true,
-            config,
-            sync_settings: SyncSettings::default(),
-            last_sync,
-            created_at: Utc::now(),
-        }
-    }
-
-    #[tokio::test]
-    async fn failed_refresh_or_fetch_does_not_advance_last_sync() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut mgr = ReadLaterManager::new(&dir.path().join("rl.db"), dir.path()).unwrap();
-        let last = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        // Wallabag with no tokens: refresh fails, so the sync aborts before fetching.
-        let wb = ProviderConfig::Wallabag {
-            instance_url: "http://127.0.0.1:9".into(),
-            client_id: "c".into(),
-            client_secret: None,
-            access_token: None,
-            refresh_token: None,
-            token_expires_at: None,
-            username: None,
-            password: None,
-        };
-        mgr.add_account(test_account(
-            "wb",
-            ReadLaterProvider::Wallabag,
-            wb,
-            Some(last),
-        ))
-        .unwrap();
-        let r = mgr.sync_account("wb").await.unwrap();
-        assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
-        assert!(r.errors[0].starts_with("Auth refresh"));
-        assert_eq!(mgr.get_account("wb").unwrap().last_sync, Some(last));
-        // Valid (unexpired) token but an unreachable server: refresh is a no-op, fetch fails.
-        let unreachable = wallabag_config(
-            "http://127.0.0.1:9",
-            Some("t"),
-            None,
-            Some(Utc::now() + Duration::hours(1)),
-        );
-        mgr.add_account(test_account(
-            "wb2",
-            ReadLaterProvider::Wallabag,
-            unreachable,
-            Some(last),
-        ))
-        .unwrap();
-        let r = mgr.sync_account("wb2").await.unwrap();
-        assert!(
-            r.errors.iter().any(|e| e.starts_with("Fetch")),
-            "{:?}",
-            r.errors
-        );
-        assert_eq!(mgr.get_account("wb2").unwrap().last_sync, Some(last));
-    }
-
-    fn wallabag_config(
-        instance_url: &str,
-        access_token: Option<&str>,
-        refresh_token: Option<&str>,
-        token_expires_at: Option<DateTime<Utc>>,
-    ) -> ProviderConfig {
-        ProviderConfig::Wallabag {
-            instance_url: instance_url.into(),
-            client_id: "cid".into(),
-            client_secret: Some("csecret".into()),
-            access_token: access_token.map(Into::into),
-            refresh_token: refresh_token.map(Into::into),
-            token_expires_at,
-            username: None,
-            password: None,
-        }
-    }
-
-    async fn spawn_server(app: axum::Router) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        format!("http://{}", addr)
-    }
-
     #[test]
     fn credentials_persist_across_restart_but_not_in_config_json() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("rl.db");
-        let mut mgr = ReadLaterManager::new(&db, dir.path()).unwrap();
+        let mut mgr = ReadLaterManager::new(&db).unwrap();
         let mut wb = wallabag_config("https://wb.example", Some("AT"), Some("RT"), None);
         if let ProviderConfig::Wallabag {
             username, password, ..
@@ -3769,7 +3420,7 @@ mod tests {
         mgr.update_account_config("wb", &refreshed).unwrap();
         drop(mgr);
 
-        let mgr = ReadLaterManager::new(&db, dir.path()).unwrap();
+        let mgr = ReadLaterManager::new(&db).unwrap();
         let ProviderConfig::Wallabag {
             client_secret,
             access_token,
@@ -3848,7 +3499,7 @@ mod tests {
             .unwrap();
         }
 
-        let mut mgr = ReadLaterManager::new(&db_path, dir.path()).unwrap();
+        let mut mgr = ReadLaterManager::new(&db_path).unwrap();
         let om = mgr.get_account("om").unwrap();
         assert_eq!(om.provider, ReadLaterProvider::Omnivore);
         assert!(!om.config.is_authenticated());
@@ -3862,13 +3513,6 @@ mod tests {
         };
         assert_eq!(access_token.as_deref(), Some("legacy"));
 
-        // Syncing the discontinued account reports it instead of failing.
-        let r = mgr.sync_account("om").await.unwrap();
-        assert!(
-            r.errors.iter().any(|e| e.contains("Omnivore shut down")),
-            "{:?}",
-            r.errors
-        );
         let err = provider_for(ReadLaterProvider::Omnivore).err().unwrap();
         assert!(matches!(err, ReadLaterError::Discontinued(_)));
         // New Omnivore accounts are rejected; the old one can still be deleted.
@@ -3886,7 +3530,7 @@ mod tests {
         // The migration added the column and is idempotent; the legacy token was kept.
         mgr.update_account(mgr.get_account("pk").unwrap()).unwrap();
         drop(mgr);
-        let mgr = ReadLaterManager::new(&db_path, dir.path()).unwrap();
+        let mgr = ReadLaterManager::new(&db_path).unwrap();
         let secrets: String = mgr
             .db
             .query_row(
@@ -3958,54 +3602,6 @@ mod tests {
             )
             .with_state(Arc::clone(&state));
         (spawn_server(app).await, state)
-    }
-
-    /// A revoked token (unexpired as far as we know) gets a 401: refresh once, retry, persist.
-    #[tokio::test]
-    async fn wallabag_401_refreshes_retries_and_persists_token() {
-        let (base, mock) = mock_wallabag("fresh", "fresh").await;
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("rl.db");
-        let mut mgr = ReadLaterManager::new(&db, dir.path()).unwrap();
-        let mut account = test_account(
-            "wb",
-            ReadLaterProvider::Wallabag,
-            wallabag_config(
-                &base,
-                Some("revoked"),
-                Some("old-refresh"),
-                Some(Utc::now() + Duration::hours(1)),
-            ),
-            None,
-        );
-        account.sync_settings.convert_format = ArticleFormat::Html;
-        mgr.add_account(account).unwrap();
-
-        let r = mgr.sync_account("wb").await.unwrap();
-        assert!(r.errors.is_empty(), "{:?}", r.errors);
-        assert_eq!(r.articles_fetched, 1);
-        {
-            let reqs = mock.token_requests.lock().unwrap();
-            assert_eq!(reqs.len(), 1);
-            assert_eq!(reqs[0]["grant_type"], "refresh_token");
-            assert_eq!(reqs[0]["refresh_token"], "old-refresh");
-            assert_eq!(reqs[0]["client_secret"], "csecret");
-        }
-        drop(mgr);
-
-        let mgr = ReadLaterManager::new(&db, dir.path()).unwrap();
-        let ProviderConfig::Wallabag {
-            access_token,
-            refresh_token,
-            token_expires_at,
-            ..
-        } = mgr.get_account("wb").unwrap().config
-        else {
-            panic!("wrong variant")
-        };
-        assert_eq!(access_token.as_deref(), Some("fresh"));
-        assert_eq!(refresh_token.as_deref(), Some("rotated-refresh"));
-        assert!(token_expires_at.unwrap() > Utc::now());
     }
 
     /// No refresh token: the password grant is used, and a retry that still gets 401 is not
@@ -4168,7 +3764,7 @@ mod tests {
         // The obtained tokens persist with the account.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("rl.db");
-        let mut mgr = ReadLaterManager::new(&db, dir.path()).unwrap();
+        let mut mgr = ReadLaterManager::new(&db).unwrap();
         mgr.add_account(test_account(
             "ip",
             ReadLaterProvider::Instapaper,
@@ -4177,7 +3773,7 @@ mod tests {
         ))
         .unwrap();
         drop(mgr);
-        let mgr = ReadLaterManager::new(&db, dir.path()).unwrap();
+        let mgr = ReadLaterManager::new(&db).unwrap();
         assert!(mgr.get_account("ip").unwrap().config.is_authenticated());
 
         // Missing username / consumer credentials are clear errors, not requests.

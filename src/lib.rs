@@ -22,6 +22,7 @@ pub mod passcode;
 pub mod protocol;
 pub mod readlater;
 pub mod readlater_api;
+pub mod readlater_sync;
 pub mod reports;
 pub mod screenshare;
 pub mod screenshare_rest;
@@ -560,9 +561,7 @@ impl Default for ServerConfig {
 }
 
 pub fn init_readlater_manager(storage_path: &Path) -> anyhow::Result<ReadLaterManager> {
-    let db_path = storage_path.join("readlater.db");
-    std::fs::create_dir_all(storage_path.join("articles"))?;
-    Ok(ReadLaterManager::new(&db_path, storage_path)?)
+    Ok(ReadLaterManager::new(&storage_path.join("readlater.db"))?)
 }
 
 /// Reject requests without a valid device/user token. Applied to every feature API
@@ -613,6 +612,22 @@ pub fn feature_routes(
         .is_ok()
         .then(|| feeds.clone().start_scheduler(FEED_CHECK_SECS));
 
+    // Read-later articles go into the device's sync tree. Scheduled syncs run only inside a
+    // Tokio runtime (not in unit tests) and unless READLATER_AUTO_SYNC turns them off; a pass
+    // with no accounts does nothing.
+    let readlater = ReadLaterState::new(
+        init_readlater_manager(storage_path)?,
+        state.storage.clone(),
+        state.notification_tx.clone(),
+    );
+    let readlater_schedule = readlater_sync::SchedulerConfig::from_env();
+    if readlater_schedule.enabled && tokio::runtime::Handle::try_current().is_ok() {
+        readlater
+            .syncer
+            .clone()
+            .spawn_scheduler(readlater_schedule.tick);
+    }
+
     // Cloud syncs may only touch directories under <storage>/integrations.
     let cloud = IntegrationState::with_sync_base(storage_path.join("integrations"));
     let mut router = Router::new()
@@ -630,10 +645,7 @@ pub fn feature_routes(
             "/integrations/v2/calendars",
             calendar_router(CalendarState::new(init_calendar_manager(storage_path)?)),
         )
-        .nest(
-            "/integrations/v2/readlater",
-            readlater_router(ReadLaterState::new(init_readlater_manager(storage_path)?)),
-        )
+        .nest("/integrations/v2/readlater", readlater_router(readlater))
         // xochitl 3.29 uses /storage/; older builds use /cloud. Share one state so both see the same accounts.
         .nest(
             "/integrations/v2/cloud",
