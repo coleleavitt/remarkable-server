@@ -2,14 +2,20 @@
 //!
 //! Handles sync between local remarkable storage and cloud providers.
 
-use crate::integrations::{
-    conflict::{Conflict, ConflictResolution, ConflictResolver, ConflictStrategy, ConflictType},
-    CloudFile, CloudProvider, Result, SyncFolderConfig,
-};
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
 use tokio::fs;
+
+use crate::integrations::conflict::{
+    Conflict,
+    ConflictResolution,
+    ConflictResolver,
+    ConflictStrategy,
+    ConflictType,
+};
+use crate::integrations::{CloudFile, CloudProvider, Result, SyncFolderConfig};
 
 /// Sync direction
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,11 +159,17 @@ impl<P: CloudProvider> CloudSync<P> {
         };
 
         // Get cloud files
-        let cloud_files = match self.provider.list_files(self.config.cloud_folder.as_deref()).await {
+        let cloud_files = match self
+            .provider
+            .list_files(self.config.cloud_folder.as_deref())
+            .await
+        {
             Ok(files) => files,
             Err(e) => {
                 result.status = SyncStatus::Failed;
-                result.errors.push(format!("Failed to list cloud files: {}", e));
+                result
+                    .errors
+                    .push(format!("Failed to list cloud files: {}", e));
                 result.duration_ms = start.elapsed().as_millis() as u64;
                 return Ok(result);
             }
@@ -174,7 +186,9 @@ impl<P: CloudProvider> CloudSync<P> {
             Ok(files) => files,
             Err(e) => {
                 result.status = SyncStatus::Failed;
-                result.errors.push(format!("Failed to list local files: {}", e));
+                result
+                    .errors
+                    .push(format!("Failed to list local files: {}", e));
                 result.duration_ms = start.elapsed().as_millis() as u64;
                 return Ok(result);
             }
@@ -186,10 +200,10 @@ impl<P: CloudProvider> CloudSync<P> {
 
         // Files only in local (need upload)
         let upload_paths: Vec<&String> = local_paths.difference(&cloud_paths).collect();
-        
+
         // Files only in cloud (need download)
         let download_paths: Vec<&String> = cloud_paths.difference(&local_paths).collect();
-        
+
         // Files in both (need comparison)
         let common_paths: Vec<&String> = local_paths.intersection(&cloud_paths).collect();
 
@@ -218,7 +232,9 @@ impl<P: CloudProvider> CloudSync<P> {
                         match self.download_file(cloud_file).await {
                             Ok(_) => result.downloaded += 1,
                             Err(e) => {
-                                result.errors.push(format!("Download {} failed: {}", path, e));
+                                result
+                                    .errors
+                                    .push(format!("Download {} failed: {}", path, e));
                             }
                         }
                     }
@@ -231,7 +247,7 @@ impl<P: CloudProvider> CloudSync<P> {
         for path in common_paths {
             let local_info = &local_files[path];
             let cloud_file = &cloud_map[path];
-            
+
             // Check for conflicts
             let conflict = ConflictResolver::detect_conflict(
                 &local_info.0,
@@ -244,13 +260,15 @@ impl<P: CloudProvider> CloudSync<P> {
 
             if let Some(mut conflict) = conflict {
                 let resolution = self.conflict_resolver.resolve(&mut conflict);
-                
+
                 match resolution {
                     ConflictResolution::UseLocal => {
                         if self.config.direction != SyncDirection::Download {
                             match self.upload_file(path, local_info).await {
                                 Ok(_) => result.uploaded += 1,
-                                Err(e) => result.errors.push(format!("Upload {} failed: {}", path, e)),
+                                Err(e) => {
+                                    result.errors.push(format!("Upload {} failed: {}", path, e))
+                                }
                             }
                         }
                     }
@@ -258,7 +276,9 @@ impl<P: CloudProvider> CloudSync<P> {
                         if self.config.direction != SyncDirection::Upload {
                             match self.download_file(cloud_file).await {
                                 Ok(_) => result.downloaded += 1,
-                                Err(e) => result.errors.push(format!("Download {} failed: {}", path, e)),
+                                Err(e) => result
+                                    .errors
+                                    .push(format!("Download {} failed: {}", path, e)),
                             }
                         }
                     }
@@ -268,14 +288,20 @@ impl<P: CloudProvider> CloudSync<P> {
                         renamed_file.name = renamed_to;
                         renamed_file.path = format!(
                             "{}/{}",
-                            cloud_file.path.rsplit_once('/').map(|(p, _)| p).unwrap_or(""),
+                            cloud_file
+                                .path
+                                .rsplit_once('/')
+                                .map(|(p, _)| p)
+                                .unwrap_or(""),
                             renamed_file.name
                         );
-                        
+
                         if self.config.direction != SyncDirection::Upload {
                             match self.download_file(&renamed_file).await {
                                 Ok(_) => result.downloaded += 1,
-                                Err(e) => result.errors.push(format!("Download conflict copy failed: {}", e)),
+                                Err(e) => result
+                                    .errors
+                                    .push(format!("Download conflict copy failed: {}", e)),
                             }
                         }
                     }
@@ -287,18 +313,22 @@ impl<P: CloudProvider> CloudSync<P> {
             } else {
                 // No conflict - sync based on modification time
                 let last_sync = self.state.mtime_map.get(path).copied().unwrap_or(0);
-                
+
                 if local_info.1 > last_sync && self.config.direction != SyncDirection::Download {
                     // Local is newer
                     match self.upload_file(path, local_info).await {
                         Ok(_) => result.uploaded += 1,
                         Err(e) => result.errors.push(format!("Upload {} failed: {}", path, e)),
                     }
-                } else if cloud_file.modified_at > last_sync && self.config.direction != SyncDirection::Upload {
+                } else if cloud_file.modified_at > last_sync
+                    && self.config.direction != SyncDirection::Upload
+                {
                     // Cloud is newer
                     match self.download_file(cloud_file).await {
                         Ok(_) => result.downloaded += 1,
-                        Err(e) => result.errors.push(format!("Download {} failed: {}", path, e)),
+                        Err(e) => result
+                            .errors
+                            .push(format!("Download {} failed: {}", path, e)),
                     }
                 }
             }
@@ -324,7 +354,8 @@ impl<P: CloudProvider> CloudSync<P> {
     /// Returns map of relative path to (full path, mtime, size)
     async fn list_local_files(&self) -> Result<HashMap<String, (PathBuf, i64, u64)>> {
         let mut files = HashMap::new();
-        self.scan_directory(&self.config.local_path, &self.config.local_path, &mut files).await?;
+        self.scan_directory(&self.config.local_path, &self.config.local_path, &mut files)
+            .await?;
         Ok(files)
     }
 
@@ -336,11 +367,11 @@ impl<P: CloudProvider> CloudSync<P> {
         files: &mut HashMap<String, (PathBuf, i64, u64)>,
     ) -> Result<()> {
         let mut entries = fs::read_dir(dir).await?;
-        
+
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            
+
             // Skip hidden files if configured
             if !self.config.sync_hidden && name.starts_with('.') {
                 continue;
@@ -352,7 +383,7 @@ impl<P: CloudProvider> CloudSync<P> {
             }
 
             let metadata = entry.metadata().await?;
-            
+
             if metadata.is_dir() {
                 // Check if folder is in selective sync
                 if self.should_sync_folder(&path) {
@@ -444,15 +475,16 @@ impl<P: CloudProvider> CloudSync<P> {
                 return true;
             }
         }
-        
+
         false
     }
 
     /// Upload a file to cloud
     async fn upload_file(&mut self, path: &str, local_info: &(PathBuf, i64, u64)) -> Result<()> {
         let content = fs::read(&local_info.0).await?;
-        
-        let name = local_info.0
+
+        let name = local_info
+            .0
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "unknown".into());
@@ -460,7 +492,10 @@ impl<P: CloudProvider> CloudSync<P> {
         // Determine parent folder
         let parent_id = self.config.cloud_folder.as_deref();
 
-        let cloud_file = self.provider.upload_file(parent_id, &name, &content, None).await?;
+        let cloud_file = self
+            .provider
+            .upload_file(parent_id, &name, &content, None)
+            .await?;
 
         // Update state
         self.state.file_map.insert(path.to_string(), cloud_file.id);
@@ -475,10 +510,11 @@ impl<P: CloudProvider> CloudSync<P> {
     /// Download a file from cloud
     async fn download_file(&mut self, cloud_file: &CloudFile) -> Result<()> {
         let content = self.provider.download_file(&cloud_file.id).await?;
-        
-        let local_path = self.config.local_path.join(
-            cloud_file.path.trim_start_matches('/')
-        );
+
+        let local_path = self
+            .config
+            .local_path
+            .join(cloud_file.path.trim_start_matches('/'));
 
         // Create parent directories
         if let Some(parent) = local_path.parent() {
@@ -488,11 +524,17 @@ impl<P: CloudProvider> CloudSync<P> {
         fs::write(&local_path, &content).await?;
 
         // Update state
-        self.state.file_map.insert(cloud_file.path.clone(), cloud_file.id.clone());
+        self.state
+            .file_map
+            .insert(cloud_file.path.clone(), cloud_file.id.clone());
         if let Some(ref hash) = cloud_file.content_hash {
-            self.state.hash_map.insert(cloud_file.path.clone(), hash.clone());
+            self.state
+                .hash_map
+                .insert(cloud_file.path.clone(), hash.clone());
         }
-        self.state.mtime_map.insert(cloud_file.path.clone(), cloud_file.modified_at);
+        self.state
+            .mtime_map
+            .insert(cloud_file.path.clone(), cloud_file.modified_at);
 
         Ok(())
     }
@@ -511,20 +553,24 @@ impl<P: CloudProvider> CloudSync<P> {
         };
 
         // Get changes since last cursor
-        let (changes, new_cursor) = self.provider.get_changes(self.state.cursor.as_deref()).await?;
+        let (changes, new_cursor) = self
+            .provider
+            .get_changes(self.state.cursor.as_deref())
+            .await?;
 
         for cloud_file in changes {
             if cloud_file.is_folder {
                 continue;
             }
 
-            let local_path = self.config.local_path.join(
-                cloud_file.path.trim_start_matches('/')
-            );
+            let local_path = self
+                .config
+                .local_path
+                .join(cloud_file.path.trim_start_matches('/'));
 
             // Check if local file exists
             let local_exists = local_path.exists();
-            
+
             if local_exists {
                 // Check for conflict
                 let metadata = fs::metadata(&local_path).await?;
@@ -534,7 +580,7 @@ impl<P: CloudProvider> CloudSync<P> {
                     .unwrap_or(0);
 
                 let last_sync_time = self.state.mtime_map.get(&cloud_file.path).copied();
-                
+
                 if local_mtime > last_sync_time.unwrap_or(0) {
                     // Local modified since last sync - conflict
                     let mut conflict = Conflict {
@@ -545,7 +591,7 @@ impl<P: CloudProvider> CloudSync<P> {
                         conflict_type: ConflictType::BothModified,
                         resolution: None,
                     };
-                    
+
                     let resolution = self.conflict_resolver.resolve(&mut conflict);
                     match resolution {
                         ConflictResolution::UseCloud => {
@@ -594,11 +640,35 @@ mod tests {
 
     #[test]
     fn test_glob_match() {
-        assert!(CloudSync::<crate::integrations::google_drive::GoogleDrive>::glob_match("*.txt", "test.txt"));
-        assert!(CloudSync::<crate::integrations::google_drive::GoogleDrive>::glob_match("*.txt", "file.txt"));
-        assert!(!CloudSync::<crate::integrations::google_drive::GoogleDrive>::glob_match("*.txt", "test.pdf"));
-        assert!(CloudSync::<crate::integrations::google_drive::GoogleDrive>::glob_match("test?", "test1"));
-        assert!(!CloudSync::<crate::integrations::google_drive::GoogleDrive>::glob_match("test?", "test12"));
-        assert!(CloudSync::<crate::integrations::google_drive::GoogleDrive>::glob_match("*", "anything"));
+        assert!(
+            CloudSync::<crate::integrations::google_drive::GoogleDrive>::glob_match(
+                "*.txt", "test.txt"
+            )
+        );
+        assert!(
+            CloudSync::<crate::integrations::google_drive::GoogleDrive>::glob_match(
+                "*.txt", "file.txt"
+            )
+        );
+        assert!(
+            !CloudSync::<crate::integrations::google_drive::GoogleDrive>::glob_match(
+                "*.txt", "test.pdf"
+            )
+        );
+        assert!(
+            CloudSync::<crate::integrations::google_drive::GoogleDrive>::glob_match(
+                "test?", "test1"
+            )
+        );
+        assert!(
+            !CloudSync::<crate::integrations::google_drive::GoogleDrive>::glob_match(
+                "test?", "test12"
+            )
+        );
+        assert!(
+            CloudSync::<crate::integrations::google_drive::GoogleDrive>::glob_match(
+                "*", "anything"
+            )
+        );
     }
 }

@@ -1,5 +1,5 @@
 //! Firmware OTA server for reMarkable devices
-//! 
+//!
 //! Serves firmware updates from a local archive, supporting:
 //! - Version checking and compatibility
 //! - Firmware downloads  
@@ -7,21 +7,19 @@
 //! - Rollback support (serving older versions)
 //! - Delta updates (if delta files exist)
 
-use axum::{
-    body::Body,
-    extract::{Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
-    Json,
-};
+use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use axum::Json;
+use axum::body::Body;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    fs,
-    path::PathBuf,
-    sync::Arc,
-};
-use tokio::{fs::File, io::{AsyncReadExt, AsyncSeekExt}};
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
 use crate::error::{Result, ServerError};
@@ -30,11 +28,11 @@ use crate::error::{Result, ServerError};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DeviceType {
-    Rm1,      // reMarkable 1
-    Rm2,      // reMarkable 2
-    Ferrari,  // Paper Pro (codename)
-    Chiappa,  // reMarkable 2 variant
-    Tatsu,    // Newest device
+    Rm1,     // reMarkable 1
+    Rm2,     // reMarkable 2
+    Ferrari, // Paper Pro (codename)
+    Chiappa, // reMarkable 2 variant
+    Tatsu,   // Newest device
 }
 
 impl DeviceType {
@@ -52,13 +50,13 @@ impl DeviceType {
     fn as_str(&self) -> &'static str {
         match self {
             Self::Rm1 => "rm1",
-            Self::Rm2 => "rm2", 
+            Self::Rm2 => "rm2",
             Self::Ferrari => "ferrari",
             Self::Chiappa => "chiappa",
             Self::Tatsu => "tatsu",
         }
     }
-    
+
     /// Returns compatible device families (for firmware that works across models)
     fn compatible_with(&self) -> Vec<DeviceType> {
         match self {
@@ -93,30 +91,42 @@ impl FirmwareVersion {
             build: parts[3].parse().ok()?,
         })
     }
-    
+
     pub fn to_string(&self) -> String {
-        format!("{}.{}.{}.{}", self.major, self.minor, self.patch, self.build)
+        format!(
+            "{}.{}.{}.{}",
+            self.major, self.minor, self.patch, self.build
+        )
     }
-    
+
     /// Compare versions, returning ordering
     pub fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (self.major, self.minor, self.patch, self.build)
-            .cmp(&(other.major, other.minor, other.patch, other.build))
+        (self.major, self.minor, self.patch, self.build).cmp(&(
+            other.major,
+            other.minor,
+            other.patch,
+            other.build,
+        ))
     }
-    
+
     pub fn is_newer_than(&self, other: &Self) -> bool {
         self.cmp(other) == std::cmp::Ordering::Greater
     }
 }
 
 impl Serialize for FirmwareVersion {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         serializer.serialize_str(&self.to_string())
     }
 }
 
 impl<'de> Deserialize<'de> for FirmwareVersion {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
         Self::parse(&s).ok_or_else(|| serde::de::Error::custom("invalid version format"))
     }
@@ -138,8 +148,8 @@ pub struct FirmwareInfo {
 #[serde(rename_all = "lowercase")]
 pub enum ReleaseType {
     Production,
-    Memfault,    // Debug/diagnostic builds
-    Prototype,   // CT prototype builds
+    Memfault,  // Debug/diagnostic builds
+    Prototype, // CT prototype builds
     Beta,
 }
 
@@ -204,13 +214,14 @@ impl FirmwareManager {
         // Scan for .swu files
         // Pattern: remarkable-{type}-image-{version}-{device}-public.swu
         let re = regex::Regex::new(
-            r"remarkable-(\w+(?:-\w+)?)-image-(\d+\.\d+\.\d+\.\d+)-(\w+)-public\.swu"
-        ).unwrap();
+            r"remarkable-(\w+(?:-\w+)?)-image-(\d+\.\d+\.\d+\.\d+)-(\w+)-public\.swu",
+        )
+        .unwrap();
 
         for entry in fs::read_dir(&archive_path).map_err(|e| ServerError::Storage(e))? {
             let entry = entry.map_err(|e| ServerError::Storage(e))?;
             let path = entry.path();
-            
+
             if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
                 if let Some(caps) = delta_re.captures(filename) {
                     if let (Some(from), Some(to), Some(device)) = (
@@ -222,7 +233,10 @@ impl FirmwareManager {
                             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
                             let download_url = format!(
                                 "{}/firmware/v1/delta/{}/{}/{}",
-                                base_url, device.as_str(), from.to_string(), to.to_string()
+                                base_url,
+                                device.as_str(),
+                                from.to_string(),
+                                to.to_string()
                             );
                             deltas.insert(
                                 (device, from.to_string(), to.to_string()),
@@ -242,14 +256,14 @@ impl FirmwareManager {
                     let release_type = ReleaseType::from_str(&caps[1]);
                     let version_str = &caps[2];
                     let device_str = &caps[3];
-                    
+
                     if let (Some(version), Some(device)) = (
                         FirmwareVersion::parse(version_str),
                         DeviceType::from_str(device_str),
                     ) {
                         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
                         let key = (device, version_str.to_string());
-                        
+
                         let info = FirmwareInfo {
                             version: version.clone(),
                             device,
@@ -257,9 +271,12 @@ impl FirmwareManager {
                             size,
                             checksum: None, // Could compute SHA256 on startup
                             release_type,
-                            download_url: format!("{}/firmware/v1/download/{}", base_url, version_str),
+                            download_url: format!(
+                                "{}/firmware/v1/download/{}",
+                                base_url, version_str
+                            ),
                         };
-                        
+
                         // Only keep production builds as primary, but track all
                         if release_type == ReleaseType::Production {
                             firmware.insert(key, info);
@@ -338,7 +355,7 @@ impl FirmwareManager {
                     firmware: None,
                     delta: None,
                     rollback_versions: vec![],
-                }
+                };
             }
         };
 
@@ -391,8 +408,15 @@ impl FirmwareManager {
     }
 
     /// Resolve the on-disk path and filename of a delta update
-    pub fn get_delta_path(&self, device: DeviceType, from: &str, to: &str) -> Option<(PathBuf, String)> {
-        let d = self.deltas.get(&(device, from.to_string(), to.to_string()))?;
+    pub fn get_delta_path(
+        &self,
+        device: DeviceType,
+        from: &str,
+        to: &str,
+    ) -> Option<(PathBuf, String)> {
+        let d = self
+            .deltas
+            .get(&(device, from.to_string(), to.to_string()))?;
         Some((self.archive_path.join(&d.filename), d.filename.clone()))
     }
 
@@ -404,9 +428,14 @@ impl FirmwareManager {
     }
 
     /// Generate changelog between versions
-    pub fn get_changelog(&self, device: DeviceType, from: Option<&str>, to: Option<&str>) -> ChangelogResponse {
+    pub fn get_changelog(
+        &self,
+        device: DeviceType,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> ChangelogResponse {
         let versions = self.get_versions(device);
-        
+
         let entries: Vec<ChangelogEntry> = versions
             .iter()
             .filter(|info| {
@@ -446,7 +475,11 @@ impl FirmwareManager {
 ///   <archive>/changelogs/<version>.md|.txt
 /// Each non-empty line becomes one entry; leading `-`, `*`, `•` bullets and
 /// markdown headings (`#`) are stripped.
-fn read_changelog(archive: &std::path::Path, device: DeviceType, version: &FirmwareVersion) -> Option<Vec<String>> {
+fn read_changelog(
+    archive: &std::path::Path,
+    device: DeviceType,
+    version: &FirmwareVersion,
+) -> Option<Vec<String>> {
     let v = version.to_string();
     let base = archive.join("changelogs");
     let candidates = [
@@ -455,7 +488,9 @@ fn read_changelog(archive: &std::path::Path, device: DeviceType, version: &Firmw
         base.join(format!("{v}.md")),
         base.join(format!("{v}.txt")),
     ];
-    let text = candidates.iter().find_map(|p| std::fs::read_to_string(p).ok())?;
+    let text = candidates
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())?;
     let lines: Vec<String> = text
         .lines()
         .map(|l| l.trim().trim_start_matches(['#', '-', '*', '•']).trim())
@@ -540,7 +575,7 @@ pub async fn check_update(
 ) -> Result<Json<UpdateCheckResult>> {
     let device = DeviceType::from_str(&query.device)
         .ok_or_else(|| ServerError::NotFound(format!("Unknown device type: {}", query.device)))?;
-    
+
     let result = state.manager.check_update(device, &query.version);
     Ok(Json(result))
 }
@@ -555,16 +590,24 @@ pub async fn download_firmware(
 ) -> Result<Response> {
     // Try to find firmware for any device if not specified
     let devices = if let Some(d) = &query.device {
-        vec![DeviceType::from_str(d)
-            .ok_or_else(|| ServerError::NotFound(format!("Unknown device: {}", d)))?]
+        vec![
+            DeviceType::from_str(d)
+                .ok_or_else(|| ServerError::NotFound(format!("Unknown device: {}", d)))?,
+        ]
     } else {
-        vec![DeviceType::Rm1, DeviceType::Rm2, DeviceType::Ferrari, DeviceType::Chiappa, DeviceType::Tatsu]
+        vec![
+            DeviceType::Rm1,
+            DeviceType::Rm2,
+            DeviceType::Ferrari,
+            DeviceType::Chiappa,
+            DeviceType::Tatsu,
+        ]
     };
 
     // Find the firmware
     let mut firmware_path = None;
     let mut filename = String::new();
-    
+
     for device in devices {
         if let Some(info) = state.manager.get_version(device, &version) {
             if let Some(path) = state.manager.get_firmware_path(device, &version) {
@@ -601,7 +644,11 @@ pub async fn download_delta(
 
 /// Stream a file as an attachment, honouring a single `Range: bytes=` request so
 /// interrupted update downloads can resume.
-async fn serve_file(path: &std::path::Path, filename: &str, headers: &HeaderMap) -> Result<Response> {
+async fn serve_file(
+    path: &std::path::Path,
+    filename: &str,
+    headers: &HeaderMap,
+) -> Result<Response> {
     let mut file = File::open(path).await.map_err(ServerError::Storage)?;
     let total = file.metadata().await.map_err(ServerError::Storage)?.len();
     let disposition = format!("attachment; filename=\"{}\"", filename);
@@ -622,7 +669,10 @@ async fn serve_file(path: &std::path::Path, filename: &str, headers: &HeaderMap)
                 [
                     (header::CONTENT_TYPE, "application/octet-stream".to_string()),
                     (header::CONTENT_LENGTH, len.to_string()),
-                    (header::CONTENT_RANGE, format!("bytes {}-{}/{}", start, end, total)),
+                    (
+                        header::CONTENT_RANGE,
+                        format!("bytes {}-{}/{}", start, end, total),
+                    ),
                     (header::ACCEPT_RANGES, "bytes".to_string()),
                     (header::CONTENT_DISPOSITION, disposition),
                 ],
@@ -670,7 +720,11 @@ fn parse_byte_range(value: &str, total: u64) -> Option<(u64, u64)> {
         (total.saturating_sub(n), total - 1)
     } else {
         let start: u64 = a.parse().ok()?;
-        let end = if b.is_empty() { total - 1 } else { b.parse::<u64>().ok()?.min(total - 1) };
+        let end = if b.is_empty() {
+            total - 1
+        } else {
+            b.parse::<u64>().ok()?.min(total - 1)
+        };
         (start, end)
     };
     (start <= end && start < total).then_some((start, end))
@@ -687,13 +741,11 @@ pub async fn get_changelog(
         .as_ref()
         .and_then(|d| DeviceType::from_str(d))
         .unwrap_or(DeviceType::Rm2);
-    
-    let changelog = state.manager.get_changelog(
-        device,
-        query.from.as_deref(),
-        query.to.as_deref(),
-    );
-    
+
+    let changelog = state
+        .manager
+        .get_changelog(device, query.from.as_deref(), query.to.as_deref());
+
     Ok(Json(changelog))
 }
 
@@ -708,12 +760,14 @@ pub async fn list_versions(
         .as_ref()
         .and_then(|d| DeviceType::from_str(d))
         .unwrap_or(DeviceType::Rm2);
-    
-    let versions: Vec<FirmwareInfo> = state.manager.get_versions(device)
+
+    let versions: Vec<FirmwareInfo> = state
+        .manager
+        .get_versions(device)
         .into_iter()
         .cloned()
         .collect();
-    
+
     Ok(Json(versions))
 }
 
@@ -729,20 +783,23 @@ pub async fn list_devices(
         DeviceType::Chiappa,
         DeviceType::Tatsu,
     ];
-    
+
     let mut result = HashMap::new();
     for device in devices {
-        let latest = state.manager.get_latest(device).map(|f| f.version.to_string());
+        let latest = state
+            .manager
+            .get_latest(device)
+            .map(|f| f.version.to_string());
         result.insert(device.as_str().to_string(), latest);
     }
-    
+
     Json(result)
 }
 
 /// Create firmware router
 pub fn firmware_router(state: FirmwareState) -> axum::Router {
     use axum::routing::get;
-    
+
     axum::Router::new()
         .route("/check", get(check_update))
         .route("/download/{version}", get(download_firmware))
@@ -758,10 +815,22 @@ mod tests {
 
     #[test]
     fn byte_range_parsing() {
-        assert_eq!(super::parse_byte_range("bytes=0-1023", 5000), Some((0, 1023)));
-        assert_eq!(super::parse_byte_range("bytes=100-", 5000), Some((100, 4999)));
-        assert_eq!(super::parse_byte_range("bytes=-500", 5000), Some((4500, 4999)));
-        assert_eq!(super::parse_byte_range("bytes=0-99999", 5000), Some((0, 4999)));
+        assert_eq!(
+            super::parse_byte_range("bytes=0-1023", 5000),
+            Some((0, 1023))
+        );
+        assert_eq!(
+            super::parse_byte_range("bytes=100-", 5000),
+            Some((100, 4999))
+        );
+        assert_eq!(
+            super::parse_byte_range("bytes=-500", 5000),
+            Some((4500, 4999))
+        );
+        assert_eq!(
+            super::parse_byte_range("bytes=0-99999", 5000),
+            Some((0, 4999))
+        );
         assert_eq!(super::parse_byte_range("bytes=6000-", 5000), None);
         assert_eq!(super::parse_byte_range("bytes=0-1,5-9", 5000), None);
         assert_eq!(super::parse_byte_range("items=0-1", 5000), None);
@@ -775,7 +844,7 @@ mod tests {
         assert_eq!(v.minor, 28);
         assert_eq!(v.patch, 0);
         assert_eq!(v.build, 172);
-        
+
         assert!(FirmwareVersion::parse("invalid").is_none());
         assert!(FirmwareVersion::parse("1.2.3").is_none());
     }
@@ -785,7 +854,7 @@ mod tests {
         let v1 = FirmwareVersion::parse("3.27.0.97").unwrap();
         let v2 = FirmwareVersion::parse("3.28.0.172").unwrap();
         let v3 = FirmwareVersion::parse("3.28.0.172").unwrap();
-        
+
         assert!(v2.is_newer_than(&v1));
         assert!(!v1.is_newer_than(&v2));
         assert!(!v2.is_newer_than(&v3));
@@ -828,11 +897,24 @@ mod tests {
         let r = mgr.check_update(DeviceType::Rm2, "3.20.0.92");
         assert!(r.update_available);
         let d = r.delta.expect("delta offered");
-        assert_eq!(d.download_url, "http://h/firmware/v1/delta/rm2/3.20.0.92/3.22.0.64");
-        assert!(mgr.get_delta_path(DeviceType::Rm2, "3.20.0.92", "3.22.0.64").is_some());
-        assert!(mgr.get_delta_path(DeviceType::Rm2, "3.22.0.64", "3.20.0.92").is_none());
+        assert_eq!(
+            d.download_url,
+            "http://h/firmware/v1/delta/rm2/3.20.0.92/3.22.0.64"
+        );
+        assert!(
+            mgr.get_delta_path(DeviceType::Rm2, "3.20.0.92", "3.22.0.64")
+                .is_some()
+        );
+        assert!(
+            mgr.get_delta_path(DeviceType::Rm2, "3.22.0.64", "3.20.0.92")
+                .is_none()
+        );
         // no delta from an unrelated version
-        assert!(mgr.check_update(DeviceType::Rm2, "3.21.0.1").delta.is_none());
+        assert!(
+            mgr.check_update(DeviceType::Rm2, "3.21.0.1")
+                .delta
+                .is_none()
+        );
         // delta files are not listed as full images
         assert_eq!(mgr.get_versions(DeviceType::Rm2).len(), 2);
         fs::remove_dir_all(dir).ok();
@@ -842,13 +924,28 @@ mod tests {
     fn changelog_prefers_real_notes() {
         let dir = temp_archive("changelog");
         fs::create_dir_all(dir.join("changelogs/rm2")).unwrap();
-        fs::write(dir.join("changelogs/rm2/3.22.0.64.md"), "- Real note A\n* Real note B\n\n").unwrap();
+        fs::write(
+            dir.join("changelogs/rm2/3.22.0.64.md"),
+            "- Real note A\n* Real note B\n\n",
+        )
+        .unwrap();
         let mgr = FirmwareManager::new(&dir, "http://h").unwrap();
         let cl = mgr.get_changelog(DeviceType::Rm2, None, None);
-        let e22 = cl.entries.iter().find(|e| e.version == "3.22.0.64").unwrap();
-        assert_eq!(e22.changes, vec!["Real note A".to_string(), "Real note B".to_string()]);
+        let e22 = cl
+            .entries
+            .iter()
+            .find(|e| e.version == "3.22.0.64")
+            .unwrap();
+        assert_eq!(
+            e22.changes,
+            vec!["Real note A".to_string(), "Real note B".to_string()]
+        );
         // version without notes falls back to synthetic text
-        let e20 = cl.entries.iter().find(|e| e.version == "3.20.0.92").unwrap();
+        let e20 = cl
+            .entries
+            .iter()
+            .find(|e| e.version == "3.20.0.92")
+            .unwrap();
         assert!(!e20.changes.is_empty());
         fs::remove_dir_all(dir).ok();
     }

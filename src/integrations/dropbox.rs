@@ -2,13 +2,20 @@
 //!
 //! Full read/write access via Dropbox API v2.
 
-use crate::integrations::{
-    oauth::{refresh_token, OAuthConfig, OAuthToken},
-    CloudFile, CloudFolder, CloudProvider, IntegrationError, ProviderType, Result, StorageQuota,
-};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+
+use crate::integrations::oauth::{OAuthConfig, OAuthToken, refresh_token};
+use crate::integrations::{
+    CloudFile,
+    CloudFolder,
+    CloudProvider,
+    IntegrationError,
+    ProviderType,
+    Result,
+    StorageQuota,
+};
 
 const API_BASE: &str = "https://api.dropboxapi.com/2";
 const CONTENT_BASE: &str = "https://content.dropboxapi.com/2";
@@ -243,7 +250,7 @@ impl CloudProvider for Dropbox {
         };
 
         let response: ListFolderResponse = self.api_request("files/list_folder", &arg).await?;
-        
+
         let mut files: Vec<CloudFile> = response
             .entries
             .into_iter()
@@ -261,7 +268,10 @@ impl CloudProvider for Dropbox {
             }
 
             let cont: ListFolderResponse = self
-                .api_request("files/list_folder/continue", &ContinueArg { cursor: &cursor })
+                .api_request(
+                    "files/list_folder/continue",
+                    &ContinueArg { cursor: &cursor },
+                )
                 .await?;
 
             files.extend(cont.entries.into_iter().map(|e| e.to_cloud_file()));
@@ -286,7 +296,7 @@ impl CloudProvider for Dropbox {
         };
 
         let response: ListFolderResponse = self.api_request("files/list_folder", &arg).await?;
-        
+
         let mut folders: Vec<CloudFolder> = response
             .entries
             .into_iter()
@@ -305,7 +315,10 @@ impl CloudProvider for Dropbox {
             }
 
             let cont: ListFolderResponse = self
-                .api_request("files/list_folder/continue", &ContinueArg { cursor: &cursor })
+                .api_request(
+                    "files/list_folder/continue",
+                    &ContinueArg { cursor: &cursor },
+                )
                 .await?;
 
             folders.extend(
@@ -336,7 +349,7 @@ impl CloudProvider for Dropbox {
 
     async fn download_file(&self, file_id: &str) -> Result<Vec<u8>> {
         let token = self.access_token()?;
-        
+
         #[derive(Serialize)]
         struct DownloadArg<'a> {
             path: &'a str,
@@ -375,7 +388,7 @@ impl CloudProvider for Dropbox {
         _mime_type: Option<&str>,
     ) -> Result<CloudFile> {
         let token = self.access_token()?;
-        
+
         let path = if let Some(parent) = parent_id {
             format!("{}/{}", parent, name)
         } else {

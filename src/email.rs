@@ -1,7 +1,7 @@
 //! Email-to-device integration for remarkable-server
 //!
 //! Receives emails via SMTP and syncs attachments (PDF, EPUB) to device folders.
-//! 
+//!
 //! Addressing: send@{device-id}.remarkable.local
 //! - Attachments are extracted and converted to remarkable format
 //! - Confirmation email sent back to sender
@@ -13,22 +13,23 @@
 //! Attachment: report.pdf
 //! ```
 
-use crate::error::{Result, ServerError};
-use crate::storage::Storage;
-use crate::device::DeviceManager;
-use chrono::{DateTime, Utc};
-use parking_lot::RwLock;
-use std::sync::Mutex;
-use rusqlite::{params, Connection};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use chrono::{DateTime, Utc};
+use parking_lot::RwLock;
+use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
+
+use crate::device::DeviceManager;
+use crate::error::{Result, ServerError};
+use crate::storage::Storage;
 
 /// Supported attachment types
 const SUPPORTED_EXTENSIONS: &[&str] = &["pdf", "epub"];
@@ -150,7 +151,7 @@ impl EmailServer {
                 FOREIGN KEY (email_id) REFERENCES emails(id)
             );
             CREATE INDEX IF NOT EXISTS idx_email_device ON emails(device_id);
-            CREATE INDEX IF NOT EXISTS idx_email_status ON emails(status);"
+            CREATE INDEX IF NOT EXISTS idx_email_status ON emails(status);",
         )?;
 
         Ok(Self {
@@ -171,12 +172,17 @@ impl EmailServer {
 
     /// Start the SMTP server
     pub async fn run(&self) -> Result<()> {
-        let addr: SocketAddr = self.inner.config.smtp_bind.parse()
+        let addr: SocketAddr = self
+            .inner
+            .config
+            .smtp_bind
+            .parse()
             .map_err(|e| ServerError::Config(format!("Invalid SMTP bind address: {}", e)))?;
-        
-        let listener = TcpListener::bind(&addr).await
+
+        let listener = TcpListener::bind(&addr)
+            .await
             .map_err(|e| ServerError::Io(e.to_string()))?;
-        
+
         tracing::info!("SMTP server listening on {}", addr);
         tracing::info!("Email domain: {}", self.inner.config.domain);
 
@@ -203,7 +209,7 @@ impl EmailServer {
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
         let mut line = String::new();
-        
+
         // Session state
         let session_id = Uuid::new_v4().to_string();
         let mut mail_from: Option<String> = None;
@@ -212,7 +218,10 @@ impl EmailServer {
         let mut data_buf: Vec<u8> = Vec::new();
 
         // Send greeting
-        let greeting = format!("220 {} remarkable-server SMTP\r\n", self.inner.config.domain);
+        let greeting = format!(
+            "220 {} remarkable-server SMTP\r\n",
+            self.inner.config.domain
+        );
         writer.write_all(greeting.as_bytes()).await?;
 
         loop {
@@ -229,12 +238,13 @@ impl EmailServer {
                 // Check for end of data
                 if line_trimmed == "." {
                     in_data = false;
-                    
+
                     // Process the email
                     if let Some(from) = &mail_from {
                         match self.process_email(from, &rcpt_to, &data_buf).await {
                             Ok(count) => {
-                                let msg = format!("250 OK: {} attachment(s) queued for sync\r\n", count);
+                                let msg =
+                                    format!("250 OK: {} attachment(s) queued for sync\r\n", count);
                                 writer.write_all(msg.as_bytes()).await?;
                             }
                             Err(e) => {
@@ -243,7 +253,7 @@ impl EmailServer {
                             }
                         }
                     }
-                    
+
                     // Reset for next message
                     mail_from = None;
                     rcpt_to.clear();
@@ -262,7 +272,7 @@ impl EmailServer {
 
             // Parse SMTP commands
             let cmd = line_trimmed.to_uppercase();
-            
+
             if cmd.starts_with("HELO") || cmd.starts_with("EHLO") {
                 let response = format!(
                     "250-{} Hello {}\r\n250-SIZE 52428800\r\n250-8BITMIME\r\n250 OK\r\n",
@@ -281,7 +291,9 @@ impl EmailServer {
             } else if cmd.starts_with("RCPT TO:") {
                 let to = extract_email_address(&line_trimmed[8..]);
                 if to.is_empty() {
-                    writer.write_all(b"501 Invalid recipient address\r\n").await?;
+                    writer
+                        .write_all(b"501 Invalid recipient address\r\n")
+                        .await?;
                 } else if !self.validate_recipient(&to) {
                     writer.write_all(b"550 Unknown recipient\r\n").await?;
                 } else {
@@ -290,10 +302,14 @@ impl EmailServer {
                 }
             } else if cmd == "DATA" {
                 if mail_from.is_none() || rcpt_to.is_empty() {
-                    writer.write_all(b"503 MAIL FROM and RCPT TO required first\r\n").await?;
+                    writer
+                        .write_all(b"503 MAIL FROM and RCPT TO required first\r\n")
+                        .await?;
                 } else {
                     in_data = true;
-                    writer.write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n").await?;
+                    writer
+                        .write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n")
+                        .await?;
                 }
             } else if cmd == "QUIT" {
                 writer.write_all(b"221 Bye\r\n").await?;
@@ -320,24 +336,24 @@ impl EmailServer {
         if parts.len() != 2 {
             return false;
         }
-        
+
         let local = parts[0].to_lowercase();
         let domain = parts[1].to_lowercase();
-        
+
         // Must be "send@..." or "sync@..."
         if local != "send" && local != "sync" {
             return false;
         }
-        
+
         // Domain must be {device-id}.{our-domain}
         let expected_suffix = format!(".{}", self.inner.config.domain);
         if !domain.ends_with(&expected_suffix) {
             return false;
         }
-        
+
         // Extract device ID
         let device_id = &domain[..domain.len() - expected_suffix.len()];
-        
+
         // Verify device exists
         match self.inner.devices.get_device(device_id) {
             Ok(Some(_)) => true,
@@ -354,14 +370,14 @@ impl EmailServer {
         if parts.len() != 2 {
             return None;
         }
-        
+
         let domain = parts[1].to_lowercase();
         let expected_suffix = format!(".{}", self.inner.config.domain);
-        
+
         if !domain.ends_with(&expected_suffix) {
             return None;
         }
-        
+
         Some(domain[..domain.len() - expected_suffix.len()].to_uppercase())
     }
 
@@ -370,27 +386,29 @@ impl EmailServer {
         // Parse the email
         let parsed = mailparse::parse_mail(data)
             .map_err(|e| ServerError::Email(format!("Parse error: {}", e)))?;
-        
-        let subject = parsed.headers.iter()
+
+        let subject = parsed
+            .headers
+            .iter()
             .find(|h| h.get_key().eq_ignore_ascii_case("subject"))
             .map(|h| h.get_value())
             .unwrap_or_else(|| "No Subject".into());
-        
+
         tracing::info!("Processing email from {} subject: {}", from, subject);
-        
+
         let mut total_attachments = 0;
-        
+
         // Process each recipient (device)
         for recipient in to {
             let device_id = match self.extract_device_id(recipient) {
                 Some(id) => id,
                 None => continue,
             };
-            
+
             // Create email record
             let email_id = Uuid::new_v4().to_string();
             let now = Utc::now();
-            
+
             {
                 let db = self.inner.db.lock().unwrap();
                 db.execute(
@@ -399,30 +417,39 @@ impl EmailServer {
                     params![email_id, from, recipient, subject, device_id, now.to_rfc3339(), "processing"],
                 )?;
             }
-            
+
             // Extract and sync attachments
             let attachments = self.extract_attachments(&parsed)?;
-            let synced_count = self.sync_attachments(&email_id, &device_id, &attachments, &subject).await?;
+            let synced_count = self
+                .sync_attachments(&email_id, &device_id, &attachments, &subject)
+                .await?;
             total_attachments += synced_count;
-            
+
             // Update status
             {
                 let db = self.inner.db.lock().unwrap();
-                let status = if synced_count > 0 { "synced" } else { "no_attachments" };
+                let status = if synced_count > 0 {
+                    "synced"
+                } else {
+                    "no_attachments"
+                };
                 db.execute(
                     "UPDATE emails SET status = ?1 WHERE id = ?2",
                     params![status, email_id],
                 )?;
             }
-            
+
             // Send confirmation
             if synced_count > 0 {
-                if let Err(e) = self.send_confirmation(from, &subject, synced_count, &device_id).await {
+                if let Err(e) = self
+                    .send_confirmation(from, &subject, synced_count, &device_id)
+                    .await
+                {
                     tracing::warn!("Failed to send confirmation: {}", e);
                 }
             }
         }
-        
+
         Ok(total_attachments)
     }
 
@@ -434,33 +461,36 @@ impl EmailServer {
     }
 
     fn extract_attachments_recursive(
-        &self, 
-        mail: &mailparse::ParsedMail, 
-        attachments: &mut Vec<Attachment>
+        &self,
+        mail: &mailparse::ParsedMail,
+        attachments: &mut Vec<Attachment>,
     ) -> Result<()> {
         // Check content disposition
         let content_type = mail.ctype.mimetype.to_lowercase();
-        let filename = mail.get_content_disposition().params
+        let filename = mail
+            .get_content_disposition()
+            .params
             .get("filename")
             .cloned()
             .or_else(|| mail.ctype.params.get("name").cloned());
-        
+
         if let Some(name) = filename {
             let ext = Path::new(&name)
                 .extension()
                 .and_then(|e| e.to_str())
                 .map(|e| e.to_lowercase())
                 .unwrap_or_default();
-            
+
             if SUPPORTED_EXTENSIONS.contains(&ext.as_str()) {
-                let body = mail.get_body_raw()
+                let body = mail
+                    .get_body_raw()
                     .map_err(|e| ServerError::Email(format!("Body decode error: {}", e)))?;
-                
+
                 // Calculate hash
                 let mut hasher = Sha256::new();
                 hasher.update(&body);
                 let hash = hex::encode(hasher.finalize());
-                
+
                 attachments.push(Attachment {
                     filename: name,
                     content_type: content_type.clone(),
@@ -469,12 +499,12 @@ impl EmailServer {
                 });
             }
         }
-        
+
         // Recurse into multipart parts
         for subpart in &mail.subparts {
             self.extract_attachments_recursive(subpart, attachments)?;
         }
-        
+
         Ok(())
     }
 
@@ -487,23 +517,38 @@ impl EmailServer {
         subject: &str,
     ) -> Result<usize> {
         let mut synced = 0;
-        
+
         for attachment in attachments {
             tracing::info!(
-                "Syncing attachment: {} ({} bytes) to device {}", 
-                attachment.filename, 
+                "Syncing attachment: {} ({} bytes) to device {}",
+                attachment.filename,
                 attachment.data.len(),
                 device_id
             );
-            
+
             // Only PDF/EPUB become documents; the tablet can't open anything else.
             let Some(ext) = document_ext(&attachment.filename, &attachment.content_type) else {
-                tracing::warn!("Skipping attachment {} ({}): not a PDF/EPUB", attachment.filename, attachment.content_type);
+                tracing::warn!(
+                    "Skipping attachment {} ({}): not a PDF/EPUB",
+                    attachment.filename,
+                    attachment.content_type
+                );
                 continue;
             };
             // Adds the document to the sync tree and commits a new root, so the device pulls it.
-            let (doc_id, generation) = crate::documents::create_document(&self.inner.storage, &strip_extension(&attachment.filename), ext, &attachment.data)?;
-            tracing::info!("Emailed {} became document {} (subject {:?}, root generation {})", attachment.filename, doc_id, subject, generation);
+            let (doc_id, generation) = crate::documents::create_document(
+                &self.inner.storage,
+                &strip_extension(&attachment.filename),
+                ext,
+                &attachment.data,
+            )?;
+            tracing::info!(
+                "Emailed {} became document {} (subject {:?}, root generation {})",
+                attachment.filename,
+                doc_id,
+                subject,
+                generation
+            );
 
             // Record attachment in database (the hash column holds the new document id)
             let attachment_id = Uuid::new_v4().to_string();
@@ -525,7 +570,7 @@ impl EmailServer {
 
             synced += 1;
         }
-        
+
         Ok(synced)
     }
 
@@ -544,36 +589,47 @@ impl EmailServer {
                 return Ok(());
             }
         };
-        
+
         let message = format!(
             "Your email \"{}\r\n\" has been received and {} attachment(s) are being synced to your reMarkable device ({}).\r\n\r\n--\r\nreMarkable Server",
             subject, count, device_id
         );
-        
+
         // Build email using lettre
-        use lettre::{Message, SmtpTransport, Transport};
         use lettre::transport::smtp::authentication::Credentials;
-        
+        use lettre::{Message, SmtpTransport, Transport};
+
         let email = Message::builder()
-            .from(self.inner.config.from_address.parse().map_err(|e| ServerError::Email(format!("Invalid from address: {}", e)))?)
-            .to(to.parse().map_err(|e| ServerError::Email(format!("Invalid to address: {}", e)))?)
+            .from(
+                self.inner
+                    .config
+                    .from_address
+                    .parse()
+                    .map_err(|e| ServerError::Email(format!("Invalid from address: {}", e)))?,
+            )
+            .to(to
+                .parse()
+                .map_err(|e| ServerError::Email(format!("Invalid to address: {}", e)))?)
             .subject(format!("reMarkable: {} synced", count))
             .body(message)
             .map_err(|e| ServerError::Email(format!("Build email error: {}", e)))?;
-        
+
         let mut mailer = SmtpTransport::relay(relay)
             .map_err(|e| ServerError::Email(format!("SMTP relay error: {}", e)))?
             .port(self.inner.config.relay_port);
-        
-        if let (Some(user), Some(pass)) = (&self.inner.config.relay_user, &self.inner.config.relay_pass) {
+
+        if let (Some(user), Some(pass)) =
+            (&self.inner.config.relay_user, &self.inner.config.relay_pass)
+        {
             mailer = mailer.credentials(Credentials::new(user.clone(), pass.clone()));
         }
-        
+
         let mailer = mailer.build();
-        
-        mailer.send(&email)
+
+        mailer
+            .send(&email)
             .map_err(|e| ServerError::Email(format!("Send error: {}", e)))?;
-        
+
         // Mark confirmation sent
         {
             let db = self.inner.db.lock().unwrap();
@@ -584,7 +640,7 @@ impl EmailServer {
                 params![to],
             )?;
         }
-        
+
         tracing::info!("Confirmation sent to {}", to);
         Ok(())
     }
@@ -599,7 +655,7 @@ impl EmailServer {
              ORDER BY e.received_at DESC
              LIMIT ?2"
         )?;
-        
+
         let rows = stmt.query_map(params![device_id, limit as i64], |row| {
             Ok(EmailRecord {
                 id: row.get(0)?,
@@ -620,7 +676,7 @@ impl EmailServer {
                 confirmation_sent: row.get::<_, i32>(7)? != 0,
             })
         })?;
-        
+
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| ServerError::Database(e.to_string()))
     }
@@ -629,10 +685,19 @@ impl EmailServer {
     pub fn stats(&self) -> Result<EmailStats> {
         let db = self.inner.db.lock().unwrap();
         let total: i64 = db.query_row("SELECT COUNT(*) FROM emails", [], |r| r.get(0))?;
-        let synced: i64 = db.query_row("SELECT COUNT(*) FROM emails WHERE status = 'synced'", [], |r| r.get(0))?;
-        let attachments: i64 = db.query_row("SELECT COUNT(*) FROM email_attachments", [], |r| r.get(0))?;
-        let bytes: i64 = db.query_row("SELECT COALESCE(SUM(size), 0) FROM email_attachments", [], |r| r.get(0))?;
-        
+        let synced: i64 = db.query_row(
+            "SELECT COUNT(*) FROM emails WHERE status = 'synced'",
+            [],
+            |r| r.get(0),
+        )?;
+        let attachments: i64 =
+            db.query_row("SELECT COUNT(*) FROM email_attachments", [], |r| r.get(0))?;
+        let bytes: i64 = db.query_row(
+            "SELECT COALESCE(SUM(size), 0) FROM email_attachments",
+            [],
+            |r| r.get(0),
+        )?;
+
         Ok(EmailStats {
             total_emails: total as u64,
             synced_emails: synced as u64,
@@ -662,14 +727,14 @@ pub struct EmailStats {
 fn extract_email_address(s: &str) -> String {
     let s = s.trim();
     if s.starts_with('<') && s.ends_with('>') {
-        s[1..s.len()-1].to_string()
+        s[1..s.len() - 1].to_string()
     } else {
         // Handle "user@domain" or "<user@domain> SIZE=..."
         s.split_whitespace()
             .next()
             .map(|addr| {
                 if addr.starts_with('<') && addr.ends_with('>') {
-                    addr[1..addr.len()-1].to_string()
+                    addr[1..addr.len() - 1].to_string()
                 } else {
                     addr.to_string()
                 }
@@ -707,28 +772,40 @@ fn detect_file_type(filename: &str) -> &'static str {
     {
         Some("pdf") => "pdf",
         Some("epub") => "epub",
-        _ => "pdf"
+        _ => "pdf",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_extract_email_address() {
-        assert_eq!(extract_email_address("<user@example.com>"), "user@example.com");
-        assert_eq!(extract_email_address("user@example.com"), "user@example.com");
-        assert_eq!(extract_email_address("<user@example.com> SIZE=1234"), "user@example.com");
+        assert_eq!(
+            extract_email_address("<user@example.com>"),
+            "user@example.com"
+        );
+        assert_eq!(
+            extract_email_address("user@example.com"),
+            "user@example.com"
+        );
+        assert_eq!(
+            extract_email_address("<user@example.com> SIZE=1234"),
+            "user@example.com"
+        );
     }
-    
+
     #[test]
     fn test_sanitize_filename() {
-        assert_eq!(sanitize_filename("Quarterly Report 2024"), "Quarterly Report 2024");
+        assert_eq!(
+            sanitize_filename("Quarterly Report 2024"),
+            "Quarterly Report 2024"
+        );
         assert_eq!(sanitize_filename("Report<>|:*?"), "Report");
         assert_eq!(sanitize_filename("a".repeat(100).as_str()).len(), 50);
     }
-    
+
     #[test]
     fn test_strip_extension() {
         assert_eq!(strip_extension("report.pdf"), "report");
@@ -742,7 +819,8 @@ fn document_ext(filename: &str, content_type: &str) -> Option<&'static str> {
     let lower = filename.to_ascii_lowercase();
     if lower.ends_with(".pdf") || content_type.eq_ignore_ascii_case("application/pdf") {
         Some("pdf")
-    } else if lower.ends_with(".epub") || content_type.eq_ignore_ascii_case("application/epub+zip") {
+    } else if lower.ends_with(".epub") || content_type.eq_ignore_ascii_case("application/epub+zip")
+    {
         Some("epub")
     } else {
         None

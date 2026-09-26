@@ -1,12 +1,14 @@
-use crate::error::{Result, ServerError};
-use chrono::{DateTime, Duration, Utc};
-use jsonwebtoken::{encode, decode, Algorithm, Header, Validation};
-use rand::Rng;
-use rusqlite::{params, Connection};
-use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
+
+use chrono::{DateTime, Duration, Utc};
+use jsonwebtoken::{Algorithm, Header, Validation, decode, encode};
 use parking_lot::Mutex;
+use rand::Rng;
+use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
+
+use crate::error::{Result, ServerError};
 
 const MIN_JWT_SECRET_LEN: usize = 32;
 const JWT_SECRET_FILENAME: &str = "jwt_secret";
@@ -20,51 +22,126 @@ const BLOB_URL_LIFETIME_MINUTES: i64 = 60;
 const USER_SCOPES: &str = "intgr docedit screenshare sync:fox hwc:-1 mail:-1";
 
 #[derive(Clone)]
-pub struct DeviceManager { inner: Arc<Inner> }
-struct Inner { 
-    conn: Mutex<Connection>, 
-    region: String, 
+pub struct DeviceManager {
+    inner: Arc<Inner>,
+}
+struct Inner {
+    conn: Mutex<Connection>,
+    region: String,
     issuer: String,
     encoding_key: jsonwebtoken::EncodingKey,
     decoding_key: jsonwebtoken::DecodingKey,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Device { pub device_id: String, pub device_desc: String, pub registered_at: DateTime<Utc>, pub last_refresh: DateTime<Utc>, pub user_id: String }
+pub struct Device {
+    pub device_id: String,
+    pub device_desc: String,
+    pub registered_at: DateTime<Utc>,
+    pub last_refresh: DateTime<Utc>,
+    pub user_id: String,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
-struct DeviceTokenClaims { sub: String, iss: String, iat: i64, nbf: i64, jti: String, #[serde(rename = "device-id")] device_id: String, #[serde(rename = "device-desc")] device_desc: String, #[serde(rename = "auth0-userid")] auth0_userid: String }
+struct DeviceTokenClaims {
+    sub: String,
+    iss: String,
+    iat: i64,
+    nbf: i64,
+    jti: String,
+    #[serde(rename = "device-id")]
+    device_id: String,
+    #[serde(rename = "device-desc")]
+    device_desc: String,
+    #[serde(rename = "auth0-userid")]
+    auth0_userid: String,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
-struct UserTokenClaims { sub: String, iss: String, iat: i64, exp: i64, nbf: i64, jti: String, #[serde(rename = "https://auth.remarkable.com/tectonic")] tectonic: String, scopes: String, #[serde(rename = "auth0-profile")] auth0_profile: Auth0Profile, #[serde(rename = "device-id")] device_id: String, #[serde(rename = "device-desc")] device_desc: String, #[serde(rename = "https://auth.remarkable.com/subscription")] subscription: SubscriptionClaim }
+struct UserTokenClaims {
+    sub: String,
+    iss: String,
+    iat: i64,
+    exp: i64,
+    nbf: i64,
+    jti: String,
+    #[serde(rename = "https://auth.remarkable.com/tectonic")]
+    tectonic: String,
+    scopes: String,
+    #[serde(rename = "auth0-profile")]
+    auth0_profile: Auth0Profile,
+    #[serde(rename = "device-id")]
+    device_id: String,
+    #[serde(rename = "device-desc")]
+    device_desc: String,
+    #[serde(rename = "https://auth.remarkable.com/subscription")]
+    subscription: SubscriptionClaim,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Auth0Profile { #[serde(rename = "UserID")] user_id: String, #[serde(rename = "Email")] email: String, #[serde(rename = "Name", default)] name: String, #[serde(rename = "Nickname", default)] nickname: String, #[serde(default)] level: String, #[serde(rename = "IsConnected")] is_connected: bool, #[serde(rename = "IsBeta")] is_beta: bool }
+struct Auth0Profile {
+    #[serde(rename = "UserID")]
+    user_id: String,
+    #[serde(rename = "Email")]
+    email: String,
+    #[serde(rename = "Name", default)]
+    name: String,
+    #[serde(rename = "Nickname", default)]
+    nickname: String,
+    #[serde(default)]
+    level: String,
+    #[serde(rename = "IsConnected")]
+    is_connected: bool,
+    #[serde(rename = "IsBeta")]
+    is_beta: bool,
+}
 
 /// Tablet-facing passcode reset request (field names match the cloud API).
 #[derive(Debug, Clone, Serialize)]
 pub struct PasscodeReset {
-    #[serde(rename = "DeviceID")] pub device_id: String,
-    #[serde(rename = "DeviceName")] pub device_name: String,
-    #[serde(rename = "RequestID")] pub request_id: String,
-    #[serde(rename = "Created")] pub created: DateTime<Utc>,
-    #[serde(rename = "Expires")] pub expires: DateTime<Utc>,
-    #[serde(rename = "Approved")] pub approved: bool,
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    #[serde(rename = "DeviceName")]
+    pub device_name: String,
+    #[serde(rename = "RequestID")]
+    pub request_id: String,
+    #[serde(rename = "Created")]
+    pub created: DateTime<Utc>,
+    #[serde(rename = "Expires")]
+    pub expires: DateTime<Utc>,
+    #[serde(rename = "Approved")]
+    pub approved: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct BlobClaims { blob: String, write: bool, exp: i64 }
+struct BlobClaims {
+    blob: String,
+    write: bool,
+    exp: i64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct SubscriptionClaim { status: String, plan: String }
+struct SubscriptionClaim {
+    status: String,
+    plan: String,
+}
 
 #[derive(Serialize)]
 struct IdTokenClaims {
-    sub: String, iss: String, aud: String, iat: i64, exp: i64, email: String,
-    #[serde(rename = "https://auth.remarkable.com/tectonic")] tectonic: String,
-    #[serde(rename = "https://auth.remarkable.com/subscription")] subscription: String,
-    #[serde(rename = "https://auth.remarkable.com/mdm")] mdm: bool,
-    #[serde(rename = "https://auth.remarkable.com/created_at")] created_at: String,
+    sub: String,
+    iss: String,
+    aud: String,
+    iat: i64,
+    exp: i64,
+    email: String,
+    #[serde(rename = "https://auth.remarkable.com/tectonic")]
+    tectonic: String,
+    #[serde(rename = "https://auth.remarkable.com/subscription")]
+    subscription: String,
+    #[serde(rename = "https://auth.remarkable.com/mdm")]
+    mdm: bool,
+    #[serde(rename = "https://auth.remarkable.com/created_at")]
+    created_at: String,
 }
 
 /// Load the JWT signing secret. Precedence:
@@ -75,12 +152,17 @@ struct IdTokenClaims {
 fn load_jwt_secret(storage_dir: &Path) -> Result<Vec<u8>> {
     let check = |secret: Vec<u8>, source: &str| -> Result<Vec<u8>> {
         if secret.len() < MIN_JWT_SECRET_LEN {
-            return Err(ServerError::Config(format!("JWT secret from {source} is {} bytes; need at least {MIN_JWT_SECRET_LEN}", secret.len())));
+            return Err(ServerError::Config(format!(
+                "JWT secret from {source} is {} bytes; need at least {MIN_JWT_SECRET_LEN}",
+                secret.len()
+            )));
         }
         Ok(secret)
     };
     let read_file = |path: &Path| -> Result<Vec<u8>> {
-        let raw = std::fs::read_to_string(path).map_err(|e| ServerError::Config(format!("reading JWT secret {}: {e}", path.display())))?;
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            ServerError::Config(format!("reading JWT secret {}: {e}", path.display()))
+        })?;
         Ok(raw.trim().as_bytes().to_vec())
     };
     if let Ok(path) = std::env::var("JWT_SECRET_FILE") {
@@ -103,7 +185,9 @@ fn load_jwt_secret(storage_dir: &Path) -> Result<Vec<u8>> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut file = opts.open(&path).map_err(|e| ServerError::Config(format!("creating JWT secret {}: {e}", path.display())))?;
+    let mut file = opts
+        .open(&path)
+        .map_err(|e| ServerError::Config(format!("creating JWT secret {}: {e}", path.display())))?;
     std::io::Write::write_all(&mut file, secret.as_bytes())?;
     file.sync_all()?;
     tracing::info!("Generated new JWT signing secret at {}", path.display());
@@ -118,52 +202,123 @@ impl DeviceManager {
         let secret = load_jwt_secret(db_path.as_ref().parent().unwrap_or_else(|| Path::new(".")))?;
         let encoding_key = jsonwebtoken::EncodingKey::from_secret(&secret);
         let decoding_key = jsonwebtoken::DecodingKey::from_secret(&secret);
-        Ok(Self { inner: Arc::new(Inner { 
-            conn: Mutex::new(conn), 
-            region: region.into(), 
-            issuer: issuer.into(),
-            encoding_key,
-            decoding_key,
-        }) })
+        Ok(Self {
+            inner: Arc::new(Inner {
+                conn: Mutex::new(conn),
+                region: region.into(),
+                issuer: issuer.into(),
+                encoding_key,
+                decoding_key,
+            }),
+        })
     }
-    fn gen_code() -> String { const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789"; let mut rng = rand::thread_rng(); (0..8).map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char).collect() }
+    fn gen_code() -> String {
+        const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+        let mut rng = rand::thread_rng();
+        (0..8)
+            .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+            .collect()
+    }
     pub fn create_pairing_code(&self, user_id: &str) -> Result<String> {
-        let code = Self::gen_code(); let expires = Utc::now() + Duration::seconds(CODE_LIFETIME); let conn = self.inner.conn.lock();
-        conn.execute("DELETE FROM pending_codes WHERE expires_at < ?", params![Utc::now().to_rfc3339()]).ok();
-        conn.execute("INSERT INTO pending_codes (code, user_id, expires_at) VALUES (?, ?, ?)", params![code, user_id, expires.to_rfc3339()])?;
+        let code = Self::gen_code();
+        let expires = Utc::now() + Duration::seconds(CODE_LIFETIME);
+        let conn = self.inner.conn.lock();
+        conn.execute(
+            "DELETE FROM pending_codes WHERE expires_at < ?",
+            params![Utc::now().to_rfc3339()],
+        )
+        .ok();
+        conn.execute(
+            "INSERT INTO pending_codes (code, user_id, expires_at) VALUES (?, ?, ?)",
+            params![code, user_id, expires.to_rfc3339()],
+        )?;
         Ok(code)
     }
-    pub fn exchange_code(&self, code: &str, device_id: &str, device_desc: &str) -> Result<(String, String)> {
+    pub fn exchange_code(
+        &self,
+        code: &str,
+        device_id: &str,
+        device_desc: &str,
+    ) -> Result<(String, String)> {
         let conn = self.inner.conn.lock();
-        let (user_id, expires_str): (String, String) = conn.query_row("SELECT user_id, expires_at FROM pending_codes WHERE code = ?", params![code], |r| Ok((r.get(0)?, r.get(1)?))).map_err(|_| ServerError::InvalidCode("Code not found".into()))?;
-        let expires = DateTime::parse_from_rfc3339(&expires_str).map_err(|_| ServerError::InvalidCode("Invalid expiry".into()))?.with_timezone(&Utc);
-        if Utc::now() > expires { conn.execute("DELETE FROM pending_codes WHERE code = ?", params![code]).ok(); return Err(ServerError::InvalidCode("Code expired".into())); }
-        conn.execute("DELETE FROM pending_codes WHERE code = ?", params![code]).ok();
+        let (user_id, expires_str): (String, String) = conn
+            .query_row(
+                "SELECT user_id, expires_at FROM pending_codes WHERE code = ?",
+                params![code],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|_| ServerError::InvalidCode("Code not found".into()))?;
+        let expires = DateTime::parse_from_rfc3339(&expires_str)
+            .map_err(|_| ServerError::InvalidCode("Invalid expiry".into()))?
+            .with_timezone(&Utc);
+        if Utc::now() > expires {
+            conn.execute("DELETE FROM pending_codes WHERE code = ?", params![code])
+                .ok();
+            return Err(ServerError::InvalidCode("Code expired".into()));
+        }
+        conn.execute("DELETE FROM pending_codes WHERE code = ?", params![code])
+            .ok();
         let now = Utc::now();
         conn.execute("INSERT INTO devices (device_id, device_desc, registered_at, last_refresh, user_id) VALUES (?, ?, ?, ?, ?) ON CONFLICT(device_id) DO UPDATE SET device_desc=excluded.device_desc, last_refresh=excluded.last_refresh, user_id=excluded.user_id", params![device_id, device_desc, now.to_rfc3339(), now.to_rfc3339(), user_id])?;
         drop(conn);
-        let dt = self.gen_device_token(device_id, device_desc, &user_id)?; let ut = self.gen_user_token(device_id, device_desc, &user_id)?;
+        let dt = self.gen_device_token(device_id, device_desc, &user_id)?;
+        let ut = self.gen_user_token(device_id, device_desc, &user_id)?;
         Ok((dt, ut))
     }
     pub fn device_id_for_token(&self, device_token: &str) -> Result<String> {
         Ok(self.decode_device_token(device_token)?.device_id)
     }
     pub fn refresh_user_token(&self, device_token: &str) -> Result<String> {
-        let claims = self.decode_device_token(device_token)?; let conn = self.inner.conn.lock();
-        conn.execute("UPDATE devices SET last_refresh = ? WHERE device_id = ?", params![Utc::now().to_rfc3339(), claims.device_id]).ok();
-        drop(conn); self.gen_user_token(&claims.device_id, &claims.device_desc, &claims.auth0_userid)
+        let claims = self.decode_device_token(device_token)?;
+        let conn = self.inner.conn.lock();
+        conn.execute(
+            "UPDATE devices SET last_refresh = ? WHERE device_id = ?",
+            params![Utc::now().to_rfc3339(), claims.device_id],
+        )
+        .ok();
+        drop(conn);
+        self.gen_user_token(&claims.device_id, &claims.device_desc, &claims.auth0_userid)
     }
     pub fn list_devices(&self) -> Result<Vec<Device>> {
         let conn = self.inner.conn.lock();
-        let mut stmt = conn.prepare("SELECT device_id, device_desc, registered_at, last_refresh, user_id FROM devices")?;
-        let devices = stmt.query_map([], |row| Ok(Device { device_id: row.get(0)?, device_desc: row.get(1)?, registered_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(2)?).map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()), last_refresh: DateTime::parse_from_rfc3339(&row.get::<_, String>(3)?).map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()), user_id: row.get(4)? }))?.filter_map(|r| r.ok()).collect();
+        let mut stmt = conn.prepare(
+            "SELECT device_id, device_desc, registered_at, last_refresh, user_id FROM devices",
+        )?;
+        let devices = stmt
+            .query_map([], |row| {
+                Ok(Device {
+                    device_id: row.get(0)?,
+                    device_desc: row.get(1)?,
+                    registered_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(2)?)
+                        .map(|d| d.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now()),
+                    last_refresh: DateTime::parse_from_rfc3339(&row.get::<_, String>(3)?)
+                        .map(|d| d.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now()),
+                    user_id: row.get(4)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
         Ok(devices)
     }
-    pub fn delete_device(&self, device_id: &str) -> Result<bool> { let conn = self.inner.conn.lock(); Ok(conn.execute("DELETE FROM devices WHERE device_id = ?", params![device_id])? > 0) }
+    pub fn delete_device(&self, device_id: &str) -> Result<bool> {
+        let conn = self.inner.conn.lock();
+        Ok(conn.execute(
+            "DELETE FROM devices WHERE device_id = ?",
+            params![device_id],
+        )? > 0)
+    }
 
     // ---- MDM instruction queue (enterprise device management, /mdm/v1) ----
     /// Enqueue an instruction for the user's devices; returns its id.
-    pub fn mdm_enqueue(&self, user_id: &str, name: &str, key: Option<&str>, value: Option<&str>) -> Result<String> {
+    pub fn mdm_enqueue(
+        &self,
+        user_id: &str,
+        name: &str,
+        key: Option<&str>,
+        value: Option<&str>,
+    ) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
         let conn = self.inner.conn.lock();
         conn.execute(
@@ -174,7 +329,10 @@ impl DeviceManager {
     }
 
     /// Oldest still-pending instruction for the user: (id, name, key, value).
-    pub fn mdm_next_pending(&self, user_id: &str) -> Result<Option<(String, String, Option<String>, Option<String>)>> {
+    pub fn mdm_next_pending(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<(String, String, Option<String>, Option<String>)>> {
         let conn = self.inner.conn.lock();
         let mut stmt = conn.prepare("SELECT id, name, data_key, data_value FROM mdm_instructions WHERE user_id = ? AND status = 'pending' ORDER BY created ASC LIMIT 1")?;
         let mut rows = stmt.query(params![user_id])?;
@@ -187,41 +345,115 @@ impl DeviceManager {
     /// Record a device-reported status for an instruction.
     pub fn mdm_set_status(&self, id: &str, status: &str, detail: Option<&str>) -> Result<bool> {
         let conn = self.inner.conn.lock();
-        Ok(conn.execute("UPDATE mdm_instructions SET status = ?, detail = ? WHERE id = ?", params![status, detail, id])? > 0)
+        Ok(conn.execute(
+            "UPDATE mdm_instructions SET status = ?, detail = ? WHERE id = ?",
+            params![status, detail, id],
+        )? > 0)
     }
 
     /// All instructions for the user: (id, name, status, detail).
     pub fn mdm_list(&self, user_id: &str) -> Result<Vec<(String, String, String, Option<String>)>> {
         let conn = self.inner.conn.lock();
         let mut stmt = conn.prepare("SELECT id, name, status, detail FROM mdm_instructions WHERE user_id = ? ORDER BY created ASC")?;
-        let rows = stmt.query_map(params![user_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.filter_map(|x| x.ok()).collect();
+        let rows = stmt
+            .query_map(params![user_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .filter_map(|x| x.ok())
+            .collect();
         Ok(rows)
     }
-    fn gen_device_token(&self, device_id: &str, device_desc: &str, user_id: &str) -> Result<String> {
+    fn gen_device_token(
+        &self,
+        device_id: &str,
+        device_desc: &str,
+        user_id: &str,
+    ) -> Result<String> {
         let now = Utc::now().timestamp();
-        encode(&Header::new(Algorithm::HS256), &DeviceTokenClaims { sub: "rM Device Token".into(), iss: self.inner.issuer.clone(), iat: now, nbf: now, jti: uuid::Uuid::new_v4().to_string(), device_id: device_id.into(), device_desc: device_desc.into(), auth0_userid: user_id.into() }, &self.inner.encoding_key).map_err(|e| ServerError::TokenError(e.to_string()))
+        encode(
+            &Header::new(Algorithm::HS256),
+            &DeviceTokenClaims {
+                sub: "rM Device Token".into(),
+                iss: self.inner.issuer.clone(),
+                iat: now,
+                nbf: now,
+                jti: uuid::Uuid::new_v4().to_string(),
+                device_id: device_id.into(),
+                device_desc: device_desc.into(),
+                auth0_userid: user_id.into(),
+            },
+            &self.inner.encoding_key,
+        )
+        .map_err(|e| ServerError::TokenError(e.to_string()))
     }
     fn gen_user_token(&self, device_id: &str, device_desc: &str, user_id: &str) -> Result<String> {
         let now = Utc::now().timestamp();
-        encode(&Header::new(Algorithm::HS256), &UserTokenClaims { sub: user_id.into(), iss: self.inner.issuer.clone(), iat: now, exp: now + USER_TOKEN_LIFETIME, nbf: now, jti: uuid::Uuid::new_v4().to_string(), tectonic: self.inner.region.clone(), scopes: USER_SCOPES.into(), auth0_profile: Auth0Profile { user_id: user_id.into(), email: format!("local@{}", self.inner.issuer), name: user_id.into(), nickname: user_id.into(), level: "connect".into(), is_connected: true, is_beta: false }, device_id: device_id.into(), device_desc: device_desc.into(), subscription: SubscriptionClaim { status: "active".into(), plan: "connect".into() } }, &self.inner.encoding_key).map_err(|e| ServerError::TokenError(e.to_string()))
+        encode(
+            &Header::new(Algorithm::HS256),
+            &UserTokenClaims {
+                sub: user_id.into(),
+                iss: self.inner.issuer.clone(),
+                iat: now,
+                exp: now + USER_TOKEN_LIFETIME,
+                nbf: now,
+                jti: uuid::Uuid::new_v4().to_string(),
+                tectonic: self.inner.region.clone(),
+                scopes: USER_SCOPES.into(),
+                auth0_profile: Auth0Profile {
+                    user_id: user_id.into(),
+                    email: format!("local@{}", self.inner.issuer),
+                    name: user_id.into(),
+                    nickname: user_id.into(),
+                    level: "connect".into(),
+                    is_connected: true,
+                    is_beta: false,
+                },
+                device_id: device_id.into(),
+                device_desc: device_desc.into(),
+                subscription: SubscriptionClaim {
+                    status: "active".into(),
+                    plan: "connect".into(),
+                },
+            },
+            &self.inner.encoding_key,
+        )
+        .map_err(|e| ServerError::TokenError(e.to_string()))
     }
     fn decode_device_token(&self, token: &str) -> Result<DeviceTokenClaims> {
-        let mut val = Validation::new(Algorithm::HS256); val.validate_exp = false; val.set_required_spec_claims(&["sub", "iss", "iat"]);
-        decode::<DeviceTokenClaims>(token, &self.inner.decoding_key, &val).map(|d| d.claims).map_err(|_| ServerError::InvalidToken)
+        let mut val = Validation::new(Algorithm::HS256);
+        val.validate_exp = false;
+        val.set_required_spec_claims(&["sub", "iss", "iat"]);
+        decode::<DeviceTokenClaims>(token, &self.inner.decoding_key, &val)
+            .map(|d| d.claims)
+            .map_err(|_| ServerError::InvalidToken)
     }
     pub fn validate_token(&self, auth: &str) -> Result<String> {
-        let token = auth.strip_prefix("Bearer ").ok_or(ServerError::Unauthorized)?;
-        if let Ok(c) = self.decode_device_token(token) { return Ok(c.auth0_userid); }
-        let mut val = Validation::new(Algorithm::HS256); val.set_required_spec_claims(&["sub", "exp"]);
-        if let Ok(d) = decode::<UserTokenClaims>(token, &self.inner.decoding_key, &val) { return Ok(d.claims.sub); }
+        let token = auth
+            .strip_prefix("Bearer ")
+            .ok_or(ServerError::Unauthorized)?;
+        if let Ok(c) = self.decode_device_token(token) {
+            return Ok(c.auth0_userid);
+        }
+        let mut val = Validation::new(Algorithm::HS256);
+        val.set_required_spec_claims(&["sub", "exp"]);
+        if let Ok(d) = decode::<UserTokenClaims>(token, &self.inner.decoding_key, &val) {
+            return Ok(d.claims.sub);
+        }
         Err(ServerError::InvalidToken)
     }
     /// Resolve a bearer header to (user id, device id, device description).
     pub fn caller(&self, auth: &str) -> Result<(String, String, String)> {
-        let token = auth.strip_prefix("Bearer ").ok_or(ServerError::Unauthorized)?;
-        if let Ok(c) = self.decode_device_token(token) { return Ok((c.auth0_userid, c.device_id, c.device_desc)); }
-        let mut val = Validation::new(Algorithm::HS256); val.set_required_spec_claims(&["sub", "exp"]);
-        let c = decode::<UserTokenClaims>(token, &self.inner.decoding_key, &val).map_err(|_| ServerError::InvalidToken)?.claims;
+        let token = auth
+            .strip_prefix("Bearer ")
+            .ok_or(ServerError::Unauthorized)?;
+        if let Ok(c) = self.decode_device_token(token) {
+            return Ok((c.auth0_userid, c.device_id, c.device_desc));
+        }
+        let mut val = Validation::new(Algorithm::HS256);
+        val.set_required_spec_claims(&["sub", "exp"]);
+        let c = decode::<UserTokenClaims>(token, &self.inner.decoding_key, &val)
+            .map_err(|_| ServerError::InvalidToken)?
+            .claims;
         Ok((c.sub, c.device_id, c.device_desc))
     }
 
@@ -243,26 +475,64 @@ impl DeviceManager {
             params![request_id, user_id],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, bool>(4)?)),
         ).map_err(|_| ServerError::NotFound(request_id.into()))?;
-        let parse = |s: &str| DateTime::parse_from_rfc3339(s).map(|d| d.with_timezone(&Utc)).map_err(|e| ServerError::Internal(e.to_string()));
-        let reset = PasscodeReset { device_id: row.0, device_name: row.1, request_id: request_id.into(), created: parse(&row.2)?, expires: parse(&row.3)?, approved: row.4 };
-        if reset.expires < Utc::now() { return Err(ServerError::NotFound(request_id.into())); }
+        let parse = |s: &str| {
+            DateTime::parse_from_rfc3339(s)
+                .map(|d| d.with_timezone(&Utc))
+                .map_err(|e| ServerError::Internal(e.to_string()))
+        };
+        let reset = PasscodeReset {
+            device_id: row.0,
+            device_name: row.1,
+            request_id: request_id.into(),
+            created: parse(&row.2)?,
+            expires: parse(&row.3)?,
+            approved: row.4,
+        };
+        if reset.expires < Utc::now() {
+            return Err(ServerError::NotFound(request_id.into()));
+        }
         Ok(reset)
     }
 
     /// Approve a pending reset; returns (user id, reset) so the caller can notify the device.
-    pub fn approve_passcode_reset(&self, request_id: &str, owner: Option<&str>) -> Result<(String, PasscodeReset)> {
-        let user_id: String = self.inner.conn.lock()
-            .query_row("SELECT user_id FROM passcode_resets WHERE request_id = ?", params![request_id], |r| r.get(0))
+    pub fn approve_passcode_reset(
+        &self,
+        request_id: &str,
+        owner: Option<&str>,
+    ) -> Result<(String, PasscodeReset)> {
+        let user_id: String = self
+            .inner
+            .conn
+            .lock()
+            .query_row(
+                "SELECT user_id FROM passcode_resets WHERE request_id = ?",
+                params![request_id],
+                |r| r.get(0),
+            )
             .map_err(|_| ServerError::NotFound(request_id.into()))?;
-        if owner.is_some_and(|o| o != user_id) { return Err(ServerError::NotFound(request_id.into())); }
+        if owner.is_some_and(|o| o != user_id) {
+            return Err(ServerError::NotFound(request_id.into()));
+        }
         let reset = self.get_passcode_reset(request_id, &user_id)?;
-        self.inner.conn.lock().execute("UPDATE passcode_resets SET approved = 1 WHERE request_id = ?", params![request_id])?;
-        Ok((user_id, PasscodeReset { approved: true, ..reset }))
+        self.inner.conn.lock().execute(
+            "UPDATE passcode_resets SET approved = 1 WHERE request_id = ?",
+            params![request_id],
+        )?;
+        Ok((
+            user_id,
+            PasscodeReset {
+                approved: true,
+                ..reset
+            },
+        ))
     }
 
     /// Drop a reset request owned by `user_id` (deny). Returns whether one existed.
     pub fn delete_passcode_reset(&self, request_id: &str, user_id: &str) -> Result<bool> {
-        Ok(self.inner.conn.lock().execute("DELETE FROM passcode_resets WHERE request_id = ? AND user_id = ?", params![request_id, user_id])? > 0)
+        Ok(self.inner.conn.lock().execute(
+            "DELETE FROM passcode_resets WHERE request_id = ? AND user_id = ?",
+            params![request_id, user_id],
+        )? > 0)
     }
 
     /// Get the endpoint URL for this server
@@ -273,18 +543,35 @@ impl DeviceManager {
     /// Sign a short-lived token granting read or write access to one blob (sync 1.5 signed URLs).
     pub fn sign_blob(&self, blob: &str, write: bool) -> Result<(String, DateTime<Utc>)> {
         let exp = Utc::now() + Duration::minutes(BLOB_URL_LIFETIME_MINUTES);
-        let claims = BlobClaims { blob: blob.into(), write, exp: exp.timestamp() };
-        let token = encode(&Header::new(Algorithm::HS256), &claims, &self.inner.encoding_key).map_err(|e| ServerError::TokenError(e.to_string()))?;
+        let claims = BlobClaims {
+            blob: blob.into(),
+            write,
+            exp: exp.timestamp(),
+        };
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &self.inner.encoding_key,
+        )
+        .map_err(|e| ServerError::TokenError(e.to_string()))?;
         Ok((token, exp))
     }
 
     /// Check a blob token grants `write` (or read) access to `blob`.
     pub fn verify_blob(&self, token: &str, blob: &str, write: bool) -> Result<()> {
-        let claims = decode::<BlobClaims>(token, &self.inner.decoding_key, &Validation::new(Algorithm::HS256)).map_err(|_| ServerError::InvalidToken)?.claims;
-        if claims.blob != blob || claims.write != write { return Err(ServerError::Unauthorized); }
+        let claims = decode::<BlobClaims>(
+            token,
+            &self.inner.decoding_key,
+            &Validation::new(Algorithm::HS256),
+        )
+        .map_err(|_| ServerError::InvalidToken)?
+        .claims;
+        if claims.blob != blob || claims.write != write {
+            return Err(ServerError::Unauthorized);
+        }
         Ok(())
     }
-    
+
     /// Create a user token for admin/test purposes
     pub fn create_user_token(&self, user_id: &str) -> Result<String> {
         // Same claims as a device-issued user token, so validate_token accepts it.
@@ -294,7 +581,12 @@ impl DeviceManager {
     /// Register/refresh a device and mint an OAuth bundle for software 3.28:
     /// access = the same user auth data our sync/gentree auth already accepts,
     /// refresh = a device auth data, id = an HS512 id auth data with auth.remarkable.com claims.
-    pub fn oauth_bundle(&self, user_id: &str, device_id: &str, device_desc: &str) -> Result<(String, String, String)> {
+    pub fn oauth_bundle(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        device_desc: &str,
+    ) -> Result<(String, String, String)> {
         let now = Utc::now();
         {
             let conn = self.inner.conn.lock();
@@ -336,9 +628,14 @@ impl DeviceManager {
             mdm: false,
             created_at: now.to_rfc3339(),
         };
-        encode(&Header::new(Algorithm::HS512), &claims, &self.inner.encoding_key).map_err(|e| ServerError::TokenError(e.to_string()))
+        encode(
+            &Header::new(Algorithm::HS512),
+            &claims,
+            &self.inner.encoding_key,
+        )
+        .map_err(|e| ServerError::TokenError(e.to_string()))
     }
-    
+
     /// Get a device by ID
     pub fn get_device(&self, device_id: &str) -> Result<Option<Device>> {
         let conn = self.inner.conn.lock();
@@ -364,7 +661,6 @@ impl DeviceManager {
             Err(e) => Err(ServerError::Database(e.to_string())),
         }
     }
-
 }
 
 #[cfg(test)]
@@ -373,7 +669,8 @@ mod jwt_secret_tests {
 
     #[test]
     fn generated_secret_is_persisted_and_reused() {
-        if std::env::var_os("JWT_SECRET").is_some() || std::env::var_os("JWT_SECRET_FILE").is_some() {
+        if std::env::var_os("JWT_SECRET").is_some() || std::env::var_os("JWT_SECRET_FILE").is_some()
+        {
             return; // env override would bypass the file path under test
         }
         let dir = tempfile::tempdir().unwrap();
@@ -384,18 +681,26 @@ mod jwt_secret_tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(dir.path().join(JWT_SECRET_FILENAME)).unwrap().permissions().mode();
+            let mode = std::fs::metadata(dir.path().join(JWT_SECRET_FILENAME))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
         let other = tempfile::tempdir().unwrap();
-        assert_ne!(first, load_jwt_secret(other.path()).unwrap(), "each install gets its own secret");
+        assert_ne!(
+            first,
+            load_jwt_secret(other.path()).unwrap(),
+            "each install gets its own secret"
+        );
     }
 
     #[test]
     fn short_secret_file_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(JWT_SECRET_FILENAME), "too-short").unwrap();
-        if std::env::var_os("JWT_SECRET").is_none() && std::env::var_os("JWT_SECRET_FILE").is_none() {
+        if std::env::var_os("JWT_SECRET").is_none() && std::env::var_os("JWT_SECRET_FILE").is_none()
+        {
             assert!(load_jwt_secret(dir.path()).is_err());
         }
     }

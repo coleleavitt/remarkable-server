@@ -2,7 +2,8 @@
 //!
 //! reMarkable sync API uses GCS which requires CRC32C in x-goog-hash header.
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 
 /// Calculate CRC32C checksum using the crc32c crate
 pub fn crc32c(data: &[u8]) -> u32 {

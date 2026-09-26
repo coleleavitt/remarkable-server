@@ -1,11 +1,25 @@
-use axum::{body::Bytes, extract::{Path, Query, State}, http::{header, HeaderMap, StatusCode}, response::{IntoResponse, Response}, Json};
-use crate::{checksum, device::DeviceManager, error::{Result, ServerError}, storage::Storage};
-use crate::types::{DeviceInfo, DeviceRegisterRequest, PairingCodeResponse, SyncRoot, UploadResponse};
+use axum::Json;
+use axum::body::Bytes;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
+use crate::checksum;
+use crate::device::DeviceManager;
+use crate::error::{Result, ServerError};
+use crate::storage::Storage;
+use crate::types::{
+    DeviceInfo,
+    DeviceRegisterRequest,
+    PairingCodeResponse,
+    SyncRoot,
+    UploadResponse,
+};
+
 #[derive(Clone)]
-pub struct AppState { 
-    pub storage: Storage, 
+pub struct AppState {
+    pub storage: Storage,
     pub devices: DeviceManager,
     pub notification_tx: tokio::sync::broadcast::Sender<crate::notifications::WsMessage>,
     pub screenshare: crate::screenshare_rest::RoomManager,
@@ -13,14 +27,28 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(storage: Storage, devices: DeviceManager) -> Self { 
+    pub fn new(storage: Storage, devices: DeviceManager) -> Self {
         let (notification_tx, _) = tokio::sync::broadcast::channel(64);
-        Self { storage, devices, notification_tx, screenshare: crate::screenshare_rest::RoomManager::new(), ice_servers: std::sync::Arc::new(serde_json::json!([])) } 
+        Self {
+            storage,
+            devices,
+            notification_tx,
+            screenshare: crate::screenshare_rest::RoomManager::new(),
+            ice_servers: std::sync::Arc::new(serde_json::json!([])),
+        }
     }
     /// Set the ICE server list handed out to screenshare clients.
-    pub fn with_ice_servers(mut self, ice: serde_json::Value) -> Self { self.ice_servers = std::sync::Arc::new(ice); self }
+    pub fn with_ice_servers(mut self, ice: serde_json::Value) -> Self {
+        self.ice_servers = std::sync::Arc::new(ice);
+        self
+    }
     pub(crate) fn auth_user(&self, headers: &HeaderMap) -> Result<String> {
-        self.devices.validate_token(headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).ok_or(ServerError::Unauthorized)?)
+        self.devices.validate_token(
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or(ServerError::Unauthorized)?,
+        )
     }
 }
 
@@ -42,34 +70,64 @@ pub struct PutRootRequest {
 }
 
 #[derive(Serialize)]
-pub struct PutRootResponse { pub generation: u64, pub hash: String }
+pub struct PutRootResponse {
+    pub generation: u64,
+    pub hash: String,
+}
 
 /// Sync v3 root update: compare-and-swap on `generation`, 412 if another client got there first.
-pub async fn put_root(State(state): State<AppState>, headers: HeaderMap, Json(req): Json<PutRootRequest>) -> Result<Json<PutRootResponse>> {
+pub async fn put_root(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<PutRootRequest>,
+) -> Result<Json<PutRootResponse>> {
     let (user_id, device_id, _) = state.devices.caller(bearer_header(&headers)?)?;
     if !crate::storage::is_valid_hash(&req.hash) {
         return Err(ServerError::InvalidHash(req.hash));
     }
     if !state.storage.exists(&req.hash) {
-        return Err(ServerError::NotFound(format!("root index {} not uploaded", req.hash)));
+        return Err(ServerError::NotFound(format!(
+            "root index {} not uploaded",
+            req.hash
+        )));
     }
     let root = state.storage.set_root_if(req.hash, Some(req.generation))?;
     if req.broadcast {
-        let _ = state.notification_tx.send(crate::notifications::WsMessage::sync_complete(root.generation, &device_id, &user_id));
+        let _ = state
+            .notification_tx
+            .send(crate::notifications::WsMessage::sync_complete(
+                root.generation,
+                &device_id,
+                &user_id,
+            ));
     }
-    Ok(Json(PutRootResponse { generation: root.generation, hash: root.hash }))
+    Ok(Json(PutRootResponse {
+        generation: root.generation,
+        hash: root.hash,
+    }))
 }
 
 #[derive(Deserialize)]
-pub struct CheckFilesRequest { #[serde(default)] pub files: Vec<String> }
+pub struct CheckFilesRequest {
+    #[serde(default)]
+    pub files: Vec<String>,
+}
 
 #[derive(Serialize)]
-pub struct CheckFilesResponse { #[serde(rename = "missingFiles")] pub missing_files: Vec<String> }
+pub struct CheckFilesResponse {
+    #[serde(rename = "missingFiles")]
+    pub missing_files: Vec<String>,
+}
 
 /// Which of the listed blobs the server doesn't have.
-pub async fn check_files(State(state): State<AppState>, headers: HeaderMap, Json(req): Json<CheckFilesRequest>) -> Result<Json<CheckFilesResponse>> {
+pub async fn check_files(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CheckFilesRequest>,
+) -> Result<Json<CheckFilesResponse>> {
     state.auth_user(&headers)?;
-    let (present, missing_files): (Vec<String>, Vec<String>) = req.files.into_iter().partition(|h| state.storage.exists(h));
+    let (present, missing_files): (Vec<String>, Vec<String>) =
+        req.files.into_iter().partition(|h| state.storage.exists(h));
     // The client won't re-upload these, so keep them out of the unreachable report's grace window.
     if let Err(e) = state.storage.touch(&present) {
         tracing::warn!(error = %e, "could not mark checked blobs as recently used");
@@ -78,59 +136,120 @@ pub async fn check_files(State(state): State<AppState>, headers: HeaderMap, Json
 }
 
 #[derive(Serialize)]
-pub struct MissingResponse { pub hashes: Vec<String> }
+pub struct MissingResponse {
+    pub hashes: Vec<String>,
+}
 
 /// Blobs referenced from the current root's tree that aren't stored.
-pub async fn missing_blobs(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<MissingResponse>> {
+pub async fn missing_blobs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<MissingResponse>> {
     state.auth_user(&headers)?;
-    Ok(Json(MissingResponse { hashes: state.storage.missing_from_root()? }))
+    Ok(Json(MissingResponse {
+        hashes: state.storage.missing_from_root()?,
+    }))
 }
 
 /// Every stored blob hash (rm_api uses this to skip per-file existence checks).
-pub async fn files_list(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Vec<String>>> {
+pub async fn files_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<String>>> {
     state.auth_user(&headers)?;
     Ok(Json(state.storage.list_hashes()?))
 }
 
-pub async fn get_file(State(state): State<AppState>, Path(hash): Path<String>, headers: HeaderMap) -> Result<Response> {
+pub async fn get_file(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response> {
     state.auth_user(&headers)?;
-    let _filename = headers.get("rm-filename").and_then(|v| v.to_str().ok()).ok_or_else(|| ServerError::MissingHeader("rm-filename".into()))?;
+    let _filename = headers
+        .get("rm-filename")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ServerError::MissingHeader("rm-filename".into()))?;
     let data = state.storage.get(&hash)?;
-    Ok((StatusCode::OK, [(header::CONTENT_TYPE, "application/octet-stream"), (header::CONTENT_LENGTH, &data.len().to_string())], [(header::HeaderName::from_static("x-goog-hash"), checksum::format_goog_hash(&data))], data).into_response())
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/octet-stream"),
+            (header::CONTENT_LENGTH, &data.len().to_string()),
+        ],
+        [(
+            header::HeaderName::from_static("x-goog-hash"),
+            checksum::format_goog_hash(&data),
+        )],
+        data,
+    )
+        .into_response())
 }
 
-pub async fn put_file(State(state): State<AppState>, Path(hash): Path<String>, headers: HeaderMap, body: Bytes) -> Result<Json<UploadResponse>> {
+pub async fn put_file(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<UploadResponse>> {
     let _user_id = state.auth_user(&headers)?;
-    let filename = headers.get("rm-filename").and_then(|v| v.to_str().ok()).ok_or_else(|| ServerError::MissingHeader("rm-filename".into()))?;
+    let filename = headers
+        .get("rm-filename")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ServerError::MissingHeader("rm-filename".into()))?;
     // Verify transport integrity via crc32c when the client sends it; the sha256 in
     // the URL can't be checked against the body (index hashes are over child hashes).
     if let Some(goog) = headers.get("x-goog-hash").and_then(|v| v.to_str().ok()) {
         if checksum::parse_goog_hash(goog).is_some_and(|crc| crc != checksum::crc32c(&body)) {
-            return Err(ServerError::ChecksumMismatch { expected: goog.to_string(), actual: checksum::format_goog_hash(&body) });
+            return Err(ServerError::ChecksumMismatch {
+                expected: goog.to_string(),
+                actual: checksum::format_goog_hash(&body),
+            });
         }
     }
     state.storage.put_with_hash(&body, &hash, filename)?;
-    Ok(Json(UploadResponse { hash, size: body.len() as u64 }))
+    Ok(Json(UploadResponse {
+        hash,
+        size: body.len() as u64,
+    }))
 }
 
-pub async fn create_pairing_code(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<PairingCodeResponse>> {
+pub async fn create_pairing_code(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<PairingCodeResponse>> {
     let user_id = state.auth_user(&headers)?;
     let code = state.devices.create_pairing_code(&user_id)?;
-    Ok(Json(PairingCodeResponse { code, expires_in: 600 }))
+    Ok(Json(PairingCodeResponse {
+        code,
+        expires_in: 600,
+    }))
 }
 
-pub async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Vec<DeviceInfo>>> {
+pub async fn list_devices(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<DeviceInfo>>> {
     let _user_id = state.auth_user(&headers)?;
-    let devices = state.devices.list_devices()?.into_iter().map(|d| DeviceInfo {
-        device_id: d.device_id,
-        device_desc: d.device_desc,
-        registered_at: d.registered_at.to_rfc3339(),
-        last_activity: d.last_refresh.to_rfc3339(),
-    }).collect();
+    let devices = state
+        .devices
+        .list_devices()?
+        .into_iter()
+        .map(|d| DeviceInfo {
+            device_id: d.device_id,
+            device_desc: d.device_desc,
+            registered_at: d.registered_at.to_rfc3339(),
+            last_activity: d.last_refresh.to_rfc3339(),
+        })
+        .collect();
     Ok(Json(devices))
 }
 
-pub async fn delete_device(State(state): State<AppState>, Path(id): Path<String>, headers: HeaderMap) -> Result<StatusCode> {
+pub async fn delete_device(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode> {
     let _user_id = state.auth_user(&headers)?;
     state.devices.delete_device(&id)?;
     Ok(StatusCode::NO_CONTENT)
@@ -138,12 +257,17 @@ pub async fn delete_device(State(state): State<AppState>, Path(id): Path<String>
 
 /// The raw `Authorization` header value (`Bearer ...`).
 fn bearer_header(headers: &HeaderMap) -> Result<&str> {
-    headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).ok_or(ServerError::Unauthorized)
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or(ServerError::Unauthorized)
 }
 
 /// Extract the bearer token from the Authorization header.
 fn bearer(headers: &HeaderMap) -> Result<&str> {
-    headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or(ServerError::Unauthorized)
 }
@@ -154,12 +278,21 @@ pub async fn refresh_token(State(state): State<AppState>, headers: HeaderMap) ->
 }
 
 /// Pairing code -> device token (plain-text body, as the device expects).
-pub async fn register_device(State(state): State<AppState>, Json(req): Json<DeviceRegisterRequest>) -> Result<String> {
-    let (device_token, _user_token) = state.devices.exchange_code(&req.code, &req.device_id, &req.device_desc)?;
+pub async fn register_device(
+    State(state): State<AppState>,
+    Json(req): Json<DeviceRegisterRequest>,
+) -> Result<String> {
+    let (device_token, _user_token) =
+        state
+            .devices
+            .exchange_code(&req.code, &req.device_id, &req.device_desc)?;
     Ok(device_token)
 }
 
-pub async fn delete_device_token(State(state): State<AppState>, headers: HeaderMap) -> Result<StatusCode> {
+pub async fn delete_device_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode> {
     let device_id = state.devices.device_id_for_token(bearer(&headers)?)?;
     state.devices.delete_device(&device_id)?;
     Ok(StatusCode::NO_CONTENT)
@@ -177,59 +310,110 @@ pub async fn discovery(State(state): State<AppState>) -> Json<DiscoveryResponse>
     })
 }
 
-pub async fn health() -> &'static str { "OK" }
-
-#[derive(Serialize)]
-pub struct FileInfo { pub hash: String, pub filename: String, pub size: usize }
-
-pub async fn list_files(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Vec<FileInfo>>> {
-    state.auth_user(&headers)?;
-    Ok(Json(state.storage.list().into_iter().map(|(hash, filename, size)| FileInfo { hash, filename, size }).collect()))
+pub async fn health() -> &'static str {
+    "OK"
 }
 
-pub async fn clear_storage(State(state): State<AppState>, headers: HeaderMap) -> Result<StatusCode> {
+#[derive(Serialize)]
+pub struct FileInfo {
+    pub hash: String,
+    pub filename: String,
+    pub size: usize,
+}
+
+pub async fn list_files(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<FileInfo>>> {
+    state.auth_user(&headers)?;
+    Ok(Json(
+        state
+            .storage
+            .list()
+            .into_iter()
+            .map(|(hash, filename, size)| FileInfo {
+                hash,
+                filename,
+                size,
+            })
+            .collect(),
+    ))
+}
+
+pub async fn clear_storage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode> {
     state.auth_user(&headers)?;
     state.storage.clear()?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]
-pub struct UnreachableQuery { pub grace_secs: Option<u64> }
+pub struct UnreachableQuery {
+    pub grace_secs: Option<u64>,
+}
 
 #[derive(Serialize)]
-pub struct UnreachableResponse { #[serde(rename = "graceSecs")] pub grace_secs: u64, pub hashes: Vec<String> }
+pub struct UnreachableResponse {
+    #[serde(rename = "graceSecs")]
+    pub grace_secs: u64,
+    pub hashes: Vec<String>,
+}
 
 /// Admin: blobs no longer reachable from the current root (default grace 24h). Report only;
 /// nothing is deleted. Includes server-side copies outside the tree, e.g. restored versions.
-pub async fn unreachable_blobs(State(state): State<AppState>, headers: HeaderMap, Query(q): Query<UnreachableQuery>) -> Result<Json<UnreachableResponse>> {
+pub async fn unreachable_blobs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<UnreachableQuery>,
+) -> Result<Json<UnreachableResponse>> {
     require_admin(&headers)?;
     let grace_secs = q.grace_secs.unwrap_or(24 * 60 * 60);
-    let hashes = state.storage.unreachable_blobs(std::time::Duration::from_secs(grace_secs))?;
+    let hashes = state
+        .storage
+        .unreachable_blobs(std::time::Duration::from_secs(grace_secs))?;
     Ok(Json(UnreachableResponse { grace_secs, hashes }))
 }
 
 #[derive(Deserialize)]
-pub struct CreateUserRequest { pub email: String }
+pub struct CreateUserRequest {
+    pub email: String,
+}
 
 /// Admin-only endpoints are disabled unless `ADMIN_TOKEN` is set; callers must send it
 /// in `x-admin-token`.
 pub(crate) fn require_admin(headers: &HeaderMap) -> Result<()> {
-    let expected = std::env::var("ADMIN_TOKEN").ok().filter(|t| !t.is_empty()).ok_or(ServerError::Unauthorized)?;
-    let given = headers.get("x-admin-token").and_then(|v| v.to_str().ok()).ok_or(ServerError::Unauthorized)?;
-    if given.as_bytes() != expected.as_bytes() { return Err(ServerError::Unauthorized); }
+    let expected = std::env::var("ADMIN_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .ok_or(ServerError::Unauthorized)?;
+    let given = headers
+        .get("x-admin-token")
+        .and_then(|v| v.to_str().ok())
+        .ok_or(ServerError::Unauthorized)?;
+    if given.as_bytes() != expected.as_bytes() {
+        return Err(ServerError::Unauthorized);
+    }
     Ok(())
 }
 
 /// Mint a user token. Only enabled when the `ADMIN_TOKEN` env var is set, and the
 /// request must carry it in `x-admin-token`. (Use `--pair` on the CLI for pairing codes.)
-pub async fn create_test_user(State(state): State<AppState>, headers: HeaderMap, Json(req): Json<CreateUserRequest>) -> Result<Json<TokenResponse>> {
+pub async fn create_test_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateUserRequest>,
+) -> Result<Json<TokenResponse>> {
     require_admin(&headers)?;
     let token = state.devices.create_user_token(&req.email)?;
     Ok(Json(TokenResponse { token }))
 }
 
 #[derive(Serialize)]
-pub struct TokenResponse { pub token: String }
+pub struct TokenResponse {
+    pub token: String,
+}
 
 /// Discovery response format matching real reMarkable API
 /// Device reads 'notifications' field to construct wss://{host}/notifications/ws/json/1
@@ -253,13 +437,19 @@ pub struct ServiceResponse {
     pub status: &'static str,
 }
 
-pub async fn service_locator(State(state): State<AppState>, Path(service): Path<String>) -> Json<ServiceResponse> {
+pub async fn service_locator(
+    State(state): State<AppState>,
+    Path(service): Path<String>,
+) -> Json<ServiceResponse> {
     let host = state.devices.get_endpoint();
     // blob-storage is the one service clients expect as a full URL (matches rmfakecloud)
-    let host = if service == "blob-storage" { format!("https://{host}") } else { host };
+    let host = if service == "blob-storage" {
+        format!("https://{host}")
+    } else {
+        host
+    };
     Json(ServiceResponse { host, status: "OK" })
 }
-
 
 pub async fn check_updates() -> Json<serde_json::Value> {
     Json(serde_json::json!({

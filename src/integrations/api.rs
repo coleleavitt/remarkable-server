@@ -2,24 +2,22 @@
 //!
 //! REST API for managing cloud storage integrations.
 
-use crate::integrations::{
-    dropbox::Dropbox,
-    google_drive::GoogleDrive,
-    oauth::{OAuthConfig, OAuthToken, PkceFlow, validate_state},
-    onedrive::OneDrive,
-    sync::{CloudSync, SyncConfig, SyncState},
-    CloudProvider, ProviderType,
-};
-use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
-    response::Redirect,
-    Json,
-};
-use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use axum::Json;
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::response::Redirect;
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+
+use crate::integrations::dropbox::Dropbox;
+use crate::integrations::google_drive::GoogleDrive;
+use crate::integrations::oauth::{OAuthConfig, OAuthToken, PkceFlow, validate_state};
+use crate::integrations::onedrive::OneDrive;
+use crate::integrations::sync::{CloudSync, SyncConfig, SyncState};
+use crate::integrations::{CloudProvider, ProviderType};
 
 /// Integration state shared across requests
 #[derive(Clone)]
@@ -195,7 +193,10 @@ pub async fn get_auth_url(
         .read()
         .get(&provider_type)
         .cloned()
-        .ok_or((StatusCode::BAD_REQUEST, "Provider not configured".to_string()))?;
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "Provider not configured".to_string(),
+        ))?;
 
     let flow = PkceFlow::new(config);
     let auth_url = flow.authorization_url();
@@ -227,7 +228,10 @@ pub async fn oauth_callback(
         .oauth_flows
         .write()
         .remove(&query.state)
-        .ok_or((StatusCode::BAD_REQUEST, "Invalid or expired state".to_string()))?;
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "Invalid or expired state".to_string(),
+        ))?;
 
     // Validate state
     validate_state(flow_state.flow.state(), &query.state)
@@ -245,7 +249,10 @@ pub async fn oauth_callback(
     state.set_token(provider, token);
 
     // Redirect to success page
-    Ok(Redirect::to(&format!("/integrations/v2/cloud/{}/success", provider)))
+    Ok(Redirect::to(&format!(
+        "/integrations/v2/cloud/{}/success",
+        provider
+    )))
 }
 
 /// Get token status for a provider
@@ -277,7 +284,10 @@ pub async fn refresh_token(
         .read()
         .get(&provider_type)
         .cloned()
-        .ok_or((StatusCode::BAD_REQUEST, "Provider not configured".to_string()))?;
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "Provider not configured".to_string(),
+        ))?;
 
     let current_token = state
         .get_token(provider_type)
@@ -288,9 +298,10 @@ pub async fn refresh_token(
         .as_ref()
         .ok_or((StatusCode::BAD_REQUEST, "No refresh token".to_string()))?;
 
-    let new_token = crate::integrations::oauth::refresh_token(&config, refresh, &state.inner.client)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let new_token =
+        crate::integrations::oauth::refresh_token(&config, refresh, &state.inner.client)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let expires_at = new_token.expires_at;
     state.set_token(provider_type, new_token);
@@ -313,7 +324,10 @@ pub async fn trigger_sync(
         .read()
         .get(&req.provider)
         .cloned()
-        .ok_or((StatusCode::BAD_REQUEST, "Provider not configured".to_string()))?;
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "Provider not configured".to_string(),
+        ))?;
 
     let token = state
         .get_token(req.provider)
@@ -385,7 +399,10 @@ pub async fn get_quota(
         .read()
         .get(&provider_type)
         .cloned()
-        .ok_or((StatusCode::BAD_REQUEST, "Provider not configured".to_string()))?;
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "Provider not configured".to_string(),
+        ))?;
 
     let token = state
         .get_token(provider_type)
@@ -425,9 +442,7 @@ pub async fn get_quota(
 }
 
 /// List all providers with their status
-pub async fn list_providers(
-    State(state): State<IntegrationState>,
-) -> Json<Vec<ProviderStatus>> {
+pub async fn list_providers(State(state): State<IntegrationState>) -> Json<Vec<ProviderStatus>> {
     let configs = state.inner.configs.read();
     let tokens = state.inner.tokens.read();
 
@@ -442,7 +457,7 @@ pub async fn list_providers(
         .map(|&provider| {
             let configured = configs.contains_key(&provider);
             let token = tokens.get(&provider);
-            
+
             ProviderStatus {
                 provider,
                 configured,
@@ -490,7 +505,10 @@ pub fn integration_router(state: IntegrationState) -> axum::Router {
         .route("/providers/{provider}/status", get(get_token_status))
         .route("/providers/{provider}/refresh", post(refresh_token))
         .route("/providers/{provider}/quota", get(get_quota))
-        .route("/providers/{provider}/disconnect", delete(disconnect_provider))
+        .route(
+            "/providers/{provider}/disconnect",
+            delete(disconnect_provider),
+        )
         .route("/callback", get(oauth_callback))
         .route("/sync", post(trigger_sync))
         .with_state(state)

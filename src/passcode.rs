@@ -4,26 +4,42 @@
 //! approves it (here via the admin endpoint), which also pushes `PasscodeResetApproved`
 //! to the device over the notifications socket.
 
-use axum::{extract::{Path, State}, http::{header, HeaderMap, StatusCode}, Json};
+use axum::Json;
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use chrono::{Duration, Utc};
 
-use crate::{api::AppState, device::PasscodeReset, error::{Result, ServerError}, notifications::WsMessage};
+use crate::api::AppState;
+use crate::device::PasscodeReset;
+use crate::error::{Result, ServerError};
+use crate::notifications::WsMessage;
 
 /// Matches rmfakecloud's `passcodestore.ResetTTL`.
 const RESET_TTL_HOURS: i64 = 24;
 
 fn auth(headers: &HeaderMap) -> Result<&str> {
-    headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).ok_or(ServerError::Unauthorized)
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or(ServerError::Unauthorized)
 }
 
 /// `POST /passcode/v1/resets/{uuid}`: create the request, or re-check an existing one.
 /// Returns the stored request (201 if new, 200 if it already existed) so a re-POST sees `Approved`.
-pub async fn create(State(state): State<AppState>, Path(request_id): Path<String>, headers: HeaderMap) -> Result<(StatusCode, Json<PasscodeReset>)> {
+pub async fn create(
+    State(state): State<AppState>,
+    Path(request_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<PasscodeReset>)> {
     let (user_id, device_id, device_desc) = state.devices.caller(auth(&headers)?)?;
     let now = Utc::now();
     let reset = PasscodeReset {
         device_id,
-        device_name: if device_desc.is_empty() { "reMarkable".into() } else { device_desc },
+        device_name: if device_desc.is_empty() {
+            "reMarkable".into()
+        } else {
+            device_desc
+        },
         request_id,
         created: now,
         expires: now + Duration::hours(RESET_TTL_HOURS),
@@ -34,43 +50,83 @@ pub async fn create(State(state): State<AppState>, Path(request_id): Path<String
         tracing::warn!(request_id = %reset.request_id, device = %reset.device_id,
             "passcode reset requested; approve with POST /admin/passcode/resets/{{id}}/approve");
     }
-    let stored = state.devices.get_passcode_reset(&reset.request_id, &user_id)?;
-    Ok((if created { StatusCode::CREATED } else { StatusCode::OK }, Json(stored)))
+    let stored = state
+        .devices
+        .get_passcode_reset(&reset.request_id, &user_id)?;
+    Ok((
+        if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(stored),
+    ))
 }
 
 /// `GET /passcode/v1/resets/{uuid}`: device polls its request.
-pub async fn get(State(state): State<AppState>, Path(request_id): Path<String>, headers: HeaderMap) -> Result<Json<PasscodeReset>> {
+pub async fn get(
+    State(state): State<AppState>,
+    Path(request_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<PasscodeReset>> {
     let (user_id, ..) = state.devices.caller(auth(&headers)?)?;
-    Ok(Json(state.devices.get_passcode_reset(&request_id, &user_id)?))
+    Ok(Json(
+        state.devices.get_passcode_reset(&request_id, &user_id)?,
+    ))
 }
 
 /// `POST /admin/passcode/resets/{uuid}/approve` (requires `x-admin-token` = `ADMIN_TOKEN`).
-pub async fn approve(State(state): State<AppState>, Path(request_id): Path<String>, headers: HeaderMap) -> Result<Json<PasscodeReset>> {
+pub async fn approve(
+    State(state): State<AppState>,
+    Path(request_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<PasscodeReset>> {
     crate::api::require_admin(&headers)?;
     approve_and_notify(&state, &request_id, None)
 }
 
-fn approve_and_notify(state: &AppState, request_id: &str, owner: Option<&str>) -> Result<Json<PasscodeReset>> {
+fn approve_and_notify(
+    state: &AppState,
+    request_id: &str,
+    owner: Option<&str>,
+) -> Result<Json<PasscodeReset>> {
     let (user_id, reset) = state.devices.approve_passcode_reset(request_id, owner)?;
-    let _ = state.notification_tx.send(WsMessage::passcode_reset_approved(&user_id, &reset.device_id, &reset.device_name, &reset.request_id));
+    let _ = state
+        .notification_tx
+        .send(WsMessage::passcode_reset_approved(
+            &user_id,
+            &reset.device_id,
+            &reset.device_name,
+            &reset.request_id,
+        ));
     tracing::info!(%request_id, "passcode reset approved");
     Ok(Json(reset))
 }
 
 /// `POST /passcode/v1/reset/{uuid}/approve`: another of the owner's devices approves
 /// (firmware sub_484934; POST per the method enum in sub_1A4264).
-pub async fn device_approve(State(state): State<AppState>, Path(request_id): Path<String>, headers: HeaderMap) -> Result<Json<PasscodeReset>> {
+pub async fn device_approve(
+    State(state): State<AppState>,
+    Path(request_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<PasscodeReset>> {
     let (user_id, ..) = state.devices.caller(auth(&headers)?)?;
     approve_and_notify(&state, &request_id, Some(&user_id))
 }
 
 /// `POST /passcode/v1/reset/{uuid}/deny` (firmware sub_485124).
-pub async fn device_deny(State(state): State<AppState>, Path(request_id): Path<String>, headers: HeaderMap) -> Result<StatusCode> {
+pub async fn device_deny(
+    State(state): State<AppState>,
+    Path(request_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode> {
     let (user_id, ..) = state.devices.caller(auth(&headers)?)?;
     if !state.devices.delete_passcode_reset(&request_id, &user_id)? {
         return Err(ServerError::NotFound(request_id));
     }
-    let _ = state.notification_tx.send(WsMessage::passcode_reset_denied(&user_id, &request_id));
+    let _ = state
+        .notification_tx
+        .send(WsMessage::passcode_reset_denied(&user_id, &request_id));
     tracing::info!(%request_id, "passcode reset denied");
     Ok(StatusCode::NO_CONTENT)
 }

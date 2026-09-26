@@ -8,15 +8,20 @@
 //! Set `HWR_COMMAND` to use a different recogniser (see `tesseract()` below and
 //! contrib/hwr/trocr_hwr.py). Set `HWR_CAPTURE_DIR` to save every request/response pair (we have no real captures yet).
 
-use std::{path::PathBuf, process::Stdio, time::Duration};
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::Duration;
 
-use axum::{extract::State, http::{header, HeaderMap, StatusCode}, response::{IntoResponse, Response}};
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tiny_skia::{LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform};
 use tokio::io::AsyncWriteExt;
 
-use crate::{api::AppState, error::{Result, ServerError}};
+use crate::api::AppState;
+use crate::error::{Result, ServerError};
 
 const JIIX_CONTENT_TYPE: &str = "application/vnd.myscript.jiix";
 /// Padding around the ink, in output pixels.
@@ -36,20 +41,36 @@ struct Request {
 }
 
 #[derive(Deserialize, Default)]
-struct Configuration { #[serde(default)] lang: Option<String> }
+struct Configuration {
+    #[serde(default)]
+    lang: Option<String>,
+}
 
 #[derive(Deserialize)]
-struct StrokeGroup { #[serde(default)] strokes: Vec<InkStroke> }
+struct StrokeGroup {
+    #[serde(default)]
+    strokes: Vec<InkStroke>,
+}
 
 #[derive(Deserialize)]
-struct InkStroke { x: Vec<f32>, y: Vec<f32> }
+struct InkStroke {
+    x: Vec<f32>,
+    y: Vec<f32>,
+}
 
 /// Maps rendered-image pixels back to the tablet's coordinate space.
-struct Frame { min_x: f32, min_y: f32, scale: f32 }
+struct Frame {
+    min_x: f32,
+    min_y: f32,
+    scale: f32,
+}
 
 impl Frame {
     fn to_ink(&self, px: f32, py: f32) -> (f32, f32) {
-        ((px - PAD) / self.scale + self.min_x, (py - PAD) / self.scale + self.min_y)
+        (
+            (px - PAD) / self.scale + self.min_x,
+            (py - PAD) / self.scale + self.min_y,
+        )
     }
 }
 
@@ -59,32 +80,53 @@ pub(crate) type Points = Vec<(f32, f32)>;
 fn render(strokes: &[Points]) -> Result<(Vec<u8>, Frame)> {
     let (mut min_x, mut min_y, mut max_x, mut max_y) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
     for &(x, y) in strokes.iter().flatten() {
-        min_x = min_x.min(x); min_y = min_y.min(y); max_x = max_x.max(x); max_y = max_y.max(y);
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
     }
     let (w, h) = ((max_x - min_x).max(1.0), (max_y - min_y).max(1.0));
     let scale = (MAX_SIDE / w.max(h)).min(1.0);
-    let frame = Frame { min_x, min_y, scale };
+    let frame = Frame {
+        min_x,
+        min_y,
+        scale,
+    };
 
-    let mut pixmap = Pixmap::new((w * scale + 2.0 * PAD) as u32, (h * scale + 2.0 * PAD) as u32)
-        .ok_or_else(|| ServerError::Internal("empty ink bounds".into()))?;
+    let mut pixmap = Pixmap::new(
+        (w * scale + 2.0 * PAD) as u32,
+        (h * scale + 2.0 * PAD) as u32,
+    )
+    .ok_or_else(|| ServerError::Internal("empty ink bounds".into()))?;
     pixmap.fill(tiny_skia::Color::WHITE);
     let mut paint = Paint::default();
     paint.set_color_rgba8(0, 0, 0, 255);
     paint.anti_alias = true;
-    let pen = Stroke { width: PEN, line_cap: LineCap::Round, line_join: LineJoin::Round, ..Default::default() };
+    let pen = Stroke {
+        width: PEN,
+        line_cap: LineCap::Round,
+        line_join: LineJoin::Round,
+        ..Default::default()
+    };
 
     for s in strokes {
         let mut pb = PathBuilder::new();
-        let mut pts = s.iter().map(|&(x, y)| ((x - min_x) * scale + PAD, (y - min_y) * scale + PAD));
+        let mut pts = s
+            .iter()
+            .map(|&(x, y)| ((x - min_x) * scale + PAD, (y - min_y) * scale + PAD));
         let Some((x0, y0)) = pts.next() else { continue };
         pb.move_to(x0, y0);
         pb.line_to(x0 + 0.01, y0); // dots / single-point strokes still leave ink
-        for (x, y) in pts { pb.line_to(x, y); }
+        for (x, y) in pts {
+            pb.line_to(x, y);
+        }
         if let Some(path) = pb.finish() {
             pixmap.stroke_path(&path, &paint, &pen, Transform::identity(), None);
         }
     }
-    let png = pixmap.encode_png().map_err(|e| ServerError::Internal(e.to_string()))?;
+    let png = pixmap
+        .encode_png()
+        .map_err(|e| ServerError::Internal(e.to_string()))?;
     Ok((png, frame))
 }
 
@@ -95,7 +137,10 @@ const TESSERACT_LANG: &str = "eng";
 async fn tesseract(png: &[u8], lang: &str) -> Result<String> {
     // `HWR_COMMAND` swaps in another recogniser (e.g. contrib/hwr/trocr_hwr.py). It is run
     // via `sh -c`, gets the PNG on stdin and must print Tesseract-format TSV on stdout.
-    let mut cmd = match std::env::var("HWR_COMMAND").ok().filter(|c| !c.trim().is_empty()) {
+    let mut cmd = match std::env::var("HWR_COMMAND")
+        .ok()
+        .filter(|c| !c.trim().is_empty())
+    {
         Some(c) => {
             let mut cmd = tokio::process::Command::new("sh");
             cmd.arg("-c").arg(c).env("HWR_LANG", lang);
@@ -108,17 +153,23 @@ async fn tesseract(png: &[u8], lang: &str) -> Result<String> {
         }
     };
     let mut child = cmd
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| ServerError::Internal(format!("recogniser not available: {e}")))?;
     let mut stdin = child.stdin.take().expect("piped stdin");
     stdin.write_all(png).await?;
     drop(stdin);
-    let out = tokio::time::timeout(TESSERACT_TIMEOUT, child.wait_with_output()).await
+    let out = tokio::time::timeout(TESSERACT_TIMEOUT, child.wait_with_output())
+        .await
         .map_err(|_| ServerError::Internal("recogniser timed out".into()))??;
     if !out.status.success() {
-        return Err(ServerError::Internal(format!("recogniser exited with {}", out.status)));
+        return Err(ServerError::Internal(format!(
+            "recogniser exited with {}",
+            out.status
+        )));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -137,16 +188,30 @@ pub(crate) struct Word {
 
 /// Tesseract TSV (level 5 = word rows) -> words mapped back to ink coordinates.
 fn parse_tsv(tsv: &str, frame: &Frame) -> Vec<Word> {
-    tsv.lines().skip(1).filter_map(|row| {
-        let f: Vec<&str> = row.split('\t').collect();
-        if f.len() < 12 || f[0] != "5" { return None; }
-        let text = f[11].trim();
-        if text.is_empty() { return None; }
-        let num = |i: usize| f[i].parse::<f32>().unwrap_or(0.0);
-        let (x, y) = frame.to_ink(num(6), num(7));
-        let (x2, y2) = frame.to_ink(num(6) + num(8), num(7) + num(9));
-        Some(Word { text: text.to_owned(), x, y, w: x2 - x, h: y2 - y, line: (num(2) as u32, num(3) as u32, num(4) as u32) })
-    }).collect()
+    tsv.lines()
+        .skip(1)
+        .filter_map(|row| {
+            let f: Vec<&str> = row.split('\t').collect();
+            if f.len() < 12 || f[0] != "5" {
+                return None;
+            }
+            let text = f[11].trim();
+            if text.is_empty() {
+                return None;
+            }
+            let num = |i: usize| f[i].parse::<f32>().unwrap_or(0.0);
+            let (x, y) = frame.to_ink(num(6), num(7));
+            let (x2, y2) = frame.to_ink(num(6) + num(8), num(7) + num(9));
+            Some(Word {
+                text: text.to_owned(),
+                x,
+                y,
+                w: x2 - x,
+                h: y2 - y,
+                line: (num(2) as u32, num(3) as u32, num(4) as u32),
+            })
+        })
+        .collect()
 }
 
 /// Recognise handwriting in `strokes` (page coordinates) with the local engine.
@@ -179,10 +244,17 @@ fn to_jiix(words: &[Word]) -> Value {
             "bounding-box": { "x": w.x, "y": w.y, "width": w.w, "height": w.h },
         }));
     }
-    let (x0, y0) = words.iter().fold((f32::MAX, f32::MAX), |(x, y), w| (x.min(w.x), y.min(w.y)));
-    let (x1, y1) = words.iter().fold((f32::MIN, f32::MIN), |(x, y), w| (x.max(w.x + w.w), y.max(w.y + w.h)));
-    let bbox = if words.is_empty() { json!({ "x": 0, "y": 0, "width": 0, "height": 0 }) }
-        else { json!({ "x": x0, "y": y0, "width": x1 - x0, "height": y1 - y0 }) };
+    let (x0, y0) = words
+        .iter()
+        .fold((f32::MAX, f32::MAX), |(x, y), w| (x.min(w.x), y.min(w.y)));
+    let (x1, y1) = words.iter().fold((f32::MIN, f32::MIN), |(x, y), w| {
+        (x.max(w.x + w.w), y.max(w.y + w.h))
+    });
+    let bbox = if words.is_empty() {
+        json!({ "x": 0, "y": 0, "width": 0, "height": 0 })
+    } else {
+        json!({ "x": x0, "y": y0, "width": x1 - x0, "height": y1 - y0 })
+    };
     json!({
         "type": "Raw Content",
         "version": "3",
@@ -192,18 +264,30 @@ fn to_jiix(words: &[Word]) -> Value {
 }
 
 fn capture(name: &str, body: &[u8]) {
-    let Some(dir) = std::env::var_os("HWR_CAPTURE_DIR").map(PathBuf::from) else { return };
-    let path = dir.join(format!("{}-{name}", chrono::Utc::now().format("%Y%m%dT%H%M%S%.3f")));
+    let Some(dir) = std::env::var_os("HWR_CAPTURE_DIR").map(PathBuf::from) else {
+        return;
+    };
+    let path = dir.join(format!(
+        "{}-{name}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%.3f")
+    ));
     if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, body)) {
         tracing::warn!("could not save handwriting capture {}: {e}", path.display());
     }
 }
 
-pub async fn convert(State(state): State<AppState>, headers: HeaderMap, body: axum::body::Bytes) -> Result<Response> {
+pub async fn convert(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response> {
     state.auth_user(&headers)?;
     capture("request.json", &body);
     let req: Request = serde_json::from_slice(&body)?;
-    let strokes: Vec<Points> = req.stroke_groups.iter().flat_map(|g| &g.strokes)
+    let strokes: Vec<Points> = req
+        .stroke_groups
+        .iter()
+        .flat_map(|g| &g.strokes)
         .filter(|s| !s.x.is_empty() && s.x.len() == s.y.len())
         .map(|s| s.x.iter().copied().zip(s.y.iter().copied()).collect())
         .collect();
@@ -211,15 +295,28 @@ pub async fn convert(State(state): State<AppState>, headers: HeaderMap, body: ax
         return Err(ServerError::Config("no strokes in request".into()));
     }
 
-    if let Some(lang) = req.configuration.lang.as_deref().filter(|l| !l.starts_with("en")) {
-        tracing::warn!(lang, "no tesseract pack for this language; reading as English");
+    if let Some(lang) = req
+        .configuration
+        .lang
+        .as_deref()
+        .filter(|l| !l.starts_with("en"))
+    {
+        tracing::warn!(
+            lang,
+            "no tesseract pack for this language; reading as English"
+        );
     }
     let jiix = to_jiix(&recognize(&strokes).await?);
     tracing::info!(strokes = strokes.len(), text = %jiix["elements"][0]["label"].as_str().unwrap_or_default(), "handwriting converted");
 
     let out = serde_json::to_vec(&jiix)?;
     capture("response.jiix", &out);
-    Ok((StatusCode::OK, [(header::CONTENT_TYPE, JIIX_CONTENT_TYPE)], out).into_response())
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, JIIX_CONTENT_TYPE)],
+        out,
+    )
+        .into_response())
 }
 
 #[cfg(test)]
@@ -229,23 +326,50 @@ mod tests {
     /// Mirror of xochitl 3.3.2's JIIX reader (sub_4A155C / sub_4A0D18): anything this
     /// can't find, the tablet can't either.
     fn read_like_firmware(jiix: &Value) -> Option<(String, [f64; 4])> {
-        let el = jiix["elements"].as_array()?.iter().find(|e| e["type"] == "Text")?;
+        let el = jiix["elements"]
+            .as_array()?
+            .iter()
+            .find(|e| e["type"] == "Text")?;
         let b = &el["bounding-box"];
-        let bbox = [b["x"].as_f64()?, b["y"].as_f64()?, b["width"].as_f64()?, b["height"].as_f64()?];
-        let text = el["words"].as_array()?.iter().map(|w| {
-            let l = w["label"].as_str().unwrap_or_default();
-            if l == "\n" { w["reflow-label"].as_str().unwrap_or("\n").to_owned() } else { l.to_owned() }
-        }).collect();
+        let bbox = [
+            b["x"].as_f64()?,
+            b["y"].as_f64()?,
+            b["width"].as_f64()?,
+            b["height"].as_f64()?,
+        ];
+        let text = el["words"]
+            .as_array()?
+            .iter()
+            .map(|w| {
+                let l = w["label"].as_str().unwrap_or_default();
+                if l == "\n" {
+                    w["reflow-label"].as_str().unwrap_or("\n").to_owned()
+                } else {
+                    l.to_owned()
+                }
+            })
+            .collect();
         Some((text, bbox))
     }
 
     fn word(text: &str, x: f32, line: u32) -> Word {
-        Word { text: text.into(), x, y: 5.0, w: 10.0, h: 4.0, line: (1, 1, line) }
+        Word {
+            text: text.into(),
+            x,
+            y: 5.0,
+            w: 10.0,
+            h: 4.0,
+            line: (1, 1, line),
+        }
     }
 
     #[test]
     fn jiix_is_readable_by_firmware_parser() {
-        let jiix = to_jiix(&[word("hello", 0.0, 1), word("world", 20.0, 1), word("again", 0.0, 2)]);
+        let jiix = to_jiix(&[
+            word("hello", 0.0, 1),
+            word("world", 20.0, 1),
+            word("again", 0.0, 2),
+        ]);
         let (text, bbox) = read_like_firmware(&jiix).expect("firmware would find no text");
         assert_eq!(text, "hello world again"); // line break reflows to a space
         assert_eq!(bbox, [0.0, 5.0, 30.0, 4.0]);

@@ -6,10 +6,18 @@
 //! `x-goog-if-generation-match`) so concurrent writers get a 412 instead of a lost update.
 //! Mirrors rmfakecloud's `blobStorageDownload`/`blobStorageUpload`/`/blobstorage`.
 
-use axum::{body::Bytes, extract::{Query, State}, http::{header, HeaderMap, HeaderValue, StatusCode}, response::{IntoResponse, Response}, Json};
+use axum::Json;
+use axum::body::Bytes;
+use axum::extract::{Query, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
-use crate::{api::AppState, checksum, error::{Result, ServerError}, notifications::WsMessage, storage::is_valid_hash};
+use crate::api::AppState;
+use crate::checksum;
+use crate::error::{Result, ServerError};
+use crate::notifications::WsMessage;
+use crate::storage::is_valid_hash;
 
 const ROOT_BLOB: &str = "root";
 const GENERATION_HEADER: &str = "x-goog-generation";
@@ -48,7 +56,9 @@ pub struct SyncCompleteResponse {
 }
 
 fn check_blob_id(blob: &str) -> Result<()> {
-    if blob == ROOT_BLOB || is_valid_hash(blob) { return Ok(()); }
+    if blob == ROOT_BLOB || is_valid_hash(blob) {
+        return Ok(());
+    }
     tracing::warn!(blob, "rejected blob id");
     Err(ServerError::InvalidHash(blob.to_string()))
 }
@@ -61,7 +71,12 @@ fn parse_signed_request(body: &Bytes) -> Result<SignedUrlRequest> {
     })
 }
 
-fn signed_url(state: &AppState, headers: &HeaderMap, req: SignedUrlRequest, write: bool) -> Result<Json<SignedUrlResponse>> {
+fn signed_url(
+    state: &AppState,
+    headers: &HeaderMap,
+    req: SignedUrlRequest,
+    write: bool,
+) -> Result<Json<SignedUrlResponse>> {
     state.auth_user(headers)?;
     check_blob_id(&req.relative_path)?;
     if write && req.initial_sync {
@@ -82,15 +97,26 @@ fn signed_url(state: &AppState, headers: &HeaderMap, req: SignedUrlRequest, writ
     }))
 }
 
-pub async fn signed_download(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<Json<SignedUrlResponse>> {
+pub async fn signed_download(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<SignedUrlResponse>> {
     signed_url(&state, &headers, parse_signed_request(&body)?, false)
 }
 
-pub async fn signed_upload(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<Json<SignedUrlResponse>> {
+pub async fn signed_upload(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<SignedUrlResponse>> {
     signed_url(&state, &headers, parse_signed_request(&body)?, true)
 }
 
-pub async fn blob_get(State(state): State<AppState>, Query(q): Query<BlobQuery>) -> Result<Response> {
+pub async fn blob_get(
+    State(state): State<AppState>,
+    Query(q): Query<BlobQuery>,
+) -> Result<Response> {
     state.devices.verify_blob(&q.token, &q.blob, false)?;
     check_blob_id(&q.blob)?;
 
@@ -107,22 +133,35 @@ pub async fn blob_get(State(state): State<AppState>, Query(q): Query<BlobQuery>)
     let mut resp = (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/octet-stream")],
-        [(header::HeaderName::from_static("x-goog-hash"), checksum::format_goog_hash(&data))],
+        [(
+            header::HeaderName::from_static("x-goog-hash"),
+            checksum::format_goog_hash(&data),
+        )],
         data,
-    ).into_response();
+    )
+        .into_response();
     if let Some(generation) = generation {
-        resp.headers_mut().insert(GENERATION_HEADER, HeaderValue::from(generation));
+        resp.headers_mut()
+            .insert(GENERATION_HEADER, HeaderValue::from(generation));
     }
     Ok(resp)
 }
 
-pub async fn blob_put(State(state): State<AppState>, Query(q): Query<BlobQuery>, headers: HeaderMap, body: Bytes) -> Result<Response> {
+pub async fn blob_put(
+    State(state): State<AppState>,
+    Query(q): Query<BlobQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response> {
     state.devices.verify_blob(&q.token, &q.blob, true)?;
     check_blob_id(&q.blob)?;
 
     if let Some(goog) = headers.get("x-goog-hash").and_then(|v| v.to_str().ok()) {
         if checksum::parse_goog_hash(goog).is_some_and(|crc| crc != checksum::crc32c(&body)) {
-            return Err(ServerError::ChecksumMismatch { expected: goog.to_string(), actual: checksum::format_goog_hash(&body) });
+            return Err(ServerError::ChecksumMismatch {
+                expected: goog.to_string(),
+                actual: checksum::format_goog_hash(&body),
+            });
         }
     }
 
@@ -131,7 +170,9 @@ pub async fn blob_put(State(state): State<AppState>, Query(q): Query<BlobQuery>,
         return Ok(Json(serde_json::json!({})).into_response());
     }
 
-    let hash = std::str::from_utf8(&body).map(str::trim).unwrap_or_default();
+    let hash = std::str::from_utf8(&body)
+        .map(str::trim)
+        .unwrap_or_default();
     if !is_valid_hash(hash) {
         return Err(ServerError::InvalidHash(hash.to_string()));
     }
@@ -143,12 +184,22 @@ pub async fn blob_put(State(state): State<AppState>, Query(q): Query<BlobQuery>,
     tracing::info!(generation = root.generation, hash = %root.hash, "root updated");
 
     let mut resp = Json(serde_json::json!({})).into_response();
-    resp.headers_mut().insert(GENERATION_HEADER, HeaderValue::from(root.generation));
+    resp.headers_mut()
+        .insert(GENERATION_HEADER, HeaderValue::from(root.generation));
     Ok(resp)
 }
 
-pub async fn sync_complete(State(state): State<AppState>, headers: HeaderMap, Json(req): Json<SyncCompleteRequest>) -> Result<Json<SyncCompleteResponse>> {
-    let (user_id, device_id, _) = state.devices.caller(headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or_default())?;
+pub async fn sync_complete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<SyncCompleteRequest>,
+) -> Result<Json<SyncCompleteResponse>> {
+    let (user_id, device_id, _) = state.devices.caller(
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default(),
+    )?;
     tracing::info!(generation = req.generation, device = %device_id, "sync complete");
     // Attributed to the pushing device so it skips its own notification (xochitl 3.28 C.2).
     let msg = WsMessage::sync_complete(req.generation, &device_id, &user_id);

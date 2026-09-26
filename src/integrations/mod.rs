@@ -15,14 +15,14 @@ pub mod oauth;
 pub mod onedrive;
 pub mod sync;
 
+use std::path::PathBuf;
+
 pub use api::{IntegrationState, integration_router};
+use async_trait::async_trait;
 pub use conflict::{ConflictResolution, ConflictResolver, ConflictStrategy};
 pub use oauth::{OAuthConfig, OAuthProvider, OAuthToken, PkceFlow};
-pub use sync::{CloudSync, SyncConfig, SyncDirection, SyncResult, SyncStatus};
-
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+pub use sync::{CloudSync, SyncConfig, SyncDirection, SyncResult, SyncStatus};
 use thiserror::Error;
 
 /// Errors from cloud integrations

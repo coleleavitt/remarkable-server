@@ -2,10 +2,12 @@
 //!
 //! Supports all three providers with proper PKCE challenge/verifier.
 
-use crate::integrations::{IntegrationError, ProviderType, Result};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::integrations::{IntegrationError, ProviderType, Result};
 
 /// OAuth configuration for a provider
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,7 +22,11 @@ pub struct OAuthConfig {
 
 impl OAuthConfig {
     /// Google Drive OAuth config
-    pub fn google_drive(client_id: String, client_secret: Option<String>, redirect_uri: String) -> Self {
+    pub fn google_drive(
+        client_id: String,
+        client_secret: Option<String>,
+        redirect_uri: String,
+    ) -> Self {
         Self {
             provider: ProviderType::GoogleDrive,
             client_id,
@@ -50,16 +56,17 @@ impl OAuthConfig {
     }
 
     /// OneDrive OAuth config
-    pub fn onedrive(client_id: String, client_secret: Option<String>, redirect_uri: String) -> Self {
+    pub fn onedrive(
+        client_id: String,
+        client_secret: Option<String>,
+        redirect_uri: String,
+    ) -> Self {
         Self {
             provider: ProviderType::OneDrive,
             client_id,
             client_secret,
             redirect_uri,
-            scopes: vec![
-                "Files.ReadWrite.All".into(),
-                "offline_access".into(),
-            ],
+            scopes: vec!["Files.ReadWrite.All".into(), "offline_access".into()],
         }
     }
 
@@ -68,7 +75,9 @@ impl OAuthConfig {
         match self.provider {
             ProviderType::GoogleDrive => "https://accounts.google.com/o/oauth2/v2/auth",
             ProviderType::Dropbox => "https://www.dropbox.com/oauth2/authorize",
-            ProviderType::OneDrive => "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+            ProviderType::OneDrive => {
+                "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+            }
         }
     }
 
@@ -114,14 +123,17 @@ impl OAuthToken {
 
     /// Parse from OAuth token response
     pub fn from_response(response: &TokenResponse) -> Self {
-        let expires_at = response.expires_in.map(|secs| {
-            chrono::Utc::now().timestamp() + secs as i64
-        });
-        
+        let expires_at = response
+            .expires_in
+            .map(|secs| chrono::Utc::now().timestamp() + secs as i64);
+
         Self {
             access_token: response.access_token.clone(),
             refresh_token: response.refresh_token.clone(),
-            token_type: response.token_type.clone().unwrap_or_else(|| "Bearer".into()),
+            token_type: response
+                .token_type
+                .clone()
+                .unwrap_or_else(|| "Bearer".into()),
             expires_at,
             scope: response.scope.clone(),
         }
@@ -152,7 +164,7 @@ impl PkceFlow {
         let code_verifier = Self::generate_verifier();
         let code_challenge = Self::generate_challenge(&code_verifier);
         let state = Self::generate_state();
-        
+
         Self {
             config,
             code_verifier,
@@ -198,7 +210,7 @@ impl PkceFlow {
     /// Build authorization URL for user redirect
     pub fn authorization_url(&self) -> String {
         let scopes = self.config.scopes.join(" ");
-        
+
         let mut params = vec![
             ("client_id", self.config.client_id.as_str()),
             ("redirect_uri", self.config.redirect_uri.as_str()),
@@ -296,14 +308,14 @@ pub async fn refresh_token(
     if !response.status().is_success() {
         let status = response.status();
         let error_text = response.text().await.unwrap_or_default();
-        
+
         if status.as_u16() == 400 || status.as_u16() == 401 {
             return Err(IntegrationError::TokenRefreshFailed(format!(
                 "Refresh token invalid or revoked: {}",
                 error_text
             )));
         }
-        
+
         return Err(IntegrationError::TokenRefreshFailed(error_text));
     }
 
@@ -342,7 +354,7 @@ mod tests {
             None,
             "http://localhost:8080/callback".into(),
         ));
-        
+
         // Verify challenge is S256 of verifier
         let expected = PkceFlow::generate_challenge(flow.code_verifier());
         assert_eq!(flow.code_challenge, expected);

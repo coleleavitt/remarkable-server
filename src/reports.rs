@@ -6,14 +6,14 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{OriginalUri, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::Json;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::api::{require_admin, AppState};
+use crate::api::{AppState, require_admin};
 use crate::error::Result;
 
 /// Largest body kept per report. Also the request body limit on the telemetry
@@ -36,27 +36,41 @@ fn rotated_path(base: &Path) -> PathBuf {
 /// not break the tablet.
 fn append(base: &Path, path: &str, body: &[u8]) {
     let body = &body[..body.len().min(MAX_BODY)];
-    let parsed = serde_json::from_slice::<Value>(body).unwrap_or_else(|_| Value::String(String::from_utf8_lossy(body).into_owned()));
-    let line = json!({ "at": chrono::Utc::now().to_rfc3339(), "path": path, "body": parsed }).to_string();
+    let parsed = serde_json::from_slice::<Value>(body)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(body).into_owned()));
+    let line =
+        json!({ "at": chrono::Utc::now().to_rfc3339(), "path": path, "body": parsed }).to_string();
     let file = log_path(base);
     let _guard = WRITE.lock();
     if std::fs::metadata(&file).is_ok_and(|m| m.len() > MAX_FILE) {
         let _ = std::fs::rename(&file, rotated_path(base));
     }
-    let result = std::fs::OpenOptions::new().create(true).append(true).open(&file).and_then(|mut f| writeln!(f, "{line}"));
+    let result = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&file)
+        .and_then(|mut f| writeln!(f, "{line}"));
     if let Err(e) = result {
         tracing::warn!("could not record report from {path}: {e}");
     }
 }
 
 /// `POST /v1/reports`, `/v2/reports`, `/report/v1`, `/v2/events`, `/sync/reports/v1` -> 200.
-pub async fn store(State(state): State<AppState>, OriginalUri(uri): OriginalUri, body: Bytes) -> StatusCode {
+pub async fn store(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    body: Bytes,
+) -> StatusCode {
     append(state.storage.base_path(), uri.path(), &body);
     StatusCode::OK
 }
 
 /// `POST /analytics/v2/events` -> 201 `{"message":"Success"}`.
-pub async fn store_analytics(State(state): State<AppState>, OriginalUri(uri): OriginalUri, body: Bytes) -> (StatusCode, Json<Value>) {
+pub async fn store_analytics(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    body: Bytes,
+) -> (StatusCode, Json<Value>) {
     append(state.storage.base_path(), uri.path(), &body);
     (StatusCode::CREATED, Json(json!({ "message": "Success" })))
 }
@@ -89,7 +103,10 @@ pub fn recent(base: &Path, limit: usize, contains: Option<&str>) -> Vec<Value> {
     // via `spawn_blocking` at the call sites.
     let (current, rotated) = {
         let _guard = WRITE.lock();
-        (std::fs::File::open(log_path(base)).ok(), std::fs::File::open(rotated_path(base)).ok())
+        (
+            std::fs::File::open(log_path(base)).ok(),
+            std::fs::File::open(rotated_path(base)).ok(),
+        )
     };
     let read = |file: Option<std::fs::File>| -> String {
         let mut buf = String::new();
@@ -103,7 +120,11 @@ pub fn recent(base: &Path, limit: usize, contains: Option<&str>) -> Vec<Value> {
         .lines()
         .rev()
         .chain(rotated.lines().rev())
-        .filter(|l| needle.as_deref().is_none_or(|n| l.to_lowercase().contains(n)))
+        .filter(|l| {
+            needle
+                .as_deref()
+                .is_none_or(|n| l.to_lowercase().contains(n))
+        })
         .filter_map(|l| serde_json::from_str(l).ok())
         .take(limit)
         .collect();
@@ -112,13 +133,19 @@ pub fn recent(base: &Path, limit: usize, contains: Option<&str>) -> Vec<Value> {
 }
 
 /// `GET /admin/reports?limit=&contains=` (requires `x-admin-token`).
-pub async fn list(State(state): State<AppState>, headers: HeaderMap, Query(q): Query<ListQuery>) -> Result<Json<Vec<Value>>> {
+pub async fn list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ListQuery>,
+) -> Result<Json<Vec<Value>>> {
     require_admin(&headers)?;
     // recent() does blocking file I/O; keep it off the async worker.
     let base = state.storage.base_path().to_path_buf();
     let limit = q.limit.unwrap_or(100).min(1000);
     let contains = q.contains;
-    let reports = tokio::task::spawn_blocking(move || recent(&base, limit, contains.as_deref())).await.unwrap_or_default();
+    let reports = tokio::task::spawn_blocking(move || recent(&base, limit, contains.as_deref()))
+        .await
+        .unwrap_or_default();
     Ok(Json(reports))
 }
 
@@ -129,7 +156,11 @@ mod tests {
     #[test]
     fn reports_are_kept_and_filtered() {
         let tmp = tempfile::tempdir().unwrap();
-        append(tmp.path(), "/v1/reports", br#"{"event":"screenshare-client-connected","roomId":"r1"}"#);
+        append(
+            tmp.path(),
+            "/v1/reports",
+            br#"{"event":"screenshare-client-connected","roomId":"r1"}"#,
+        );
         append(tmp.path(), "/v1/reports", b"not json");
         append(tmp.path(), "/v2/events", br#"{"event":"sync"}"#);
         let all = recent(tmp.path(), 10, None);
@@ -160,11 +191,21 @@ mod tests {
         // History across both files, oldest first.
         let all = recent(tmp.path(), 10, None);
         assert_eq!(all.len(), 3);
-        assert_eq!([&all[0]["body"]["n"], &all[1]["body"]["n"], &all[2]["body"]["n"]], [&json!(1), &json!(2), &json!(3)]);
+        assert_eq!(
+            [
+                &all[0]["body"]["n"],
+                &all[1]["body"]["n"],
+                &all[2]["body"]["n"]
+            ],
+            [&json!(1), &json!(2), &json!(3)]
+        );
         // The limit spans both files and keeps the newest.
         let newest = recent(tmp.path(), 2, None);
         assert_eq!(newest.len(), 2);
-        assert_eq!([&newest[0]["body"]["n"], &newest[1]["body"]["n"]], [&json!(2), &json!(3)]);
+        assert_eq!(
+            [&newest[0]["body"]["n"], &newest[1]["body"]["n"]],
+            [&json!(2), &json!(3)]
+        );
     }
 
     #[test]
@@ -175,7 +216,10 @@ mod tests {
         // trailing '\n', so the next appended report is concatenated onto it and
         // the two become a single invalid-JSON line.
         {
-            let mut f = std::fs::OpenOptions::new().append(true).open(log_path(tmp.path())).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(log_path(tmp.path()))
+                .unwrap();
             write!(f, "{{\"at\":\"x\",\"pa").unwrap();
         }
         append(tmp.path(), "/v1/reports", br#"{"b":2}"#);

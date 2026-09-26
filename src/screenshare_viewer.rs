@@ -20,9 +20,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
@@ -30,7 +30,15 @@ use base64::Engine;
 use parking_lot::Mutex;
 use remarkable_mqtt::screenshare::{signaling_topic, subscriptions};
 use remarkable_mqtt::{PeerMessage, SignalingEvent, SignalingRequest, WebRtcMessage};
-use remarkable_screenshare::{pump_frames, Area, Frame, PixelFormat, TransportConfig, Update, WebRtcHandler};
+use remarkable_screenshare::{
+    Area,
+    Frame,
+    PixelFormat,
+    TransportConfig,
+    Update,
+    WebRtcHandler,
+    pump_frames,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
 
@@ -74,7 +82,12 @@ pub struct ViewerConfig {
 impl Default for ViewerConfig {
     /// The paired account, host candidates only, 20 s idle grace.
     fn default() -> Self {
-        Self { user_id: "local-user".into(), transport: TransportConfig::default(), idle_grace: IDLE_GRACE, reports_dir: None }
+        Self {
+            user_id: "local-user".into(),
+            transport: TransportConfig::default(),
+            idle_grace: IDLE_GRACE,
+            reports_dir: None,
+        }
     }
 }
 
@@ -104,18 +117,30 @@ pub enum Status {
     /// connect it sends the whole current screen image (xochitl 3.29
     /// 0x459250 marks QImage::rect() dirty); with no image, only pings come.
     Connected,
-    Streaming { width: u32, height: u32 },
+    Streaming {
+        width: u32,
+        height: u32,
+    },
     /// The last session failed; trying again in `in_secs`.
-    Reconnecting { attempt: u32, max: u32, in_secs: u64, message: String },
+    Reconnecting {
+        attempt: u32,
+        max: u32,
+        in_secs: u64,
+        message: String,
+    },
     /// The tablet ended its screen share; waiting for it to start a new one.
     Stopped,
     /// Gave up after [`MAX_RETRIES`] failed attempts.
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 /// Delay before retry `attempt` (1-based): 2, 4, 8, 16, 30 s.
 fn retry_delay(attempt: u32) -> Duration {
-    RETRY_BASE.saturating_mul(2u32.saturating_pow(attempt)).min(RETRY_CAP)
+    RETRY_BASE
+        .saturating_mul(2u32.saturating_pow(attempt))
+        .min(RETRY_CAP)
 }
 
 /// One published frame: the picture, and what changed since the previous one.
@@ -206,7 +231,10 @@ enum SessionEnd {
 }
 
 fn failed(message: impl Into<String>) -> SessionEnd {
-    SessionEnd::Failed { message: message.into(), streamed: false }
+    SessionEnd::Failed {
+        message: message.into(),
+        streamed: false,
+    }
 }
 
 impl ScreenViewer {
@@ -347,10 +375,22 @@ impl ScreenViewer {
     fn newest_room(&self) -> Option<(String, bool)> {
         let uid = &self.inner.config.user_id;
         let signaling = &self.inner.signaling;
-        let mqtt = signaling.mqtt.as_ref().and_then(|b| b.active_room_age(uid)).map(|(id, age)| (id, age, false));
-        let rest = signaling.rest.as_ref().and_then(|r| r.rooms.active_room_age(uid)).map(|(id, age)| (id, age, true));
+        let mqtt = signaling
+            .mqtt
+            .as_ref()
+            .and_then(|b| b.active_room_age(uid))
+            .map(|(id, age)| (id, age, false));
+        let rest = signaling
+            .rest
+            .as_ref()
+            .and_then(|r| r.rooms.active_room_age(uid))
+            .map(|(id, age)| (id, age, true));
         // A stale room on one broker mustn't hide a fresh one on the other.
-        [mqtt, rest].into_iter().flatten().min_by_key(|(_, age, _)| *age).map(|(id, _, rest)| (id, rest))
+        [mqtt, rest]
+            .into_iter()
+            .flatten()
+            .min_by_key(|(_, age, _)| *age)
+            .map(|(id, _, rest)| (id, rest))
     }
 
     fn active_room(&self) -> Option<String> {
@@ -361,7 +401,13 @@ impl ScreenViewer {
     async fn open_channel(&self, cid: &str) -> Result<Channel, SessionEnd> {
         let uid = &self.inner.config.user_id;
         let prefer_rest = self.newest_room().is_some_and(|(_, rest)| rest);
-        let try_rest = || self.inner.signaling.rest.as_ref().and_then(|rest| Channel::join_rest(rest, uid, cid));
+        let try_rest = || {
+            self.inner
+                .signaling
+                .rest
+                .as_ref()
+                .and_then(|rest| Channel::join_rest(rest, uid, cid))
+        };
         if prefer_rest {
             if let Some(channel) = try_rest() {
                 return Ok(channel);
@@ -378,12 +424,17 @@ impl ScreenViewer {
 
     /// One negotiation and stream with the tablet.
     async fn session(&self) -> SessionEnd {
-        let cid = format!("server-viewer-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+        let cid = format!(
+            "server-viewer-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        );
         let mut channel = match self.open_channel(&cid).await {
             Ok(c) => c,
             Err(end) => return end,
         };
-        if let Err(e) = channel.broadcast(PeerMessage::RequestOffer { id: Some(cid.clone()) }) {
+        if let Err(e) = channel.broadcast(PeerMessage::RequestOffer {
+            id: Some(cid.clone()),
+        }) {
             return failed(e.to_string());
         }
 
@@ -394,7 +445,9 @@ impl ScreenViewer {
             match tokio::time::timeout(SIGNALING_TIMEOUT, channel.recv()).await {
                 Ok(Some((from, PeerMessage::WebRtc { payload }))) => match payload {
                     WebRtcMessage::Offer { description } => break (from, description),
-                    WebRtcMessage::Candidate { candidate, mid } => early.push((from, candidate, mid)),
+                    WebRtcMessage::Candidate { candidate, mid } => {
+                        early.push((from, candidate, mid))
+                    }
                     WebRtcMessage::Answer { .. } => {}
                 },
                 Ok(Some(_)) => {}
@@ -403,19 +456,27 @@ impl ScreenViewer {
             }
         };
 
-        let (webrtc, mut ice_rx, mut data_rx) = match WebRtcHandler::new(self.inner.config.transport.clone()).await {
-            Ok(w) => w,
-            Err(e) => return failed(format!("WebRTC setup failed: {e}")),
-        };
+        let (webrtc, mut ice_rx, mut data_rx) =
+            match WebRtcHandler::new(self.inner.config.transport.clone()).await {
+                Ok(w) => w,
+                Err(e) => return failed(format!("WebRTC setup failed: {e}")),
+            };
         let answer = match webrtc.accept_offer(&offer).await {
             Ok(a) => a,
             Err(e) => return failed(format!("bad offer from tablet: {e}")),
         };
-        if let Err(e) = channel.direct(&tablet, WebRtcMessage::Answer { description: answer }) {
+        if let Err(e) = channel.direct(
+            &tablet,
+            WebRtcMessage::Answer {
+                description: answer,
+            },
+        ) {
             return failed(e.to_string());
         }
         for (_, candidate, mid) in early.into_iter().filter(|(from, ..)| *from == tablet) {
-            let _ = webrtc.add_ice_candidate(&candidate, mid.as_deref(), Some(0)).await;
+            let _ = webrtc
+                .add_ice_candidate(&candidate, mid.as_deref(), Some(0))
+                .await;
         }
         tracing::info!(room = %channel.room_id(), tablet = %tablet, via = channel.kind(), "screenshare viewer answered tablet offer");
         let channel_room = channel.room_id().to_owned();
@@ -434,13 +495,19 @@ impl ScreenViewer {
             }
             Update::Frame(frame) => {
                 status.send_if_modified(|s| {
-                    let streaming = Status::Streaming { width: frame.width, height: frame.height };
+                    let streaming = Status::Streaming {
+                        width: frame.width,
+                        height: frame.height,
+                    };
                     (*s != streaming).then(|| *s = streaming).is_some()
                 });
                 let partial = frame.changed != frame.full_area();
-                let patch = partial.then(|| encode_png(&frame, frame.changed)).and_then(|r| {
-                    r.map_err(|e| tracing::warn!("screenshare viewer: PNG encode failed: {e}")).ok()
-                });
+                let patch = partial
+                    .then(|| encode_png(&frame, frame.changed))
+                    .and_then(|r| {
+                        r.map_err(|e| tracing::warn!("screenshare viewer: PNG encode failed: {e}"))
+                            .ok()
+                    });
                 let shot = Shot {
                     seq: seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
                     patch: patch.map(|bytes| (frame.changed, bytes)),
@@ -485,7 +552,14 @@ impl ScreenViewer {
             }
         };
         // Recorded even when the session is cancelled (everyone left).
-        let record = SessionRecorder { viewer: self, started, via, room_id: channel_room.clone(), seq: &seq, outcome: "no watchers".into() };
+        let record = SessionRecorder {
+            viewer: self,
+            started,
+            via,
+            room_id: channel_room.clone(),
+            seq: &seq,
+            outcome: "no watchers".into(),
+        };
         let end = tokio::select! {
             r = frames => match r {
                 Ok(()) => SessionEnd::Stopped { room_id: channel_room.clone() },
@@ -543,15 +617,28 @@ impl ScreenViewer {
 
 /// The viewer's membership of the tablet's room on one broker.
 enum Channel {
-    Mqtt { client: LocalClient, topic: String, room_id: String },
-    Rest { rest: RestRooms, rx: broadcast::Receiver<WsMessage>, user_id: String, client_id: String, room_id: String },
+    Mqtt {
+        client: LocalClient,
+        topic: String,
+        room_id: String,
+    },
+    Rest {
+        rest: RestRooms,
+        rx: broadcast::Receiver<WsMessage>,
+        user_id: String,
+        client_id: String,
+        room_id: String,
+    },
 }
 
 impl Channel {
     async fn join_mqtt(broker: &Broker, uid: &str, cid: &str) -> Result<Channel, SessionEnd> {
         let mut client = broker.local_client(uid, cid, &subscriptions(uid, cid));
         let topic = signaling_topic(uid, cid);
-        let join = SignalingRequest::JoinActiveRoom { room: String::new(), room_id: String::new() };
+        let join = SignalingRequest::JoinActiveRoom {
+            room: String::new(),
+            room_id: String::new(),
+        };
         client
             .publish(&topic, serde_json::to_vec(&join).unwrap_or_default())
             .map_err(|e| failed(e.to_string()))?;
@@ -563,7 +650,13 @@ impl Channel {
             };
             match SignalingEvent::from_bytes(&p.payload) {
                 Some(SignalingEvent::RoomNotFound) => return Err(SessionEnd::NotSharing),
-                Some(SignalingEvent::RoomJoined { room_id, .. }) => return Ok(Channel::Mqtt { client, topic, room_id }),
+                Some(SignalingEvent::RoomJoined { room_id, .. }) => {
+                    return Ok(Channel::Mqtt {
+                        client,
+                        topic,
+                        room_id,
+                    });
+                }
                 _ => {}
             }
         }
@@ -588,7 +681,12 @@ impl Channel {
     /// room that no longer exists.
     fn keepalive(&self) -> bool {
         match self {
-            Channel::Rest { rest, room_id, user_id, .. } => rest.rooms.keepalive(room_id, user_id),
+            Channel::Rest {
+                rest,
+                room_id,
+                user_id,
+                ..
+            } => rest.rooms.keepalive(room_id, user_id),
             Channel::Mqtt { .. } => true,
         }
     }
@@ -608,26 +706,49 @@ impl Channel {
 
     fn broadcast(&self, payload: PeerMessage) -> anyhow::Result<()> {
         match self {
-            Channel::Mqtt { client, topic, room_id } => {
-                let req = SignalingRequest::Broadcast { room_id: room_id.clone(), payload };
+            Channel::Mqtt {
+                client,
+                topic,
+                room_id,
+            } => {
+                let req = SignalingRequest::Broadcast {
+                    room_id: room_id.clone(),
+                    payload,
+                };
                 client.publish(topic, serde_json::to_vec(&req)?)
             }
-            Channel::Rest { rest, user_id, client_id, room_id, .. } => {
-                rest_send(rest, user_id, client_id, room_id, None, &payload)
-            }
+            Channel::Rest {
+                rest,
+                user_id,
+                client_id,
+                room_id,
+                ..
+            } => rest_send(rest, user_id, client_id, room_id, None, &payload),
         }
     }
 
     fn direct(&self, target: &str, msg: WebRtcMessage) -> anyhow::Result<()> {
         let payload = PeerMessage::WebRtc { payload: msg };
         match self {
-            Channel::Mqtt { client, topic, room_id } => {
-                let req = SignalingRequest::Direct { room_id: room_id.clone(), client_id: target.into(), payload };
+            Channel::Mqtt {
+                client,
+                topic,
+                room_id,
+            } => {
+                let req = SignalingRequest::Direct {
+                    room_id: room_id.clone(),
+                    client_id: target.into(),
+                    payload,
+                };
                 client.publish(topic, serde_json::to_vec(&req)?)
             }
-            Channel::Rest { rest, user_id, client_id, room_id, .. } => {
-                rest_send(rest, user_id, client_id, room_id, Some(target), &payload)
-            }
+            Channel::Rest {
+                rest,
+                user_id,
+                client_id,
+                room_id,
+                ..
+            } => rest_send(rest, user_id, client_id, room_id, Some(target), &payload),
         }
     }
 
@@ -637,12 +758,21 @@ impl Channel {
             Channel::Mqtt { client, .. } => loop {
                 let p = client.recv().await?;
                 match SignalingEvent::from_bytes(&p.payload) {
-                    Some(SignalingEvent::Direct { client_id, payload }) => return Some((client_id, payload)),
-                    Some(SignalingEvent::Broadcast { client_id, payload }) => return Some((client_id, payload)),
+                    Some(SignalingEvent::Direct { client_id, payload }) => {
+                        return Some((client_id, payload));
+                    }
+                    Some(SignalingEvent::Broadcast { client_id, payload }) => {
+                        return Some((client_id, payload));
+                    }
                     _ => {}
                 }
             },
-            Channel::Rest { rx, client_id, room_id, .. } => loop {
+            Channel::Rest {
+                rx,
+                client_id,
+                room_id,
+                ..
+            } => loop {
                 let msg = match rx.recv().await {
                     Ok(msg) => msg,
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -652,14 +782,23 @@ impl Channel {
                     Err(broadcast::error::RecvError::Closed) => return None,
                 };
                 let a = &msg.message.attributes;
-                let for_us = a.target_client_id.as_deref().is_none_or(|t| t == client_id.as_str());
-                if a.event != "ScreenshareMessage" || a.source_device_id == *client_id || !for_us
+                let for_us = a
+                    .target_client_id
+                    .as_deref()
+                    .is_none_or(|t| t == client_id.as_str());
+                if a.event != "ScreenshareMessage"
+                    || a.source_device_id == *client_id
+                    || !for_us
                     || a.room_id.as_deref() != Some(room_id.as_str())
                 {
                     continue;
                 }
-                let Some(data) = msg.message.data.as_deref() else { continue };
-                let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) else { continue };
+                let Some(data) = msg.message.data.as_deref() else {
+                    continue;
+                };
+                let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) else {
+                    continue;
+                };
                 if let Ok(payload) = serde_json::from_slice::<PeerMessage>(&bytes) {
                     return Some((a.source_device_id.clone(), payload));
                 }
@@ -669,17 +808,32 @@ impl Channel {
 }
 
 /// Relay like `POST /screenshare/v1/rooms/{id}/messages/{broadcast,direct}`.
-fn rest_send(rest: &RestRooms, user_id: &str, client_id: &str, room_id: &str, target: Option<&str>, payload: &PeerMessage) -> anyhow::Result<()> {
+fn rest_send(
+    rest: &RestRooms,
+    user_id: &str,
+    client_id: &str,
+    room_id: &str,
+    target: Option<&str>,
+    payload: &PeerMessage,
+) -> anyhow::Result<()> {
     let data = base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(payload)?);
     rest.notifications
-        .send(WsMessage::screenshare_message(user_id, client_id, room_id, target, &data))
+        .send(WsMessage::screenshare_message(
+            user_id, client_id, room_id, target, &data,
+        ))
         .map_err(|_| anyhow::anyhow!("no notification subscribers"))?;
     Ok(())
 }
 
 impl Drop for Channel {
     fn drop(&mut self) {
-        if let Channel::Rest { rest, client_id, room_id, .. } = self {
+        if let Channel::Rest {
+            rest,
+            client_id,
+            room_id,
+            ..
+        } = self
+        {
             rest.rooms.leave(room_id, client_id);
         }
     }
@@ -723,26 +877,43 @@ pub fn router(viewer: ScreenViewer) -> Router {
 }
 
 fn admin_token() -> Option<String> {
-    std::env::var("ADMIN_TOKEN").ok().map(|t| t.trim().to_owned()).filter(|t| !t.is_empty())
+    std::env::var("ADMIN_TOKEN")
+        .ok()
+        .map(|t| t.trim().to_owned())
+        .filter(|t| !t.is_empty())
 }
 
 /// Constant-time comparison, so response timing leaks nothing about the token.
 fn token_matches(given: &str, expected: &str) -> bool {
     given.len() == expected.len()
-        && given.bytes().zip(expected.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+        && given
+            .bytes()
+            .zip(expected.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
 }
 
 fn authorized(headers: &HeaderMap) -> bool {
-    let Some(expected) = admin_token() else { return false };
+    let Some(expected) = admin_token() else {
+        return false;
+    };
     let header = headers.get("x-admin-token").and_then(|v| v.to_str().ok());
     let cookie = headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
-        .filter_map(|c| c.trim().strip_prefix(&format!("{COOKIE}=")).map(str::to_owned))
+        .filter_map(|c| {
+            c.trim()
+                .strip_prefix(&format!("{COOKIE}="))
+                .map(str::to_owned)
+        })
         .next();
-    header.into_iter().map(str::to_owned).chain(cookie).any(|t| token_matches(&t, &expected))
+    header
+        .into_iter()
+        .map(str::to_owned)
+        .chain(cookie)
+        .any(|t| token_matches(&t, &expected))
 }
 
 async fn page(headers: HeaderMap) -> Html<String> {
@@ -765,9 +936,16 @@ async fn login(Form(form): Form<LoginForm>) -> Response {
                 "{COOKIE}={}; HttpOnly; Secure; SameSite=Strict; Path=/screenshare/view; Max-Age=2592000",
                 form.token.trim()
             );
-            ([(header::SET_COOKIE, cookie)], Redirect::to("/screenshare/view")).into_response()
+            (
+                [(header::SET_COOKIE, cookie)],
+                Redirect::to("/screenshare/view"),
+            )
+                .into_response()
         }
-        _ => (StatusCode::UNAUTHORIZED, Html(LOGIN_HTML.replace("{error}", "<p class=err>Wrong token.</p>")))
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            Html(LOGIN_HTML.replace("{error}", "<p class=err>Wrong token.</p>")),
+        )
             .into_response(),
     }
 }
@@ -777,10 +955,25 @@ async fn frame(State(viewer): State<ScreenViewer>, headers: HeaderMap) -> Respon
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let mut watcher = viewer.watch();
-    let latest = tokio::time::timeout(Duration::from_secs(20), watcher.png.wait_for(Option::is_some)).await;
+    let latest = tokio::time::timeout(
+        Duration::from_secs(20),
+        watcher.png.wait_for(Option::is_some),
+    )
+    .await;
     match latest.ok().and_then(|r| r.ok()).and_then(|p| p.clone()) {
-        Some(shot) => ([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "no-store")], shot.full_png().to_vec()).into_response(),
-        None => (StatusCode::SERVICE_UNAVAILABLE, format!("{:?}", *watcher.status.borrow())).into_response(),
+        Some(shot) => (
+            [
+                (header::CONTENT_TYPE, "image/png"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            shot.full_png().to_vec(),
+        )
+            .into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("{:?}", *watcher.status.borrow()),
+        )
+            .into_response(),
     }
 }
 
@@ -794,7 +987,11 @@ async fn usage(State(viewer): State<ScreenViewer>, headers: HeaderMap) -> Respon
     let tablet = match viewer.inner.config.reports_dir.as_deref() {
         Some(dir) => {
             let dir = dir.to_path_buf();
-            tokio::task::spawn_blocking(move || crate::reports::recent(&dir, 50, Some("screenshare"))).await.unwrap_or_default()
+            tokio::task::spawn_blocking(move || {
+                crate::reports::recent(&dir, 50, Some("screenshare"))
+            })
+            .await
+            .unwrap_or_default()
         }
         None => Vec::new(),
     };
@@ -806,7 +1003,11 @@ async fn usage(State(viewer): State<ScreenViewer>, headers: HeaderMap) -> Respon
     .into_response()
 }
 
-async fn ws(State(viewer): State<ScreenViewer>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
+async fn ws(
+    State(viewer): State<ScreenViewer>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
     if !authorized(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -819,12 +1020,21 @@ async fn ws(State(viewer): State<ScreenViewer>, headers: HeaderMap, upgrade: Web
 fn frame_message(shot: &Shot, previous: Option<u64>) -> Vec<u8> {
     let (kind, area, png) = match &shot.patch {
         // Patches only apply on top of the frame right before them.
-        Some((area, png)) if previous == Some(shot.seq.wrapping_sub(1)) => (1u8, *area, png.as_slice()),
+        Some((area, png)) if previous == Some(shot.seq.wrapping_sub(1)) => {
+            (1u8, *area, png.as_slice())
+        }
         _ => (0u8, shot.frame.full_area(), shot.full_png()),
     };
     let mut msg = Vec::with_capacity(25 + png.len());
     msg.push(kind);
-    for v in [area.x, area.y, area.width, area.height, shot.frame.width, shot.frame.height] {
+    for v in [
+        area.x,
+        area.y,
+        area.width,
+        area.height,
+        shot.frame.width,
+        shot.frame.height,
+    ] {
         msg.extend(v.to_be_bytes());
     }
     msg.extend_from_slice(png);
@@ -952,11 +1162,25 @@ mod tests {
 
     fn shot(seq: u64, patch: bool) -> Shot {
         let frame = Frame {
-            data: (0..16u8).collect(), width: 4, height: 4, format: PixelFormat::Gray8,
-            changed: Area { x: 1, y: 1, width: 2, height: 2 }, timestamp: std::time::Instant::now(),
+            data: (0..16u8).collect(),
+            width: 4,
+            height: 4,
+            format: PixelFormat::Gray8,
+            changed: Area {
+                x: 1,
+                y: 1,
+                width: 2,
+                height: 2,
+            },
+            timestamp: std::time::Instant::now(),
         };
         let patch = patch.then(|| (frame.changed, encode_png(&frame, frame.changed).unwrap()));
-        Shot { seq, frame, patch, full: std::sync::OnceLock::new() }
+        Shot {
+            seq,
+            frame,
+            patch,
+            full: std::sync::OnceLock::new(),
+        }
     }
 
     #[test]
@@ -964,8 +1188,13 @@ mod tests {
         let s = shot(5, true);
         let msg = frame_message(&s, Some(4));
         assert_eq!(msg[0], 1, "next in sequence: patch");
-        assert_eq!(&msg[1..17], &[0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 2]);
-        let reader = png::Decoder::new(std::io::Cursor::new(msg[25..].to_vec())).read_info().unwrap();
+        assert_eq!(
+            &msg[1..17],
+            &[0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 2]
+        );
+        let reader = png::Decoder::new(std::io::Cursor::new(msg[25..].to_vec()))
+            .read_info()
+            .unwrap();
         assert_eq!((reader.info().width, reader.info().height), (2, 2));
         // A gap (or a first message) needs the whole picture.
         assert_eq!(frame_message(&s, Some(2))[0], 0);
@@ -982,22 +1211,42 @@ mod tests {
 
     #[test]
     fn png_round_trips_pixels() {
-        for (format, bpp, color) in [(PixelFormat::Gray8, 1usize, png::ColorType::Grayscale), (PixelFormat::Rgb8, 3, png::ColorType::Rgb)] {
+        for (format, bpp, color) in [
+            (PixelFormat::Gray8, 1usize, png::ColorType::Grayscale),
+            (PixelFormat::Rgb8, 3, png::ColorType::Rgb),
+        ] {
             let (w, h) = (4u32, 3u32);
             // Distinct per-pixel, per-channel values so a swapped or dropped
             // channel (or wrong pixel order) fails the round trip, not just the
             // metadata.
-            let data: Vec<u8> = (0..(w * h) as usize).flat_map(|p| (0..bpp).map(move |c| (p * 7 + c * 3 + 1) as u8)).collect();
+            let data: Vec<u8> = (0..(w * h) as usize)
+                .flat_map(|p| (0..bpp).map(move |c| (p * 7 + c * 3 + 1) as u8))
+                .collect();
             let frame = Frame {
-                data: data.clone(), width: w, height: h, format: format.clone(),
-                changed: Area { x: 0, y: 0, width: w, height: h }, timestamp: std::time::Instant::now(),
+                data: data.clone(),
+                width: w,
+                height: h,
+                format: format.clone(),
+                changed: Area {
+                    x: 0,
+                    y: 0,
+                    width: w,
+                    height: h,
+                },
+                timestamp: std::time::Instant::now(),
             };
             let png = encode_png(&frame, frame.full_area()).unwrap();
-            let mut reader = png::Decoder::new(std::io::Cursor::new(png)).read_info().unwrap();
+            let mut reader = png::Decoder::new(std::io::Cursor::new(png))
+                .read_info()
+                .unwrap();
             let mut buf = vec![0u8; data.len()];
             let info = reader.next_frame(&mut buf).unwrap();
             assert_eq!((info.width, info.height, info.color_type), (w, h, color));
-            assert_eq!(&buf[..info.buffer_size()], &data[..], "pixels must round-trip for {format:?}");
+            assert_eq!(
+                &buf[..info.buffer_size()],
+                &data[..],
+                "pixels must round-trip for {format:?}"
+            );
         }
     }
 }
