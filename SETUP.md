@@ -155,7 +155,7 @@ If this is a fresh setup (tablet was signed out or never paired):
 ./target/release/remarkable-server --pair
 ```
 
-This prints a one-time code. On the tablet, go to **Settings > Account > Connect** and enter the code.
+This prints a one-time code (or `POST /devices/v1` with `x-admin-token` returns one). On the tablet, go to **Settings > Account > Connect** and enter the code.
 
 ## 7. Verify Sync
 

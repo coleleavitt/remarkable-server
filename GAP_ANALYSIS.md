@@ -17,7 +17,7 @@
 - /identifier/json/2/device/new - Device registration ✓
 - /identifier/json/2/user/new - Token refresh ✓
 - /identifier/json/3/device/delete - Device deletion ✓
-- /devices/v1 - Pairing code generation, device listing ✓
+- /devices/v1 - Pairing code generation (admin token only), device listing ✓
 
 ### Discovery & Settings
 - /discovery/v1/endpoints - Service discovery ✓
