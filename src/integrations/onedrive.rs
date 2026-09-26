@@ -32,6 +32,28 @@ fn encode_path(path: &str) -> String {
         .join("/")
 }
 
+/// OneDrive's `quickXorHash` of `content`, in base64: byte `i` is XORed into a 160-bit value at
+/// bit `11 * i` (wrapping round), and the length, as 8 little-endian bytes, into its last 8
+/// bytes (<https://learn.microsoft.com/onedrive/developer/code-snippets/quickxorhash>).
+fn quick_xor_hash(content: &[u8]) -> String {
+    use base64::Engine;
+    const BITS: usize = 160;
+    let mut hash = [0u8; BITS / 8];
+    for (i, &b) in content.iter().enumerate() {
+        let at = (i % BITS) * 11 % BITS;
+        let (byte, shift) = (at / 8, at % 8);
+        hash[byte] ^= b << shift;
+        if shift > 0 {
+            hash[(byte + 1) % hash.len()] ^= b >> (8 - shift);
+        }
+    }
+    let len = (content.len() as u64).to_le_bytes();
+    for (h, l) in hash[BITS / 8 - len.len()..].iter_mut().zip(len) {
+        *h ^= l;
+    }
+    base64::engine::general_purpose::STANDARD.encode(hash)
+}
+
 /// OneDrive provider
 pub struct OneDrive {
     config: OAuthConfig,
@@ -542,10 +564,11 @@ impl CloudProvider for OneDrive {
     /// Recursively list everything under `folder_id` (an item id; default: the drive root),
     /// walking `children` breadth-first and paging each folder with `@odata.nextLink`. Works on
     /// personal and business drives alike (folder-scoped delta is personal-only). Paths are
-    /// relative to that folder (`/Sub/dir/file.pdf`), matching the local scan so nested files
-    /// aren't seen as missing and re-uploaded every sync. Each item is listed once, the first
-    /// wins a duplicate path, names that aren't a single safe path segment are skipped (with
-    /// everything under them), and folders deeper than [`MAX_LIST_DEPTH`] aren't entered.
+    /// relative to that folder (`/Sub/dir/file.pdf`), matching the local scan, so a nested file
+    /// is compared with its local copy rather than seen as missing. Each item is listed once,
+    /// the first wins a duplicate path, names that aren't a single safe path segment are
+    /// skipped (with everything under them), and folders deeper than [`MAX_LIST_DEPTH`] aren't
+    /// entered.
     async fn list_files(&self, folder_id: Option<&str>) -> Result<Vec<CloudFile>> {
         // The same root as `get_changes_in`, so `""` and `root` both mean the drive root.
         let root = SyncRoot::of(folder_id);
@@ -592,10 +615,46 @@ impl CloudProvider for OneDrive {
         Ok(out)
     }
 
-    /// Before #34 a folder's listing pathed each item by its `parentReference.path`, its path
-    /// from the drive root. `root` was listed the same way it is now, and `""` not at all.
-    fn had_drive_rooted_layout(&self, folder_id: Option<&str>) -> bool {
-        matches!(SyncRoot::of(folder_id), SyncRoot::Folder(_))
+    /// Before #34 a folder's listing pathed each item by its `parentReference.path` with
+    /// `/drive/root:` removed, its path from the drive root, so the folder was kept under the
+    /// components of its own path, worked out here the same way. `root` was listed the same way
+    /// it is now, `""` not at all, and so was the drive root by its real id (its children's
+    /// path is `/drive/root:`), recognized by its `root` facet. A folder with no
+    /// `parentReference.path`, or a path the old layout couldn't have written locally, gives
+    /// `None`.
+    async fn legacy_layout_dir(&self, folder_id: Option<&str>) -> Result<Option<Vec<String>>> {
+        let root = SyncRoot::of(folder_id);
+        if matches!(root, SyncRoot::Drive) {
+            return Ok(None);
+        }
+        let folder: DriveItem = self.get_json(&self.root_url(&root)).await?;
+        if folder.root.is_some() {
+            return Ok(None);
+        }
+        let Some(parent) = folder
+            .parent_reference
+            .as_ref()
+            .and_then(|p| p.path.as_ref())
+        else {
+            return Ok(None);
+        };
+        let path = format!("{}/{}", parent.replace("/drive/root:", ""), folder.name);
+        let parts: Vec<String> = path
+            .split('/')
+            .filter(|p| !p.is_empty())
+            .map(str::to_owned)
+            .collect();
+        Ok(parts.iter().all(|p| is_safe_name(p)).then_some(parts))
+    }
+
+    /// Compares `content_hash` (Graph's `sha256Hash`, else its `quickXorHash`) with the same
+    /// hash of `content`.
+    fn content_matches(&self, file: &CloudFile, content: &[u8]) -> bool {
+        use sha2::{Digest, Sha256};
+        file.content_hash.as_deref().is_some_and(|h| {
+            h.eq_ignore_ascii_case(&hex::encode(Sha256::digest(content)))
+                || h == quick_xor_hash(content)
+        })
     }
 
     async fn list_folders(&self) -> Result<Vec<CloudFolder>> {
@@ -1112,6 +1171,11 @@ mod tests {
             json!({ "id": id, "name": name, "deleted": { "state": "deleted" },
                     "parentReference": { "id": parent } })
         }
+        /// Folder `id` whose parent is at `path`.
+        fn at(id: &str, name: &str, path: &str) -> Value {
+            json!({ "id": id, "name": name, "folder": { "childCount": 1 },
+                    "parentReference": { "id": "P", "path": path } })
+        }
         fn drive_root() -> Value {
             json!({ "id": "ROOTID", "name": "root", "folder": {}, "root": {} })
         }
@@ -1159,6 +1223,10 @@ mod tests {
             Some(match id {
                 "ROOTID" => drive_root(),
                 "F" => folder("F", "Notes", "ROOTID"),
+                // With the `parentReference.path` Graph gives for an item looked up by id.
+                "DOCN" => at("DOCN", "Notes", "/drive/root:/Documents"),
+                "TOPN" => at("TOPN", "Notes", "/drive/root:"),
+                "ENC" => at("ENC", "My Notes", "/drive/root:/My%20Documents"),
                 "S" => folder("S", "Sub", "F"),
                 "O" => folder("O", "Other", "ROOTID"),
                 "X" => folder("X", "..", "F"),
@@ -1651,15 +1719,68 @@ mod tests {
             );
         }
 
-        /// Only a folder other than the drive root had its files laid out by their path from
-        /// the drive root before #34.
-        #[test]
-        fn drive_rooted_layout_only_for_folders() {
-            let d = onedrive(GRAPH_BASE);
-            for root in [None, Some(""), Some("root")] {
-                assert!(!d.had_drive_rooted_layout(root), "{root:?}");
+        /// A folder other than the drive root was kept under its own path from the drive root
+        /// before #34, worked out from its `parentReference.path` as the listing did then. The
+        /// root aliases need no request; the drive root by its real id, and a folder with no
+        /// path, had no such layout.
+        #[tokio::test]
+        async fn legacy_layout_dir_is_the_folders_path_from_the_drive_root() {
+            let (base, fake) = fake_graph().await;
+            let d = onedrive(&base);
+            for root in [None, Some(""), Some("root"), Some("ROOTID"), Some("F")] {
+                assert_eq!(d.legacy_layout_dir(root).await.unwrap(), None, "{root:?}");
             }
-            assert!(d.had_drive_rooted_layout(Some("F")));
+            assert_eq!(fake.calls("item"), vec!["item ROOTID", "item F"]);
+            for (id, dir) in [
+                ("DOCN", vec!["Documents", "Notes"]),
+                ("TOPN", vec!["Notes"]),
+                ("ENC", vec!["My%20Documents", "My Notes"]),
+            ] {
+                let got = d.legacy_layout_dir(Some(id)).await.unwrap();
+                assert_eq!(got.unwrap(), dir, "{id}");
+            }
+            let err = d.legacy_layout_dir(Some("missing")).await.unwrap_err();
+            assert!(matches!(err, IntegrationError::NotFound(_)), "{err}");
+        }
+
+        /// The first full sync of such a folder moves `<local>/Documents/Notes` aside, however
+        /// it was cased or percent-encoded; later ones don't.
+        #[tokio::test]
+        async fn full_sync_moves_the_old_layout_aside_once() {
+            let (base, fake) = fake_graph().await;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            std::fs::create_dir_all(root.join("documents/Notes")).unwrap();
+            std::fs::write(root.join("documents/Notes/a.pdf"), "old a").unwrap();
+            let config = SyncConfig {
+                local_path: root.to_path_buf(),
+                cloud_folder: Some("DOCN".into()),
+                direction: SyncDirection::Download,
+                ..Default::default()
+            };
+            let r = CloudSync::new(onedrive(&base), config.clone())
+                .sync()
+                .await
+                .unwrap();
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+            assert_eq!(r.notices.len(), 1, "{:?}", r.notices);
+            assert!(
+                r.notices[0]
+                    .starts_with("Moved documents/Notes to .rms-old-layout/documents/Notes: ")
+            );
+            assert_eq!(
+                std::fs::read(root.join(".rms-old-layout/documents/Notes/a.pdf")).unwrap(),
+                b"old a"
+            );
+
+            std::fs::create_dir_all(root.join("documents/Notes")).unwrap();
+            let r = CloudSync::new(onedrive(&base), config)
+                .sync()
+                .await
+                .unwrap();
+            assert!(r.errors.is_empty() && r.notices.is_empty(), "{r:?}");
+            assert!(root.join("documents/Notes").exists());
+            assert_eq!(fake.calls("item"), vec!["item DOCN", "item DOCN"]);
         }
 
         /// Neither the sync folder nor the drive root is in the delta, so the parent chains are
@@ -1838,6 +1959,75 @@ mod tests {
             );
             assert_eq!(fake.calls("delta"), vec!["delta expired", "delta latest"]);
         }
+    }
+
+    /// OneDrive's quickXorHash: known values, and the byte-at-a-time implementation against the
+    /// definition taken bit by bit, across the wrap at 160 bits and many lengths.
+    #[test]
+    fn quick_xor_hash_matches_its_definition() {
+        use base64::Engine;
+        assert_eq!(quick_xor_hash(b""), "AAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+        assert_eq!(quick_xor_hash(&[0x4a]), "SgAAAAAAAAAAAAAAAQAAAAAAAAA=");
+        assert_eq!(
+            quick_xor_hash(&[0xb5, 0xb4]),
+            "taAFAAAAAAAAAAAAAgAAAAAAAAA="
+        );
+        let by_bits = |data: &[u8]| {
+            let mut bits = [false; 160];
+            for (i, b) in data.iter().enumerate() {
+                for k in 0..8 {
+                    if b >> k & 1 == 1 {
+                        let at = (11 * i + k) % 160;
+                        bits[at] = !bits[at];
+                    }
+                }
+            }
+            let mut out = [0u8; 20];
+            for (at, set) in bits.iter().enumerate() {
+                if *set {
+                    out[at / 8] |= 1 << (at % 8);
+                }
+            }
+            for (o, l) in out[12..].iter_mut().zip((data.len() as u64).to_le_bytes()) {
+                *o ^= l;
+            }
+            base64::engine::general_purpose::STANDARD.encode(out)
+        };
+        let data: Vec<u8> = (0..1000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        for len in (0..400).chain([999, 1000]) {
+            assert_eq!(quick_xor_hash(&data[..len]), by_bits(&data[..len]), "{len}");
+        }
+    }
+
+    /// Graph's `sha256Hash` (upper-case hex) or `quickXorHash`, whichever the listing kept.
+    #[test]
+    fn content_matches_either_hash() {
+        use sha2::{Digest, Sha256};
+        let d = OneDrive::new(OAuthConfig::onedrive(
+            "id".into(),
+            None,
+            "http://x/cb".into(),
+        ));
+        let file = |hash: Option<String>| CloudFile {
+            id: "X".into(),
+            name: "x".into(),
+            mime_type: None,
+            size: 3,
+            modified_at: 0,
+            content_hash: hash,
+            parent_id: None,
+            is_folder: false,
+            path: "/x".into(),
+            deleted: false,
+        };
+        let sha = hex::encode_upper(Sha256::digest(b"abc"));
+        assert!(d.content_matches(&file(Some(sha.clone())), b"abc"));
+        assert!(d.content_matches(&file(Some(quick_xor_hash(b"abc"))), b"abc"));
+        assert!(!d.content_matches(&file(Some(sha)), b"abd"));
+        assert!(!d.content_matches(&file(Some(quick_xor_hash(b"abc"))), b"abd"));
+        assert!(!d.content_matches(&file(None), b"abc"));
     }
 
     #[test]

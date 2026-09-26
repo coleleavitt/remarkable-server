@@ -152,6 +152,9 @@ pub struct SyncResponse {
     pub deleted: usize,
     pub conflicts: usize,
     pub errors: Vec<String>,
+    /// Things done that aren't failures but need the user's attention (an old local layout
+    /// moved aside on the first sync after upgrading past #34).
+    pub notices: Vec<String>,
     pub duration_ms: u64,
 }
 
@@ -458,6 +461,7 @@ pub async fn trigger_sync(
         deleted: result.deleted,
         conflicts: result.conflicts.len(),
         errors: result.errors,
+        notices: result.notices,
         duration_ms: result.duration_ms,
     }))
 }

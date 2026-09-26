@@ -48,6 +48,17 @@ fn api_path(folder: Option<&str>) -> &str {
     folder.unwrap_or("").trim_end_matches('/')
 }
 
+/// Dropbox's `content_hash` of `content`: SHA-256 over the concatenated SHA-256 digests of its
+/// 4 MiB blocks, in hex (<https://www.dropbox.com/developers/reference/content-hash>).
+fn content_hash(content: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for block in content.chunks(4 * 1024 * 1024) {
+        hash.update(Sha256::digest(block));
+    }
+    hex::encode(hash.finalize())
+}
+
 /// `error_summary` of a Dropbox error body (`"reset/.."`, `"path/not_found/.."`).
 fn error_summary(body: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
@@ -538,10 +549,10 @@ impl CloudProvider for Dropbox {
 
     /// Everything under `folder_id` (a path or `id:`; default: the whole Dropbox) in one
     /// recursive `list_folder`, paged with `list_folder/continue`. Paths are relative to that
-    /// folder (`/Sub/dir/file.pdf`), matching the local scan so nested files aren't seen as
-    /// missing and re-uploaded every sync. The pages are [replayed](replay) in order, so an
-    /// item changed or deleted while they were fetched is listed as it ended up, once. Entries
-    /// that can't be given a safe relative path (see [`relative_path`]) are skipped.
+    /// folder (`/Sub/dir/file.pdf`), matching the local scan, so a nested file is compared with
+    /// its local copy rather than seen as missing. The pages are [replayed](replay) in order, so
+    /// an item changed or deleted while they were fetched is listed as it ended up, once.
+    /// Entries that can't be given a safe relative path (see [`relative_path`]) are skipped.
     async fn list_files(&self, folder_id: Option<&str>) -> Result<Vec<CloudFile>> {
         let path = api_path(folder_id);
         let root = self.root_lower(path).await?;
@@ -567,10 +578,30 @@ impl CloudProvider for Dropbox {
         Ok(out)
     }
 
-    /// Before #34 a folder's listing kept each entry's `path_display`, its path from the
-    /// Dropbox root. The root itself (`""`, `/`) was listed the same way it is now.
-    fn had_drive_rooted_layout(&self, folder_id: Option<&str>) -> bool {
-        !api_path(folder_id).is_empty()
+    /// Before #34 a folder's listing kept each entry's `path_display`, its path from the Dropbox
+    /// root, so the folder was kept under the components of its own `path_display` (asked of
+    /// Dropbox, as the folder may be given in any case or as an `id:`). The root itself (`""`,
+    /// `/`) was listed the same way it is now. A path the old layout couldn't have written
+    /// locally (an unsafe component) gives `None`.
+    async fn legacy_layout_dir(&self, folder_id: Option<&str>) -> Result<Option<Vec<String>>> {
+        let path = api_path(folder_id);
+        if path.is_empty() {
+            return Ok(None);
+        }
+        let display = self.metadata(path).await?.path_display.unwrap_or_default();
+        let parts: Vec<String> = display
+            .split('/')
+            .filter(|p| !p.is_empty())
+            .map(str::to_owned)
+            .collect();
+        Ok(parts.iter().all(|p| is_safe_name(p)).then_some(parts))
+    }
+
+    /// Compares `content_hash` with the [Dropbox content hash](content_hash) of `content`.
+    fn content_matches(&self, file: &CloudFile, content: &[u8]) -> bool {
+        file.content_hash
+            .as_deref()
+            .is_some_and(|h| h.eq_ignore_ascii_case(&content_hash(content)))
     }
 
     async fn list_folders(&self) -> Result<Vec<CloudFolder>> {
@@ -1513,12 +1544,12 @@ mod tests {
         }
 
         /// Upgrading from the layout a folder sync had before #34, which kept the folder's files
-        /// by their `path_display` (`<local>/Notes/a.pdf`): a full sync brings the files down to
-        /// their folder-relative paths, but reports the old copy instead of uploading it to
-        /// `/Notes/Notes/a.pdf`. Other new local files still go up. The root never had that
-        /// layout, so nothing is held back there.
+        /// by their `path_display` (`<local>/Notes/a.pdf`): the full sync moves that directory
+        /// aside before anything else, so the old copy isn't uploaded to `/Notes/Notes/a.pdf`,
+        /// and brings the files down to their folder-relative paths. Other new local files still
+        /// go up. The root never had that layout: nothing is moved, and no marker is written.
         #[tokio::test]
-        async fn full_sync_does_not_upload_leftovers_of_the_old_layout() {
+        async fn full_sync_moves_the_old_layout_aside() {
             let (base, log) = fake_dropbox().await;
             let uploaded = |log: &Log| -> Vec<Value> {
                 calls(log, "upload")
@@ -1539,9 +1570,10 @@ mod tests {
             std::fs::write(dir.path().join("mine.pdf"), "new").unwrap();
             let mut sync = CloudSync::new(dropbox(&base), config(dir.path(), "/Notes"));
             let r = sync.sync().await.unwrap();
-            assert_eq!((r.uploaded, r.downloaded), (1, 3), "{:?}", r.errors);
-            assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
-            assert!(r.errors[0].starts_with("Not uploading /Notes/a.pdf: "));
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+            assert_eq!((r.uploaded, r.downloaded), (1, 3));
+            assert_eq!(r.notices.len(), 1, "{:?}", r.notices);
+            assert!(r.notices[0].starts_with("Moved Notes to .rms-old-layout/Notes: "));
             assert_eq!(uploaded(&log), vec![json!("/Notes/mine.pdf")]);
             assert_eq!(
                 std::fs::read(dir.path().join("a.pdf")).unwrap(),
@@ -1549,31 +1581,49 @@ mod tests {
             );
             assert!(dir.path().join("Sub/Deeper/c.pdf").exists());
             assert_eq!(
-                std::fs::read(dir.path().join("Notes/a.pdf")).unwrap(),
+                std::fs::read(dir.path().join(".rms-old-layout/Notes/a.pdf")).unwrap(),
                 b"old copy"
             );
 
-            // The root: the same shape of file is just a new one.
+            // The root: the same shape of directory is just a new one.
             log.lock().unwrap().clear();
             let dir = tempfile::tempdir().unwrap();
-            std::fs::create_dir(dir.path().join("Stuff")).unwrap();
-            std::fs::write(dir.path().join("Stuff/Top.pdf"), "mine").unwrap();
+            std::fs::create_dir(dir.path().join("Notes")).unwrap();
+            std::fs::write(dir.path().join("Notes/Top.pdf"), "mine").unwrap();
             let mut sync = CloudSync::new(dropbox(&base), config(dir.path(), "/"));
             let r = sync.sync().await.unwrap();
-            assert!(r.errors.is_empty(), "{:?}", r.errors);
-            assert_eq!(uploaded(&log), vec![json!("/Stuff/Top.pdf")]);
+            assert!(r.errors.is_empty() && r.notices.is_empty(), "{r:?}");
+            assert_eq!(uploaded(&log), vec![json!("/Notes/Top.pdf")]);
+            assert!(
+                !dir.path()
+                    .join(crate::integrations::sync::LAYOUT_MARKER)
+                    .exists()
+            );
         }
 
-        /// Only a folder other than the root was listed by `path_display` before #34.
-        #[test]
-        fn drive_rooted_layout_only_for_folders() {
-            let d = dropbox(API_BASE);
+        /// A folder other than the root was kept under its own `path_display` before #34, looked
+        /// up however the folder is given. The root never was, and needs no request to say so.
+        #[tokio::test]
+        async fn legacy_layout_dir_is_the_folders_path_display() {
+            let (base, log) = fake_dropbox().await;
+            let d = dropbox(&base);
             for root in [None, Some(""), Some("/")] {
-                assert!(!d.had_drive_rooted_layout(root), "{root:?}");
+                assert_eq!(d.legacy_layout_dir(root).await.unwrap(), None, "{root:?}");
             }
-            for folder in ["/Notes", "/Notes/", "id:abc"] {
-                assert!(d.had_drive_rooted_layout(Some(folder)), "{folder}");
+            assert!(calls(&log, "get_metadata").is_empty());
+            for folder in ["/Notes", "/notes/", "id:notes"] {
+                assert_eq!(
+                    d.legacy_layout_dir(Some(folder)).await.unwrap(),
+                    Some(vec!["Notes".to_string()]),
+                    "{folder}"
+                );
             }
+            assert_eq!(
+                d.legacy_layout_dir(Some("/notes/sub")).await.unwrap(),
+                Some(vec!["Notes".to_string(), "Sub".to_string()])
+            );
+            let err = d.legacy_layout_dir(Some("/missing")).await.unwrap_err();
+            assert!(matches!(err, IntegrationError::NotFound(_)), "{err}");
         }
 
         /// An invalidated cursor, or none yet, falls back to a full (recursive) sync and a
@@ -1597,6 +1647,329 @@ mod tests {
                 let listed = order.iter().position(|e| e == "list_folder").unwrap();
                 assert!(latest < listed, "{cursor:?}: {order:?}");
             }
+        }
+    }
+
+    /// Dropbox's documented content hash: SHA-256 over the SHA-256 of each 4 MiB block.
+    #[test]
+    fn content_hash_is_dropbox_s() {
+        use sha2::{Digest, Sha256};
+        // No blocks: the SHA-256 of nothing, as Dropbox gives for an empty file.
+        assert_eq!(
+            content_hash(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        let twice = |blocks: &[&[u8]]| {
+            let mut outer = Sha256::new();
+            for block in blocks {
+                outer.update(Sha256::digest(block));
+            }
+            hex::encode(outer.finalize())
+        };
+        assert_eq!(content_hash(b"abc"), twice(&[b"abc"]));
+        let block = vec![7u8; 4 * 1024 * 1024];
+        assert_eq!(content_hash(&block), twice(&[&block]));
+        let mut more = block.clone();
+        more.push(8);
+        assert_eq!(content_hash(&more), twice(&[&block, &[8]]));
+
+        let d = Dropbox::new(OAuthConfig::dropbox(
+            "id".into(),
+            None,
+            "http://x/cb".into(),
+        ));
+        let file = |hash: Option<&str>| CloudFile {
+            id: "id:x".into(),
+            name: "x".into(),
+            mime_type: None,
+            size: 3,
+            modified_at: 0,
+            content_hash: hash.map(Into::into),
+            parent_id: None,
+            is_folder: false,
+            path: "/x".into(),
+            deleted: false,
+        };
+        let abc = content_hash(b"abc");
+        assert!(d.content_matches(&file(Some(&abc)), b"abc"));
+        assert!(d.content_matches(&file(Some(&abc.to_uppercase())), b"abc"));
+        assert!(!d.content_matches(&file(Some(&abc)), b"abd"));
+        assert!(!d.content_matches(&file(None), b"abc"));
+    }
+
+    /// Upgrading from before #34 against a Dropbox that keeps what is uploaded, synced the way
+    /// `POST /sync` does it: a fresh `CloudSync` (no state) for every sync.
+    mod upgrade {
+        use std::collections::BTreeMap;
+        use std::path::Path;
+        use std::sync::{Arc, Mutex};
+
+        use axum::Json;
+        use axum::extract::State;
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use serde_json::{Value, json};
+
+        use super::*;
+        use crate::integrations::sync::{CloudSync, SyncConfig, SyncDirection, SyncResult};
+
+        #[derive(Default)]
+        struct Remote {
+            /// By `path_lower`: the entry and the file's content.
+            entries: BTreeMap<String, (Value, Vec<u8>)>,
+            /// Paths uploaded to, in order.
+            uploads: Vec<String>,
+            downloads: usize,
+        }
+        type Shared = Arc<Mutex<Remote>>;
+
+        fn entry(tag: &str, display: &str, content: &[u8]) -> Value {
+            let lower = display.to_lowercase();
+            let mut e = json!({
+                ".tag": tag,
+                "name": display.rsplit('/').next().unwrap(),
+                "id": format!("id:{}", lower),
+                "path_lower": lower,
+                "path_display": display,
+            });
+            if tag == "file" {
+                e["size"] = json!(content.len());
+                e["server_modified"] = json!("2024-01-02T03:04:05Z");
+                e["content_hash"] = json!(content_hash(content));
+            }
+            e
+        }
+
+        /// Store a file (and the folders above it) at `display`.
+        fn put(remote: &mut Remote, display: &str, content: &[u8]) {
+            let mut parent = String::new();
+            let parts: Vec<&str> = display.split('/').skip(1).collect();
+            for part in &parts[..parts.len() - 1] {
+                parent.push('/');
+                parent.push_str(part);
+                remote
+                    .entries
+                    .entry(parent.to_lowercase())
+                    .or_insert_with(|| (entry("folder", &parent, b""), Vec::new()));
+            }
+            remote.entries.insert(
+                display.to_lowercase(),
+                (entry("file", display, content), content.to_vec()),
+            );
+        }
+
+        fn key(path: &str) -> String {
+            let lower = path.to_lowercase();
+            lower.strip_prefix("id:").unwrap_or(&lower).to_string()
+        }
+
+        fn api_arg(headers: &HeaderMap) -> Value {
+            serde_json::from_str(headers["Dropbox-API-Arg"].to_str().unwrap()).unwrap()
+        }
+
+        async fn fake(remote: Shared) -> String {
+            let app =
+                axum::Router::new()
+                    .route(
+                        "/files/get_metadata",
+                        post(|State(r): State<Shared>, Json(b): Json<Value>| async move {
+                            let found = r
+                                .lock()
+                                .unwrap()
+                                .entries
+                                .get(&key(b["path"].as_str().unwrap()))
+                                .map(|(e, _)| e.clone());
+                            match found {
+                                Some(e) => Json(e).into_response(),
+                                None => (
+                                    StatusCode::CONFLICT,
+                                    r#"{"error_summary":"path/not_found/.."}"#,
+                                )
+                                    .into_response(),
+                            }
+                        }),
+                    )
+                    .route(
+                        "/files/list_folder",
+                        post(|State(r): State<Shared>, Json(b): Json<Value>| async move {
+                            let root = key(b["path"].as_str().unwrap());
+                            let entries: Vec<Value> = r
+                                .lock()
+                                .unwrap()
+                                .entries
+                                .iter()
+                                .filter(|(k, _)| **k == root || k.starts_with(&format!("{root}/")))
+                                .map(|(_, (e, _))| e.clone())
+                                .collect();
+                            Json(json!({ "entries": entries, "cursor": "c", "has_more": false }))
+                        }),
+                    )
+                    .route(
+                        "/files/download",
+                        post(|State(r): State<Shared>, headers: HeaderMap| async move {
+                            let path = key(api_arg(&headers)["path"].as_str().unwrap());
+                            let mut r = r.lock().unwrap();
+                            r.downloads += 1;
+                            r.entries[&path].1.clone()
+                        }),
+                    )
+                    .route(
+                        "/files/upload",
+                        post(
+                            |State(r): State<Shared>,
+                             headers: HeaderMap,
+                             body: axum::body::Bytes| async move {
+                                let path = api_arg(&headers)["path"].as_str().unwrap().to_string();
+                                let mut r = r.lock().unwrap();
+                                r.uploads.push(path.clone());
+                                put(&mut r, &path, &body);
+                                Json(entry("file", &path, &body))
+                            },
+                        ),
+                    )
+                    .with_state(remote);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            base
+        }
+
+        async fn sync(base: &str, root: &Path, folder: &str) -> SyncResult {
+            let config = OAuthConfig::dropbox("id".into(), None, "http://localhost/cb".into());
+            let token = OAuthToken {
+                access_token: "t".into(),
+                refresh_token: None,
+                token_type: "Bearer".into(),
+                expires_at: None,
+                scope: None,
+            };
+            let dropbox = Dropbox::with_token(config, token).with_base_urls(base, base);
+            let config = SyncConfig {
+                local_path: root.to_path_buf(),
+                cloud_folder: Some(folder.into()),
+                direction: SyncDirection::Bidirectional,
+                ..Default::default()
+            };
+            let r = CloudSync::new(dropbox, config).sync().await.unwrap();
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+            r
+        }
+
+        fn write(root: &Path, rel: &str, body: &str) {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+
+        fn uploads(remote: &Shared) -> Vec<String> {
+            let mut paths = remote.lock().unwrap().uploads.clone();
+            paths.sort();
+            paths
+        }
+
+        /// None of the old layout reaches `/Notes/Notes`, in the first sync or later ones: not
+        /// a copy of a remote file, one deleted remotely since, one whose remote file is now
+        /// over the size limit, or a file of the user's under a new directory that shares a
+        /// top-level file's name (which is uploaded, like any new file).
+        #[tokio::test]
+        async fn old_copies_never_reach_the_folder_one_level_down() {
+            let remote = Shared::default();
+            {
+                let mut r = remote.lock().unwrap();
+                put(&mut r, "/Notes/a.pdf", b"A");
+                put(&mut r, "/Notes/b.pdf", b"B");
+                put(&mut r, "/Notes/big.pdf", b"");
+                r.entries.get_mut("/notes/big.pdf").unwrap().0["size"] = json!(200u64 << 20);
+            }
+            let base = fake(remote.clone()).await;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            write(root, "Notes/a.pdf", "old a");
+            write(root, "Notes/b.pdf", "old b");
+            write(root, "Notes/gone.pdf", "deleted remotely since");
+            write(root, "Notes/big.pdf", "old big");
+            write(root, "Archive/2024/a.pdf", "a new report");
+            write(root, "mine.pdf", "mine");
+
+            let r = sync(&base, root, "/Notes").await;
+            assert_eq!(r.notices.len(), 1, "{:?}", r.notices);
+            assert_eq!(r.downloaded, 2);
+            let first = vec!["/Notes/Archive/2024/a.pdf", "/Notes/mine.pdf"];
+            assert_eq!(uploads(&remote), first);
+            assert_eq!(
+                std::fs::read_to_string(root.join(".rms-old-layout/Notes/big.pdf")).unwrap(),
+                "old big"
+            );
+
+            for _ in 0..2 {
+                let r = sync(&base, root, "/Notes").await;
+                assert!(r.notices.is_empty(), "{:?}", r.notices);
+                assert_eq!((r.uploaded, r.downloaded), (0, 0));
+            }
+            assert_eq!(uploads(&remote), first);
+            assert_eq!(remote.lock().unwrap().downloads, 2);
+        }
+
+        /// Versions before #34 uploaded the folder's files into `/Notes/Notes` from their second
+        /// sync on. The upgrade sync says so and adds nothing to it; once it is deleted remotely
+        /// and here, as the notice says, it stays gone.
+        #[tokio::test]
+        async fn a_copy_made_before_the_upgrade_is_reported_and_not_added_to() {
+            let remote = Shared::default();
+            {
+                let mut r = remote.lock().unwrap();
+                put(&mut r, "/Notes/a.pdf", b"A");
+                put(&mut r, "/Notes/c.pdf", b"C");
+                put(&mut r, "/Notes/Notes/a.pdf", b"old a");
+            }
+            let base = fake(remote.clone()).await;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            write(root, "Notes/a.pdf", "old a");
+            write(root, "Notes/c.pdf", "old c");
+
+            let r = sync(&base, root, "/Notes").await;
+            assert_eq!(r.notices.len(), 2, "{:?}", r.notices);
+            assert!(r.notices[1].starts_with("This folder has a subfolder /Notes. "));
+            assert_eq!((r.uploaded, r.downloaded), (0, 3));
+            assert!(uploads(&remote).is_empty());
+
+            remote
+                .lock()
+                .unwrap()
+                .entries
+                .retain(|k, _| !k.starts_with("/notes/notes"));
+            std::fs::remove_dir_all(root.join("Notes")).unwrap();
+            let r = sync(&base, root, "/Notes").await;
+            assert_eq!((r.uploaded, r.downloaded), (0, 0));
+            assert!(!root.join("Notes").exists());
+        }
+
+        /// A tree that hasn't changed isn't sent again by the next sync, however deep; an edit
+        /// is.
+        #[tokio::test]
+        async fn unchanged_trees_are_not_sent_again() {
+            let remote = Shared::default();
+            {
+                let mut r = remote.lock().unwrap();
+                put(&mut r, "/Notes/a.pdf", b"A");
+                put(&mut r, "/Notes/Sub/b.pdf", b"B");
+                put(&mut r, "/Notes/Sub/Deeper/c.pdf", b"C");
+            }
+            let base = fake(remote.clone()).await;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+
+            let r = sync(&base, root, "/Notes").await;
+            assert_eq!((r.uploaded, r.downloaded), (0, 3));
+            let r = sync(&base, root, "/Notes").await;
+            assert_eq!((r.uploaded, r.downloaded), (0, 0));
+
+            write(root, "Sub/b.pdf", "edited here");
+            let r = sync(&base, root, "/Notes").await;
+            assert_eq!((r.uploaded, r.downloaded), (1, 0));
+            assert_eq!(uploads(&remote), vec!["/Notes/Sub/b.pdf"]);
         }
     }
 

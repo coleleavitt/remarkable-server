@@ -124,6 +124,11 @@ The community's top *concrete* pains. Small, bounded, high-value.
   scheduler is never started; wire them to an actual sync.
 - ✅ **Dropbox / OneDrive listings** — full listings are recursive and relative
   to the sync folder, and their deltas are scoped to it (#34).
+- ⬜ **Cloud full sync keeps no state** — `POST /integrations/v2/cloud/sync`
+  runs a fresh full sync every time, so a file deleted remotely is uploaded again
+  from its local copy, and Google Drive files present on both sides go through
+  the conflict strategy on every run (Dropbox and OneDrive skip files whose
+  content hash matches, #34). Needs per-folder sync state kept between runs.
 - ⬜ **Screenshare MQTT broker vs revocation** — sessions on the `SCREENSHARE_BIND`
   broker are not closed when their device is revoked (the `/notifications/ws`
   and `/mqtt` sessions are).

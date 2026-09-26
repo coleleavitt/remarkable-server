@@ -258,16 +258,29 @@ both are at the same generation with different hashes it refuses to start until
 one is fixed by hand.
 
 Cloud sync folders after upgrading past #34 (Dropbox and OneDrive only): a sync of
-a `cloud_folder` other than the drive root used to lay the folder out under
-`integrations/<local_path>/` by each file's path from the drive root
+a `cloud_folder` other than the drive root used to keep the folder under
+`integrations/<local_path>/` at the folder's own path from the drive root
 (`Notes/a.pdf` for the Dropbox folder `/Notes`; for OneDrive, the folder's whole
 path, e.g. `Documents/Notes/a.pdf`). Files now go at their path inside the folder
-(`a.pdf`). Nothing needs doing before the first sync: it downloads the folder into
-the new layout, and reports each old copy (`Not uploading /Notes/a.pdf: it looks
-like a copy of /a.pdf ...`) instead of uploading it into the folder one level down.
-Afterwards, move anything edited in the old directory since the last sync over the
-new copy, then delete the old directory (`integrations/<local_path>/Notes/`); the
-errors stop once it is gone. Whole-drive syncs keep their layout.
+(`a.pdf`). The first full sync of each such folder moves the old directory to
+`integrations/<local_path>/.rms-old-layout/` before it syncs anything, records that
+in `.rms-sync-layout` beside it, and lists what it moved in the response's
+`notices`. It does this once per folder, so leave `.rms-sync-layout` in place.
+Afterwards:
+
+- Copy anything edited in the old directory since the last sync before the upgrade
+  over the new copy, then delete `.rms-old-layout/`.
+- From their second bidirectional or upload sync on, versions before #34 uploaded
+  every file of the folder into the folder one level down (`/Notes/Notes/…`; for
+  OneDrive, `/Documents/Notes/Documents/Notes/…`). If the folder has a subfolder at
+  that path, the upgrade sync says so in `notices` and (unless it only uploads)
+  downloads it to `integrations/<local_path>/Notes/`. If it is that duplicate,
+  delete it in Dropbox or OneDrive and delete the local copy before the next sync.
+  A full sync uploads files that exist only locally and downloads files that exist
+  only remotely, so whichever copy is left brings the other back.
+
+Before the first sync after deploying, look under `integrations/` for directories
+named after a synced folder's path, so the notices hold no surprises.
 
 Migrating storage from a local server: stop both, `rsync -a test-storage/ linode:/var/lib/remarkable-server/`,
 `chown -R remarkable:remarkable`, start. `sync.db` (with its `-wal`/`-shm`

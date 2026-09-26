@@ -168,36 +168,108 @@ fn local_write_error(cloud_path: &str, e: IntegrationError) -> IntegrationError 
     }
 }
 
-/// The remote file that the local-only file at `path` looks like a leftover copy of, from the
-/// layout a Dropbox or OneDrive folder sync had before #34 (see
-/// [`CloudProvider::had_drive_rooted_layout`]): `/Notes/a.pdf` for the folder's `/a.pdf`, or
-/// `/Documents/Notes/a.pdf` for a folder further down the drive. Those listings weren't
-/// recursive, so a leftover is a top-level remote file inside local directories none of which
-/// exists remotely. A file under a directory the folder does have is an ordinary new file.
-fn leftover_of<'a>(path: &str, cloud: &'a HashMap<String, CloudFile>) -> Option<&'a str> {
-    let (dirs, name) = path.rsplit_once('/')?;
-    if dirs.is_empty() {
-        return None; // top level: the same in both layouts
-    }
-    let (remote, file) = cloud.get_key_value(&format!("/{}", name))?;
-    if file.is_folder {
-        return None;
-    }
-    let exists_remotely = |dir: &str| {
-        cloud.keys().any(|p| {
-            p.strip_prefix(dir)
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-        })
-    };
-    let mut dir = String::new();
-    for part in dirs.split('/').skip(1) {
-        dir.push('/');
-        dir.push_str(part);
-        if exists_remotely(&dir) {
-            return None;
+/// File at the top of the local sync directory that records which old-layout directories (see
+/// [`CloudProvider::legacy_layout_dir`]) full sync has already dealt with.
+pub(crate) const LAYOUT_MARKER: &str = ".rms-sync-layout";
+
+/// Directory at the top of the local sync directory that old-layout directories are moved into.
+pub(crate) const OLD_LAYOUT_DIR: &str = ".rms-old-layout";
+
+/// Whether `name`, at the top of the local sync directory, is one of the sync engine's own
+/// entries ([`LAYOUT_MARKER`], [`OLD_LAYOUT_DIR`]).
+fn is_reserved_name(name: &str) -> bool {
+    [LAYOUT_MARKER, OLD_LAYOUT_DIR]
+        .iter()
+        .any(|r| name.eq_ignore_ascii_case(r))
+}
+
+/// Whether the sync path `path` (`/x/…`) is in one of the sync engine's own entries. Such a
+/// path is never uploaded, and a remote file there is never written over them.
+fn is_reserved(path: &str) -> bool {
+    is_reserved_name(
+        path.strip_prefix('/')
+            .unwrap_or(path)
+            .split('/')
+            .next()
+            .unwrap_or(""),
+    )
+}
+
+/// `name` as the old layout is matched: case-insensitively (Dropbox and OneDrive paths are),
+/// and percent-decoded (Graph's `parentReference.path`, which that layout came from, may be
+/// percent-encoded).
+fn fold_name(name: &str) -> String {
+    urlencoding::decode(name)
+        .map(|d| d.to_lowercase())
+        .unwrap_or_else(|_| name.to_lowercase())
+}
+
+/// Whether the sync path `path` is `dir` (components, matched with [`fold_name`]) or below it.
+fn is_under(path: &str, dir: &[String]) -> bool {
+    let mut parts = path.strip_prefix('/').unwrap_or(path).split('/');
+    dir.iter()
+        .all(|d| parts.next().is_some_and(|p| fold_name(p) == fold_name(d)))
+}
+
+/// Contents of [`LAYOUT_MARKER`].
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct LayoutMarker {
+    /// Old-layout directories dealt with (moved aside, or found absent), as `/` and the
+    /// [folded](fold_name) components joined by `/`.
+    handled: Vec<String>,
+}
+
+/// Move every directory at `dir` under `root` into [`OLD_LAYOUT_DIR`], keeping its relative
+/// path. Each component is matched with [`fold_name`], so every casing the old layout may have
+/// written is found; symlinks aren't followed or moved. A name already taken in
+/// [`OLD_LAYOUT_DIR`] gets a ` (2)`, ` (3)`… suffix. Returns what moved where, relative to
+/// `root`.
+async fn move_old_layout(root: &Path, dir: &[String]) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let mut found = vec![PathBuf::new()];
+    for part in dir {
+        let want = fold_name(part);
+        let mut next = Vec::new();
+        for rel in &found {
+            let mut entries = match fs::read_dir(root.join(rel)).await {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            while let Some(entry) = entries.next_entry().await? {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                if rel.as_os_str().is_empty() && is_reserved_name(name) {
+                    continue;
+                }
+                if entry.file_type().await?.is_dir() && fold_name(name) == want {
+                    next.push(rel.join(name));
+                }
+            }
         }
+        found = next;
     }
-    Some(remote)
+    found.sort();
+
+    let mut moved = Vec::new();
+    for rel in found {
+        let first = Path::new(OLD_LAYOUT_DIR).join(&rel);
+        let mut to = first.clone();
+        for n in 2.. {
+            if fs::symlink_metadata(root.join(&to)).await.is_err() {
+                break;
+            }
+            let name = first.file_name().unwrap_or_default().to_string_lossy();
+            to = first.with_file_name(format!("{} ({})", name, n));
+        }
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(root.join(parent)).await?;
+        }
+        fs::rename(root.join(&rel), root.join(&to)).await?;
+        moved.push((rel, to));
+    }
+    Ok(moved)
 }
 
 /// Sync direction
@@ -226,7 +298,26 @@ pub struct SyncResult {
     pub deleted: usize,
     pub conflicts: Vec<Conflict>,
     pub errors: Vec<String>,
+    /// Things done that the user should know about but that aren't failures (an old local
+    /// layout moved aside).
+    #[serde(default)]
+    pub notices: Vec<String>,
     pub duration_ms: u64,
+}
+
+impl SyncResult {
+    fn new() -> Self {
+        Self {
+            status: SyncStatus::Success,
+            uploaded: 0,
+            downloaded: 0,
+            deleted: 0,
+            conflicts: Vec::new(),
+            errors: Vec::new(),
+            notices: Vec::new(),
+            duration_ms: 0,
+        }
+    }
 }
 
 /// Sync status
@@ -328,11 +419,83 @@ impl<P: CloudProvider> CloudSync<P> {
         &self.state
     }
 
-    /// Perform full sync. Files only present locally are uploaded, except where the provider
-    /// [had a drive-rooted layout](CloudProvider::had_drive_rooted_layout) for this folder: a
-    /// local file that looks like a leftover of it is reported as an error and left alone.
+    /// Perform full sync: files only present locally are uploaded, files only present remotely
+    /// are downloaded, and a file on both sides is left alone when the provider vouches that
+    /// the content is the same ([`CloudProvider::content_matches`]); otherwise its conflict is
+    /// resolved by the configured strategy. With no state kept from an earlier sync (as
+    /// `POST /sync` runs it), a file deleted remotely but still here is only present locally, so
+    /// it is uploaded again.
+    ///
+    /// The first full sync of a folder the provider kept elsewhere locally before #34 (see
+    /// [`CloudProvider::legacy_layout_dir`]) moves that directory aside first; see
+    /// [`move_legacy_layout`](Self::move_legacy_layout).
     pub async fn sync(&mut self) -> Result<SyncResult> {
         Ok(self.reconcile(LocalOnly::Upload).await?.result)
+    }
+
+    /// Move the local directory where this folder's files were kept before #34 (see
+    /// [`CloudProvider::legacy_layout_dir`]) into [`OLD_LAYOUT_DIR`], once. In the layout used
+    /// now, that directory is a subfolder of the same name (`<local>/Notes/a.pdf` is
+    /// `/Notes/Notes/a.pdf`), so syncing it would copy the old files into the folder one level
+    /// down. Which directories were dealt with is recorded in [`LAYOUT_MARKER`], also when
+    /// nothing was there to move: after the first full sync, a directory of that name is a
+    /// real subfolder and is synced like any other.
+    ///
+    /// Returns notices for the result: what was moved, and whether `cloud` (the folder's
+    /// listing) has a subfolder at that path, which may be the duplicate that versions before
+    /// #34 uploaded from the second sync on.
+    async fn move_legacy_layout(&self, cloud: &HashMap<String, CloudFile>) -> Result<Vec<String>> {
+        let Some(dir) = self
+            .provider
+            .legacy_layout_dir(self.config.cloud_folder.as_deref())
+            .await?
+            .filter(|dir| !dir.is_empty())
+        else {
+            return Ok(Vec::new());
+        };
+        let root = &self.config.local_path;
+        let marker_path = root.join(LAYOUT_MARKER);
+        let mut marker: LayoutMarker = match fs::read(&marker_path).await {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+                IntegrationError::Serialization(format!("{}: {}", marker_path.display(), e))
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => LayoutMarker::default(),
+            Err(e) => return Err(e.into()),
+        };
+        let folded: Vec<String> = dir.iter().map(|c| fold_name(c)).collect();
+        let key = format!("/{}", folded.join("/"));
+        if marker.handled.contains(&key) {
+            return Ok(Vec::new());
+        }
+
+        let mut notices = Vec::new();
+        for (from, to) in move_old_layout(root, &dir).await? {
+            notices.push(format!(
+                "Moved {} to {}: versions before #34 kept this folder's files there, under the \
+                 folder's own path from the drive root, and they now go at their path inside \
+                 the folder. Copy back anything changed there since the last sync, then delete it",
+                from.display(),
+                to.display()
+            ));
+        }
+        if cloud.keys().any(|p| is_under(p, &dir)) {
+            let shown = format!("/{}", dir.join("/"));
+            notices.push(format!(
+                "This folder has a subfolder {shown}. From their second sync on, versions before \
+                 #34 uploaded the folder's files into it ({shown}/…). If that is what it holds, \
+                 delete it remotely, and its local copy {shown} here if a sync downloaded one, \
+                 before the next sync: either copy left behind brings the other back"
+            ));
+        }
+
+        marker.handled.push(key);
+        let json = serde_json::to_vec_pretty(&marker)
+            .map_err(|e| IntegrationError::Serialization(e.to_string()))?;
+        write_replace(root, &marker_path, &json).await?;
+        for notice in &notices {
+            tracing::warn!("cloud sync: {}", notice);
+        }
+        Ok(notices)
     }
 
     /// Whether `f` is a file over `max_file_size`. Such remote files are never fetched: a
@@ -342,18 +505,41 @@ impl<P: CloudProvider> CloudSync<P> {
         !f.is_folder && self.config.max_file_size.is_some_and(|max| f.size > max)
     }
 
+    /// Whether the local file at `path` has the content of `cloud_file`: the same size, and the
+    /// provider [vouches for its hash](CloudProvider::content_matches). The local file is only
+    /// read when the sizes match. If so, the state records the file as in sync.
+    async fn same_on_both_sides(
+        &mut self,
+        path: &str,
+        local_info: &(PathBuf, i64, u64),
+        cloud_file: &CloudFile,
+    ) -> bool {
+        if cloud_file.is_folder
+            || cloud_file.content_hash.is_none()
+            || cloud_file.size != local_info.2
+        {
+            return false;
+        }
+        let Ok(content) = fs::read(&local_info.0).await else {
+            return false;
+        };
+        if !self.provider.content_matches(cloud_file, &content) {
+            return false;
+        }
+        self.state
+            .file_map
+            .insert(path.to_string(), cloud_file.id.clone());
+        if let Some(hash) = &cloud_file.content_hash {
+            self.state.hash_map.insert(path.to_string(), hash.clone());
+        }
+        self.state.mtime_map.insert(path.to_string(), local_info.1);
+        true
+    }
+
     /// Full sync: compare the whole listing with the local tree and transfer what differs.
     async fn reconcile(&mut self, local_only: LocalOnly) -> Result<Reconciled> {
         let start = std::time::Instant::now();
-        let mut result = SyncResult {
-            status: SyncStatus::Success,
-            uploaded: 0,
-            downloaded: 0,
-            deleted: 0,
-            conflicts: Vec::new(),
-            errors: Vec::new(),
-            duration_ms: 0,
-        };
+        let mut result = SyncResult::new();
 
         // Get cloud files
         let cloud_files = match self
@@ -381,9 +567,39 @@ impl<P: CloudProvider> CloudSync<P> {
             .map(|f| (f.path.clone(), f))
             .collect();
 
+        // Before the local tree is read: syncing the old layout would copy it into the folder
+        // one level down, so nothing is synced until it has been moved aside.
+        match self.move_legacy_layout(&cloud_map).await {
+            Ok(notices) => result.notices = notices,
+            Err(e) => {
+                result.status = SyncStatus::Failed;
+                result
+                    .errors
+                    .push(format!("Failed to move the old local layout aside: {}", e));
+                result.duration_ms = start.elapsed().as_millis() as u64;
+                return Ok(Reconciled {
+                    result,
+                    retry_needed: true,
+                });
+            }
+        }
+        cloud_map.retain(|path, _| {
+            let keep = !is_reserved(path);
+            if !keep {
+                tracing::warn!(
+                    "cloud sync: skipping {:?}: a name the sync keeps for itself",
+                    path
+                );
+            }
+            keep
+        });
+
         // Get local files
         let mut local_files = match self.list_local_files().await {
-            Ok(files) => files,
+            Ok(mut files) => {
+                files.retain(|path, _| !is_reserved(path));
+                files
+            }
             Err(e) => {
                 result.status = SyncStatus::Failed;
                 result
@@ -433,24 +649,8 @@ impl<P: CloudProvider> CloudSync<P> {
             SyncDirection::Upload | SyncDirection::Bidirectional
                 if local_only == LocalOnly::Upload =>
             {
-                // Local files left by the layout an older version kept this folder in aren't
-                // uploaded: they'd land one level down (`/Notes/Notes/a.pdf`) for good.
-                let drive_rooted = self
-                    .provider
-                    .had_drive_rooted_layout(self.config.cloud_folder.as_deref());
                 // Upload new local files
                 for path in &upload_paths {
-                    if drive_rooted {
-                        if let Some(remote) = leftover_of(path, &cloud_map) {
-                            result.errors.push(format!(
-                                "Not uploading {}: it looks like a copy of {} left by an older \
-                                 version, which kept this folder's files under its path from \
-                                 the drive root; move or delete it",
-                                path, remote
-                            ));
-                            continue;
-                        }
-                    }
                     let local_info = &local_files[*path];
                     match self.upload_file(path, local_info).await {
                         Ok(_) => result.uploaded += 1,
@@ -488,6 +688,13 @@ impl<P: CloudProvider> CloudSync<P> {
         for path in common_paths {
             let local_info = &local_files[path];
             let cloud_file = &cloud_map[path];
+
+            // Nothing to send either way. Without this, a sync with no state from an earlier
+            // one (no `last_sync`) sees every such file as changed on both sides and, as a
+            // download is stamped with the time it was written, uploads each one again.
+            if self.same_on_both_sides(path, local_info, cloud_file).await {
+                continue;
+            }
 
             // Check for conflicts
             let conflict = ConflictResolver::detect_conflict(
@@ -847,15 +1054,7 @@ impl<P: CloudProvider> CloudSync<P> {
     pub async fn delta_sync(&mut self) -> Result<SyncResult> {
         if self.config.direction == SyncDirection::Upload {
             tracing::debug!("cloud sync: upload-only, so a delta sync has nothing to download");
-            return Ok(SyncResult {
-                status: SyncStatus::Success,
-                uploaded: 0,
-                downloaded: 0,
-                deleted: 0,
-                conflicts: Vec::new(),
-                errors: Vec::new(),
-                duration_ms: 0,
-            });
+            return Ok(SyncResult::new());
         }
         let Some(cursor) = self.state.cursor.clone() else {
             // A change feed only lists what changes after its cursor, so the files already
@@ -865,15 +1064,7 @@ impl<P: CloudProvider> CloudSync<P> {
         };
 
         let start = std::time::Instant::now();
-        let mut result = SyncResult {
-            status: SyncStatus::Success,
-            uploaded: 0,
-            downloaded: 0,
-            deleted: 0,
-            conflicts: Vec::new(),
-            errors: Vec::new(),
-            duration_ms: 0,
-        };
+        let mut result = SyncResult::new();
 
         // Get changes since last cursor
         let (changes, new_cursor) = match self
@@ -914,6 +1105,13 @@ impl<P: CloudProvider> CloudSync<P> {
                 continue;
             }
             if cloud_file.is_folder {
+                continue;
+            }
+            if is_reserved(&cloud_file.path) {
+                tracing::warn!(
+                    "cloud sync: skipping change {:?}: a name the sync keeps for itself",
+                    cloud_file.path
+                );
                 continue;
             }
             if self.too_large(&cloud_file) {
@@ -1073,11 +1271,13 @@ mod tests {
     /// downloaded ids. Downloads of ids in `fail_ids` fail with a (transient) network error,
     /// of ids in `gone_ids` with a (permanent) not-found; `get_changes` hands out
     /// `next_cursor`, except for `stale_cursor`, which it rejects as expired. While
-    /// `list_fails` is set, the full listing fails. `drive_rooted` answers
-    /// `had_drive_rooted_layout`.
+    /// `list_fails` is set, the full listing fails. `legacy_dir` answers `legacy_layout_dir`
+    /// (an error while `legacy_fails` is set), and a file's content matches when it equals its
+    /// `content_hash`.
     #[derive(Default)]
     struct MockProvider {
-        drive_rooted: bool,
+        legacy_dir: Option<Vec<String>>,
+        legacy_fails: bool,
         files: Vec<CloudFile>,
         uploads: Mutex<Vec<String>>,
         downloads: Mutex<Vec<String>>,
@@ -1182,8 +1382,14 @@ mod tests {
                 trash: None,
             })
         }
-        fn had_drive_rooted_layout(&self, _: Option<&str>) -> bool {
-            self.drive_rooted
+        async fn legacy_layout_dir(&self, _: Option<&str>) -> Result<Option<Vec<String>>> {
+            if self.legacy_fails {
+                return Err(IntegrationError::Network("metadata failed".into()));
+            }
+            Ok(self.legacy_dir.clone())
+        }
+        fn content_matches(&self, file: &CloudFile, content: &[u8]) -> bool {
+            file.content_hash.as_deref().map(str::as_bytes) == Some(content)
         }
     }
 
@@ -1900,78 +2106,336 @@ mod tests {
         }
     }
 
-    /// A leftover of the drive-rooted layout is a top-level remote file's name inside local
-    /// directories that don't exist remotely, however deep the folder was in the drive.
-    #[test]
-    fn leftovers_of_the_drive_rooted_layout() {
-        let cloud: HashMap<String, CloudFile> = [
-            cf("a", "/a.pdf"),
-            remote_folder("/Sub"),
-            cf("b", "/Sub/b.pdf"),
-            remote_folder("/Dir"),
-            cf("c", "/Implicit/c.pdf"), // a folder known only from what's in it
-        ]
-        .into_iter()
-        .map(|f| (f.path.clone(), f))
-        .collect();
-        for (local, leftover) in [
-            ("/Notes/a.pdf", Some("/a.pdf")),
-            ("/Documents/Notes/a.pdf", Some("/a.pdf")),
-            ("/Su/a.pdf", Some("/a.pdf")), // a prefix of a remote folder's name isn't it
-            ("/a.pdf", None),              // top level: the same in both layouts
-            ("/Notes/new.pdf", None),      // no remote file of that name
-            ("/Notes/b.pdf", None),        // `b.pdf` isn't at the top remotely
-            ("/Notes/Sub", None),          // the top-level `Sub` is a folder
-            ("/Sub/a.pdf", None),          // under a folder the remote has
-            ("/Dir/Deeper/a.pdf", None),   // likewise, further down
-            ("/Implicit/a.pdf", None),
-        ] {
-            assert_eq!(leftover_of(local, &cloud), leftover, "{local}");
+    /// A remote file whose content (its id, as `MockProvider` serves it) the listing vouches for
+    /// with a hash, as Dropbox and OneDrive listings do.
+    fn hashed(id: &str, path: &str) -> CloudFile {
+        CloudFile {
+            content_hash: Some(id.into()),
+            size: id.len() as u64,
+            ..cf(id, path)
         }
     }
 
-    /// Where the provider had the drive-rooted layout for the folder, a full sync reports a
-    /// leftover of it and doesn't upload it (it would land one level down for good), and syncs
-    /// everything else as usual. Otherwise the same file is just a new local file.
+    fn write(root: &Path, rel: &str, body: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn read(root: &Path, rel: &str) -> String {
+        std::fs::read_to_string(root.join(rel)).unwrap()
+    }
+
+    fn uploads(provider: &MockProvider) -> Vec<String> {
+        let mut names = provider.uploads.lock().unwrap().clone();
+        names.sort();
+        names
+    }
+
+    fn marker(root: &Path) -> Vec<String> {
+        let marker: LayoutMarker =
+            serde_json::from_str(&read(root, LAYOUT_MARKER)).expect("layout marker");
+        marker.handled
+    }
+
+    /// Upgrading from before #34, where the folder was kept under its own path from the drive
+    /// root (`<local>/Notes/…`). The first full sync, in any direction, moves that directory
+    /// aside (in every casing) before anything else, so none of it is uploaded into the folder
+    /// one level down: not the copies of remote files, not a file deleted remotely since, and
+    /// not in a later sync either. The user's other files sync as usual. From then on a
+    /// directory of that name is an ordinary subfolder: nothing is held back or moved again.
     #[tokio::test]
-    async fn leftovers_of_the_drive_rooted_layout_are_not_uploaded() {
-        for drive_rooted in [true, false] {
+    async fn old_layout_is_moved_aside_once_then_synced_like_any_folder() {
+        for first in [SyncDirection::Bidirectional, SyncDirection::Download] {
             let dir = tempfile::tempdir().unwrap();
-            for (path, body) in [
-                ("Notes/a.pdf", "old copy"),
-                ("Sub/new.pdf", "new"),
-                ("mine.pdf", "new"),
-            ] {
-                let path = dir.path().join(path);
-                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-                std::fs::write(path, body).unwrap();
-            }
-            let provider = MockProvider {
-                drive_rooted,
-                files: vec![cf("a", "/a.pdf"), remote_folder("/Sub")],
+            let root = dir.path();
+            write(root, "Notes/a.pdf", "old a");
+            write(root, "Notes/gone.pdf", "deleted remotely since");
+            write(root, "notes/Sub/b.pdf", "old b"); // Dropbox's casing of a parent may vary
+            write(root, "mine.pdf", "mine");
+            write(root, "Archive/2024/a.pdf", "not a copy of /a.pdf");
+            let provider = || MockProvider {
+                legacy_dir: Some(vec!["Notes".into()]),
+                files: vec![
+                    hashed("a", "/a.pdf"),
+                    remote_folder("/Sub"),
+                    hashed("b", "/Sub/b.pdf"),
+                ],
                 ..Default::default()
             };
-            let mut sync = CloudSync::new(provider, cfg(dir.path(), SyncDirection::Bidirectional));
-            let r = sync.sync().await.unwrap();
 
-            assert_eq!(r.downloaded, 1, "{drive_rooted}");
-            assert_eq!(std::fs::read(dir.path().join("a.pdf")).unwrap(), b"a");
-            let kept = std::fs::read(dir.path().join("Notes/a.pdf")).unwrap();
-            assert_eq!(kept, b"old copy");
-            let mut uploads = sync.provider.uploads.lock().unwrap().clone();
-            uploads.sort();
-            if drive_rooted {
-                assert_eq!(uploads, vec!["Sub/new.pdf", "mine.pdf"]);
-                assert_eq!(r.status, SyncStatus::PartialSuccess);
-                assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
-                let e = &r.errors[0];
-                assert!(e.starts_with("Not uploading /Notes/a.pdf: "), "{e}");
-                assert!(e.contains("copy of /a.pdf"), "{e}");
-            } else {
-                assert!(r.errors.is_empty(), "{:?}", r.errors);
-                assert_eq!(uploads, vec!["Notes/a.pdf", "Sub/new.pdf", "mine.pdf"]);
-            }
+            let mut sync = CloudSync::new(provider(), cfg(root, first));
+            let r = sync.sync().await.unwrap();
+            assert!(r.errors.is_empty(), "{first:?}: {:?}", r.errors);
+            assert_eq!(r.downloaded, 2, "{first:?}");
+            assert_eq!(r.notices.len(), 2, "{first:?}: {:?}", r.notices);
+            assert!(r.notices[0].starts_with("Moved Notes to .rms-old-layout/Notes: "));
+            assert!(r.notices[1].starts_with("Moved notes to .rms-old-layout/notes: "));
+            assert_eq!(read(root, ".rms-old-layout/Notes/a.pdf"), "old a");
+            assert_eq!(
+                read(root, ".rms-old-layout/Notes/gone.pdf"),
+                "deleted remotely since"
+            );
+            assert_eq!(read(root, ".rms-old-layout/notes/Sub/b.pdf"), "old b");
+            assert!(!root.join("Notes").exists() && !root.join("notes").exists());
+            assert_eq!(
+                (read(root, "a.pdf"), read(root, "Sub/b.pdf")),
+                ("a".to_string(), "b".to_string())
+            );
+            let expected: Vec<&str> = match first {
+                SyncDirection::Download => vec![],
+                _ => vec!["Archive/2024/a.pdf", "mine.pdf"],
+            };
+            assert_eq!(uploads(&sync.provider), expected, "{first:?}");
+            assert_eq!(marker(root), vec!["/notes"]);
+
+            // A later sync, with fresh state as `POST /sync` runs it: the files that are the same
+            // on both sides stay put, and a new `Notes` directory is a subfolder like any other.
+            write(root, "Notes/new.pdf", "a real subfolder");
+            let mut sync = CloudSync::new(provider(), cfg(root, SyncDirection::Bidirectional));
+            let r = sync.sync().await.unwrap();
+            assert!(r.errors.is_empty(), "{first:?}: {:?}", r.errors);
+            assert!(r.notices.is_empty(), "{first:?}: {:?}", r.notices);
+            assert_eq!(r.downloaded, 0, "{first:?}");
+            assert_eq!(
+                uploads(&sync.provider),
+                vec!["Archive/2024/a.pdf", "Notes/new.pdf", "mine.pdf"],
+                "{first:?}"
+            );
+            assert_eq!(read(root, "Notes/new.pdf"), "a real subfolder");
+            assert_eq!(marker(root), vec!["/notes"]);
         }
+    }
+
+    /// The marker records each old-layout directory by its folded path, so the same folder
+    /// spelled another way isn't moved again, another folder synced into the same directory is,
+    /// and one with nothing to move is recorded all the same. Names are matched however they
+    /// are cased or percent-encoded, and a name already taken in the old-layout directory isn't
+    /// overwritten.
+    #[tokio::test]
+    async fn old_layout_moves_are_recorded_per_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let sync_with = |legacy: &[&str]| {
+            CloudSync::new(
+                MockProvider {
+                    legacy_dir: Some(legacy.iter().map(|s| s.to_string()).collect()),
+                    ..Default::default()
+                },
+                cfg(root, SyncDirection::Download),
+            )
+        };
+        let moved = |notices: &[String]| -> Vec<String> {
+            notices
+                .iter()
+                .filter_map(|n| n.strip_prefix("Moved "))
+                .map(|n| n.split(':').next().unwrap().to_string())
+                .collect()
+        };
+        write(root, "Notes/x.pdf", "x");
+        write(root, "Books/y.pdf", "y");
+        write(root, ".rms-old-layout/Books/by-hand.pdf", "kept");
+        write(root, "documents/My Notes/q.pdf", "q");
+
+        let r = sync_with(&["Notes"]).sync().await.unwrap();
+        assert_eq!(moved(&r.notices), vec!["Notes to .rms-old-layout/Notes"]);
+
+        write(root, "Notes/z.pdf", "made after the upgrade");
+        let r = sync_with(&["NOTES"]).sync().await.unwrap();
+        assert!(r.notices.is_empty(), "{:?}", r.notices);
+        assert_eq!(read(root, "Notes/z.pdf"), "made after the upgrade");
+
+        let r = sync_with(&["Books"]).sync().await.unwrap();
+        assert_eq!(
+            moved(&r.notices),
+            vec!["Books to .rms-old-layout/Books (2)"]
+        );
+        assert_eq!(read(root, ".rms-old-layout/Books/by-hand.pdf"), "kept");
+        assert_eq!(read(root, ".rms-old-layout/Books (2)/y.pdf"), "y");
+
+        let r = sync_with(&["Documents", "My%20Notes"])
+            .sync()
+            .await
+            .unwrap();
+        assert_eq!(
+            moved(&r.notices),
+            vec!["documents/My Notes to .rms-old-layout/documents/My Notes"]
+        );
+        assert_eq!(read(root, ".rms-old-layout/documents/My Notes/q.pdf"), "q");
+
+        let r = sync_with(&["Nothing", "Here"]).sync().await.unwrap();
+        assert!(r.notices.is_empty(), "{:?}", r.notices);
+        assert_eq!(
+            marker(root),
+            vec!["/notes", "/books", "/documents/my notes", "/nothing/here"]
+        );
+
+        // No old layout at all (the drive root, Google Drive): no marker either.
+        let other = tempfile::tempdir().unwrap();
+        write(other.path(), "Notes/a.pdf", "mine");
+        let mut sync = CloudSync::new(
+            MockProvider::default(),
+            cfg(other.path(), SyncDirection::Upload),
+        );
+        let r = sync.sync().await.unwrap();
+        assert!(r.errors.is_empty() && r.notices.is_empty(), "{r:?}");
+        assert_eq!(uploads(&sync.provider), vec!["Notes/a.pdf"]);
+        assert!(!other.path().join(LAYOUT_MARKER).exists());
+    }
+
+    /// If the old layout can't be looked up or its marker can't be read, nothing is synced: the
+    /// sync fails (and a resync keeps no cursor) rather than upload the old layout.
+    #[tokio::test]
+    async fn old_layout_failures_stop_the_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "Notes/a.pdf", "old a");
+        let mut sync = CloudSync::new(
+            MockProvider {
+                legacy_fails: true,
+                files: vec![hashed("a", "/a.pdf")],
+                next_cursor: Some("c1".into()),
+                ..Default::default()
+            },
+            cfg(root, SyncDirection::Bidirectional),
+        );
+        for r in [sync.sync().await.unwrap(), sync.delta_sync().await.unwrap()] {
+            assert_eq!(
+                (r.status, r.uploaded, r.downloaded),
+                (SyncStatus::Failed, 0, 0)
+            );
+            assert!(
+                r.errors[0].starts_with("Failed to move the old local layout aside: "),
+                "{:?}",
+                r.errors
+            );
+        }
+        assert_eq!(sync.state().cursor, None);
+        assert!(sync.provider.downloads.lock().unwrap().is_empty());
+
+        sync.provider.legacy_fails = false;
+        sync.provider.legacy_dir = Some(vec!["Notes".into()]);
+        write(root, LAYOUT_MARKER, "not json");
+        let r = sync.sync().await.unwrap();
+        assert_eq!(r.status, SyncStatus::Failed);
+        assert!(r.errors[0].contains(LAYOUT_MARKER), "{:?}", r.errors);
+        assert!(uploads(&sync.provider).is_empty());
+        assert_eq!(read(root, "Notes/a.pdf"), "old a");
+    }
+
+    /// Versions before #34 uploaded the folder's files into it one level down from their second
+    /// sync on (`/Notes/Notes/a.pdf`). The sync that moves the old layout aside says when the
+    /// folder has a subfolder at that path, so it can be checked and deleted; it is otherwise
+    /// synced as it is (downloaded here), and the old copies go nowhere.
+    #[tokio::test]
+    async fn remote_copy_of_the_old_layout_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "Notes/a.pdf", "old a");
+        write(root, "Notes/c.pdf", "old c");
+        let mut sync = CloudSync::new(
+            MockProvider {
+                legacy_dir: Some(vec!["Notes".into()]),
+                files: vec![
+                    hashed("a", "/a.pdf"),
+                    hashed("c", "/c.pdf"),
+                    remote_folder("/notes"),
+                    hashed("twin", "/notes/a.pdf"),
+                ],
+                ..Default::default()
+            },
+            cfg(root, SyncDirection::Bidirectional),
+        );
+        let r = sync.sync().await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!((r.uploaded, r.downloaded), (0, 3));
+        assert_eq!(r.notices.len(), 2, "{:?}", r.notices);
+        assert!(
+            r.notices[1].starts_with("This folder has a subfolder /Notes. "),
+            "{:?}",
+            r.notices
+        );
+        assert_eq!(read(root, "notes/a.pdf"), "twin");
+        assert_eq!(read(root, ".rms-old-layout/Notes/c.pdf"), "old c");
+    }
+
+    /// The marker and the old-layout directory are the sync's own: never uploaded (even with
+    /// hidden files synced), and a remote file there is never written over them, by a full sync
+    /// or a delta.
+    #[tokio::test]
+    async fn reserved_names_are_never_synced() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, LAYOUT_MARKER, r#"{"handled":[]}"#);
+        write(root, ".rms-old-layout/x.pdf", "old");
+        write(root, "ok.txt", "ok");
+        let provider = MockProvider {
+            files: vec![
+                cf("marker", "/.rms-sync-layout"),
+                cf("old", "/.RMS-OLD-LAYOUT/x.pdf"),
+                cf("remote", "/remote.txt"),
+            ],
+            next_cursor: Some("c2".into()),
+            ..Default::default()
+        };
+        let config = SyncConfig {
+            sync_hidden: true,
+            ..cfg(root, SyncDirection::Bidirectional)
+        };
+        let mut sync = CloudSync::new(provider, config);
+        let r = sync.sync().await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(uploads(&sync.provider), vec!["ok.txt"]);
+
+        sync.state.cursor = Some("c1".into());
+        let r = sync.delta_sync().await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(*sync.provider.downloads.lock().unwrap(), vec!["remote"]);
+        assert_eq!(read(root, LAYOUT_MARKER), r#"{"handled":[]}"#);
+        assert_eq!(read(root, ".rms-old-layout/x.pdf"), "old");
+        assert!(!root.join(".RMS-OLD-LAYOUT").exists());
+    }
+
+    /// A file whose content the provider vouches is the same on both sides is left alone, even
+    /// with no state from an earlier sync; one that differs, or whose hash isn't known, goes
+    /// through conflict resolution as before (the local copy is newer here, so it's uploaded).
+    #[tokio::test]
+    async fn files_the_same_on_both_sides_are_not_transferred() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "same.txt", "same");
+        write(root, "sub/same.txt", "deep");
+        write(root, "edit.txt", "wxyz"); // same size as the remote, other content
+        write(root, "grown.txt", "longer");
+        write(root, "nohash.txt", "nohash");
+        let mut sync = CloudSync::new(
+            MockProvider {
+                files: vec![
+                    hashed("same", "/same.txt"),
+                    hashed("deep", "/sub/same.txt"),
+                    hashed("abcd", "/edit.txt"),
+                    hashed("r", "/grown.txt"),
+                    cf("nohash", "/nohash.txt"),
+                ],
+                ..Default::default()
+            },
+            cfg(root, SyncDirection::Bidirectional),
+        );
+        let r = sync.sync().await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(r.downloaded, 0);
+        assert_eq!(
+            uploads(&sync.provider),
+            vec!["edit.txt", "grown.txt", "nohash.txt"]
+        );
+        assert!(sync.provider.downloads.lock().unwrap().is_empty());
+        assert_eq!(
+            sync.state()
+                .file_map
+                .get("/sub/same.txt")
+                .map(String::as_str),
+            Some("deep")
+        );
     }
 
     #[test]

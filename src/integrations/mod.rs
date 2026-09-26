@@ -290,14 +290,24 @@ pub trait CloudProvider: Send + Sync {
     /// Get storage quota info
     async fn get_quota(&self) -> Result<StorageQuota>;
 
-    /// Whether a full sync of `folder_id` by this server before #34 laid the folder's files out
-    /// by their path from the drive root (`<local>/Notes/a.pdf` for `/Notes/a.pdf`) rather than
-    /// relative to the folder (`<local>/a.pdf`), as Dropbox and OneDrive did for any folder
-    /// other than the root. Full sync then holds back local files that look like leftovers of
-    /// that layout instead of uploading them into the folder again one level down (see
-    /// [`CloudSync::sync`]). Default: no.
-    fn had_drive_rooted_layout(&self, folder_id: Option<&str>) -> bool {
+    /// The local directory, as components under the sync directory, where a full sync of
+    /// `folder_id` by this server before #34 kept the folder's files, when that isn't where they
+    /// go now. Dropbox and OneDrive listings were pathed from the drive root then, so a folder
+    /// other than the root was laid out under its own path from the drive root: `["Notes"]`
+    /// for Dropbox `/Notes` (`<local>/Notes/a.pdf`, now `<local>/a.pdf`), `["Documents",
+    /// "Notes"]` for a OneDrive folder there. `None` when the layout didn't change (the drive
+    /// root; Google Drive, the default). Full sync moves that directory aside once (see
+    /// [`CloudSync::sync`]).
+    async fn legacy_layout_dir(&self, folder_id: Option<&str>) -> Result<Option<Vec<String>>> {
         let _ = folder_id;
+        Ok(None)
+    }
+
+    /// Whether `content` is the content of the remote file `file`, going by the hash its listing
+    /// carries ([`CloudFile::content_hash`]). `false` when that can't be told (the default).
+    /// Full sync leaves a file that is the same on both sides alone.
+    fn content_matches(&self, file: &CloudFile, content: &[u8]) -> bool {
+        let _ = (file, content);
         false
     }
 }
