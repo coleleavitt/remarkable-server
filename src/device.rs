@@ -23,9 +23,9 @@ const USER_SCOPES: &str = "intgr docedit screenshare sync:fox hwc:-1 mail:-1";
 /// `device-id` of user tokens minted by `create_user_token` (admin/test); they are not tied to
 /// a registration, so they skip the device check. Reserved: no device may register under it.
 const ADMIN_DEVICE_ID: &str = "admin";
-/// How often an open notification session re-checks its registration, as a backstop for a
-/// missed revocation event.
-const SESSION_RECHECK: std::time::Duration = std::time::Duration::from_secs(60);
+/// How often an open session (notifications WebSocket, `/mqtt`, screenshare broker) re-checks
+/// its registration, as a backstop for a missed revocation event.
+pub(crate) const SESSION_RECHECK: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct DeviceManager {

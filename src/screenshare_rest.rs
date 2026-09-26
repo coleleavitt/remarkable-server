@@ -20,6 +20,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::api::AppState;
+use crate::device::{DeviceManager, DeviceRevoked};
 use crate::error::{Result, ServerError};
 use crate::notifications::WsMessage;
 
@@ -157,6 +158,27 @@ impl RoomManager {
         }
     }
 
+    /// Take a revoked device out of its account's rooms: rooms it owns close (it can no longer
+    /// share into them), rooms it only joined lose it as a participant.
+    fn drop_device(&self, user_id: &str, device_id: &str) {
+        self.rooms.lock().retain(|room_id, r| {
+            if r.owner_user_id != user_id {
+                return true;
+            }
+            match r.participants.get(device_id) {
+                Some(c) if c.is_owner => {
+                    tracing::info!(%room_id, %device_id, "screenshare room closed: owner device revoked");
+                    false
+                }
+                Some(_) => {
+                    r.participants.remove(device_id);
+                    true
+                }
+                None => true,
+            }
+        });
+    }
+
     fn exists(&self, room_id: &str) -> bool {
         let mut rooms = self.rooms.lock();
         Self::sweep(&mut rooms);
@@ -220,6 +242,39 @@ impl RoomManager {
             r.participants.remove(client_id);
         }
     }
+}
+
+/// Drop revoked devices from REST rooms as their revocation events arrive (see
+/// [`DeviceManager::subscribe_revocations`]). Every REST call authenticates afresh, so a revoked
+/// device can't act in a room anyway; this closes the rooms it owned, which a viewer's keepalives
+/// would otherwise keep alive.
+pub fn spawn_revocation_cleanup(
+    devices: DeviceManager,
+    rooms: RoomManager,
+) -> tokio::task::JoinHandle<()> {
+    use tokio::sync::broadcast::error::RecvError;
+    let mut events = devices.subscribe_revocations();
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(ev) => on_revoked(&devices, &rooms, &ev),
+                // Missed rooms still expire after ROOM_TIMEOUT once nobody keeps them alive.
+                Err(RecvError::Lagged(n)) => {
+                    tracing::warn!("screenshare room cleanup missed {n} revocation events")
+                }
+                Err(RecvError::Closed) => return,
+            }
+        }
+    })
+}
+
+fn on_revoked(devices: &DeviceManager, rooms: &RoomManager, ev: &DeviceRevoked) {
+    // Deleted and at once paired again to the same account: rooms it has now may belong to the
+    // new registration, so leave them be.
+    if matches!(devices.get_device(&ev.device_id), Ok(Some(d)) if d.user_id == ev.user_id) {
+        return;
+    }
+    rooms.drop_device(&ev.user_id, &ev.device_id);
 }
 
 fn authz(headers: &HeaderMap) -> Result<&str> {
@@ -511,6 +566,76 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn revoked_devices_leave_their_rooms() {
+        let (state, _tk, _tmp) = state_and_auth();
+        let dm = &state.devices;
+        let pair = |user: &str, device: &str| {
+            let code = dm.create_pairing_code(user).unwrap();
+            dm.exchange_code(&code, device, "remarkable").unwrap().0
+        };
+        let tablet = pair("local-user", "RM110-1");
+        let other = pair("local-user", "RM110-2");
+        let rooms = &state.screenshare;
+        let cleanup = spawn_revocation_cleanup(dm.clone(), rooms.clone());
+
+        // The tablet shares; the in-process viewer and a second tablet join.
+        let (code, Json(body)) = create_room(State(state.clone()), hdrs(&tablet))
+            .await
+            .unwrap();
+        assert_eq!(code, StatusCode::CREATED);
+        let shared = body["roomId"].as_str().unwrap().to_string();
+        assert!(rooms.join(&shared, "viewer", "local-user"));
+        rooms.add_participant(&shared, "RM110-2", "local-user");
+        // The second tablet's own room, which the first one joined.
+        let (other_room, _) = rooms.create("local-user", "RM110-2");
+        rooms.add_participant(&other_room, "RM110-1", "local-user");
+
+        assert!(dm.delete_device("RM110-1", None).unwrap());
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while rooms.exists(&shared) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "owner revoked, room kept"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // The viewer's keepalive now fails, so it stops watching a room nobody shares into.
+        assert!(!rooms.keepalive(&shared, "local-user"));
+        let ids: Vec<_> = rooms
+            .clients(&other_room)
+            .into_iter()
+            .map(|c| c.client_id)
+            .collect();
+        assert_eq!(ids, ["RM110-2"], "revoked member left, owner stays");
+        assert!(rooms.keepalive(&other_room, "local-user"));
+        let (code, _) = join_active(State(state.clone()), hdrs(&other))
+            .await
+            .unwrap();
+        assert_eq!(code, StatusCode::OK);
+        cleanup.abort();
+    }
+
+    #[tokio::test]
+    async fn late_revocation_event_spares_a_same_account_re_pair() {
+        let (state, _tk, _tmp) = state_and_auth();
+        let dm = &state.devices;
+        let code = dm.create_pairing_code("local-user").unwrap();
+        dm.exchange_code(&code, "RM110-1", "remarkable").unwrap();
+        let (room, _) = state.screenshare.create("local-user", "RM110-1");
+        // The event of an earlier delete, handled after the device was paired back.
+        let ev = DeviceRevoked {
+            user_id: "local-user".into(),
+            device_id: "RM110-1".into(),
+        };
+        on_revoked(dm, &state.screenshare, &ev);
+        assert!(state.screenshare.exists(&room));
+        // Handled while it is gone, the event does close the room.
+        assert!(dm.delete_device("RM110-1", None).unwrap());
+        on_revoked(dm, &state.screenshare, &ev);
+        assert!(!state.screenshare.exists(&room));
     }
 
     #[tokio::test]

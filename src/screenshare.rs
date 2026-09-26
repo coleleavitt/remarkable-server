@@ -10,6 +10,10 @@
 //!
 //! Auth: the device/user JWT in the CONNECT password (or username). ACL: a client may
 //! only touch `user/{uid}/...` and `remarkable/screenshare/signaling/user/{uid}/...`.
+//! A connection lives only as long as the registration its token was minted under: once
+//! that device is revoked (deleted, self-unregistered, or re-paired to another user) the
+//! broker closes it, drops its subscriptions and leaves its rooms. In-process clients
+//! ([`Broker::local_client`]) present no token and are not tied to a device.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -36,7 +40,7 @@ use serde_json::{Map, Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-use crate::device::DeviceManager;
+use crate::device::{DeviceManager, SESSION_RECHECK};
 
 const MAX_PACKET: usize = 1024 * 1024;
 /// Rooms without activity for this long are dropped (rmfakecloud `roomTimeout`).
@@ -45,6 +49,8 @@ const ROOM_SWEEP: Duration = Duration::from_secs(15);
 const SIGNALING_PREFIX: &str = "remarkable/screenshare/signaling/user/";
 /// Outbound queue per client; messages to a client that can't keep up are dropped.
 const CLIENT_QUEUE: usize = 256;
+/// How long to wait for a TLS close_notify to go out to a revoked client before dropping it.
+const REVOKED_SHUTDOWN: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -101,6 +107,9 @@ struct Inner {
     clients: Mutex<HashMap<String, Client>>,
     rooms: Mutex<HashMap<String, Room>>,
     next_session: std::sync::atomic::AtomicU64,
+    /// How often a connection re-checks its device's registration, as a backstop for a
+    /// missed revocation event ([`SESSION_RECHECK`]; shorter in tests).
+    session_recheck: Duration,
 }
 
 fn acl_allows(user_id: &str, topic: &str, write: bool) -> bool {
@@ -112,6 +121,14 @@ fn acl_allows(user_id: &str, topic: &str, write: bool) -> bool {
 impl Broker {
     /// `ice_servers`: list for `room-joined` (xochitl wants each entry's key as singular `url`).
     pub fn new(devices: DeviceManager, ice_servers: Value) -> Self {
+        Self::with_session_recheck(devices, ice_servers, SESSION_RECHECK)
+    }
+
+    fn with_session_recheck(
+        devices: DeviceManager,
+        ice_servers: Value,
+        session_recheck: Duration,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 devices,
@@ -119,6 +136,7 @@ impl Broker {
                 clients: Mutex::default(),
                 rooms: Mutex::default(),
                 next_session: Default::default(),
+                session_recheck,
             }),
         }
     }
@@ -489,15 +507,25 @@ impl Broker {
                 }
             })
             .unwrap_or_default();
-        let Ok(user_id) = self
+        // Same acceptance as `validate_token`, keeping the device and epoch as well.
+        let Ok(identity) = self
             .inner
             .devices
-            .validate_token(&format!("Bearer {token}"))
+            .session_identity(&format!("Bearer {token}"))
         else {
             ConnAck::new(ConnectReturnCode::BadUserNamePassword, false).write(&mut out)?;
             stream.write_all(&out).await?;
             anyhow::bail!("auth failed for client {}", connect.client_id);
         };
+        // Resolves once that device is revoked (its event, or the periodic re-check, where only
+        // a definite "not registered" counts: a DB hiccup keeps the session). It subscribes to
+        // revocations here, before its first registration check, so none slips in between.
+        let revoked = self
+            .inner
+            .devices
+            .session_revoked_every(&identity, self.inner.session_recheck);
+        tokio::pin!(revoked);
+        let user_id = identity.user_id.clone();
         let client_id = if connect.client_id.is_empty() {
             uuid::Uuid::new_v4().to_string()
         } else {
@@ -517,7 +545,7 @@ impl Broker {
         );
         ConnAck::new(ConnectReturnCode::Success, false).write(&mut out)?;
         stream.write_all(&out).await?;
-        tracing::info!(client = %client_id, user = %user_id, "mqtt client connected");
+        tracing::info!(client = %client_id, user = %user_id, device = %identity.device_id, "mqtt client connected");
 
         // MQTT keepalive: disconnect after 1.5x the negotiated interval with no traffic.
         let idle = Duration::from_secs(u64::from(connect.keep_alive.max(1)) * 3 / 2);
@@ -591,6 +619,13 @@ impl Broker {
                         out.clear();
                         p.write(&mut out)?;
                         stream.write_all(&out).await?;
+                    }
+                    () = &mut revoked => {
+                        tracing::info!(client = %client_id, device = %identity.device_id, "device revoked, closing screenshare mqtt session");
+                        // MQTT 3.1.1 has no server DISCONNECT: closing the connection ends the
+                        // session. Leaving the broker and its rooms happens below, as on any exit.
+                        let _ = tokio::time::timeout(REVOKED_SHUTDOWN, stream.shutdown()).await;
+                        return Ok(());
                     }
                 }
             }
@@ -705,6 +740,221 @@ mod tests {
         );
         drop(new);
         assert!(broker.active_room("u").is_none());
+    }
+
+    fn broker_with_recheck(recheck: Duration) -> (Broker, DeviceManager, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let devices =
+            DeviceManager::new(tmp.path().join("devices.db"), "local", "local.test").unwrap();
+        let broker = Broker::with_session_recheck(devices.clone(), json!([]), recheck);
+        (broker, devices, tmp)
+    }
+
+    /// Pair `device` to `user` the way the tablet does: (device token, user token).
+    fn pair(dm: &DeviceManager, user: &str, device: &str) -> (String, String) {
+        let code = dm.create_pairing_code(user).unwrap();
+        dm.exchange_code(&code, device, "remarkable").unwrap()
+    }
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    /// A remote broker client, as xochitl drives it, over an in-memory stream in place of
+    /// the TLS connection (the session code is the same).
+    struct Remote {
+        io: tokio::io::DuplexStream,
+        buf: BytesMut,
+        session: tokio::task::JoinHandle<anyhow::Result<()>>,
+    }
+
+    impl Remote {
+        /// CONNECT with `token` as the password; `None` if the broker refuses it.
+        async fn connect(broker: &Broker, client_id: &str, token: &str) -> Option<Remote> {
+            let (io, server) = tokio::io::duplex(64 * 1024);
+            let broker = broker.clone();
+            let session = tokio::spawn(async move { broker.session(server).await });
+            let mut remote = Remote {
+                io,
+                buf: BytesMut::new(),
+                session,
+            };
+            let mut connect = v4::Connect::new(client_id);
+            connect.keep_alive = 600;
+            connect.set_login("tablet", token);
+            assert!(remote.send(|o| connect.write(o).map(drop)).await);
+            match remote.next().await {
+                Some(Packet::ConnAck(a)) if a.code == ConnectReturnCode::Success => Some(remote),
+                Some(Packet::ConnAck(_)) => None,
+                other => panic!("expected CONNACK, got {other:?}"),
+            }
+        }
+
+        /// Write one packet; false once the broker has gone.
+        async fn send(
+            &mut self,
+            write: impl FnOnce(&mut BytesMut) -> Result<(), rumqttc::mqttbytes::Error>,
+        ) -> bool {
+            let mut out = BytesMut::new();
+            write(&mut out).unwrap();
+            self.io.write_all(&out).await.is_ok()
+        }
+
+        /// Next packet from the broker; `None` once it has closed the connection.
+        async fn next(&mut self) -> Option<Packet> {
+            tokio::time::timeout(WAIT, async {
+                loop {
+                    match v4::read(&mut self.buf, MAX_PACKET) {
+                        Ok(p) => return Some(p),
+                        Err(rumqttc::mqttbytes::Error::InsufficientBytes(_)) => {}
+                        Err(e) => panic!("bad packet from broker: {e:?}"),
+                    }
+                    if !matches!(self.io.read_buf(&mut self.buf).await, Ok(n) if n > 0) {
+                        return None;
+                    }
+                }
+            })
+            .await
+            .expect("broker neither answered nor closed the connection")
+        }
+
+        async fn subscribe(&mut self, filter: &str) {
+            let mut sub = v4::Subscribe::new(filter, QoS::AtMostOnce);
+            sub.pkid = 1;
+            assert!(self.send(|o| sub.write(o).map(drop)).await);
+            assert!(matches!(self.next().await, Some(Packet::SubAck(_))));
+        }
+
+        async fn publish(&mut self, topic: &str, payload: &[u8]) {
+            let p = Publish::new(topic, QoS::AtMostOnce, payload.to_vec());
+            assert!(self.send(|o| p.write(o).map(drop)).await);
+        }
+
+        /// Whether the session is still up: a PINGREQ is answered.
+        async fn alive(&mut self) -> bool {
+            if !self.send(|o| v4::PingReq.write(o).map(drop)).await {
+                return false;
+            }
+            loop {
+                match self.next().await {
+                    Some(Packet::PingResp) => return true,
+                    Some(_) => {} // a message for a subscription
+                    None => return false,
+                }
+            }
+        }
+
+        /// The broker closes the connection, and the session (including leaving the broker and
+        /// its rooms) ends without error.
+        async fn closed(mut self) {
+            while self.next().await.is_some() {}
+            tokio::time::timeout(WAIT, self.session)
+                .await
+                .expect("session did not end after closing")
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn revoked_devices_session_is_closed_and_others_stay() {
+        use remarkable_mqtt::screenshare::{signaling_topic, subscriptions};
+        // No periodic re-check within the test: the revocation event alone must close it.
+        let (broker, dm, _tmp) = broker_with_recheck(Duration::from_secs(3600));
+        let uid = "local-user";
+        let (_, ut_a) = pair(&dm, uid, "RM110-1");
+        let (dt_b, _) = pair(&dm, uid, "RM110-2");
+        let admin = dm.create_user_token(uid).unwrap();
+
+        // Tablet A shares its screen (user token, as xochitl logs in)...
+        let mut a = Remote::connect(&broker, "tablet-a", &ut_a)
+            .await
+            .expect("tablet a connects");
+        a.subscribe(&format!("user/{uid}/signaling")).await;
+        a.publish(
+            &signaling_topic(uid, "tablet-a"),
+            br#"{"type":"create-room"}"#,
+        )
+        .await;
+        assert!(
+            matches!(a.next().await, Some(Packet::Publish(p)) if p.topic == format!("user/{uid}/signaling"))
+        );
+        let room = broker.active_room(uid).expect("room created");
+        // ...the in-process browser viewer (no token) watches it...
+        let mut viewer = broker.local_client(uid, "viewer", &subscriptions(uid, "viewer"));
+        viewer
+            .publish(
+                &signaling_topic("local-user", "viewer"),
+                br#"{"type":"join-active-room"}"#.to_vec(),
+            )
+            .unwrap();
+        let joined = tokio::time::timeout(WAIT, viewer.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&joined.payload).contains("room-joined"));
+        // ...and another tablet (device token) and an admin-token client are connected too.
+        let mut b = Remote::connect(&broker, "tablet-b", &dt_b).await.unwrap();
+        let mut adm = Remote::connect(&broker, "admin", &admin).await.unwrap();
+
+        assert!(dm.delete_device("RM110-1", None).unwrap());
+        a.closed().await;
+        assert!(!broker.inner.clients.lock().contains_key("tablet-a"));
+        assert_eq!(
+            broker.inner.rooms.lock()[&room].participants,
+            ["viewer"],
+            "the revoked tablet left its room; the viewer is still in it"
+        );
+        assert!(b.alive().await, "another device's session stays");
+        assert!(adm.alive().await, "admin sessions are not tied to a device");
+        // The viewer is unaffected: still in the broker and still receiving its signaling.
+        b.publish(
+            &signaling_topic(uid, "tablet-b"),
+            format!(
+                r#"{{"type":"direct","clientId":"viewer","roomId":"{room}","payload":{{"x":1}}}}"#
+            )
+            .as_bytes(),
+        )
+        .await;
+        let direct = tokio::time::timeout(WAIT, viewer.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            direct.topic,
+            format!("user/{uid}/client/viewer/signaling/{room}")
+        );
+        // The revoked token no longer connects.
+        assert!(Remote::connect(&broker, "tablet-a", &ut_a).await.is_none());
+
+        // Re-pairing tablet B to another account revokes it for this one.
+        pair(&dm, "other-user", "RM110-2");
+        b.closed().await;
+        assert!(adm.alive().await);
+        assert!(broker.inner.clients.lock().contains_key("viewer"));
+        assert_eq!(broker.active_room(uid).as_deref(), Some(room.as_str()));
+    }
+
+    #[tokio::test]
+    async fn db_error_keeps_session_open_and_recheck_catches_silent_revocation() {
+        let (broker, dm, tmp) = broker_with_recheck(Duration::from_millis(20));
+        let (dt, _) = pair(&dm, "local-user", "RM110-1");
+        let mut tablet = Remote::connect(&broker, "tablet", &dt).await.unwrap();
+        let side = rusqlite::Connection::open(tmp.path().join("devices.db")).unwrap();
+
+        // Every re-check in this window fails with "no such table": none may drop the tablet.
+        side.execute_batch("ALTER TABLE devices RENAME TO devices_gone")
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(tablet.alive().await, "a DB error closed the session");
+        side.execute_batch("ALTER TABLE devices_gone RENAME TO devices")
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(tablet.alive().await);
+
+        // A registration that vanishes without an event is caught by the periodic re-check.
+        side.execute("DELETE FROM devices WHERE device_id = 'RM110-1'", [])
+            .unwrap();
+        tablet.closed().await;
+        assert!(broker.inner.clients.lock().is_empty());
     }
 
     #[test]
