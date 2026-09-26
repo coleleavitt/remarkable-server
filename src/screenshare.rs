@@ -60,15 +60,24 @@ enum Exit {
     Revoked,
 }
 
-/// Write `out` to a client in full within `limit`. A client that stops reading (zero TCP
-/// window) would otherwise hold its session in `write_all` for good, and with it its broker
-/// registration, room memberships and revocation handling.
+/// Write `out` to a client in full, and flush it, within `limit`. A client that stops reading
+/// (zero TCP window) would otherwise hold its session in `write_all` for good, and with it its
+/// broker registration, room memberships and revocation handling.
+///
+/// The flush is what puts the bytes on the socket: tokio-rustls reports a write done once the
+/// TLS records are in its send buffer, even when the socket is full, and reading never sends
+/// them. Unflushed, a reply (a PINGRESP, or the CONNACK refusing a client just before the
+/// connection drops) waits for the session's next write, which may never come.
 async fn write_within<S: tokio::io::AsyncWrite + Unpin>(
     stream: &mut S,
     out: &[u8],
     limit: Duration,
 ) -> anyhow::Result<()> {
-    match tokio::time::timeout(limit, stream.write_all(out)).await {
+    let write = async {
+        stream.write_all(out).await?;
+        stream.flush().await
+    };
+    match tokio::time::timeout(limit, write).await {
         Ok(written) => Ok(written?),
         Err(_) => anyhow::bail!("client stopped reading: write timed out after {limit:?}"),
     }
@@ -720,6 +729,11 @@ impl Drop for LocalClient {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll, ready};
+
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
     use super::*;
 
     fn broker() -> (Broker, tempfile::TempDir) {
@@ -824,6 +838,36 @@ mod tests {
             capacity: usize,
         ) -> Option<Remote> {
             let (io, server) = tokio::io::duplex(capacity);
+            Self::connect_over(broker, client_id, token, io, server).await
+        }
+
+        /// [`connect_with`](Self::connect_with), with the broker writing through a
+        /// [`SendBuffered`] layer as it does through TLS: whatever doesn't fit in the pipe is
+        /// left in that layer's buffer.
+        async fn connect_buffered(
+            broker: &Broker,
+            client_id: &str,
+            token: &str,
+            capacity: usize,
+        ) -> Option<Remote> {
+            let (io, server) = tokio::io::duplex(capacity);
+            let server = SendBuffered {
+                io: server,
+                pending: Vec::new(),
+            };
+            Self::connect_over(broker, client_id, token, io, server).await
+        }
+
+        async fn connect_over<S>(
+            broker: &Broker,
+            client_id: &str,
+            token: &str,
+            io: tokio::io::DuplexStream,
+            server: S,
+        ) -> Option<Remote>
+        where
+            S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        {
             let broker = broker.clone();
             let session = tokio::spawn(async move { broker.session(server).await });
             let mut remote = Remote {
@@ -906,6 +950,111 @@ mod tests {
                 .unwrap()
                 .unwrap();
         }
+    }
+
+    /// The broker's side of a connection, written the way tokio-rustls writes (0.26,
+    /// `common::Stream::poll_write`/`poll_flush`): a write succeeds once the bytes are in the
+    /// TLS send buffer, even when the socket behind it is full, and what's left goes out only
+    /// on a flush, a shutdown or the next write. Reading never sends it.
+    struct SendBuffered {
+        io: tokio::io::DuplexStream,
+        pending: Vec<u8>,
+    }
+
+    /// rustls's default send buffer limit.
+    const SEND_BUFFER: usize = 64 * 1024;
+
+    impl SendBuffered {
+        /// Move buffered bytes to the pipe until none are left; pending while the pipe is full.
+        fn push(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            while !self.pending.is_empty() {
+                let n = ready!(Pin::new(&mut self.io).poll_write(cx, &self.pending))?;
+                if n == 0 {
+                    return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
+                }
+                self.pending.drain(..n);
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncRead for SendBuffered {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for SendBuffered {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            if buf.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+            loop {
+                let taken = buf.len().min(SEND_BUFFER - this.pending.len());
+                this.pending.extend_from_slice(&buf[..taken]);
+                match this.push(cx) {
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    // Taken is written, whether or not the pipe had room for it.
+                    _ if taken > 0 => return Poll::Ready(Ok(taken)),
+                    Poll::Pending => return Poll::Pending,
+                    // The buffer was full and has just gone out: take the bytes now.
+                    Poll::Ready(Ok(())) => {}
+                }
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            ready!(this.push(cx))?;
+            Pin::new(&mut this.io).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            ready!(this.push(cx))?;
+            Pin::new(&mut this.io).poll_shutdown(cx)
+        }
+    }
+
+    // Paused clock: a reply left in the send buffer never arrives, and `Remote::next` then gives
+    // up at its virtual deadline instead of after real seconds.
+    #[tokio::test(start_paused = true)]
+    async fn replies_are_flushed_through_the_tls_send_buffer() {
+        let (broker, dm, _tmp) = broker_with_recheck(Duration::from_secs(3600));
+        let uid = "local-user";
+        let (dt, _) = pair(&dm, uid, "RM110-1");
+        // A refusal's CONNACK arrives in full before the broker drops the connection, so the
+        // client reads "bad credentials", not a reset.
+        assert!(
+            Remote::connect_buffered(&broker, "tablet", "not-a-token", 1)
+                .await
+                .is_none()
+        );
+        // Each reply below arrives while the session is back waiting on the client: CONNACK,
+        // SUBACK, PINGRESP, and a delivery.
+        // A one-byte pipe: nearly every byte the broker writes waits in the send buffer.
+        let mut tablet = Remote::connect_buffered(&broker, "tablet", &dt, 1)
+            .await
+            .expect("tablet connects");
+        let topic = format!("user/{uid}/signaling");
+        tablet.subscribe(&topic).await;
+        assert!(tablet.alive().await);
+        broker.publish(&topic, b"hello".to_vec(), QoS::AtMostOnce);
+        assert!(
+            matches!(tablet.next().await, Some(Packet::Publish(p)) if p.topic == topic && p.payload[..] == b"hello"[..])
+        );
+        assert!(tablet.send(|o| v4::Disconnect.write(o).map(drop)).await);
+        tablet.closed().await;
+        assert!(broker.inner.clients.lock().is_empty());
     }
 
     #[tokio::test]
@@ -1070,14 +1219,20 @@ mod tests {
     /// `Remote::connect`'s keepalive (600 s) times 1.5: how long the broker waits on a client.
     const REMOTE_IDLE: Duration = Duration::from_secs(900);
 
-    /// Connect a tablet over a 1 KiB pipe and leave it subscribed to its signaling topic, then
-    /// stop reading and queue a delivery bigger than the pipe: the session is stuck writing it.
+    /// Connect a tablet over a 1 KiB pipe and [`stall`] it.
     async fn stalled_tablet(broker: &Broker, dm: &DeviceManager, uid: &str) -> Remote {
-        use remarkable_mqtt::screenshare::signaling_topic;
         let (dt, _) = pair(dm, uid, "RM110-1");
-        let mut tablet = Remote::connect_with(broker, "tablet", &dt, 1024)
+        let tablet = Remote::connect_with(broker, "tablet", &dt, 1024)
             .await
             .unwrap();
+        stall(broker, uid, tablet).await
+    }
+
+    /// Leave `tablet` (connected over a 1 KiB pipe) subscribed to its signaling topic, in a
+    /// room, then stop reading and queue a delivery bigger than the pipe: the session is stuck
+    /// writing it.
+    async fn stall(broker: &Broker, uid: &str, mut tablet: Remote) -> Remote {
+        use remarkable_mqtt::screenshare::signaling_topic;
         let topic = format!("user/{uid}/signaling");
         tablet.subscribe(&topic).await;
         tablet
@@ -1117,6 +1272,37 @@ mod tests {
         assert!(err.to_string().contains("stopped reading"), "{err}");
         assert!(start.elapsed() >= REMOTE_IDLE);
         // It left the broker and its room, which closed as it was the only participant.
+        assert!(broker.inner.clients.lock().is_empty());
+        assert!(broker.inner.rooms.lock().is_empty());
+    }
+
+    // Paused clock, as above.
+    #[tokio::test(start_paused = true)]
+    async fn client_that_pings_but_never_reads_leaves_the_broker_behind_a_tls_buffer() {
+        let (broker, dm, _tmp) = broker_with_recheck(Duration::from_secs(3600));
+        let uid = "local-user";
+        let (dt, _) = pair(&dm, uid, "RM110-1");
+        let tablet = Remote::connect_buffered(&broker, "tablet", &dt, 1024)
+            .await
+            .unwrap();
+        // The delivery "succeeds" into the send buffer at once; the pipe holds only 1 KiB of it.
+        let written = tokio::time::Instant::now();
+        let mut tablet = stall(&broker, uid, tablet).await;
+        // The client keeps its side of the keepalive going but never reads, so the read timeout
+        // never fires, and PINGRESPs would take 64 KiB of pings to fill the send buffer. Only the
+        // bound on the (flushed) write ends the session.
+        while !tablet.session.is_finished() && written.elapsed() < REMOTE_IDLE * 2 {
+            // Fails once the session has gone; the loop then ends.
+            tablet.send(|o| v4::PingReq.write(o).map(drop)).await;
+            tokio::time::sleep(Duration::from_secs(300)).await;
+        }
+        let err = tokio::time::timeout(WAIT, &mut tablet.session)
+            .await
+            .expect("a client that pings but never reads kept its session")
+            .unwrap()
+            .unwrap_err();
+        assert!(err.to_string().contains("stopped reading"), "{err}");
+        assert!(written.elapsed() >= REMOTE_IDLE);
         assert!(broker.inner.clients.lock().is_empty());
         assert!(broker.inner.rooms.lock().is_empty());
     }
