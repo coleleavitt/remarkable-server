@@ -317,7 +317,11 @@ local files, so files already the same on both sides are left alone; a file edit
 locally since its download still goes through the conflict strategy (newer wins,
 so the local edit replaces the listed copy). The duplicates earlier versions made
 stay in Drive, never seen by sync: look for same-named files in the synced folders
-and delete the newer copies once the oldest holds what you want. A Google Drive
+and delete the newer copies once the oldest holds what you want. The same goes for
+a local directory named like a file (or Google Docs file, or shortcut) in the Drive
+folder: earlier versions made a folder of that name next to the file, which sync
+never sees; now each sync reports an error for the files under that directory
+instead, until the directory or the Drive item is renamed. A Google Drive
 `cloud_folder` in the trash, deleted or no longer shared now fails the sync with an
 error instead of listing as empty.
 
