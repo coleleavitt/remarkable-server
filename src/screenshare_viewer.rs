@@ -42,6 +42,7 @@ use remarkable_screenshare::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
 
+use crate::api::token_matches;
 use crate::notifications::WsMessage;
 use crate::screenshare::{Broker, LocalClient};
 use crate::screenshare_rest::RoomManager;
@@ -891,20 +892,23 @@ fn admin_token() -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
-/// Constant-time comparison, so response timing leaks nothing about the token.
-fn token_matches(given: &str, expected: &str) -> bool {
-    given.len() == expected.len()
-        && given
-            .bytes()
-            .zip(expected.bytes())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            == 0
+/// The login cookie's value: a MAC of a fixed label keyed with `ADMIN_TOKEN`, not the token
+/// itself, so a cookie that leaks (browser storage, a proxy log) opens only this viewer, and
+/// stops working once the token is changed.
+fn session_value(admin: &str) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(admin.as_bytes())
+        .expect("HMAC takes a key of any length");
+    mac.update(b"remarkable-server screenshare viewer session v1");
+    hex::encode(mac.finalize().into_bytes())
 }
 
 fn authorized(headers: &HeaderMap) -> bool {
-    let Some(expected) = admin_token() else {
-        return false;
-    };
+    admin_token().is_some_and(|expected| authorized_with(&expected, headers))
+}
+
+/// `x-admin-token: <ADMIN_TOKEN>`, or the login cookie ([`session_value`]).
+fn authorized_with(expected: &str, headers: &HeaderMap) -> bool {
     let header = headers.get("x-admin-token").and_then(|v| v.to_str().ok());
     let cookie = headers
         .get_all(header::COOKIE)
@@ -917,11 +921,8 @@ fn authorized(headers: &HeaderMap) -> bool {
                 .map(str::to_owned)
         })
         .next();
-    header
-        .into_iter()
-        .map(str::to_owned)
-        .chain(cookie)
-        .any(|t| token_matches(&t, &expected))
+    header.is_some_and(|t| token_matches(t, expected))
+        || cookie.is_some_and(|c| token_matches(&c, &session_value(expected)))
 }
 
 async fn page(headers: HeaderMap) -> Html<String> {
@@ -938,11 +939,15 @@ struct LoginForm {
 }
 
 async fn login(Form(form): Form<LoginForm>) -> Response {
-    match admin_token() {
-        Some(expected) if token_matches(form.token.trim(), &expected) => {
+    login_with(admin_token().as_deref(), &form.token)
+}
+
+fn login_with(admin: Option<&str>, given: &str) -> Response {
+    match admin {
+        Some(expected) if token_matches(given.trim(), expected) => {
             let cookie = format!(
                 "{COOKIE}={}; HttpOnly; Secure; SameSite=Strict; Path=/screenshare/view; Max-Age=2592000",
-                form.token.trim()
+                session_value(expected)
             );
             (
                 [(header::SET_COOKIE, cookie)],
@@ -1161,6 +1166,45 @@ connect();
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The login cookie opens the viewer but isn't the admin token, and the token itself is
+    /// no longer taken as a cookie: a cookie never carries a credential for anything else.
+    #[test]
+    fn the_login_cookie_is_not_the_admin_token() {
+        let admin = "correct horse battery staple";
+        assert_eq!(
+            login_with(Some(admin), "wrong").status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(login_with(None, admin).status(), StatusCode::UNAUTHORIZED);
+        let ok = login_with(Some(admin), &format!(" {admin}\n"));
+        let set = ok.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(!set.contains(admin), "{set}");
+        let value = set
+            .strip_prefix(&format!("{COOKIE}="))
+            .and_then(|v| v.split(';').next())
+            .unwrap();
+
+        let with_cookie = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(
+                header::COOKIE,
+                format!("a=b; {COOKIE}={v}").parse().unwrap(),
+            );
+            h
+        };
+        assert!(authorized_with(admin, &with_cookie(value)));
+        assert!(!authorized_with(admin, &with_cookie(admin)));
+        assert!(!authorized_with("rotated", &with_cookie(value)));
+
+        let mut h = HeaderMap::new();
+        h.insert("x-admin-token", admin.parse().unwrap());
+        assert!(authorized_with(admin, &h));
+        assert!(!authorized_with(admin, &HeaderMap::new()));
+    }
 
     #[test]
     fn retry_delays_match_the_desktop() {
