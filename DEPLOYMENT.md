@@ -304,12 +304,12 @@ whose listing comes back empty moves nothing aside and reports an error listing 
 local files it left in place: check that the folder still exists and is shared with
 the account, and if its files really were deleted, delete the local copies. Dropbox
 and OneDrive paths ignore letter case: a sync that reports local files whose paths
-differ only in case syncs just the one spelled as the cloud folder lists it (if
-any) and leaves the others alone; rename them apart or remove the extras. The one
-left at the path is then compared with the cloud file as the last sync left it, so
-it is never overwritten with what that sync uploaded from another one (if the cloud
-file has also changed there since, the conflict strategy may decide, with a
-notice). A state file the server can't
+differ only in case leaves them all alone, but for the one spelled as the cloud
+folder lists it as long as none of the others was synced before; rename them apart
+or remove the extras. The one left at the path is then compared with the cloud file
+as its last sync left it, so it is never overwritten with another's content. State
+an earlier build of this change recorded under several such spellings sends that
+file through the conflict strategy once, with a notice. A state file the server can't
 read (not JSON, or written by a newer version) fails the sync with an error naming
 it; delete it to start over with a first sync. Rolling back to
 an older binary is safe: it ignores both (hidden entries). Upgrading again after
