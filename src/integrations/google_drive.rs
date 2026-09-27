@@ -539,6 +539,15 @@ impl CloudProvider for GoogleDrive {
         Ok(out)
     }
 
+    /// The folder's id as given, and `""` for My Drive, given as none or `root` (as
+    /// [`list_files`](CloudProvider::list_files) takes both).
+    fn folder_key(&self, folder_id: Option<&str>) -> String {
+        match folder_id {
+            None | Some("root") => String::new(),
+            Some(id) => id.to_string(),
+        }
+    }
+
     /// `about.get`'s `user.permissionId`, the signed-in user's stable id.
     async fn account_id(&self) -> Result<Option<String>> {
         #[derive(Deserialize)]
@@ -1356,6 +1365,16 @@ mod tests {
     #[test]
     fn paths_tell_case_apart() {
         assert!(!drive("http://localhost").ignores_case());
+    }
+
+    /// Full sync keeps one state for My Drive however it is given, as listings take both
+    /// spellings for it; a folder's is kept under its id, which tells case apart.
+    #[test]
+    fn folder_keys_name_my_drive_one_way() {
+        let d = drive("http://localhost");
+        for (folder, key) in [(None, ""), (Some("root"), ""), (Some("1AbC"), "1AbC")] {
+            assert_eq!(d.folder_key(folder), key, "{folder:?}");
+        }
     }
 
     /// Uploads, folder lookups, the sync folder check and full syncs with kept state, against a

@@ -319,6 +319,16 @@ pub trait CloudProvider: Send + Sync {
         Ok(None)
     }
 
+    /// The name the manifest full sync keeps between runs ([`SyncConfig::persist_state`]) is
+    /// stored under for the sync folder `folder_id` (as [`list_files`](Self::list_files) takes
+    /// it): the same for the spellings the provider takes for one folder, so a sync under one
+    /// goes by the state the last sync of the folder left, never by an older one kept for
+    /// another spelling. The default, `folder_id` without a trailing `/` (`""` for none), tells
+    /// every spelling apart.
+    fn folder_key(&self, folder_id: Option<&str>) -> String {
+        folder_id.unwrap_or("").trim_end_matches('/').to_string()
+    }
+
     /// Whether the provider takes paths that differ only in letter case for one path, as
     /// Dropbox and OneDrive do: a single file answers to every spelling, and a write to it by
     /// another spelling (an upload after a case-only rename here, or into a folder spelled

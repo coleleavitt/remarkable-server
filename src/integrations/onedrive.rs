@@ -675,6 +675,15 @@ impl CloudProvider for OneDrive {
         true
     }
 
+    /// The folder's item id as given, and `""` for the drive root however it is given (none,
+    /// `""`, `root`), as [`list_files`](CloudProvider::list_files) takes them all for it.
+    fn folder_key(&self, folder_id: Option<&str>) -> String {
+        match SyncRoot::of(folder_id) {
+            SyncRoot::Drive => String::new(),
+            SyncRoot::Folder(id) => id.to_string(),
+        }
+    }
+
     async fn list_folders(&self) -> Result<Vec<CloudFolder>> {
         // Use search to find all folders
         let url = format!(
@@ -2105,6 +2114,22 @@ mod tests {
         };
         let d = OneDrive::with_token(config, token).with_base_url(&base);
         assert_eq!(d.account_id().await.unwrap().as_deref(), Some("b!drive"));
+    }
+
+    /// Full sync keeps one state for the drive root however it is given, as listings take every
+    /// spelling for it; a folder's is kept under its id.
+    #[test]
+    fn folder_keys_name_the_root_one_way() {
+        let config = OAuthConfig::onedrive("id".into(), None, "http://localhost/cb".into());
+        let d = OneDrive::new(config);
+        for (folder, key) in [
+            (None, ""),
+            (Some(""), ""),
+            (Some("root"), ""),
+            (Some("D4648F06C91D9D3D!54927"), "D4648F06C91D9D3D!54927"),
+        ] {
+            assert_eq!(d.folder_key(folder), key, "{folder:?}");
+        }
     }
 
     /// OneDrive names are case-insensitive, so full sync matches paths ignoring case.

@@ -291,25 +291,30 @@ named after a synced folder's path, so the notices hold no surprises.
 
 Cloud sync state: each synced directory `integrations/<local_path>/` holds
 `.rms-sync-state.json`, the state of the last sync of each provider, account and
-`cloud_folder` synced into it, which full sync reconciles against (README,
-"Integrations API"). Leave it in place, and keep it with the directory when moving
-or restoring storage: without it the next sync of that directory is a first sync
-again, which can't tell deletions from new files and uploads files deleted remotely
-since from their local copies. The first sync after deploying this is such a first
-sync (as every sync was before), so a file deleted remotely before then comes back
-that one last time. Local copies of files deleted remotely are moved to
-`.rms-remote-deleted/<UTC time>/` in the same directory, never deleted: look
-through it now and then and delete what isn't needed, as nothing else does. A sync
-whose listing comes back empty moves nothing aside and reports an error listing the
-local files it left in place: check that the folder still exists and is shared with
-the account, and if its files really were deleted, delete the local copies. Dropbox
-and OneDrive paths ignore letter case: a sync that reports local files whose paths
-differ only in case leaves them all alone, but for the one spelled as the cloud
-folder lists it as long as none of the others was synced before; rename them apart
-or remove the extras. The one left at the path is then compared with the cloud file
-as its last sync left it, so it is never overwritten with another's content. State
-an earlier build of this change recorded under several such spellings sends that
-file through the conflict strategy once, with a notice. A state file the server can't
+`cloud_folder` synced into it (one state for every spelling of a folder the
+provider takes as one: `/Notes` and `/notes` on Dropbox), which full sync
+reconciles against (README, "Integrations API"). Leave it in place, and keep it
+with the directory when moving or restoring storage: without it the next sync of
+that directory is a first sync again, which can't tell deletions from new files
+and uploads files deleted remotely since from their local copies. The first sync
+after deploying this is such a first sync (as every sync was before), so a file
+deleted remotely before then comes back that one last time. Local copies of files
+deleted remotely are moved to `.rms-remote-deleted/<UTC time>/` in the same
+directory, never deleted: look through it now and then and delete what isn't
+needed, as nothing else does. A sync whose listing comes back empty moves nothing
+aside and reports an error listing the local files it left in place: check that
+the folder still exists and is shared with the account, and if its files really
+were deleted, delete the local copies. Files deleted locally stay deleted through
+such a sync. Dropbox and OneDrive paths ignore letter case: a sync that reports
+local files whose paths differ only in case leaves them all alone, including the
+one spelled as the cloud folder lists it; rename them apart or remove the extras.
+Edits to them, on either side, wait until then. The one left at the path is then
+compared with the cloud file as the last sync before the clash left it, so it is
+never overwritten with another's content; if it was never synced and the cloud
+file changed meanwhile, and the conflict strategy takes the cloud file, it is
+first moved to `.rms-remote-deleted/<UTC time>/`, with a notice. State an earlier
+build of this change recorded under several such spellings sends that file
+through the conflict strategy once, with a notice. A state file the server can't
 read (not JSON, or written by a newer version) fails the sync with an error naming
 it; delete it to start over with a first sync. Rolling back to
 an older binary is safe: it ignores both (hidden entries). Upgrading again after

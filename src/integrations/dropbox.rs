@@ -648,6 +648,17 @@ impl CloudProvider for Dropbox {
         true
     }
 
+    /// A path in lowercase (`/Notes`, `/notes/` and `/NOTES` are one folder), without a trailing
+    /// slash (`""`, `/`: the whole Dropbox). An `id:` is left as given, as ids tell case apart:
+    /// a folder given once by path and once by id has a state for each.
+    fn folder_key(&self, folder_id: Option<&str>) -> String {
+        let path = api_path(folder_id);
+        match path.starts_with("id:") {
+            true => path.to_string(),
+            false => path.to_lowercase(),
+        }
+    }
+
     async fn list_folders(&self) -> Result<Vec<CloudFolder>> {
         let first = self
             .api_request("files/list_folder", &ListFolderArg::recursive(""))
@@ -1694,6 +1705,28 @@ mod tests {
         }
     }
 
+    /// Full sync keeps one state for each sync folder, whatever the spelling of its path, as
+    /// Dropbox paths ignore case (review of #40, verification round 4). Ids tell case apart.
+    #[test]
+    fn folder_keys_ignore_the_case_of_paths() {
+        let d = Dropbox::new(OAuthConfig::dropbox(
+            "id".into(),
+            None,
+            "http://x/cb".into(),
+        ));
+        for (folder, key) in [
+            (None, ""),
+            (Some(""), ""),
+            (Some("/"), ""),
+            (Some("/Notes"), "/notes"),
+            (Some("/notes/"), "/notes"),
+            (Some("/NOTES/Sub"), "/notes/sub"),
+            (Some("id:AbC_12"), "id:AbC_12"),
+        ] {
+            assert_eq!(d.folder_key(folder), key, "{folder:?}");
+        }
+    }
+
     /// Dropbox's documented content hash: SHA-256 over the SHA-256 of each 4 MiB block.
     #[test]
     fn content_hash_is_dropbox_s() {
@@ -2090,7 +2123,7 @@ mod tests {
                 serde_json::from_slice(&std::fs::read(root.join(".rms-sync-state.json")).unwrap())
                     .unwrap();
             assert_eq!(state["syncs"][0]["account"], "dbid:alice");
-            assert_eq!(state["syncs"][0]["cloud_folder"], "/Notes");
+            assert_eq!(state["syncs"][0]["cloud_folder"], "/notes");
         }
 
         /// A token authorized without `account_info.read` (every one before it was asked for)
@@ -2275,12 +2308,43 @@ mod tests {
             assert_eq!(r.downloads, 3);
         }
 
+        /// `/Notes` and `/notes` are one Dropbox folder, with one state: going back to a spelling
+        /// synced before goes by the state the last sync left, not by an older one of its own.
+        /// Before, a restore made in Dropbox after an edit here was uploaded under the other
+        /// spelling was undone by the edit going up again (review of #40, verification round 4).
+        #[tokio::test]
+        async fn a_folder_spelled_otherwise_goes_by_the_last_state() {
+            let remote = Shared::default();
+            put(&mut remote.lock().unwrap(), "/Notes/a.pdf", b"v1");
+            let base = fake(remote.clone()).await;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let r = sync_kept(&base, root, "/Notes").await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 1, 0));
+            write(root, "a.pdf", "v2, edited here");
+            let r = sync_kept(&base, root, "/notes").await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (1, 0, 0));
+
+            put(&mut remote.lock().unwrap(), "/Notes/a.pdf", b"v1");
+            let r = sync_kept(&base, root, "/Notes").await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 1, 0));
+            let r = sync_kept(&base, root, "/NOTES/").await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 0, 0));
+            assert_eq!(std::fs::read(root.join("a.pdf")).unwrap(), b"v1");
+            assert_eq!(remote.lock().unwrap().entries["/notes/a.pdf"].1, b"v1");
+            let state: Value =
+                serde_json::from_slice(&std::fs::read(root.join(".rms-sync-state.json")).unwrap())
+                    .unwrap();
+            assert_eq!(state["syncs"].as_array().unwrap().len(), 1);
+            assert_eq!(state["syncs"][0]["cloud_folder"], "/notes");
+        }
+
         /// A file renamed here only in case, then a second local file spelled as Dropbox spells
-        /// it: that sync reports the clash and sends nothing, as the renamed file was synced
-        /// under the other spelling. Uploading the newcomer would leave the renamed file's state
-        /// describing an older version of the Dropbox file than the last synced, and once the
-        /// newcomer is removed, the renamed file would look unchanged since then and be
-        /// overwritten with the newcomer's content (review of #40, verification rounds 2 and 3).
+        /// it: that sync reports the clash and sends nothing, as it does for any clash. Uploading
+        /// the newcomer would leave the renamed file's state describing an older version of the
+        /// Dropbox file than the last synced, and once the newcomer is removed, the renamed file
+        /// would look unchanged since then and be overwritten with the newcomer's content
+        /// (review of #40, verification rounds 2 to 4).
         #[tokio::test]
         async fn a_clash_settled_by_removing_the_newcomer_keeps_the_tracked_file() {
             let remote = Shared::default();
