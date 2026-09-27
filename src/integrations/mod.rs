@@ -39,6 +39,12 @@ pub enum IntegrationError {
     #[error("Token expired")]
     TokenExpired,
 
+    /// The token wasn't granted a scope the request needs (Dropbox `401 missing_scope`, e.g. a
+    /// token authorized before the scope was requested). Refreshing it doesn't help;
+    /// connecting the provider again grants what is requested now.
+    #[error("Token lacks a required scope: {0}")]
+    MissingScope(String),
+
     #[error("Token refresh failed: {0}")]
     TokenRefreshFailed(String),
 
@@ -301,6 +307,36 @@ pub trait CloudProvider: Send + Sync {
     async fn legacy_layout_dir(&self, folder_id: Option<&str>) -> Result<Option<Vec<String>>> {
         let _ = folder_id;
         Ok(None)
+    }
+
+    /// A stable identifier of the account the token is for (Dropbox `account_id`, Google
+    /// Drive `permissionId`, OneDrive drive `id`). The manifest full sync keeps between runs
+    /// ([`SyncConfig::persist_state`]) is stored per account, so what one account's sync
+    /// recorded is never applied to another's files: after the provider is connected to
+    /// another account, that account's first sync infers no deletions. `None` when the
+    /// provider can't tell (the default); every account then shares one manifest per folder.
+    async fn account_id(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// The name the manifest full sync keeps between runs ([`SyncConfig::persist_state`]) is
+    /// stored under for the sync folder `folder_id` (as [`list_files`](Self::list_files) takes
+    /// it): the same for the spellings the provider takes for one folder, so a sync under one
+    /// goes by the state the last sync of the folder left, never by an older one kept for
+    /// another spelling. The default, `folder_id` without a trailing `/` (`""` for none), tells
+    /// every spelling apart.
+    fn folder_key(&self, folder_id: Option<&str>) -> String {
+        folder_id.unwrap_or("").trim_end_matches('/').to_string()
+    }
+
+    /// Whether the provider takes paths that differ only in letter case for one path, as
+    /// Dropbox and OneDrive do: a single file answers to every spelling, and a write to it by
+    /// another spelling (an upload after a case-only rename here, or into a folder spelled
+    /// otherwise) may leave it listed under the spelling it had. Full sync then matches local
+    /// paths to listed ones ignoring case (see [`CloudSync::sync`]). `false`, the default:
+    /// Google Drive tells `a.pdf` and `A.pdf` apart.
+    fn ignores_case(&self) -> bool {
+        false
     }
 
     /// Whether `content` is the content of the remote file `file`, going by the hash its listing

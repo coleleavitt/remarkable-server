@@ -149,6 +149,7 @@ pub struct SyncResponse {
     pub status: String,
     pub uploaded: usize,
     pub downloaded: usize,
+    /// Local copies of files deleted remotely, moved to `<local_path>/.rms-remote-deleted/`.
     pub deleted: usize,
     pub conflicts: usize,
     pub errors: Vec<String>,
@@ -392,6 +393,29 @@ async fn resolve_sync_dir(
     }
 }
 
+/// How `POST /sync` syncs: into `local_path`, from `cloud_folder`, in `direction` (`upload`,
+/// `download`, anything else both ways). Each request makes a new [`CloudSync`], so the state
+/// of the last sync is kept on disk (see [`SyncConfig::persist_state`]): without it, every sync
+/// would be a first one, uploading again what was deleted remotely.
+fn sync_config(
+    local_path: PathBuf,
+    cloud_folder: Option<String>,
+    direction: Option<&str>,
+) -> SyncConfig {
+    use crate::integrations::sync::SyncDirection;
+    SyncConfig {
+        local_path,
+        cloud_folder,
+        direction: match direction {
+            Some("upload") => SyncDirection::Upload,
+            Some("download") => SyncDirection::Download,
+            _ => SyncDirection::Bidirectional,
+        },
+        persist_state: true,
+        ..Default::default()
+    }
+}
+
 /// Trigger sync for a provider
 pub async fn trigger_sync(
     State(state): State<IntegrationState>,
@@ -402,18 +426,7 @@ pub async fn trigger_sync(
         "Sync directory not configured".to_string(),
     ))?;
     let local_path = resolve_sync_dir(base, req.local_path.as_deref()).await?;
-
-    // Create sync config
-    let sync_config = SyncConfig {
-        local_path,
-        cloud_folder: req.cloud_folder,
-        direction: match req.direction.as_deref() {
-            Some("upload") => crate::integrations::sync::SyncDirection::Upload,
-            Some("download") => crate::integrations::sync::SyncDirection::Download,
-            _ => crate::integrations::sync::SyncDirection::Bidirectional,
-        },
-        ..Default::default()
-    };
+    let sync_config = sync_config(local_path, req.cloud_folder, req.direction.as_deref());
 
     // Wait our turn *before* reading config/token: a sync queued behind another must not run
     // with a token captured before the provider was disconnected.
@@ -726,6 +739,26 @@ mod tests {
             err,
             (StatusCode::BAD_REQUEST, "Not authenticated".to_string())
         );
+    }
+
+    /// Every `POST /sync` is a new `CloudSync`, so the state of the last sync must be kept on
+    /// disk, or each sync would upload again what was deleted remotely. This checks the config
+    /// `trigger_sync` builds each sync from (`sync_config`, its only source of one); that a
+    /// config with `persist_state` keeps the state from one `CloudSync` to the next is tested
+    /// in `sync` and against the providers' fakes.
+    #[test]
+    fn sync_requests_are_configured_to_keep_state() {
+        use crate::integrations::sync::SyncDirection;
+        for (direction, expected) in [
+            (Some("upload"), SyncDirection::Upload),
+            (Some("download"), SyncDirection::Download),
+            (None, SyncDirection::Bidirectional),
+        ] {
+            let config = sync_config("/x".into(), Some("/Notes".into()), direction);
+            assert!(config.persist_state);
+            assert_eq!(config.direction, expected);
+            assert_eq!(config.cloud_folder.as_deref(), Some("/Notes"));
+        }
     }
 
     #[tokio::test]

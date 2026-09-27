@@ -28,6 +28,17 @@ const PAGE_SIZE: u32 = 1000;
 /// Fields requested for every listed file (plus `nextPageToken` for paging).
 const LIST_FIELDS: &str =
     "nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum,parents)";
+/// Fields requested of a file uploaded (created or updated).
+const FILE_FIELDS: &str = "id,name,mimeType,size,modifiedTime,md5Checksum,parents";
+/// Prefix of the MIME types of Google's own formats (Docs, Sheets, folders…), which have no
+/// content of their own to replace.
+const GOOGLE_APPS_MIME: &str = "application/vnd.google-apps.";
+
+/// Drive's `md5Checksum` of `content`, in hex.
+fn md5_hex(content: &[u8]) -> String {
+    use md5::{Digest, Md5};
+    hex::encode(Md5::digest(content))
+}
 
 /// Escape a value for a single-quoted string in a Drive `q` expression.
 fn escape_query(s: &str) -> String {
@@ -84,27 +95,58 @@ impl GoogleDrive {
         Ok(self.client.request(method, url).bearer_auth(token))
     }
 
-    /// Find a non-trashed child folder of `parent` named `name`.
-    async fn find_folder(&self, parent: &str, name: &str) -> Result<Option<String>> {
+    /// The oldest non-trashed child of `parent` named exactly `name`, of any type. Drive allows
+    /// same-named siblings, and [`list_files`](CloudProvider::list_files) lists the oldest of
+    /// them at their path, so this is the one a sync path names.
+    async fn oldest_named(&self, parent: &str, name: &str) -> Result<Option<DriveFile>> {
         let query = format!(
-            "name = '{}' and '{}' in parents and mimeType = '{}' and trashed = false",
+            "name = '{}' and '{}' in parents and trashed = false",
             escape_query(name),
-            escape_query(parent),
-            FOLDER_MIME
+            escape_query(parent)
         );
+        let files = self.list_query(&query).await?;
+        Ok(files.into_iter().find(|f| f.name == name))
+    }
+
+    /// The folder the listing walks at `parent`/`name`, so a file uploaded under it is listed
+    /// there next time: the oldest non-trashed child of that name, of any type, as in
+    /// [`list_files`](CloudProvider::list_files). `None` when there is no item of that name.
+    ///
+    /// When that oldest item is not a folder (a file, a Google Docs file, a shortcut), the
+    /// listing shows it at the path and never walks a folder of the same name, so creating one
+    /// (or using a newer one) would put uploads where the next listing can't see them, and a
+    /// sync with kept state would take them for deleted remotely. That is an error instead,
+    /// as [`upload_file`](CloudProvider::upload_file) gives for a folder in the way.
+    async fn find_folder(&self, parent: &str, name: &str) -> Result<Option<String>> {
+        match self.oldest_named(parent, name).await? {
+            None => Ok(None),
+            Some(f) if f.mime_type == FOLDER_MIME => Ok(Some(f.id)),
+            Some(f) => Err(IntegrationError::Conflict(format!(
+                "{:?}: a {} of that name is there, not a folder, so nothing can be uploaded \
+                 under it",
+                name, f.mime_type
+            ))),
+        }
+    }
+
+    /// Replace the content of file `id`, keeping its id, name, parents and (unless `mime` says
+    /// otherwise) type: `files.update` with a media upload.
+    async fn update_content(&self, id: &str, content: &[u8], mime: &str) -> Result<DriveFile> {
         let url = format!(
-            "{}/files?q={}&fields=files(id,name,mimeType,parents)",
-            self.api_base,
-            urlencoding::encode(&query)
+            "{}/files/{}?uploadType=media&fields={}",
+            self.upload_base,
+            urlencoding::encode(id),
+            FILE_FIELDS
         );
         let response = self
-            .request(reqwest::Method::GET, &url)
+            .request(reqwest::Method::PATCH, &url)
             .await?
+            .header("Content-Type", mime)
+            .body(content.to_vec())
             .send()
             .await
             .map_err(|e| IntegrationError::Network(e.to_string()))?;
-        let list: ListFilesResponse = self.handle_response(response).await?;
-        Ok(list.files.into_iter().next().map(|f| f.id))
+        self.handle_response(response).await
     }
 
     /// Every file matching `query`, following `nextPageToken` until the listing is exhausted.
@@ -425,8 +467,35 @@ impl CloudProvider for GoogleDrive {
     /// the walk is defensive: each folder is entered once (no cycles), each file id is listed
     /// once, the first item wins a duplicate path (oldest, via `orderBy=createdTime`), names
     /// that aren't a single safe path segment are skipped, and depth is capped.
+    ///
+    /// A sync folder that is gone, not visible to this account, in the trash or not a folder
+    /// is an error: its children would list as none (Drive answers the query for a missing
+    /// parent with an empty page), and a sync would take every file it knew there for deleted.
     async fn list_files(&self, folder_id: Option<&str>) -> Result<Vec<CloudFile>> {
         let root = folder_id.unwrap_or("root").to_string();
+        if root != "root" {
+            match self.folder_meta(&root).await? {
+                None => {
+                    return Err(IntegrationError::NotFound(format!(
+                        "sync folder {:?} (deleted, or not shared with this account)",
+                        root
+                    )));
+                }
+                Some(f) if f.trashed == Some(true) => {
+                    return Err(IntegrationError::Api(format!(
+                        "sync folder {:?} ({:?}) is in the trash",
+                        root, f.name
+                    )));
+                }
+                Some(f) if f.mime_type != FOLDER_MIME => {
+                    return Err(IntegrationError::Api(format!(
+                        "sync folder {:?} ({:?}) is not a folder",
+                        root, f.name
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
         let mut visited_folders = HashSet::from([root.clone()]);
         let mut seen_files = HashSet::new();
         let mut seen_paths = HashSet::new();
@@ -468,6 +537,45 @@ impl CloudProvider for GoogleDrive {
             }
         }
         Ok(out)
+    }
+
+    /// The folder's id as given, and `""` for My Drive, given as none or `root` (as
+    /// [`list_files`](CloudProvider::list_files) takes both).
+    fn folder_key(&self, folder_id: Option<&str>) -> String {
+        match folder_id {
+            None | Some("root") => String::new(),
+            Some(id) => id.to_string(),
+        }
+    }
+
+    /// `about.get`'s `user.permissionId`, the signed-in user's stable id.
+    async fn account_id(&self) -> Result<Option<String>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct User {
+            permission_id: String,
+        }
+        #[derive(Deserialize)]
+        struct About {
+            user: User,
+        }
+        let url = format!("{}/about?fields=user(permissionId)", self.api_base);
+        let response = self
+            .request(reqwest::Method::GET, &url)
+            .await?
+            .send()
+            .await
+            .map_err(|e| IntegrationError::Network(e.to_string()))?;
+        let about: About = self.handle_response(response).await?;
+        Ok(Some(about.user.permission_id))
+    }
+
+    /// Compares `content_hash` (Drive's `md5Checksum`, which files in Google's own formats
+    /// don't have) with the MD5 of `content`.
+    fn content_matches(&self, file: &CloudFile, content: &[u8]) -> bool {
+        file.content_hash
+            .as_deref()
+            .is_some_and(|h| h.eq_ignore_ascii_case(&md5_hex(content)))
     }
 
     async fn list_folders(&self) -> Result<Vec<CloudFolder>> {
@@ -523,6 +631,12 @@ impl CloudProvider for GoogleDrive {
             .map_err(|e| IntegrationError::Network(e.to_string()))
     }
 
+    /// Upload `name` into `parent_id` (default: My Drive). When the folder already has an item
+    /// of that name, the one [`list_files`](CloudProvider::list_files) lists there (the oldest)
+    /// is updated in place, keeping its id: creating another would leave the listing showing
+    /// the old one, which the next sync would take for the current remote version. An item
+    /// there with no content to replace (a folder, a Google Docs file) is an error rather than
+    /// a new file hidden behind it.
     async fn upload_file(
         &self,
         parent_id: Option<&str>,
@@ -530,6 +644,18 @@ impl CloudProvider for GoogleDrive {
         content: &[u8],
         mime_type: Option<&str>,
     ) -> Result<CloudFile> {
+        if let Some(existing) = self.oldest_named(parent_id.unwrap_or("root"), name).await? {
+            if existing.mime_type.starts_with(GOOGLE_APPS_MIME) {
+                return Err(IntegrationError::Conflict(format!(
+                    "{:?}: a {} of that name is there, which an upload can't replace",
+                    name, existing.mime_type
+                )));
+            }
+            let mime = mime_type.unwrap_or(&existing.mime_type);
+            let file = self.update_content(&existing.id, content, mime).await?;
+            return Ok(file.to_cloud_file(format!("/{}", file.name)));
+        }
+
         let mime = mime_type.unwrap_or("application/octet-stream");
 
         // Use multipart upload for simplicity
@@ -566,8 +692,8 @@ impl CloudProvider for GoogleDrive {
         body.extend_from_slice(format!("--{}--", boundary).as_bytes());
 
         let url = format!(
-            "{}/files?uploadType=multipart&fields=id,name,mimeType,size,modifiedTime,md5Checksum,parents",
-            self.upload_base
+            "{}/files?uploadType=multipart&fields={}",
+            self.upload_base, FILE_FIELDS
         );
 
         let token = self.access_token()?;
@@ -865,6 +991,7 @@ mod tests {
     }
 
     /// Fake Drive API on a random local port; returns the base URL and the logged queries.
+    /// `files.get` (not logged) knows every folder a listing starts from.
     async fn fake_drive() -> (String, Arc<Mutex<Vec<HashMap<String, String>>>>) {
         let log = Arc::new(Mutex::new(Vec::new()));
         let app = axum::Router::new()
@@ -877,6 +1004,14 @@ mod tests {
                         let body = page(&parent, q.get("pageToken").map(String::as_str));
                         log.lock().unwrap().push(q);
                         Json(body)
+                    },
+                ),
+            )
+            .route(
+                "/files/{id}",
+                get(
+                    |axum::extract::Path(id): axum::extract::Path<String>| async move {
+                        Json(folder(&id, &id))
                     },
                 ),
             )
@@ -1199,6 +1334,688 @@ mod tests {
         let err = d.download_file("flaky").await.unwrap_err();
         assert!(!err.is_permanent(), "{err}");
         assert_eq!(d.download_file("ok").await.unwrap(), b"ok");
+    }
+
+    /// The account a sync's state is kept for is `about.get`'s `user.permissionId`.
+    #[tokio::test]
+    async fn account_id_is_the_users_permission_id() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        let app = axum::Router::new().route(
+            "/about",
+            get(|Query(q): Query<HashMap<String, String>>| async move {
+                match q.get("fields").map(String::as_str) {
+                    Some("user(permissionId)") => {
+                        Json(json!({ "user": { "permissionId": "0123abc" } })).into_response()
+                    }
+                    _ => StatusCode::BAD_REQUEST.into_response(),
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        assert_eq!(
+            drive(&base).account_id().await.unwrap().as_deref(),
+            Some("0123abc")
+        );
+    }
+
+    /// Drive tells `a.pdf` and `A.pdf` apart, so full sync matches paths as they are spelled.
+    #[test]
+    fn paths_tell_case_apart() {
+        assert!(!drive("http://localhost").ignores_case());
+    }
+
+    /// Full sync keeps one state for My Drive however it is given, as listings take both
+    /// spellings for it; a folder's is kept under its id, which tells case apart.
+    #[test]
+    fn folder_keys_name_my_drive_one_way() {
+        let d = drive("http://localhost");
+        for (folder, key) in [(None, ""), (Some("root"), ""), (Some("1AbC"), "1AbC")] {
+            assert_eq!(d.folder_key(folder), key, "{folder:?}");
+        }
+    }
+
+    /// Uploads, folder lookups, the sync folder check and full syncs with kept state, against a
+    /// Drive that keeps what is written to it, with Drive's semantics: items are addressed by
+    /// id, a folder may hold several items of one name, `files.create` always adds an item,
+    /// `files.update` replaces one's content, a trashed folder's children count as trashed, and
+    /// `files.list` gives items oldest first only when asked (`orderBy=createdTime`; newest
+    /// first otherwise).
+    mod kept {
+        use std::path::Path;
+
+        use axum::body::Bytes;
+        use axum::extract::Path as UrlPath;
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::response::{IntoResponse, Response};
+        use axum::routing::patch;
+
+        use super::*;
+        use crate::integrations::sync::{
+            CloudSync,
+            SyncConfig,
+            SyncDirection,
+            SyncResult,
+            SyncStatus,
+        };
+
+        struct Item {
+            id: String,
+            name: String,
+            parent: String,
+            mime: String,
+            content: Vec<u8>,
+            /// Seconds after an arbitrary time in 2023: before anything written locally.
+            modified: i64,
+            trashed: bool,
+        }
+
+        #[derive(Default)]
+        struct Drive {
+            /// In the order they were created.
+            items: Vec<Item>,
+            clock: i64,
+            /// Ids downloaded, in order.
+            downloads: Vec<String>,
+        }
+        type Shared = Arc<Mutex<Drive>>;
+
+        impl Drive {
+            fn add(&mut self, parent: &str, name: &str, mime: &str, content: &[u8]) -> String {
+                self.clock += 1;
+                let id = format!("d{}", self.clock);
+                self.items.push(Item {
+                    id: id.clone(),
+                    name: name.into(),
+                    parent: parent.into(),
+                    mime: mime.into(),
+                    content: content.to_vec(),
+                    modified: self.clock,
+                    trashed: false,
+                });
+                id
+            }
+
+            fn folder(&mut self, parent: &str, name: &str) -> String {
+                self.add(parent, name, FOLDER_MIME, b"")
+            }
+
+            fn file(&mut self, parent: &str, name: &str, content: &[u8]) -> String {
+                self.add(parent, name, "application/pdf", content)
+            }
+
+            fn get(&self, id: &str) -> Option<&Item> {
+                self.items.iter().find(|i| i.id == id)
+            }
+
+            fn get_mut(&mut self, id: &str) -> Option<&mut Item> {
+                self.items.iter_mut().find(|i| i.id == id)
+            }
+
+            /// Trashed itself or through a folder above it.
+            fn trashed(&self, item: &Item) -> bool {
+                item.trashed || self.get(&item.parent).is_some_and(|p| self.trashed(p))
+            }
+
+            fn json(&self, item: &Item) -> Value {
+                let mut v = json!({
+                    "id": item.id, "name": item.name, "mimeType": item.mime,
+                    "parents": [item.parent], "trashed": self.trashed(item),
+                });
+                if !item.mime.starts_with(GOOGLE_APPS_MIME) {
+                    let modified =
+                        chrono::DateTime::from_timestamp(1_690_000_000 + item.modified, 0)
+                            .unwrap()
+                            .to_rfc3339();
+                    v["size"] = json!(item.content.len().to_string());
+                    v["md5Checksum"] = json!(md5_hex(&item.content));
+                    v["modifiedTime"] = json!(modified);
+                }
+                v
+            }
+
+            /// Live (not trashed) items named `name` in `parent`, oldest first.
+            fn named(&self, parent: &str, name: &str) -> Vec<&Item> {
+                self.items
+                    .iter()
+                    .filter(|i| i.parent == parent && i.name == name && !self.trashed(i))
+                    .collect()
+            }
+
+            fn content(&self, id: &str) -> String {
+                String::from_utf8(self.get(id).unwrap().content.clone()).unwrap()
+            }
+        }
+
+        /// The value of each `field = 'value'` / `'value' in parents` clause of a `q`.
+        fn clauses(q: &str) -> HashMap<String, String> {
+            q.split(" and ")
+                .filter_map(|c| {
+                    let quoted = c.split('\'').nth(1)?.to_string();
+                    let key = if c.ends_with("in parents") {
+                        "parent".to_string()
+                    } else {
+                        c.split(' ').next()?.to_string()
+                    };
+                    Some((key, quoted))
+                })
+                .collect()
+        }
+
+        async fn list(
+            State(d): State<Shared>,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> Json<Value> {
+            let d = d.lock().unwrap();
+            let want = clauses(&q["q"]);
+            assert!(q["q"].contains("trashed = false"), "{q:?}");
+            let mut found: Vec<Value> = d
+                .items
+                .iter()
+                .filter(|i| !d.trashed(i))
+                .filter(|i| want.get("parent") == Some(&i.parent))
+                .filter(|i| want.get("name").is_none_or(|n| *n == i.name))
+                .filter(|i| want.get("mimeType").is_none_or(|m| *m == i.mime))
+                .map(|i| d.json(i))
+                .collect();
+            if q.get("orderBy").map(String::as_str) != Some("createdTime") {
+                found.reverse();
+            }
+            Json(json!({ "files": found }))
+        }
+
+        async fn get_item(
+            State(d): State<Shared>,
+            UrlPath(id): UrlPath<String>,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> Response {
+            let mut d = d.lock().unwrap();
+            let Some(item) = d.get(&id) else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            if q.get("alt").map(String::as_str) == Some("media") {
+                let content = item.content.clone();
+                d.downloads.push(id);
+                return content.into_response();
+            }
+            Json(d.json(item)).into_response()
+        }
+
+        /// `files.create`: a folder (JSON metadata) or a multipart upload. Always a new item.
+        async fn create(
+            State(d): State<Shared>,
+            Query(q): Query<HashMap<String, String>>,
+            headers: HeaderMap,
+            body: Bytes,
+        ) -> Json<Value> {
+            let mut d = d.lock().unwrap();
+            let (meta, content) = if q.get("uploadType").map(String::as_str) == Some("multipart") {
+                let boundary = headers["content-type"]
+                    .to_str()
+                    .unwrap()
+                    .split("boundary=")
+                    .nth(1)
+                    .unwrap()
+                    .to_string();
+                let body = [b"\r\n".as_slice(), &body].concat();
+                let delim = format!("\r\n--{boundary}");
+                let parts = split(&body, delim.as_bytes());
+                let payload = |part: &[u8]| {
+                    let at = part.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+                    part[at + 4..].to_vec()
+                };
+                let meta: Value = serde_json::from_slice(&payload(parts[1])).unwrap();
+                (meta, payload(parts[2]))
+            } else {
+                (serde_json::from_slice(&body).unwrap(), Vec::new())
+            };
+            let parent = meta["parents"][0].as_str().unwrap_or("root").to_string();
+            let mime = meta["mimeType"].as_str().unwrap_or("application/pdf");
+            let id = d.add(&parent, meta["name"].as_str().unwrap(), mime, &content);
+            Json(d.json(d.get(&id).unwrap()))
+        }
+
+        /// `files.update` with a media upload: new content, the same item.
+        async fn update(
+            State(d): State<Shared>,
+            UrlPath(id): UrlPath<String>,
+            Query(q): Query<HashMap<String, String>>,
+            body: Bytes,
+        ) -> Response {
+            assert_eq!(q.get("uploadType").map(String::as_str), Some("media"));
+            let mut d = d.lock().unwrap();
+            d.clock += 1;
+            let clock = d.clock;
+            let Some(item) = d.get_mut(&id) else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            item.content = body.to_vec();
+            item.modified = clock;
+            Json(d.json(d.get(&id).unwrap())).into_response()
+        }
+
+        fn split<'a>(body: &'a [u8], delim: &[u8]) -> Vec<&'a [u8]> {
+            let mut parts = Vec::new();
+            let mut rest = body;
+            while let Some(at) = rest.windows(delim.len()).position(|w| w == delim) {
+                parts.push(&rest[..at]);
+                rest = &rest[at + delim.len()..];
+            }
+            parts.push(rest);
+            parts
+        }
+
+        async fn serve(d: Shared) -> String {
+            let app = axum::Router::new()
+                .route("/files", get(list).post(create))
+                .route("/files/{id}", get(get_item).merge(patch(update)))
+                .route(
+                    "/about",
+                    get(|| async { Json(json!({ "user": { "permissionId": "me" } })) }),
+                )
+                .with_state(d);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            base
+        }
+
+        /// A full sync of folder `folder` into `root`, keeping the state as `POST /sync` does.
+        async fn sync(
+            base: &str,
+            root: &Path,
+            folder: &str,
+            direction: SyncDirection,
+        ) -> SyncResult {
+            let config = SyncConfig {
+                local_path: root.to_path_buf(),
+                cloud_folder: Some(folder.into()),
+                direction,
+                persist_state: true,
+                ..Default::default()
+            };
+            CloudSync::new(drive(base), config).sync().await.unwrap()
+        }
+
+        /// [`sync`] both ways, which must report no errors; uploaded, downloaded, moved aside.
+        async fn clean(base: &str, root: &Path, folder: &str) -> (usize, usize, usize) {
+            let r = sync(base, root, folder, SyncDirection::Bidirectional).await;
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+            assert!(r.conflicts.is_empty(), "{:?}", r.conflicts);
+            (r.uploaded, r.downloaded, r.deleted)
+        }
+
+        fn write(root: &Path, rel: &str, body: &str) {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+
+        fn read(root: &Path, rel: &str) -> String {
+            std::fs::read_to_string(root.join(rel)).unwrap()
+        }
+
+        /// A file edited here is uploaded over the one listed at its path (the same id, in the
+        /// same folder, nested or not), so the next syncs find both sides unchanged: the edit
+        /// is never undone by downloading the old version, and nothing is duplicated. A new
+        /// file is created once.
+        #[tokio::test]
+        async fn a_local_edit_survives_the_syncs_after_its_upload() {
+            let d = Shared::default();
+            let (notes, a, sub, b) = {
+                let mut d = d.lock().unwrap();
+                let notes = d.folder("root", "Notes");
+                let a = d.file(&notes, "a.pdf", b"a v1");
+                let sub = d.folder(&notes, "Sub");
+                let b = d.file(&sub, "b.pdf", b"b v1");
+                (notes, a, sub, b)
+            };
+            let base = serve(d.clone()).await;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            assert_eq!(clean(&base, root, &notes).await, (0, 2, 0));
+
+            write(root, "a.pdf", "a v2, edited here");
+            write(root, "Sub/b.pdf", "b v2, edited here");
+            write(root, "Sub/c.pdf", "c, new here");
+            assert_eq!(clean(&base, root, &notes).await, (3, 0, 0));
+            {
+                let d = d.lock().unwrap();
+                let ids = |parent: &str, name: &str| -> Vec<String> {
+                    d.named(parent, name).iter().map(|i| i.id.clone()).collect()
+                };
+                assert_eq!(ids(&notes, "a.pdf"), vec![a.clone()]);
+                assert_eq!(ids(&notes, "Sub"), vec![sub.clone()]);
+                assert_eq!(ids(&sub, "b.pdf"), vec![b.clone()]);
+                assert_eq!(ids(&sub, "c.pdf").len(), 1);
+                assert_eq!(d.content(&a), "a v2, edited here");
+                assert_eq!(d.content(&b), "b v2, edited here");
+            }
+
+            for _ in 0..2 {
+                assert_eq!(clean(&base, root, &notes).await, (0, 0, 0));
+                assert_eq!(read(root, "a.pdf"), "a v2, edited here");
+                assert_eq!(read(root, "Sub/b.pdf"), "b v2, edited here");
+            }
+            let mut downloads = d.lock().unwrap().downloads.clone();
+            downloads.sort();
+            let mut first = vec![a, b];
+            first.sort();
+            assert_eq!(downloads, first, "only the first sync downloads");
+        }
+
+        /// The first sync after upgrading (no state yet) against a Drive that earlier versions
+        /// left with a duplicate of an edited file (every upload created one, and the listing
+        /// shows the oldest): the local edit wins the conflict strategy and replaces the listed
+        /// file, and later syncs leave it be. A file whose content is the same on both sides
+        /// (Drive's MD5) is recorded without going through the conflict strategy at all.
+        #[tokio::test]
+        async fn upgrading_keeps_local_edits_and_known_content() {
+            let d = Shared::default();
+            let (notes, a1, a2, c) = {
+                let mut d = d.lock().unwrap();
+                let notes = d.folder("root", "Notes");
+                let a1 = d.file(&notes, "a.pdf", b"a v1");
+                let a2 = d.file(&notes, "a.pdf", b"a v2, edited here");
+                let c = d.file(&notes, "c.pdf", b"the same");
+                (notes, a1, a2, c)
+            };
+            let base = serve(d.clone()).await;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            write(root, "a.pdf", "a v2, edited here");
+            write(root, "c.pdf", "the same");
+
+            let config = SyncConfig {
+                local_path: root.to_path_buf(),
+                cloud_folder: Some(notes.clone()),
+                conflict_strategy: crate::integrations::ConflictStrategy::AskUser,
+                persist_state: true,
+                ..Default::default()
+            };
+            let r = CloudSync::new(drive(&base), config).sync().await.unwrap();
+            assert_eq!(
+                r.conflicts.len(),
+                1,
+                "only a.pdf differs: {:?}",
+                r.conflicts
+            );
+            assert_eq!(r.conflicts[0].cloud_file.id, a1);
+            std::fs::remove_file(root.join(crate::integrations::sync::MANIFEST_FILE)).unwrap();
+
+            assert_eq!(clean(&base, root, &notes).await, (1, 0, 0));
+            {
+                let d = d.lock().unwrap();
+                assert_eq!(d.content(&a1), "a v2, edited here");
+                assert_eq!(d.content(&a2), "a v2, edited here");
+                assert_eq!(d.content(&c), "the same");
+                assert_eq!(d.items.len(), 4);
+            }
+            for _ in 0..2 {
+                assert_eq!(clean(&base, root, &notes).await, (0, 0, 0));
+                assert_eq!(read(root, "a.pdf"), "a v2, edited here");
+            }
+            assert!(d.lock().unwrap().downloads.is_empty());
+        }
+
+        /// A download-only first sync records a file already the same on both sides, so a later
+        /// remote deletion of it is applied (the unchanged local copy moved aside).
+        #[tokio::test]
+        async fn download_only_records_files_the_same_on_both_sides() {
+            let d = Shared::default();
+            let (notes, a) = {
+                let mut d = d.lock().unwrap();
+                let notes = d.folder("root", "Notes");
+                let a = d.file(&notes, "a.pdf", b"A");
+                d.file(&notes, "b.pdf", b"B");
+                (notes, a)
+            };
+            let base = serve(d.clone()).await;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            write(root, "a.pdf", "A");
+            let r = sync(&base, root, &notes, SyncDirection::Download).await;
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 1, 0));
+
+            d.lock().unwrap().get_mut(&a).unwrap().trashed = true;
+            let r = sync(&base, root, &notes, SyncDirection::Download).await;
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 0, 1));
+            assert!(!root.join("a.pdf").exists());
+            assert_eq!(read(root, "b.pdf"), "B");
+        }
+
+        /// A sync folder in the trash, gone, or not a folder fails the listing, so the sync
+        /// fails as a whole: nothing is taken for deleted remotely and moved aside. Restored,
+        /// it syncs as before.
+        #[tokio::test]
+        async fn a_trashed_or_missing_sync_folder_fails_the_sync() {
+            let d = Shared::default();
+            let (notes, file) = {
+                let mut d = d.lock().unwrap();
+                let notes = d.folder("root", "Notes");
+                let file = d.file(&notes, "a.pdf", b"A");
+                (notes, file)
+            };
+            let base = serve(d.clone()).await;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            assert_eq!(clean(&base, root, &notes).await, (0, 1, 0));
+
+            let failed = |r: SyncResult, why: &str| {
+                assert_eq!(r.status, SyncStatus::Failed);
+                assert!(
+                    r.errors[0].starts_with("Failed to list cloud files: ")
+                        && r.errors[0].contains(why),
+                    "{:?}",
+                    r.errors
+                );
+                assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 0, 0));
+            };
+            d.lock().unwrap().get_mut(&notes).unwrap().trashed = true;
+            failed(
+                sync(&base, root, &notes, SyncDirection::Bidirectional).await,
+                "in the trash",
+            );
+            failed(
+                sync(&base, root, "gone", SyncDirection::Bidirectional).await,
+                "not shared",
+            );
+            d.lock().unwrap().get_mut(&notes).unwrap().trashed = false;
+            failed(
+                sync(&base, root, &file, SyncDirection::Bidirectional).await,
+                "not a folder",
+            );
+            assert_eq!(read(root, "a.pdf"), "A");
+            assert!(
+                !root
+                    .join(crate::integrations::sync::QUARANTINE_DIR)
+                    .exists()
+            );
+
+            assert_eq!(clean(&base, root, &notes).await, (0, 0, 0));
+            assert_eq!(read(root, "a.pdf"), "A");
+        }
+
+        /// An upload goes into the folder the listing walks (the oldest of same-named ones) and
+        /// never replaces an item with no content of its own (a folder, a Google Docs file):
+        /// that is an error, not a new file hidden behind it.
+        #[tokio::test]
+        async fn uploads_go_where_the_listing_looks() {
+            let d = Shared::default();
+            let (notes, old_sub, doc) = {
+                let mut d = d.lock().unwrap();
+                let notes = d.folder("root", "Notes");
+                let old_sub = d.folder(&notes, "Sub");
+                d.folder(&notes, "Sub");
+                let doc = d.add(&notes, "doc", "application/vnd.google-apps.document", b"");
+                d.folder(&notes, "dir");
+                (notes, old_sub, doc)
+            };
+            let base = serve(d.clone()).await;
+            let g = drive(&base);
+            let f = g
+                .upload_file_at(Some(&notes), &["Sub", "x.pdf"], b"x", None)
+                .await
+                .unwrap();
+            assert_eq!(f.path, "/Sub/x.pdf");
+            assert_eq!(d.lock().unwrap().named(&old_sub, "x.pdf").len(), 1);
+
+            for name in ["doc", "dir"] {
+                let err = g
+                    .upload_file_at(Some(&notes), &[name], b"x", None)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(err, IntegrationError::Conflict(_)),
+                    "{name}: {err}"
+                );
+                assert_eq!(d.lock().unwrap().named(&notes, name).len(), 1, "{name}");
+            }
+            assert_eq!(d.lock().unwrap().content(&doc), "");
+        }
+
+        /// A directory is walked the way the listing walks it: through the oldest item of that
+        /// name, whatever its type. When that is not a folder (a file, a Google Docs file, a
+        /// shortcut), no folder is created next to it, since the listing would never walk the
+        /// new folder: uploading there is an error, and nothing is added.
+        #[tokio::test]
+        async fn uploads_never_go_into_a_folder_the_listing_skips() {
+            let d = Shared::default();
+            let (notes, pdf, hidden_x) = {
+                let mut d = d.lock().unwrap();
+                let notes = d.folder("root", "Notes");
+                let pdf = d.file(&notes, "pdf", b"a file");
+                d.add(&notes, "doc", "application/vnd.google-apps.document", b"");
+                d.add(&notes, "link", "application/vnd.google-apps.shortcut", b"");
+                // An older file and a newer folder of one name: the listing keeps the file.
+                d.file(&notes, "both", b"a file");
+                let hidden = d.folder(&notes, "both");
+                let hidden_x = d.file(&hidden, "x.pdf", b"hidden");
+                (notes, pdf, hidden_x)
+            };
+            let base = serve(d.clone()).await;
+            let g = drive(&base);
+            let listed = g.list_files(Some(&notes)).await.unwrap();
+            assert!(
+                listed.iter().all(|f| !f.path.starts_with("/both/")),
+                "{listed:?}"
+            );
+            let before = d.lock().unwrap().items.len();
+            for name in ["pdf", "doc", "link", "both"] {
+                let err = g
+                    .upload_file_at(Some(&notes), &[name, "x.pdf"], b"x", None)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(&err, IntegrationError::Conflict(m) if m.contains("not a folder")),
+                    "{name}: {err}"
+                );
+            }
+            let d = d.lock().unwrap();
+            assert_eq!(d.items.len(), before, "nothing created");
+            assert_eq!(d.content(&pdf), "a file");
+            assert_eq!(
+                d.content(&hidden_x),
+                "hidden",
+                "nothing written behind the file"
+            );
+        }
+
+        /// The same through full syncs with kept state: a local directory `A/` where the sync
+        /// folder has a file `A`. The upload under it fails every time (as does the download of
+        /// `A`, a directory being in the way), so nothing is recorded as uploaded, and no later
+        /// sync takes the local files for deleted remotely and moves them aside.
+        #[tokio::test]
+        async fn a_directory_named_like_a_remote_file_is_never_moved_aside() {
+            let d = Shared::default();
+            let (notes, a) = {
+                let mut d = d.lock().unwrap();
+                let notes = d.folder("root", "Notes");
+                let a = d.file(&notes, "A", b"remote A");
+                (notes, a)
+            };
+            let base = serve(d.clone()).await;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            write(root, "A/x.pdf", "x, new here");
+
+            for round in 0..3 {
+                let r = sync(&base, root, &notes, SyncDirection::Bidirectional).await;
+                assert_eq!(
+                    (r.uploaded, r.downloaded, r.deleted),
+                    (0, 0, 0),
+                    "round {round}: {:?}",
+                    r.errors
+                );
+                assert!(
+                    r.errors
+                        .iter()
+                        .any(|e| e.starts_with("Upload /A/x.pdf failed: ")
+                            && e.contains("not a folder")),
+                    "round {round}: {:?}",
+                    r.errors
+                );
+                assert!(
+                    r.notices.iter().all(|n| !n.contains("deleted remotely")),
+                    "round {round}: {:?}",
+                    r.notices
+                );
+                assert_eq!(read(root, "A/x.pdf"), "x, new here");
+            }
+            assert!(
+                !root
+                    .join(crate::integrations::sync::QUARANTINE_DIR)
+                    .exists()
+            );
+            let d = d.lock().unwrap();
+            let named: Vec<&str> = d.named(&notes, "A").iter().map(|i| i.id.as_str()).collect();
+            assert_eq!(
+                named,
+                vec![a.as_str()],
+                "no folder A created next to the file"
+            );
+            assert_eq!(d.items.len(), 2);
+            assert_eq!(d.content(&a), "remote A");
+        }
+
+        /// A local name Google Drive listings skip (`Q:A.pdf` below the top: a drive prefix,
+        /// taken as a name on its own) is never listed after its upload. Every sync uploads it
+        /// again, over the same Drive file, as before sync kept state; none takes it for deleted
+        /// in Drive and moves it aside.
+        #[tokio::test]
+        async fn names_the_listing_skips_are_never_moved_aside() {
+            let d = Shared::default();
+            let notes = {
+                let mut d = d.lock().unwrap();
+                let notes = d.folder("root", "Notes");
+                d.file(&notes, "x.pdf", b"X");
+                notes
+            };
+            let base = serve(d.clone()).await;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            write(root, "sub/Q:A.pdf", "mine");
+            for round in 0..3 {
+                let expected = (1, usize::from(round == 0), 0);
+                assert_eq!(clean(&base, root, &notes).await, expected, "round {round}");
+                assert_eq!(read(root, "sub/Q:A.pdf"), "mine");
+            }
+            assert!(
+                !root
+                    .join(crate::integrations::sync::QUARANTINE_DIR)
+                    .exists()
+            );
+            let d = d.lock().unwrap();
+            let sub = d.named(&notes, "sub");
+            assert_eq!(sub.len(), 1);
+            let copies = d.named(&sub[0].id, "Q:A.pdf");
+            assert_eq!(copies.len(), 1, "updated in place, not duplicated");
+            assert_eq!(d.content(&copies[0].id), "mine");
+        }
     }
 
     #[test]

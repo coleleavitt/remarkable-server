@@ -296,12 +296,69 @@ Afterwards:
   OneDrive, `/Documents/Notes/Documents/Notes/…`). If the folder has a subfolder at
   that path, the upgrade sync says so in `notices` and (unless it only uploads)
   downloads it to `integrations/<local_path>/Notes/`. If it is that duplicate,
-  delete it in Dropbox or OneDrive and delete the local copy before the next sync.
-  A full sync uploads files that exist only locally and downloads files that exist
-  only remotely, so whichever copy is left brings the other back.
+  delete it in Dropbox or OneDrive: the next sync moves the local copy it
+  downloaded into `.rms-remote-deleted/` (below). Deleting only the local copy
+  leaves the remote one in place (it isn't downloaded again, but a sync never
+  deletes remote files).
 
 Before the first sync after deploying, look under `integrations/` for directories
 named after a synced folder's path, so the notices hold no surprises.
+
+Cloud sync state: each synced directory `integrations/<local_path>/` holds
+`.rms-sync-state.json`, the state of the last sync of each provider, account and
+`cloud_folder` synced into it (one state for every spelling of a folder the
+provider takes as one: `/Notes` and `/notes` on Dropbox), which full sync
+reconciles against (README, "Integrations API"). Leave it in place, and keep it
+with the directory when moving or restoring storage: without it the next sync of
+that directory is a first sync again, which can't tell deletions from new files
+and uploads files deleted remotely since from their local copies. The first sync
+after deploying this is such a first sync (as every sync was before), so a file
+deleted remotely before then comes back that one last time. Local copies of files
+deleted remotely are moved to `.rms-remote-deleted/<UTC time>/` in the same
+directory, never deleted: look through it now and then and delete what isn't
+needed, as nothing else does. A sync whose listing comes back empty moves nothing
+aside and reports an error listing the local files it left in place: check that
+the folder still exists and is shared with the account, and if its files really
+were deleted, delete the local copies. Files deleted locally stay deleted through
+such a sync. Dropbox and OneDrive paths ignore letter case: a sync that reports
+local files whose paths differ only in case leaves them all alone, including the
+one spelled as the cloud folder lists it; rename them apart or remove the extras.
+Edits to them, on either side, wait until then. The one left at the path is then
+compared with the cloud file as the last sync before the clash left it, so it is
+never overwritten with another's content; if it was never synced and the cloud
+file changed meanwhile, and the conflict strategy takes the cloud file, it is
+first moved to `.rms-remote-deleted/<UTC time>/`, with a notice. State an earlier
+build of this change recorded under several such spellings sends that file
+through the conflict strategy once, with a notice. A state file the server can't
+read (not JSON, or written by a newer version) fails the sync with an error naming
+it; delete it to start over with a first sync. Rolling back to
+an older binary is safe: it ignores both (hidden entries). Upgrading again after
+syncs by the older binary is safe too: files changed while it synced are compared
+by content, and otherwise go through the conflict strategy, as before this change.
+
+Google Drive after deploying this: earlier versions uploaded every changed file as
+a new file next to the old one (Drive allows several files of one name in a
+folder), and a sync only ever sees the oldest of them. Uploads now update that
+oldest file in place. The first sync after deploying compares Drive's MD5 with the
+local files, so files already the same on both sides are left alone; a file edited
+locally since its download still goes through the conflict strategy (newer wins,
+so the local edit replaces the listed copy). The duplicates earlier versions made
+stay in Drive, never seen by sync: look for same-named files in the synced folders
+and delete the newer copies once the oldest holds what you want. The same goes for
+a local directory named like a file (or Google Docs file, or shortcut) in the Drive
+folder: earlier versions made a folder of that name next to the file, which sync
+never sees; now each sync reports an error for the files under that directory
+instead, until the directory or the Drive item is renamed. A Google Drive
+`cloud_folder` in the trash, deleted or no longer shared now fails the sync with an
+error instead of listing as empty.
+
+Dropbox after deploying this: full sync keeps its state per Dropbox account, read
+with the `account_info.read` scope, which the authorize URL now requests. A token
+connected before lacks it: syncs work, keeping their state for an unknown account
+(the log warns), and `GET /providers/dropbox/quota` answers "Token lacks a required
+scope" rather than "Token expired". Connecting Dropbox again (the OAuth flow) grants
+the scope; the next sync is then a first sync for that account (no deletions
+inferred), and later ones use its own state.
 
 Migrating storage from a local server: stop both, `rsync -a test-storage/ linode:/var/lib/remarkable-server/`,
 `chown -R remarkable:remarkable`, start. `sync.db` (with its `-wal`/`-shm`

@@ -295,7 +295,16 @@ fn below<'a>(lower: &'a str, root: &str) -> Option<Vec<&'a str>> {
 async fn response_error(response: reqwest::Response) -> IntegrationError {
     let status = response.status();
     match status.as_u16() {
-        401 => IntegrationError::TokenExpired,
+        // A token without a scope the endpoint needs is no expired token: refreshing it keeps
+        // the scopes it was granted.
+        401 => {
+            let body = response.text().await.unwrap_or_default();
+            if error_summary(&body).is_some_and(|s| s.starts_with("missing_scope/")) {
+                IntegrationError::MissingScope(body)
+            } else {
+                IntegrationError::TokenExpired
+            }
+        }
         429 => IntegrationError::RateLimited {
             retry_after_secs: response
                 .headers()
@@ -597,11 +606,57 @@ impl CloudProvider for Dropbox {
         Ok(parts.iter().all(|p| is_safe_name(p)).then_some(parts))
     }
 
+    /// `users/get_current_account`'s `account_id` (`dbid:…`). That endpoint needs the
+    /// `account_info.read` scope, which tokens authorized before it was requested (see
+    /// [`OAuthConfig::dropbox`]) don't carry: for those the account is unknown (`None`) rather
+    /// than the sync failing. Connecting Dropbox again grants the scope; the account is then
+    /// known, and its first sync infers no deletions.
+    async fn account_id(&self) -> Result<Option<String>> {
+        #[derive(Serialize)]
+        struct Null;
+        #[derive(Deserialize)]
+        struct Account {
+            account_id: String,
+        }
+        match self
+            .api_request::<_, Account>("users/get_current_account", &Null)
+            .await
+        {
+            Ok(account) => Ok(Some(account.account_id)),
+            Err(IntegrationError::MissingScope(why)) => {
+                tracing::warn!(
+                    "dropbox: the token can't read the account ({}); keeping the sync state \
+                     without it. Connect Dropbox again to grant account_info.read",
+                    why
+                );
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Compares `content_hash` with the [Dropbox content hash](content_hash) of `content`.
     fn content_matches(&self, file: &CloudFile, content: &[u8]) -> bool {
         file.content_hash
             .as_deref()
             .is_some_and(|h| h.eq_ignore_ascii_case(&content_hash(content)))
+    }
+
+    /// Dropbox paths are case-insensitive (`path_lower` identifies an item), and an item keeps
+    /// the casing it was created with.
+    fn ignores_case(&self) -> bool {
+        true
+    }
+
+    /// A path in lowercase (`/Notes`, `/notes/` and `/NOTES` are one folder), without a trailing
+    /// slash (`""`, `/`: the whole Dropbox). An `id:` is left as given, as ids tell case apart:
+    /// a folder given once by path and once by id has a state for each.
+    fn folder_key(&self, folder_id: Option<&str>) -> String {
+        let path = api_path(folder_id);
+        match path.starts_with("id:") {
+            true => path.to_string(),
+            false => path.to_lowercase(),
+        }
     }
 
     async fn list_folders(&self) -> Result<Vec<CloudFolder>> {
@@ -1650,6 +1705,28 @@ mod tests {
         }
     }
 
+    /// Full sync keeps one state for each sync folder, whatever the spelling of its path, as
+    /// Dropbox paths ignore case (review of #40, verification round 4). Ids tell case apart.
+    #[test]
+    fn folder_keys_ignore_the_case_of_paths() {
+        let d = Dropbox::new(OAuthConfig::dropbox(
+            "id".into(),
+            None,
+            "http://x/cb".into(),
+        ));
+        for (folder, key) in [
+            (None, ""),
+            (Some(""), ""),
+            (Some("/"), ""),
+            (Some("/Notes"), "/notes"),
+            (Some("/notes/"), "/notes"),
+            (Some("/NOTES/Sub"), "/notes/sub"),
+            (Some("id:AbC_12"), "id:AbC_12"),
+        ] {
+            assert_eq!(d.folder_key(folder), key, "{folder:?}");
+        }
+    }
+
     /// Dropbox's documented content hash: SHA-256 over the SHA-256 of each 4 MiB block.
     #[test]
     fn content_hash_is_dropbox_s() {
@@ -1712,10 +1789,21 @@ mod tests {
         use serde_json::{Value, json};
 
         use super::*;
-        use crate::integrations::sync::{CloudSync, SyncConfig, SyncDirection, SyncResult};
+        use crate::integrations::sync::{
+            CloudSync,
+            SyncConfig,
+            SyncDirection,
+            SyncResult,
+            SyncStatus,
+        };
 
         #[derive(Default)]
         struct Remote {
+            /// What `users/get_current_account` answers.
+            account: String,
+            /// `users/get_current_account` answers `401 missing_scope`, as for a token without
+            /// `account_info.read`.
+            missing_scope: bool,
             /// By `path_lower`: the entry and the file's content.
             entries: BTreeMap<String, (Value, Vec<u8>)>,
             /// Paths uploaded to, in order.
@@ -1791,6 +1879,20 @@ mod tests {
                         }),
                     )
                     .route(
+                        "/users/get_current_account",
+                        post(|State(r): State<Shared>| async move {
+                            let r = r.lock().unwrap();
+                            if r.missing_scope {
+                                return (
+                                    StatusCode::UNAUTHORIZED,
+                                    r#"{"error_summary":"missing_scope/..","error":{".tag":"missing_scope","required_scope":"account_info.read"}}"#,
+                                )
+                                    .into_response();
+                            }
+                            Json(json!({ "account_id": r.account })).into_response()
+                        }),
+                    )
+                    .route(
                         "/files/list_folder",
                         post(|State(r): State<Shared>, Json(b): Json<Value>| async move {
                             let root = key(b["path"].as_str().unwrap());
@@ -1820,9 +1922,14 @@ mod tests {
                             |State(r): State<Shared>,
                              headers: HeaderMap,
                              body: axum::body::Bytes| async move {
-                                let path = api_arg(&headers)["path"].as_str().unwrap().to_string();
+                                let mut path = api_arg(&headers)["path"].as_str().unwrap().to_string();
                                 let mut r = r.lock().unwrap();
                                 r.uploads.push(path.clone());
+                                // A file overwritten by another spelling keeps its own, as the
+                                // folders above it do (`put`).
+                                if let Some((e, _)) = r.entries.get(&path.to_lowercase()) {
+                                    path = e["path_display"].as_str().unwrap().to_string();
+                                }
                                 put(&mut r, &path, &body);
                                 Json(entry("file", &path, &body))
                             },
@@ -1836,6 +1943,32 @@ mod tests {
         }
 
         async fn sync(base: &str, root: &Path, folder: &str) -> SyncResult {
+            sync_with(base, root, folder, false).await
+        }
+
+        /// [`sync`], keeping the state between syncs as `POST /sync` does.
+        async fn sync_kept(base: &str, root: &Path, folder: &str) -> SyncResult {
+            sync_with(base, root, folder, true).await
+        }
+
+        async fn sync_with(
+            base: &str,
+            root: &Path,
+            folder: &str,
+            persist_state: bool,
+        ) -> SyncResult {
+            let r = sync_unchecked(base, root, folder, persist_state).await;
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+            r
+        }
+
+        /// [`sync_with`], whether or not the result has errors.
+        async fn sync_unchecked(
+            base: &str,
+            root: &Path,
+            folder: &str,
+            persist_state: bool,
+        ) -> SyncResult {
             let config = OAuthConfig::dropbox("id".into(), None, "http://localhost/cb".into());
             let token = OAuthToken {
                 access_token: "t".into(),
@@ -1849,11 +1982,10 @@ mod tests {
                 local_path: root.to_path_buf(),
                 cloud_folder: Some(folder.into()),
                 direction: SyncDirection::Bidirectional,
+                persist_state,
                 ..Default::default()
             };
-            let r = CloudSync::new(dropbox, config).sync().await.unwrap();
-            assert!(r.errors.is_empty(), "{:?}", r.errors);
-            r
+            CloudSync::new(dropbox, config).sync().await.unwrap()
         }
 
         fn write(root: &Path, rel: &str, body: &str) {
@@ -1946,6 +2078,141 @@ mod tests {
             assert!(!root.join("Notes").exists());
         }
 
+        /// With the state kept between syncs, as `POST /sync` keeps it: a file deleted in
+        /// Dropbox isn't uploaded again, its local copy is moved aside (and the folder it leaves
+        /// empty goes); one deleted here isn't downloaded again, nor deleted in Dropbox. The state
+        /// is the signed-in account's.
+        #[tokio::test]
+        async fn kept_state_keeps_deletions_deleted() {
+            let remote = Shared::default();
+            {
+                let mut r = remote.lock().unwrap();
+                r.account = "dbid:alice".into();
+                put(&mut r, "/Notes/a.pdf", b"A");
+                put(&mut r, "/Notes/Sub/b.pdf", b"B");
+                put(&mut r, "/Notes/c.pdf", b"C");
+            }
+            let base = fake(remote.clone()).await;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let r = sync_kept(&base, root, "/Notes").await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 3, 0));
+
+            remote.lock().unwrap().entries.remove("/notes/sub/b.pdf");
+            std::fs::remove_file(root.join("c.pdf")).unwrap();
+            let r = sync_kept(&base, root, "/Notes").await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 0, 1));
+            assert_eq!(r.notices.len(), 2, "{:?}", r.notices);
+            assert!(!root.join("Sub").exists() && !root.join("c.pdf").exists());
+            let runs: Vec<_> = std::fs::read_dir(root.join(".rms-remote-deleted"))
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            assert_eq!(runs.len(), 1);
+            assert_eq!(std::fs::read(runs[0].join("Sub/b.pdf")).unwrap(), b"B");
+
+            for _ in 0..2 {
+                let r = sync_kept(&base, root, "/Notes").await;
+                assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 0, 0));
+                assert!(r.notices.is_empty(), "{:?}", r.notices);
+            }
+            assert!(uploads(&remote).is_empty());
+            assert_eq!(remote.lock().unwrap().downloads, 3);
+            assert!(remote.lock().unwrap().entries.contains_key("/notes/c.pdf"));
+            let state: Value =
+                serde_json::from_slice(&std::fs::read(root.join(".rms-sync-state.json")).unwrap())
+                    .unwrap();
+            assert_eq!(state["syncs"][0]["account"], "dbid:alice");
+            assert_eq!(state["syncs"][0]["cloud_folder"], "/notes");
+        }
+
+        /// A token authorized without `account_info.read` (every one before it was asked for)
+        /// can't read the account: the sync still runs, keeping its state for an unknown
+        /// account, and deletions are kept deleted as with a known one. Any other failure of
+        /// the account lookup stops the sync before anything is listed or written.
+        #[tokio::test]
+        async fn a_token_that_cant_read_the_account_still_syncs() {
+            let remote = Shared::default();
+            {
+                let mut r = remote.lock().unwrap();
+                r.missing_scope = true;
+                put(&mut r, "/Notes/a.pdf", b"A");
+                put(&mut r, "/Notes/b.pdf", b"B");
+            }
+            let base = fake(remote.clone()).await;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let r = sync_kept(&base, root, "/Notes").await;
+            assert_eq!((r.status, r.downloaded), (SyncStatus::Success, 2));
+            let state: Value =
+                serde_json::from_slice(&std::fs::read(root.join(".rms-sync-state.json")).unwrap())
+                    .unwrap();
+            assert_eq!(state["syncs"][0]["account"], "");
+
+            remote.lock().unwrap().entries.remove("/notes/b.pdf");
+            let r = sync_kept(&base, root, "/Notes").await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 0, 1));
+            assert!(uploads(&remote).is_empty());
+        }
+
+        /// `401 missing_scope` is its own error, not an expired token (which refreshing would
+        /// fix); any other 401 still is one.
+        #[tokio::test]
+        async fn missing_scope_is_not_an_expired_token() {
+            let app = axum::Router::new()
+                .route(
+                    "/users/get_space_usage",
+                    post(|| async {
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            r#"{"error_summary":"missing_scope/..","error":{".tag":"missing_scope"}}"#,
+                        )
+                    }),
+                )
+                .route(
+                    "/users/get_current_account",
+                    post(|| async {
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            r#"{"error_summary":"expired_access_token/..","error":{".tag":"expired_access_token"}}"#,
+                        )
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let config = OAuthConfig::dropbox("id".into(), None, "http://localhost/cb".into());
+            let token = OAuthToken {
+                access_token: "t".into(),
+                refresh_token: None,
+                token_type: "Bearer".into(),
+                expires_at: None,
+                scope: None,
+            };
+            let d = Dropbox::with_token(config, token).with_base_urls(&base, &base);
+            let err = d.get_quota().await.unwrap_err();
+            assert!(matches!(err, IntegrationError::MissingScope(_)), "{err}");
+            let err = d.account_id().await.unwrap_err();
+            assert!(matches!(err, IntegrationError::TokenExpired), "{err}");
+
+            // An expired token fails the sync as a whole: nothing is listed, written or saved.
+            let dir = tempfile::tempdir().unwrap();
+            let config = SyncConfig {
+                local_path: dir.path().to_path_buf(),
+                cloud_folder: Some("/Notes".into()),
+                persist_state: true,
+                ..Default::default()
+            };
+            let r = CloudSync::new(d, config).sync().await.unwrap();
+            assert_eq!(r.status, SyncStatus::Failed);
+            assert!(
+                r.errors[0].starts_with("Failed to load the sync state: Token expired"),
+                "{:?}",
+                r.errors
+            );
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        }
+
         /// A tree that hasn't changed isn't sent again by the next sync, however deep; an edit
         /// is.
         #[tokio::test]
@@ -1970,6 +2237,196 @@ mod tests {
             let r = sync(&base, root, "/Notes").await;
             assert_eq!((r.uploaded, r.downloaded), (1, 0));
             assert_eq!(uploads(&remote), vec!["/Notes/Sub/b.pdf"]);
+        }
+
+        /// Dropbox ignores case, and a file or folder keeps the spelling it was created with. A
+        /// case-only rename here (of a file, or of a directory) is the same file under another
+        /// spelling, and a new file in a directory spelled otherwise than its Dropbox folder goes
+        /// into that folder: no sync after takes the local spelling for deleted in Dropbox and
+        /// moves the file aside, and an edit goes to the file Dropbox has.
+        #[tokio::test]
+        async fn case_only_differences_are_the_same_file() {
+            let remote = Shared::default();
+            {
+                let mut r = remote.lock().unwrap();
+                put(&mut r, "/Notes/report.pdf", b"R");
+                put(&mut r, "/Notes/sub/a.pdf", b"A");
+            }
+            let base = fake(remote.clone()).await;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let r = sync_kept(&base, root, "/Notes").await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 2, 0));
+
+            std::fs::rename(root.join("report.pdf"), root.join("Report.pdf")).unwrap();
+            std::fs::rename(root.join("sub"), root.join("Sub")).unwrap();
+            write(root, "Sub/c.pdf", "c, new here");
+            let r = sync_kept(&base, root, "/Notes").await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (1, 0, 0));
+            assert!(r.notices.is_empty(), "{:?}", r.notices);
+            assert_eq!(uploads(&remote), vec!["/Notes/Sub/c.pdf"]);
+
+            write(root, "Report.pdf", "R, edited here");
+            put(&mut remote.lock().unwrap(), "/Notes/sub/d.pdf", b"D");
+            let r = sync_kept(&base, root, "/Notes").await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (1, 1, 0));
+            for _ in 0..2 {
+                let r = sync_kept(&base, root, "/Notes").await;
+                assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 0, 0));
+                assert!(r.notices.is_empty(), "{:?}", r.notices);
+            }
+
+            assert_eq!(
+                std::fs::read(root.join("Report.pdf")).unwrap(),
+                b"R, edited here"
+            );
+            assert_eq!(std::fs::read(root.join("Sub/a.pdf")).unwrap(), b"A");
+            assert_eq!(
+                std::fs::read(root.join("Sub/c.pdf")).unwrap(),
+                b"c, new here"
+            );
+            assert_eq!(std::fs::read(root.join("Sub/d.pdf")).unwrap(), b"D");
+            for gone in ["report.pdf", "sub", ".rms-remote-deleted"] {
+                assert!(!root.join(gone).exists(), "{gone}");
+            }
+            let r = remote.lock().unwrap();
+            let keys: Vec<&str> = r.entries.keys().map(String::as_str).collect();
+            assert_eq!(
+                keys,
+                [
+                    "/notes",
+                    "/notes/report.pdf",
+                    "/notes/sub",
+                    "/notes/sub/a.pdf",
+                    "/notes/sub/c.pdf",
+                    "/notes/sub/d.pdf"
+                ]
+            );
+            let (report, content) = &r.entries["/notes/report.pdf"];
+            assert_eq!(report["path_display"], "/Notes/report.pdf");
+            assert_eq!(content, b"R, edited here");
+            assert_eq!(r.downloads, 3);
+        }
+
+        /// `/Notes` and `/notes` are one Dropbox folder, with one state: going back to a spelling
+        /// synced before goes by the state the last sync left, not by an older one of its own.
+        /// Before, a restore made in Dropbox after an edit here was uploaded under the other
+        /// spelling was undone by the edit going up again (review of #40, verification round 4).
+        #[tokio::test]
+        async fn a_folder_spelled_otherwise_goes_by_the_last_state() {
+            let remote = Shared::default();
+            put(&mut remote.lock().unwrap(), "/Notes/a.pdf", b"v1");
+            let base = fake(remote.clone()).await;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let r = sync_kept(&base, root, "/Notes").await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 1, 0));
+            write(root, "a.pdf", "v2, edited here");
+            let r = sync_kept(&base, root, "/notes").await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (1, 0, 0));
+
+            put(&mut remote.lock().unwrap(), "/Notes/a.pdf", b"v1");
+            let r = sync_kept(&base, root, "/Notes").await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 1, 0));
+            let r = sync_kept(&base, root, "/NOTES/").await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 0, 0));
+            assert_eq!(std::fs::read(root.join("a.pdf")).unwrap(), b"v1");
+            assert_eq!(remote.lock().unwrap().entries["/notes/a.pdf"].1, b"v1");
+            let state: Value =
+                serde_json::from_slice(&std::fs::read(root.join(".rms-sync-state.json")).unwrap())
+                    .unwrap();
+            assert_eq!(state["syncs"].as_array().unwrap().len(), 1);
+            assert_eq!(state["syncs"][0]["cloud_folder"], "/notes");
+        }
+
+        /// A file renamed here only in case, then a second local file spelled as Dropbox spells
+        /// it: that sync reports the clash and sends nothing, as it does for any clash. Uploading
+        /// the newcomer would leave the renamed file's state describing an older version of the
+        /// Dropbox file than the last synced, and once the newcomer is removed, the renamed file
+        /// would look unchanged since then and be overwritten with the newcomer's content
+        /// (review of #40, verification rounds 2 to 4).
+        #[tokio::test]
+        async fn a_clash_settled_by_removing_the_newcomer_keeps_the_tracked_file() {
+            let remote = Shared::default();
+            put(&mut remote.lock().unwrap(), "/Notes/report.pdf", b"v1");
+            let base = fake(remote.clone()).await;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let in_dropbox = || {
+                remote.lock().unwrap().entries["/notes/report.pdf"]
+                    .1
+                    .clone()
+            };
+
+            let r = sync_kept(&base, root, "/Notes").await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 1, 0));
+            std::fs::rename(root.join("report.pdf"), root.join("Report.pdf")).unwrap();
+            let r = sync_kept(&base, root, "/Notes").await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 0, 0));
+
+            write(root, "report.pdf", "other");
+            for _ in 0..2 {
+                let r = sync_unchecked(&base, root, "/Notes", true).await;
+                assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 0, 0));
+                assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+                assert!(
+                    r.errors[0].contains("/Report.pdf and /report.pdf"),
+                    "{:?}",
+                    r.errors
+                );
+                assert_eq!(in_dropbox(), b"v1");
+            }
+
+            std::fs::remove_file(root.join("report.pdf")).unwrap();
+            for _ in 0..2 {
+                let r = sync_kept(&base, root, "/Notes").await;
+                assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 0, 0));
+            }
+            assert_eq!(std::fs::read(root.join("Report.pdf")).unwrap(), b"v1");
+            assert_eq!(in_dropbox(), b"v1");
+            assert!(remote.lock().unwrap().uploads.is_empty());
+            assert_eq!(remote.lock().unwrap().downloads, 1);
+        }
+
+        /// A local name Dropbox listings skip (one starting with a letter and a colon, below the
+        /// top, or a path deeper than [`MAX_LIST_DEPTH`]) is never listed after its upload. It is
+        /// uploaded by every sync, as before sync kept state, and never taken for deleted in
+        /// Dropbox and moved aside.
+        #[tokio::test]
+        async fn names_the_listing_skips_are_never_moved_aside() {
+            let remote = Shared::default();
+            put(&mut remote.lock().unwrap(), "/Notes/x.pdf", b"X");
+            let base = fake(remote.clone()).await;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let deep = format!("{}x.pdf", "d/".repeat(MAX_LIST_DEPTH));
+            write(root, "sub/Q:A notes.pdf", "mine");
+            write(root, &deep, "deep");
+            for round in 0..3 {
+                let r = sync_kept(&base, root, "/Notes").await;
+                let expected = (2, usize::from(round == 0), 0);
+                assert_eq!(
+                    (r.uploaded, r.downloaded, r.deleted),
+                    expected,
+                    "round {round}"
+                );
+                assert!(r.notices.is_empty(), "round {round}: {:?}", r.notices);
+                assert_eq!(
+                    std::fs::read(root.join("sub/Q:A notes.pdf")).unwrap(),
+                    b"mine"
+                );
+                assert_eq!(std::fs::read(root.join(&deep)).unwrap(), b"deep");
+            }
+            assert!(!root.join(".rms-remote-deleted").exists());
+            let state: Value =
+                serde_json::from_slice(&std::fs::read(root.join(".rms-sync-state.json")).unwrap())
+                    .unwrap();
+            let files: Vec<&String> = state["syncs"][0]["files"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect();
+            assert_eq!(files, ["/x.pdf"]);
         }
     }
 

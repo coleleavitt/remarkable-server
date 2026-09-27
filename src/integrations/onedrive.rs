@@ -647,6 +647,18 @@ impl CloudProvider for OneDrive {
         Ok(parts.iter().all(|p| is_safe_name(p)).then_some(parts))
     }
 
+    /// The `id` of the signed-in user's drive (`/me/drive`), which every path here is in.
+    async fn account_id(&self) -> Result<Option<String>> {
+        #[derive(Deserialize)]
+        struct Drive {
+            id: String,
+        }
+        let drive: Drive = self
+            .get_json(&format!("{}/me/drive?$select=id", self.graph_base))
+            .await?;
+        Ok(Some(drive.id))
+    }
+
     /// Compares `content_hash` (Graph's `sha256Hash`, else its `quickXorHash`) with the same
     /// hash of `content`.
     fn content_matches(&self, file: &CloudFile, content: &[u8]) -> bool {
@@ -655,6 +667,21 @@ impl CloudProvider for OneDrive {
             h.eq_ignore_ascii_case(&hex::encode(Sha256::digest(content)))
                 || h == quick_xor_hash(content)
         })
+    }
+
+    /// OneDrive names are case-insensitive: a folder can't hold two items whose names differ
+    /// only in letter case.
+    fn ignores_case(&self) -> bool {
+        true
+    }
+
+    /// The folder's item id as given, and `""` for the drive root however it is given (none,
+    /// `""`, `root`), as [`list_files`](CloudProvider::list_files) takes them all for it.
+    fn folder_key(&self, folder_id: Option<&str>) -> String {
+        match SyncRoot::of(folder_id) {
+            SyncRoot::Drive => String::new(),
+            SyncRoot::Folder(id) => id.to_string(),
+        }
     }
 
     async fn list_folders(&self) -> Result<Vec<CloudFolder>> {
@@ -1316,6 +1343,8 @@ mod tests {
             /// Base of another server, for links that point away from this one.
             foreign: Arc<Mutex<String>>,
             log: Arc<Mutex<Vec<String>>>,
+            /// Ids of items deleted since: left out of `children`.
+            deleted: Arc<Mutex<Vec<String>>>,
         }
 
         impl Fake {
@@ -1348,7 +1377,9 @@ mod tests {
                 let next = format!("{}/me/drive/items/F/children", foreign);
                 return Json(json!({ "value": [], "@odata.nextLink": next }));
             }
-            let (value, next) = children(&id, page);
+            let (mut value, next) = children(&id, page);
+            let deleted = fake.deleted.lock().unwrap().clone();
+            value.retain(|v| !deleted.iter().any(|d| v["id"] == **d));
             let base = fake.base.lock().unwrap().clone();
             let mut body = json!({ "value": value });
             if let Some(next) = next {
@@ -1422,7 +1453,16 @@ mod tests {
                 .route("/me/drive/items/{id}", get(item_route))
                 .route(
                     "/me/drive/items/{id}/content",
-                    get(|Path(id): Path<String>| async move { id }),
+                    get(
+                        |State(fake): State<Fake>, Path(id): Path<String>| async move {
+                            fake.log(format!("content {}", id));
+                            id
+                        },
+                    ),
+                )
+                .route(
+                    "/me/drive",
+                    get(|| async { Json(json!({ "id": "b!drive" })) }),
                 )
                 .route("/me/drive/root/delta", get(delta_route))
                 .with_state(fake.clone());
@@ -1719,6 +1759,49 @@ mod tests {
             );
         }
 
+        /// With the state kept between syncs, as `POST /sync` keeps it, against Graph listings
+        /// (no hash here, so ids and times tell a change): files unchanged on both sides aren't
+        /// transferred again, a file deleted here isn't downloaded again, and the local copy of
+        /// one deleted in OneDrive is moved aside rather than uploaded again. The state is the
+        /// signed-in user's drive's.
+        #[tokio::test]
+        async fn kept_state_keeps_deletions_deleted() {
+            let (base, fake) = fake_graph().await;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let config = SyncConfig {
+                local_path: root.to_path_buf(),
+                cloud_folder: Some("F".into()),
+                persist_state: true,
+                ..Default::default()
+            };
+            let sync = || async {
+                let r = CloudSync::new(onedrive(&base), config.clone())
+                    .sync()
+                    .await
+                    .unwrap();
+                assert!(r.errors.is_empty(), "{:?}", r.errors);
+                (r.uploaded, r.downloaded, r.deleted)
+            };
+            assert_eq!(sync().await, (0, 4, 0));
+            assert_eq!(fake.calls("content").len(), 4);
+
+            std::fs::remove_file(root.join("a.pdf")).unwrap();
+            fake.deleted.lock().unwrap().push("B".into());
+            assert_eq!(sync().await, (0, 0, 1));
+            assert!(!root.join("a.pdf").exists() && !root.join("b.pdf").exists());
+            assert_eq!(std::fs::read(root.join("Sub/c.pdf")).unwrap(), b"C");
+            assert!(root.join(".rms-remote-deleted").is_dir());
+
+            assert_eq!(sync().await, (0, 0, 0));
+            assert_eq!(fake.calls("content").len(), 4);
+            let state: Value =
+                serde_json::from_slice(&std::fs::read(root.join(".rms-sync-state.json")).unwrap())
+                    .unwrap();
+            assert_eq!(state["syncs"][0]["account"], "b!drive");
+            assert_eq!(state["syncs"][0]["cloud_folder"], "F");
+        }
+
         /// A folder other than the drive root was kept under its own path from the drive root
         /// before #34, worked out from its `parentReference.path` as the listing did then. The
         /// root aliases need no request; the drive root by its real id, and a folder with no
@@ -1999,6 +2082,61 @@ mod tests {
         for len in (0..400).chain([999, 1000]) {
             assert_eq!(quick_xor_hash(&data[..len]), by_bits(&data[..len]), "{len}");
         }
+    }
+
+    /// The account a sync's state is kept for is the signed-in user's drive, by its `id`.
+    #[tokio::test]
+    async fn account_id_is_the_drive_id() {
+        use std::collections::HashMap;
+
+        use axum::extract::Query;
+        let app = axum::Router::new().route(
+            "/me/drive",
+            axum::routing::get(|Query(q): Query<HashMap<String, String>>| async move {
+                match q.get("$select").map(String::as_str) {
+                    Some("id") => {
+                        axum::Json(serde_json::json!({ "id": "b!drive" })).into_response()
+                    }
+                    _ => StatusCode::BAD_REQUEST.into_response(),
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = OAuthConfig::onedrive("id".into(), None, "http://localhost/cb".into());
+        let token = OAuthToken {
+            access_token: "t".into(),
+            refresh_token: None,
+            token_type: "Bearer".into(),
+            expires_at: None,
+            scope: None,
+        };
+        let d = OneDrive::with_token(config, token).with_base_url(&base);
+        assert_eq!(d.account_id().await.unwrap().as_deref(), Some("b!drive"));
+    }
+
+    /// Full sync keeps one state for the drive root however it is given, as listings take every
+    /// spelling for it; a folder's is kept under its id.
+    #[test]
+    fn folder_keys_name_the_root_one_way() {
+        let config = OAuthConfig::onedrive("id".into(), None, "http://localhost/cb".into());
+        let d = OneDrive::new(config);
+        for (folder, key) in [
+            (None, ""),
+            (Some(""), ""),
+            (Some("root"), ""),
+            (Some("D4648F06C91D9D3D!54927"), "D4648F06C91D9D3D!54927"),
+        ] {
+            assert_eq!(d.folder_key(folder), key, "{folder:?}");
+        }
+    }
+
+    /// OneDrive names are case-insensitive, so full sync matches paths ignoring case.
+    #[test]
+    fn paths_ignore_case() {
+        let config = OAuthConfig::onedrive("id".into(), None, "http://localhost/cb".into());
+        assert!(OneDrive::new(config).ignores_case());
     }
 
     /// Graph's `sha256Hash` (upper-case hex) or `quickXorHash`, whichever the listing kept.
