@@ -2,8 +2,11 @@
 //! the sync window and feed each returned VCALENDAR through the ICS parser.
 //!
 //! Recurring events come back expanded into their occurrences (`<C:expand>`); from servers
-//! that cannot expand, the masters are expanded here (see [`parse_ics_expanded`]). `TZID=`
-//! times are converted with the VTIMEZONEs sent along.
+//! that cannot expand, the masters are expanded here (see [`parse_ics_expanded`]). A series of
+//! RDATEs that a server asked to expand sends back as is may lack the VEVENTs that move or
+//! cancel its occurrences (Radicale sends its master alone), so it is fetched again whole with
+//! a `calendar-multiget` REPORT and expanded here. `TZID=` times are converted with the
+//! VTIMEZONEs sent along.
 //!
 //! Discovery (RFC 4791 section 7 / RFC 6764) starts at the configured URL: a calendar
 //! collection is used as is; otherwise its `calendar-home-set` (directly or through
@@ -18,6 +21,8 @@
 //! address: not by IP literal ([`follow`]), and not by a name that resolves to one
 //! ([`super::dns`]).
 
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -36,7 +41,15 @@ use super::{
     redact,
     snippet,
 };
-use crate::calendar::{Calendar, CalendarError, Expansion, Result, parse_ics_expanded};
+use crate::calendar::{
+    Calendar,
+    CalendarError,
+    CalendarEvent,
+    Expansion,
+    Result,
+    parse_ics_expanded,
+    parse_ics_server_expanded,
+};
 
 /// Redirect hops followed per request (e.g. `/.well-known/caldav` to the DAV root).
 const MAX_REDIRECTS: usize = 5;
@@ -89,8 +102,15 @@ impl Dav<'_> {
     }
 
     /// Send a WebDAV request, following redirects with the same method and body (reqwest
-    /// would turn a redirected PROPFIND/REPORT into a GET).
-    async fn send(&self, method: &str, url: &Url, depth: &str, body: &str) -> Result<DavResponse> {
+    /// would turn a redirected PROPFIND/REPORT into a GET). `depth` is the `Depth` header, if
+    /// the request takes one.
+    async fn send(
+        &self,
+        method: &str,
+        url: &Url,
+        depth: Option<&str>,
+        body: &str,
+    ) -> Result<DavResponse> {
         let method = Method::from_bytes(method.as_bytes())
             .map_err(|e| CalendarError::Backend(format!("caldav: {}", e)))?;
         let mut url = url.clone();
@@ -103,12 +123,14 @@ impl Dav<'_> {
                     self.configured.host_str().unwrap_or("")
                 )));
             }
-            let request = self
+            let mut request = self
                 .http
                 .request(method.clone(), url.clone())
-                .header("Depth", depth)
                 .header(CONTENT_TYPE, "application/xml; charset=utf-8")
                 .body(body.to_string());
+            if let Some(depth) = depth {
+                request = request.header("Depth", depth);
+            }
             let response = self
                 .authorize(request)
                 .send()
@@ -148,7 +170,7 @@ impl Dav<'_> {
         depth: &str,
         body: &str,
     ) -> Result<Option<(Url, Vec<Resource>)>> {
-        let response = self.send("PROPFIND", url, depth, body).await?;
+        let response = self.send("PROPFIND", url, Some(depth), body).await?;
         match response.status {
             StatusCode::MULTI_STATUS => {
                 let resources = parse_resources(&response.url, &response.body)?;
@@ -169,7 +191,7 @@ impl Dav<'_> {
     /// or root): any answer but a multistatus means "not here" (a web page, a login redirect,
     /// a refusal), except 401, which says the credentials are wrong.
     async fn probe(&self, url: &Url) -> Result<Option<(Url, Vec<Resource>)>> {
-        let response = self.send("PROPFIND", url, "0", PROPFIND_SELF).await?;
+        let response = self.send("PROPFIND", url, Some("0"), PROPFIND_SELF).await?;
         match response.status {
             StatusCode::MULTI_STATUS => {
                 let resources = parse_resources(&response.url, &response.body)?;
@@ -584,6 +606,33 @@ fn calendar_query(window: SyncWindow, expand: bool) -> String {
     )
 }
 
+/// A `calendar-multiget` REPORT (RFC 4791 section 7.9) for the resources at `hrefs`, whole:
+/// without `expand` or a filter. It takes no `Depth` header.
+fn calendar_multiget<'a>(hrefs: impl IntoIterator<Item = &'a Url>) -> String {
+    let hrefs: String = hrefs
+        .into_iter()
+        .map(|href| {
+            // A URL's path has `<` and `>` percent-encoded, but may hold `&`.
+            let path = href
+                .path()
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
+            format!("\n  <D:href>{}</D:href>", path)
+        })
+        .collect();
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<C:calendar-multiget xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop>
+    <D:getetag/>
+    <C:calendar-data/>
+  </D:prop>{}
+</C:calendar-multiget>"#,
+        hrefs
+    )
+}
+
 /// REPORT the collection's events in `window`.
 async fn report(
     dav: &Dav<'_>,
@@ -592,8 +641,14 @@ async fn report(
     window: SyncWindow,
 ) -> Result<Fetched> {
     let mut response = dav
-        .send("REPORT", collection, "1", &calendar_query(window, true))
+        .send(
+            "REPORT",
+            collection,
+            Some("1"),
+            &calendar_query(window, true),
+        )
         .await?;
+    let mut expanded = true;
     // Servers without `expand` support reject the query; ask for the plain data instead and
     // expand the recurring events here. Not after a 5xx, which is usually transient.
     if matches!(
@@ -605,8 +660,14 @@ async fn report(
             | StatusCode::NOT_IMPLEMENTED
     ) {
         response = dav
-            .send("REPORT", collection, "1", &calendar_query(window, false))
+            .send(
+                "REPORT",
+                collection,
+                Some("1"),
+                &calendar_query(window, false),
+            )
             .await?;
+        expanded = false;
     }
     if response.status != StatusCode::MULTI_STATUS {
         return Err(dav_error(
@@ -615,18 +676,94 @@ async fn report(
             &response.body,
         ));
     }
-    // Parsing and expanding a large answer is CPU work (bounded by the expansion budgets):
-    // it runs on a blocking thread, not on the async workers that also serve the tablet.
     let calendar_id = calendar_id.to_string();
-    tokio::task::spawn_blocking(move || read_report(&response, &calendar_id, window))
-        .await
-        .map_err(|e| {
-            CalendarError::Backend(format!("caldav: reading a REPORT answer failed: {}", e))
-        })?
+    let mut report =
+        blocking(move || read_report(&response, &calendar_id, window, expanded)).await??;
+    if !report.refetch.is_empty() {
+        // Asked of the collection that answered, which the hrefs are inside of.
+        let answer = dav
+            .send(
+                "REPORT",
+                &report.url,
+                None,
+                &calendar_multiget(report.refetch.values()),
+            )
+            .await;
+        report = blocking(move || {
+            report.read_refetched(answer);
+            report
+        })
+        .await?;
+    }
+    Ok(report.finish())
 }
 
-/// The events of a REPORT's multistatus answer, expanded into their occurrences in `window`.
-fn read_report(response: &DavResponse, calendar_id: &str, window: SyncWindow) -> Result<Fetched> {
+/// Run `work` on a blocking thread: parsing and expanding a large answer is CPU work (bounded
+/// by the expansion budgets), which is not done on the async workers that also serve the
+/// tablet.
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+    tokio::task::spawn_blocking(work).await.map_err(|e| {
+        CalendarError::Backend(format!("caldav: reading a REPORT answer failed: {}", e))
+    })
+}
+
+/// A REPORT answer read so far: the events it holds, and the resources to fetch again whole.
+struct Report {
+    /// The collection, as it answered.
+    url: Url,
+    calendar_id: String,
+    expansion: Expansion,
+    events: Vec<CalendarEvent>,
+    /// Why stored events the answer does not list are kept, if they are.
+    incomplete: Option<String>,
+    /// Resources holding a series of RDATEs that the server was asked to expand but sent as
+    /// is, maybe without the VEVENTs that move or cancel its occurrences (see
+    /// [`parse_ics_server_expanded`]): left out until they are fetched whole. By
+    /// [`href_key`].
+    refetch: BTreeMap<String, Url>,
+}
+
+/// What names the resource at `href`, however its path is percent-encoded: a server may
+/// encode a character in one answer and not in another.
+fn href_key(href: &Url) -> String {
+    let path = href.path();
+    let path = urlencoding::decode(path).unwrap_or(Cow::Borrowed(path));
+    format!("{}{}", href.origin().ascii_serialization(), path)
+}
+
+/// Whether `href` names a resource inside `collection` (on its server, below its path): what a
+/// `calendar-multiget` on the collection may ask for. Not the collection itself, which would
+/// ask for all of it.
+///
+/// The paths are compared with their percent-encoding undone, as [`href_key`] does: Radicale
+/// encodes every href it sends (`@` as `%40`, `+` as `%2B`), while a collection URL configured
+/// by hand keeps them as typed, as for an email address user name. They are compared a segment
+/// at a time, so an encoded `/` stays inside its segment.
+fn inside(collection: &Url, href: &Url) -> bool {
+    if href.origin() != collection.origin() {
+        return false;
+    }
+    let same = |a: &str, b: &str| {
+        urlencoding::decode_binary(a.as_bytes()) == urlencoding::decode_binary(b.as_bytes())
+    };
+    let mut path = href.path().split('/');
+    let below = collection
+        .path()
+        .trim_end_matches('/')
+        .split('/')
+        .all(|dir| path.next().is_some_and(|segment| same(segment, dir)));
+    // Something is left besides a trailing `/`.
+    below && !matches!((path.next(), path.next()), (None, _) | (Some(""), None))
+}
+
+/// The events of a REPORT's multistatus answer, expanded into their occurrences in `window`;
+/// `expanded` when the server was asked to expand them.
+fn read_report(
+    response: &DavResponse,
+    calendar_id: &str,
+    window: SyncWindow,
+    expanded: bool,
+) -> Result<Report> {
     let resources = parse_resources(&response.url, &response.body)?;
     let incomplete = resources.iter().find_map(|r| {
         Some(format!(
@@ -637,66 +774,167 @@ fn read_report(response: &DavResponse, calendar_id: &str, window: SyncWindow) ->
             r.href.as_ref().map_or_else(|| "a resource".into(), redact)
         ))
     });
-    // Expanded here too: a server may also ignore `expand` and send the masters anyway.
-    let mut expansion = Expansion::new(window.start, window.end);
-    let mut events = Vec::new();
+    let mut report = Report {
+        url: response.url.clone(),
+        calendar_id: calendar_id.to_string(),
+        expansion: Expansion::new(window.start, window.end),
+        events: Vec::new(),
+        incomplete,
+        refetch: BTreeMap::new(),
+    };
     for resource in resources {
         let Some(data) = resource.calendar_data else {
             continue;
         };
-        events.extend(parse_ics_expanded(
-            &data,
-            calendar_id,
-            resource.etag.as_deref(),
-            &mut expansion,
-        ));
-    }
-    let unknown: Vec<&str> = expansion.unknown_zones().collect();
-    if !unknown.is_empty() {
-        tracing::warn!(
-            "caldav: REPORT {}: time zones without a VTIMEZONE ({}) were read as UTC",
-            redact(&response.url),
-            unknown.join(", ")
-        );
-    }
-    let incomplete = incomplete.or_else(|| {
-        expansion.truncated().then(|| {
-            format!(
-                "caldav: REPORT {}: too many recurring event occurrences (or too much text in \
-                 them) or time zone rules to go through in one sync, so stored events it did \
-                 not list were kept",
-                redact(&response.url)
-            )
-        })
-    });
-    // Series stored as their first occurrence only: reported, but the answer is complete
-    // otherwise, so stored events it does not list are still removed.
-    let unexpanded = expansion.unexpanded();
-    let warnings = match unexpanded.len() {
-        0 => Vec::new(),
-        count => {
-            let mut named: Vec<String> = unexpanded
-                .take(NAMED_UNEXPANDED)
-                .map(|summary| format!("{:?}", summary))
-                .collect();
-            if count > NAMED_UNEXPANDED {
-                named.push(format!("{} more", count - NAMED_UNEXPANDED));
-            }
-            vec![format!(
-                "caldav: REPORT {}: {} recurring event(s) ({}) use a recurrence rule that \
-                 the CalDAV server did not expand and this server cannot, so only their first \
-                 occurrence was stored",
-                redact(&response.url),
-                count,
-                named.join(", ")
-            )]
+        let etag = resource.etag.as_deref();
+        // Expanded here too: a server may also ignore `expand` and send the masters anyway.
+        if !expanded {
+            report.events.extend(parse_ics_expanded(
+                &data,
+                calendar_id,
+                etag,
+                &mut report.expansion,
+            ));
+            continue;
         }
-    };
-    Ok(Fetched {
-        events,
-        incomplete,
-        warnings,
-    })
+        if let Some(events) =
+            parse_ics_server_expanded(&data, calendar_id, etag, &mut report.expansion)
+        {
+            report.events.extend(events);
+            continue;
+        }
+        // Fetched from the collection that answered, by the path it named.
+        match resource.href.filter(|href| inside(&response.url, href)) {
+            Some(href) => {
+                report.refetch.insert(href_key(&href), href);
+            }
+            None => {
+                report.incomplete.get_or_insert_with(|| {
+                    format!(
+                        "caldav: REPORT {}: a recurring event the server did not expand has no \
+                         href inside the collection to fetch it whole by, so it was left out and \
+                         stored events the answer did not list were kept",
+                        redact(&response.url)
+                    )
+                });
+            }
+        }
+    }
+    Ok(report)
+}
+
+impl Report {
+    /// Read `answer`, the server's answer to [`calendar_multiget`] for [`Report::refetch`], and
+    /// expand the series it holds whole. One it does not hold (the request failed, the
+    /// resource is gone or failed) stays left out, and the answer is incomplete: its stored
+    /// occurrences are kept.
+    fn read_refetched(&mut self, answer: Result<DavResponse>) {
+        let mut pending = std::mem::take(&mut self.refetch);
+        let requested = pending.len();
+        let answer = match answer {
+            Ok(response) if response.status == StatusCode::MULTI_STATUS => {
+                parse_resources(&response.url, &response.body).map_err(|e| e.to_string())
+            }
+            Ok(response) => Err(format!(
+                "HTTP {}: {}",
+                response.status.as_u16(),
+                snippet(&response.body)
+            )),
+            Err(e) => Err(e.to_string()),
+        };
+        let failure = match answer {
+            Ok(resources) => {
+                for resource in resources {
+                    let (Some(href), None, Some(data)) =
+                        (&resource.href, resource.failure, &resource.calendar_data)
+                    else {
+                        continue;
+                    };
+                    if pending.remove(&href_key(href)).is_none() {
+                        continue;
+                    }
+                    self.events.extend(parse_ics_expanded(
+                        data,
+                        &self.calendar_id,
+                        resource.etag.as_deref(),
+                        &mut self.expansion,
+                    ));
+                }
+                "the answer did not hold them".to_string()
+            }
+            Err(failure) => failure,
+        };
+        if !pending.is_empty() {
+            self.incomplete.get_or_insert_with(|| {
+                format!(
+                    "caldav: REPORT {}: {} of {} recurring event(s) the server did not expand \
+                     could not be fetched whole with calendar-multiget ({}), so they were left \
+                     out and stored events the answer did not list were kept",
+                    redact(&self.url),
+                    pending.len(),
+                    requested,
+                    failure
+                )
+            });
+        }
+    }
+
+    /// What the sync stores: the events, and what they lack.
+    fn finish(self) -> Fetched {
+        let Report {
+            url,
+            expansion,
+            events,
+            incomplete,
+            ..
+        } = self;
+        let unknown: Vec<&str> = expansion.unknown_zones().collect();
+        if !unknown.is_empty() {
+            tracing::warn!(
+                "caldav: REPORT {}: time zones without a VTIMEZONE ({}) were read as UTC",
+                redact(&url),
+                unknown.join(", ")
+            );
+        }
+        let incomplete = incomplete.or_else(|| {
+            expansion.truncated().then(|| {
+                format!(
+                    "caldav: REPORT {}: too many recurring event occurrences (or too much text \
+                     in them) or time zone rules to go through in one sync, so stored events it \
+                     did not list were kept",
+                    redact(&url)
+                )
+            })
+        });
+        // Series stored as their first occurrence at most: reported, but the answer is
+        // complete otherwise, so stored events it does not list are still removed.
+        let unexpanded = expansion.unexpanded();
+        let warnings = match unexpanded.len() {
+            0 => Vec::new(),
+            count => {
+                let mut named: Vec<String> = unexpanded
+                    .take(NAMED_UNEXPANDED)
+                    .map(|summary| format!("{:?}", summary))
+                    .collect();
+                if count > NAMED_UNEXPANDED {
+                    named.push(format!("{} more", count - NAMED_UNEXPANDED));
+                }
+                vec![format!(
+                    "caldav: REPORT {}: {} recurring event(s) ({}) use a recurrence rule that \
+                     the CalDAV server did not expand and this server cannot, so at most their \
+                     first occurrence was stored",
+                    redact(&url),
+                    count,
+                    named.join(", ")
+                )]
+            }
+        };
+        Fetched {
+            events,
+            incomplete,
+            warnings,
+        }
+    }
 }
 
 pub(super) async fn fetch(
@@ -1030,7 +1268,7 @@ mod tests {
             start: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
             end: Utc.with_ymd_and_hms(2027, 1, 1, 0, 0, 0).unwrap(),
         };
-        let fetched = read_report(&response, "c", window).unwrap();
+        let fetched = read_report(&response, "c", window, true).unwrap().finish();
         let etags: Vec<_> = fetched
             .events
             .iter()
@@ -1049,7 +1287,7 @@ mod tests {
             ]
         );
         // The answer is complete (stored events it does not list are removed), but the
-        // series kept as their first occurrence are named.
+        // series kept as their first occurrence at most are named.
         assert_eq!(fetched.incomplete, None);
         assert_eq!(fetched.warnings.len(), 1);
         let warning = &fetched.warnings[0];
@@ -1059,10 +1297,321 @@ mod tests {
             warning
         );
         assert!(
-            warning.contains("only their first occurrence"),
+            warning.contains("at most their first occurrence was stored"),
             "{}",
             warning
         );
+    }
+
+    /// A `DAV:response` for `href` holding `etag` and calendar data `ics`.
+    fn with_data(href: &str, etag: &str, ics: &str) -> String {
+        format!(
+            "<d:response><d:href>{}</d:href><d:propstat><d:prop><d:getetag>{}</d:getetag>\
+             <c:calendar-data>{}</c:calendar-data></d:prop>\
+             <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>",
+            href, etag, ics
+        )
+    }
+
+    /// A 207 answer from `url` holding `responses`.
+    fn answer(url: &str, responses: &str) -> DavResponse {
+        DavResponse {
+            url: Url::parse(url).unwrap(),
+            status: StatusCode::MULTI_STATUS,
+            body: format!(
+                r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">{}</d:multistatus>"#,
+                responses
+            ),
+        }
+    }
+
+    /// A series of three RDATE occurrences in March 2026.
+    fn rdates(uid: &str) -> String {
+        format!(
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:{uid}\nDTSTART:20260302T090000Z\nRDATE:20260309T090000Z,20260316T090000Z\nEND:VEVENT\nEND:VCALENDAR\n"
+        )
+    }
+
+    fn march() -> SyncWindow {
+        SyncWindow {
+            start: Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap(),
+            end: Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).unwrap(),
+        }
+    }
+
+    fn ids(events: &[CalendarEvent]) -> Vec<(&str, Option<&str>)> {
+        let mut ids: Vec<_> = events
+            .iter()
+            .map(|e| (e.id.as_str(), e.etag.as_deref()))
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn series_of_rdates_a_server_left_unexpanded_are_fetched_whole() {
+        let occurrence = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:w\nRECURRENCE-ID:20260302T090000Z\nDTSTART:20260302T100000Z\nEND:VEVENT\nEND:VCALENDAR\n";
+        let body = [
+            with_data("/cal/a.ics", "\"a1\"", &rdates("a")),
+            with_data("/cal/w.ics", "\"w1\"", occurrence),
+            with_data("/cal/b&amp;c.ics", "\"b1\"", &rdates("b")),
+            // Listed twice, fetched once.
+            with_data("https://dav.example/cal/a.ics", "\"a1\"", &rdates("a")),
+        ]
+        .concat();
+        let expanded = answer("https://dav.example/cal/", &body);
+
+        // Not asked to expand: the answer holds the masters whole, and they are expanded here.
+        let plain = read_report(&expanded, "c", march(), false).unwrap();
+        assert!(plain.refetch.is_empty());
+        assert_eq!(plain.finish().events.len(), 10);
+
+        // Asked to expand: the series of RDATEs are left out until fetched whole.
+        let mut report = read_report(&expanded, "c", march(), true).unwrap();
+        assert_eq!(
+            ids(&report.events),
+            [("c:w:20260302T090000Z", Some("\"w1\""))]
+        );
+        let paths: Vec<_> = report.refetch.values().map(Url::path).collect();
+        assert_eq!(paths, ["/cal/a.ics", "/cal/b&c.ics"]);
+        let multiget = calendar_multiget(report.refetch.values());
+        let root = xml::parse(&multiget).unwrap();
+        assert!(root.is(CALDAV, "calendar-multiget"));
+        let hrefs: Vec<_> = root
+            .children_named(DAV, "href")
+            .map(|h| h.text.as_str())
+            .collect();
+        assert_eq!(hrefs, ["/cal/a.ics", "/cal/b&c.ics"]);
+        let prop = root.child(DAV, "prop").unwrap();
+        assert!(
+            prop.child(DAV, "getetag").is_some() && prop.child(CALDAV, "calendar-data").is_some()
+        );
+        assert!(!multiget.contains("expand") && !multiget.contains("filter"));
+
+        // Their occurrences come from the whole objects, with the etags sent along; a resource
+        // that was not asked for is not taken.
+        report.read_refetched(Ok(answer(
+            "https://dav.example/cal/",
+            &[
+                with_data("/cal/b%26c.ics", "\"b2\"", &rdates("b")),
+                with_data("/cal/z.ics", "\"z1\"", &rdates("z")),
+                with_data("/cal/a.ics", "\"a2\"", &rdates("a")),
+            ]
+            .concat(),
+        )));
+        assert!(report.refetch.is_empty());
+        let fetched = report.finish();
+        assert_eq!(fetched.incomplete, None);
+        assert_eq!(
+            ids(&fetched.events),
+            [
+                ("c:a:20260302T090000Z", Some("\"a2\"")),
+                ("c:a:20260309T090000Z", Some("\"a2\"")),
+                ("c:a:20260316T090000Z", Some("\"a2\"")),
+                ("c:b:20260302T090000Z", Some("\"b2\"")),
+                ("c:b:20260309T090000Z", Some("\"b2\"")),
+                ("c:b:20260316T090000Z", Some("\"b2\"")),
+                ("c:w:20260302T090000Z", Some("\"w1\"")),
+            ]
+        );
+    }
+
+    #[test]
+    fn series_of_rdates_are_fetched_whole_however_the_collection_path_is_encoded() {
+        // Radicale percent-encodes every href it sends (`@` as `%40`, `+` as `%2B`), while a
+        // collection URL configured by hand keeps them as typed; or the other way round.
+        for (collection, href) in [
+            (
+                "https://dav.example/alice@example.com/cal/",
+                "/alice%40example.com/cal/a.ics",
+            ),
+            (
+                "https://dav.example/alice%40example.com/cal/",
+                "/alice@example.com/cal/a.ics",
+            ),
+            ("https://dav.example/a+b/", "/a%2Bb/a.ics"),
+            ("https://dav.example/a%2bb/", "/a%2Bb/a.ics"),
+        ] {
+            let mut report = read_report(
+                &answer(collection, &with_data(href, "\"a1\"", &rdates("a"))),
+                "c",
+                march(),
+                true,
+            )
+            .unwrap();
+            assert_eq!(report.incomplete, None, "{} {}", collection, href);
+            // Asked for as the server named it.
+            let paths: Vec<_> = report.refetch.values().map(Url::path).collect();
+            assert_eq!(paths, [href], "{}", collection);
+            report.read_refetched(Ok(answer(
+                collection,
+                &with_data(href, "\"a2\"", &rdates("a")),
+            )));
+            let fetched = report.finish();
+            assert_eq!(fetched.incomplete, None, "{} {}", collection, href);
+            assert_eq!(
+                ids(&fetched.events),
+                [
+                    ("c:a:20260302T090000Z", Some("\"a2\"")),
+                    ("c:a:20260309T090000Z", Some("\"a2\"")),
+                    ("c:a:20260316T090000Z", Some("\"a2\"")),
+                ],
+                "{} {}",
+                collection,
+                href
+            );
+        }
+    }
+
+    #[test]
+    fn series_of_rdates_that_cannot_be_fetched_whole_are_left_out() {
+        let expanded = answer(
+            "https://dav.example/cal/",
+            &[
+                with_data("/cal/a.ics", "\"a1\"", &rdates("a")),
+                with_data("/cal/b.ics", "\"b1\"", &rdates("b")),
+                with_data("/cal/e.ics", "\"e1\"", "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:e\nDTSTART:20260305T090000Z\nEND:VEVENT\nEND:VCALENDAR\n"),
+            ]
+            .concat(),
+        );
+        let refetched = |answer: Result<DavResponse>| {
+            let mut report = read_report(&expanded, "c", march(), true).unwrap();
+            report.read_refetched(answer);
+            report.finish()
+        };
+        let a = [
+            ("c:a:20260302T090000Z", Some("\"a1\"")),
+            ("c:a:20260309T090000Z", Some("\"a1\"")),
+            ("c:a:20260316T090000Z", Some("\"a1\"")),
+        ];
+        let e = ("c:e", Some("\"e1\""));
+        let cases = [
+            // One of the two is not in the answer, or is there as a failure.
+            (
+                Ok(answer(
+                    "https://dav.example/cal/",
+                    &with_data("/cal/a.ics", "\"a1\"", &rdates("a")),
+                )),
+                "1 of 2",
+                "the answer did not hold them",
+                true,
+            ),
+            (
+                Ok(answer(
+                    "https://dav.example/cal/",
+                    &[
+                        with_data("/cal/a.ics", "\"a1\"", &rdates("a")),
+                        "<d:response><d:href>/cal/b.ics</d:href><d:status>HTTP/1.1 404 Not Found</d:status></d:response>".to_string(),
+                    ]
+                    .concat(),
+                )),
+                "1 of 2",
+                "the answer did not hold them",
+                true,
+            ),
+            (
+                Ok(answer(
+                    "https://dav.example/cal/",
+                    &[
+                        with_data("/cal/a.ics", "\"a1\"", &rdates("a")),
+                        with_data("/cal/b.ics", "\"b1\"", &rdates("b")).replace(
+                            "</d:response>",
+                            "<d:propstat><d:prop><d:displayname/></d:prop>\
+                             <d:status>HTTP/1.1 503 Service Unavailable</d:status></d:propstat>\
+                             </d:response>",
+                        ),
+                    ]
+                    .concat(),
+                )),
+                "1 of 2",
+                "the answer did not hold them",
+                true,
+            ),
+            // The request fails.
+            (
+                Ok(DavResponse {
+                    url: Url::parse("https://dav.example/cal/").unwrap(),
+                    status: StatusCode::FORBIDDEN,
+                    body: "no multiget here".into(),
+                }),
+                "2 of 2",
+                "HTTP 403: no multiget here",
+                false,
+            ),
+            (
+                Err(CalendarError::Backend("connection reset".into())),
+                "2 of 2",
+                "connection reset",
+                false,
+            ),
+            (
+                Ok(DavResponse {
+                    url: Url::parse("https://dav.example/cal/").unwrap(),
+                    status: StatusCode::MULTI_STATUS,
+                    body: "<html>".into(),
+                }),
+                "2 of 2",
+                "bad multistatus",
+                false,
+            ),
+        ];
+        for (answer, count, why, a_came) in cases {
+            let fetched = refetched(answer);
+            // The series fetched whole and the rest of the answer are stored; nothing stored
+            // is pruned, so the occurrences stored for the others stay as they were.
+            let mut expected = if a_came { a.to_vec() } else { Vec::new() };
+            expected.push(e);
+            assert_eq!(ids(&fetched.events), expected, "{}", why);
+            let incomplete = fetched.incomplete.expect(why);
+            assert!(
+                incomplete.contains(&format!("{} recurring event(s)", count))
+                    && incomplete.contains("calendar-multiget")
+                    && incomplete.contains(why),
+                "{}",
+                incomplete
+            );
+        }
+
+        // One whose href is on another server, outside the collection, the collection itself
+        // (however it is encoded) or missing cannot be fetched from this collection. An
+        // encoded `/` does not split a segment.
+        for href in [
+            "https://other.example/cal/x.ics",
+            "/other/x.ics",
+            "/calendar.ics",
+            "/cal%2Fx.ics",
+            "/cal/",
+            "/cal",
+            "/%63al/",
+            "/%63al",
+            "",
+        ] {
+            let report = read_report(
+                &answer(
+                    "https://dav.example/cal/",
+                    &[
+                        with_data(href, "\"x1\"", &rdates("x")),
+                        with_data("/cal/e.ics", "\"e1\"", "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:e\nDTSTART:20260305T090000Z\nEND:VEVENT\nEND:VCALENDAR\n"),
+                    ]
+                    .concat(),
+                ),
+                "c",
+                march(),
+                true,
+            )
+            .unwrap();
+            assert!(report.refetch.is_empty());
+            let fetched = report.finish();
+            assert_eq!(ids(&fetched.events), [e]);
+            assert!(
+                fetched
+                    .incomplete
+                    .as_deref()
+                    .is_some_and(|m| m.contains("no href inside the collection")),
+                "{:?}",
+                fetched.incomplete
+            );
+        }
     }
 
     #[test]

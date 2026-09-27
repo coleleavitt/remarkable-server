@@ -63,7 +63,13 @@ These are done and, in several cases, ahead of rmfakecloud:
   `calendars.db` (mode 0600) apart from the config and never reach API
   responses; OAuth tokens refresh on expiry or 401 and are saved even when the
   sync fails or the client disconnects. On-premises Exchange (EWS) is not
-  supported and says so.
+  supported and says so. From CalDAV servers that don't expand, series defined
+  only by RDATE (irregular series from Apple Calendar / Outlook) are expanded
+  like RRULE ones instead of showing just their first date, RDATE periods keep
+  their own length, and an unsupported RRULE's first occurrence honours EXDATE.
+  Such a series that a server asked to `expand` sends back as is (Radicale sends
+  its master alone) is fetched again whole with `calendar-multiget`, so its
+  moved and cancelled occurrences are not shown at their old time.
 - ✅ **Read-later sync runs** — a scheduler (per-account interval, backoff on
   account-wide failures, one sync per account at a time) and the `/sync`
   endpoints put new articles on the tablet as EPUB/PDF documents through the
@@ -167,6 +173,17 @@ The community's top *concrete* pains. Small, bounded, high-value.
 - 🧪 **Tablet's screenshare broker subscriptions** — all were inside the ACL (no
   denials logged), but the exact filters weren't logged; accepted filters now
   log at debug (`remarkable_server::screenshare=debug`).
+- ⬜ **RDATE-only series on Radicale** *(#39)* — Radicale accepts `expand`
+  but does not expand a series of RDATEs without an RRULE: it sends the master
+  alone (without the VEVENTs that move or cancel its occurrences) while the
+  master's own DTSTART..DTEND overlaps the window, and leaves the resource out
+  of the answer after that. While the master comes, the resource is fetched
+  again whole with `calendar-multiget` and expanded here, moves and
+  cancellations included. Once its DTSTART is over 30 days old the series is
+  missing, and its stored dates are pruned. Fix: find the resources an
+  `expand` answer leaves out (say, an etag-only `calendar-query` without
+  `expand`, compared with the answer) and fetch them the same way, or have
+  Radicale expand RDATE.
 
 ---
 

@@ -95,8 +95,8 @@ pub struct Fetched {
     pub incomplete: Option<String>,
     /// Events the answer holds only in part, which the user should hear about although the
     /// answer is complete otherwise (a recurring event whose rule could be expanded neither by
-    /// the server nor here, so only its first occurrence came). Stored events the answer does
-    /// not list are still removed.
+    /// the server nor here, so at most its first occurrence came). Stored events the answer
+    /// does not list are still removed.
     pub warnings: Vec<String>,
 }
 
