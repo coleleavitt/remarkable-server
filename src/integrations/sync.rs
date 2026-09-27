@@ -590,9 +590,9 @@ struct CaseMatch {
     /// spellings (see [`case_base`]), for a notice.
     undecided: Vec<String>,
     /// The files compared with an entry recorded under another spelling ([`CaseBase::Other`]),
-    /// with that spelling. Such a file may never have been synced, so the conflict strategy
-    /// never overwrites it (see [`CloudSync::sync_both`]); and until it ends a sync in step,
-    /// its entry is kept under that spelling, so the next sync still knows.
+    /// with that spelling. Such a file may never have been synced; until it ends a sync in
+    /// step, its entry is kept under that spelling. (No download overwrites it unless its
+    /// content was synced: [`CloudSync::guard_overwrite`].)
     carried: HashMap<String, String>,
 }
 
@@ -1016,10 +1016,10 @@ impl<P: CloudProvider> CloudSync<P> {
     /// differ only in case from each other are all left alone, with an error, until renamed
     /// apart or all but one removed: so the one remote file is never written from one of them,
     /// and once the clash is settled, the file left is compared with the one record of the
-    /// last sync of the remote file before the clash. A file compared with the record of
-    /// another spelling may never have been synced (the file left may be the newcomer), so if
-    /// the conflict strategy takes the remote file over it, it is moved into
-    /// [`QUARANTINE_DIR`] first, with a notice. A file recorded under several such spellings
+    /// last sync of the remote file before the clash. No download writes over a local file
+    /// whose content no sync recorded (the newcomer left once a clash is settled, a local edit
+    /// the conflict strategy overrides): it is moved into [`QUARANTINE_DIR`] first, with a
+    /// notice, whichever record the file was compared with. A file recorded under several such spellings
     /// (by an earlier build, or a delta sync) is taken for changed on both sides, with a notice
     /// (see [`case_base`]).
     ///
@@ -1601,11 +1601,6 @@ impl<P: CloudProvider> CloudSync<P> {
                         .await
                 }
                 Step::Both { known } => {
-                    let known = match (known, case.carried.get(&path)) {
-                        (false, _) => Known::No,
-                        (true, None) => Known::Yes,
-                        (true, Some(from)) => Known::Carried { from, run: &run },
-                    };
                     self.sync_both(
                         &path,
                         &local_files[&path],
@@ -1708,15 +1703,17 @@ impl<P: CloudProvider> CloudSync<P> {
         })
     }
 
-    /// A file present on both sides and not unchanged on both since the last sync; `known` says
-    /// what the manifest tells of it. Returns the manifest entry when the two sides end up in
+    /// A file present on both sides and not unchanged on both since the last sync; `known`: the
+    /// manifest has an entry for it, so both sides changed since (otherwise a conflict is
+    /// detected as with no state). Whatever the entry, a download never overwrites local content
+    /// that wasn't synced ([`Self::guard_overwrite`]). Returns the manifest entry when the two sides end up in
     /// step.
     async fn sync_both(
         &mut self,
         path: &str,
         local: &LocalFile,
         cloud_file: &CloudFile,
-        known: Known<'_>,
+        known: bool,
         result: &mut SyncResult,
         retry_needed: &mut bool,
     ) -> Option<ManifestEntry> {
@@ -1729,7 +1726,7 @@ impl<P: CloudProvider> CloudSync<P> {
 
         // Check for conflicts
         let conflict = match known {
-            Known::Yes | Known::Carried { .. } => Some(Conflict {
+            true => Some(Conflict {
                 local_path: local.path.clone(),
                 cloud_file: cloud_file.clone(),
                 local_modified_at: local.mtime,
@@ -1737,7 +1734,7 @@ impl<P: CloudProvider> CloudSync<P> {
                 conflict_type: ConflictType::BothModified,
                 resolution: None,
             }),
-            Known::No => ConflictResolver::detect_conflict(
+            false => ConflictResolver::detect_conflict(
                 &local.path,
                 local.mtime,
                 local.size,
@@ -1771,29 +1768,6 @@ impl<P: CloudProvider> CloudSync<P> {
                     .await
             }
             ConflictResolution::UseCloud if direction != SyncDirection::Upload => {
-                if let Known::Carried { from, run } = known {
-                    match quarantine(&self.config.local_path, run, path, &local.path).await {
-                        Ok(to) => result.notices.push(format!(
-                            "{} changed here and remotely since the last sync, and the conflict \
-                             strategy took the remote version. Its state was recorded as {}, \
-                             which differs only in letter case, so this local file may never \
-                             have been uploaded: it was moved to {} rather than overwritten",
-                            path,
-                            from,
-                            to.display()
-                        )),
-                        Err(e) => {
-                            result.errors.push(format!(
-                                "{} changed here and remotely since the last sync, and the \
-                                 conflict strategy took the remote version, but the local file, \
-                                 which may never have been uploaded, couldn't be moved aside \
-                                 first, so it was left as it is: {}",
-                                path, e
-                            ));
-                            return None;
-                        }
-                    }
-                }
                 self.download_counted(cloud_file, result, retry_needed)
                     .await
             }
@@ -2468,22 +2442,6 @@ struct Reconciled {
     /// Something remote wasn't fetched for a reason that may go away (a listing failed, or a
     /// download failed with a non-permanent error).
     retry_needed: bool,
-}
-
-/// What the manifest tells [`CloudSync::sync_both`] of a file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Known<'a> {
-    /// Nothing (no entry): a conflict is detected as with no state.
-    No,
-    /// Both sides changed since the last sync.
-    Yes,
-    /// Both sides changed since the last sync, going by an entry recorded under another
-    /// spelling, `from` (see [`CaseMatch::carried`]). The local file may then never have been
-    /// synced (the newcomer left once a clash is settled), so its content may be nowhere else:
-    /// if the conflict strategy takes the remote file, the local one is first moved into
-    /// [`QUARANTINE_DIR`]`/<run>/` (this sync's `run`), with a notice, rather than overwritten.
-    /// If it can't be moved, nothing is downloaded.
-    Carried { from: &'a str, run: &'a str },
 }
 
 #[cfg(test)]
@@ -5616,7 +5574,7 @@ mod tests {
                 assert_eq!(counts(&r), (0, 1, 0), "{case}");
                 assert_eq!(r.notices.len(), 1, "{case}: {:?}", r.notices);
                 assert!(
-                    r.notices[0].starts_with("/Report.pdf changed here and remotely")
+                    r.notices[0].starts_with("/Report.pdf held local content never recorded as synced")
                         && r.notices[0].contains(&format!("{QUARANTINE_DIR}/")),
                     "{case}: {:?}",
                     r.notices
