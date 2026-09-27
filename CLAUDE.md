@@ -44,6 +44,11 @@ local content. `webrtc` dev-dep waits for an upstream 0.17.3 release.
 - Tablet-facing paths: no behaviour change unless that is the task; prove compatibility with tests.
 - Never destructive by default: quarantine instead of delete, dry-run defaults for admin ops,
   refuse to rewrite what can't be parsed.
+- Enforce data-safety invariants at the sink (the one function that overwrites, deletes or
+  moves user data), not in the decision logic upstream of it. Find every sink with
+  `codegraph callers` first; if a review finds a second path to data loss in the same feature,
+  stop patching paths and move the check to the sink (lesson of #40: four rounds of case-match
+  fixes, closed by `guard_overwrite` in `download_counted`).
 - Tests are deterministic: no sleep-as-sync, no global env mutation (inject config), no real
   network (local axum mock servers), no wall-clock limits deciding which assertion trips.
 - See `.claude/rules/` for code style, security and testing detail.
