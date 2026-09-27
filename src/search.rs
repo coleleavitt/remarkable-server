@@ -619,8 +619,9 @@ enum Bounded {
 }
 
 /// Run `cmd` without stdin or stderr, reading at most `cap` bytes of its stdout, and kill it
-/// if it hasn't exited after `timeout`. Once `cap` bytes are read its stdout is closed, so a
-/// program still writing gets `SIGPIPE`; what it wrote is kept.
+/// (with anything it started) if it hasn't exited and closed its output within `timeout`. Once
+/// `cap` bytes are read its stdout is closed, so a program still writing gets `SIGPIPE`; what it
+/// wrote is kept.
 fn run_bounded(
     mut cmd: Command,
     timeout: std::time::Duration,
@@ -628,35 +629,53 @@ fn run_bounded(
 ) -> std::io::Result<Bounded> {
     use std::io::Read;
     use std::process::Stdio;
+    // Its own process group, so the deadline kills anything it started too: a helper left
+    // running would keep the output pipe open.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
     let stdout = child.stdout.take().expect("piped stdout");
-    let reader = std::thread::spawn(move || {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut out = Vec::new();
         let _ = stdout.take(cap).read_to_end(&mut out);
-        out
+        let _ = tx.send(out);
     });
     let deadline = std::time::Instant::now() + timeout;
+    let timed_out = |child: &mut std::process::Child| -> std::io::Result<Bounded> {
+        #[cfg(unix)]
+        if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
+            // SAFETY: kill(2) with a negative pid signals that process group; no memory is
+            // involved.
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        }
+        let _ = child.kill();
+        child.wait()?;
+        // The reader ends once the last holder of the pipe is gone; not waited for.
+        Ok(Bounded::TimedOut)
+    };
     let status = loop {
         if let Some(status) = child.try_wait()? {
-            break Some(status);
+            break status;
         }
         if std::time::Instant::now() >= deadline {
-            // It may have exited just now; either way, reap it.
-            let _ = child.kill();
-            child.wait()?;
-            break None;
+            return timed_out(&mut child);
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
-    let out = reader.join().unwrap_or_default();
-    Ok(match status {
-        None => Bounded::TimedOut,
-        Some(s) if s.success() || out.len() as u64 >= cap => Bounded::Done(out),
-        Some(_) => Bounded::Failed,
+    // Exited, but something it started may still hold the pipe open.
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    let Ok(out) = rx.recv_timeout(left) else {
+        return timed_out(&mut child);
+    };
+    Ok(if status.success() || out.len() as u64 >= cap {
+        Bounded::Done(out)
+    } else {
+        Bounded::Failed
     })
 }
 
@@ -687,9 +706,28 @@ mod tests {
             run_bounded(sh("yes"), long, 1000).unwrap(),
             Bounded::Done(b"y\n".repeat(500))
         );
+        // `; true` keeps the shell from exec'ing sleep (dash doesn't either), so the sleep is a
+        // grandchild holding the pipe: it has to be killed with the shell.
         let started = std::time::Instant::now();
         assert_eq!(
-            run_bounded(sh("sleep 30"), std::time::Duration::from_millis(100), 100).unwrap(),
+            run_bounded(
+                sh("sleep 30; true"),
+                std::time::Duration::from_millis(100),
+                100
+            )
+            .unwrap(),
+            Bounded::TimedOut
+        );
+        assert!(started.elapsed() < long);
+        // Exits at once, leaving a background process that holds the pipe.
+        let started = std::time::Instant::now();
+        assert_eq!(
+            run_bounded(
+                sh("sleep 30 & echo started"),
+                std::time::Duration::from_millis(200),
+                100
+            )
+            .unwrap(),
             Bounded::TimedOut
         );
         assert!(started.elapsed() < long);
