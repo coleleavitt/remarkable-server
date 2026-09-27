@@ -937,6 +937,17 @@ pub struct CloudSync<P: CloudProvider> {
     /// With [`SyncConfig::persist_state`], which stored manifest is this sync's; set once it is
     /// loaded.
     manifest_key: Option<ManifestKey>,
+    /// Set for a sync that has a manifest from an earlier one; see [`Self::guard_overwrite`].
+    overwrite_guard: Option<OverwriteGuard>,
+}
+
+/// What a sync with a manifest needs to keep a download from overwriting local content that
+/// was never synced.
+struct OverwriteGuard {
+    /// The recorded local content (SHA-256) of every manifest entry.
+    synced: HashSet<String>,
+    /// This sync's quarantine run.
+    run: String,
 }
 
 impl<P: CloudProvider> CloudSync<P> {
@@ -952,6 +963,7 @@ impl<P: CloudProvider> CloudSync<P> {
             state,
             conflict_resolver,
             manifest_key: None,
+            overwrite_guard: None,
         }
     }
 
@@ -1320,6 +1332,17 @@ impl<P: CloudProvider> CloudSync<P> {
             true => None,
             false => self.state.manifest.take(),
         };
+        let run = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        // Taken before the case matching below: which entry a local file is compared with can
+        // be wrong for a group of names that differ only in case, so no overwrite relies on it.
+        self.overwrite_guard = base.as_ref().map(|base| OverwriteGuard {
+            synced: base
+                .files
+                .values()
+                .filter_map(|e| e.local.as_ref()?.sha256.clone())
+                .collect(),
+            run: run.clone(),
+        });
 
         // Paths left alone in both directions, whose manifest entries stay as they were: they
         // are never taken for deleted.
@@ -1528,7 +1551,6 @@ impl<P: CloudProvider> CloudSync<P> {
         // Stable, so paths stay sorted within a step. Local copies are moved aside first, so a
         // remote folder that replaced a file, or a file that replaced a folder, can come down.
         plan.sort_by_key(|p| p.step.order());
-        let run = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
         let mut quarantined = Vec::new();
         for Planned {
             path,
@@ -1855,6 +1877,47 @@ impl<P: CloudProvider> CloudSync<P> {
         }
     }
 
+    /// Before a download writes over the local file at `path`: unless its content is one the
+    /// manifest recorded as synced, move it into quarantine first, whichever manifest entry the
+    /// sync compared it with. On a first sync (no manifest) nothing is moved. `false` if it
+    /// couldn't be moved: the download is then skipped.
+    async fn guard_overwrite(&self, path: &str, result: &mut SyncResult) -> bool {
+        let Some(guard) = &self.overwrite_guard else {
+            return true;
+        };
+        let Ok(target) = local_path_for(&self.config.local_path, path) else {
+            return true;
+        };
+        match fs::symlink_metadata(&target).await {
+            Ok(meta) if meta.is_file() => {}
+            _ => return true,
+        }
+        if let Ok(content) = fs::read(&target).await {
+            if guard.synced.contains(&sha256_hex(&content)) {
+                return true;
+            }
+        }
+        match quarantine(&self.config.local_path, &guard.run, path, &target).await {
+            Ok(to) => {
+                result.notices.push(format!(
+                    "{} held local content never recorded as synced: it was moved to {} \
+                     before the remote version was downloaded",
+                    path,
+                    to.display()
+                ));
+                true
+            }
+            Err(e) => {
+                result.errors.push(format!(
+                    "{} holds local content never recorded as synced, which couldn't be moved \
+                     aside, so the remote version wasn't downloaded: {}",
+                    path, e
+                ));
+                false
+            }
+        }
+    }
+
     /// [Download](Self::download_file) `cloud_file`, counting it in `result`; its manifest
     /// entry, if it came. A failure that may go away sets `retry_needed`.
     async fn download_counted(
@@ -1863,6 +1926,9 @@ impl<P: CloudProvider> CloudSync<P> {
         result: &mut SyncResult,
         retry_needed: &mut bool,
     ) -> Option<ManifestEntry> {
+        if !self.guard_overwrite(&cloud_file.path, result).await {
+            return None;
+        }
         match self.download_file(cloud_file).await {
             Ok(local) => {
                 result.downloaded += 1;
@@ -4818,6 +4884,83 @@ mod tests {
         assert_eq!(read(root, "report.pdf"), "other");
         assert_eq!(recorded(&sync), ["/Report.pdf"]);
         again(sync)
+    }
+
+    /// A never-synced newcomer at the tracked file's recorded spelling, left once the clash is
+    /// settled by removing the renamed tracked file, while the remote file changed: the entry
+    /// is the tracked file's own (same spelling), so nothing marks the newcomer as never
+    /// synced. Taking the remote version must not overwrite it: its content was never uploaded,
+    /// so it is moved aside first (verification round 4 of #40).
+    #[tokio::test]
+    async fn a_never_synced_file_is_moved_aside_before_the_remote_version_comes_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = Store {
+            hashed: true,
+            ignores_case: true,
+            ..Default::default()
+        };
+        store.put("/report.pdf", "v1");
+        let mut sync = CloudSync::new(store, kept(root, SyncDirection::Bidirectional));
+        assert_eq!(counts(&clean(&mut sync).await), (0, 1, 0));
+        // Renamed in case only and a newcomer at the old spelling, before any sync.
+        std::fs::rename(root.join("report.pdf"), root.join("Report.pdf")).unwrap();
+        write(root, "report.pdf", "other");
+        sync = again(sync);
+        let r = sync.sync().await.unwrap();
+        assert_eq!(counts(&r), (0, 0, 0));
+        assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+        // Settled by removing the tracked file; meanwhile the remote file changed.
+        std::fs::remove_file(root.join("Report.pdf")).unwrap();
+        sync.provider.put("/report.pdf", "v2");
+        sync = again_with(sync, |c| c.conflict_strategy = ConflictStrategy::CloudWins);
+        let r = clean(&mut sync).await;
+        assert_eq!(read(root, "report.pdf"), "v2");
+        let aside = quarantined(root);
+        assert_eq!(aside.len(), 1, "{:?} {:?}", aside, r.notices);
+        let moved = std::fs::read_dir(root.join(QUARANTINE_DIR))
+            .unwrap()
+            .flat_map(|run| walk_files(&run.unwrap().path()))
+            .map(|p| std::fs::read_to_string(p).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(moved, ["other"]);
+        assert!(!r.notices.is_empty());
+    }
+
+    /// The conflict strategy taking the remote version of a file edited on both sides doesn't
+    /// destroy the local edit, which was never synced: it goes to quarantine.
+    #[tokio::test]
+    async fn a_local_edit_the_strategy_overrides_is_moved_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = Store::default();
+        store.put("/notes.txt", "v1");
+        let mut sync = CloudSync::new(store, kept(root, SyncDirection::Bidirectional));
+        assert_eq!(counts(&clean(&mut sync).await), (0, 1, 0));
+        write(root, "notes.txt", "local edit");
+        sync.provider.put("/notes.txt", "remote edit");
+        sync = again_with(sync, |c| c.conflict_strategy = ConflictStrategy::CloudWins);
+        let r = clean(&mut sync).await;
+        assert_eq!(read(root, "notes.txt"), "remote edit");
+        let moved = std::fs::read_dir(root.join(QUARANTINE_DIR))
+            .unwrap()
+            .flat_map(|run| walk_files(&run.unwrap().path()))
+            .map(|p| std::fs::read_to_string(p).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(moved, ["local edit"], "{:?}", r.notices);
+    }
+
+    fn walk_files(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                out.extend(walk_files(&p));
+            } else {
+                out.push(p);
+            }
+        }
+        out
     }
 
     /// A clash settled by removing the newcomer: `Report.pdf` is where it was, and the remote
