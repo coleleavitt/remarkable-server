@@ -1032,6 +1032,8 @@ pub struct CloudSync<P: CloudProvider> {
     /// sending. One left when the sync records the path failed, and goes in its entry's
     /// [`ManifestEntry::sent`].
     unconfirmed: HashMap<String, LocalIdentity>,
+    /// Notices from the downloads ([`Self::guard_overwrite`]), for the sync's result.
+    notices: Vec<String>,
 }
 
 /// What a sync with a manifest needs to keep a download from overwriting local content that
@@ -1041,6 +1043,19 @@ struct OverwriteGuard {
     synced: HashSet<String>,
     /// This sync's quarantine run.
     run: String,
+}
+
+impl OverwriteGuard {
+    fn of(manifest: &SyncManifest, run: &str) -> Self {
+        Self {
+            synced: manifest
+                .files
+                .values()
+                .filter_map(|e| e.local.as_ref()?.sha256.clone())
+                .collect(),
+            run: run.to_string(),
+        }
+    }
 }
 
 impl<P: CloudProvider> CloudSync<P> {
@@ -1058,6 +1073,7 @@ impl<P: CloudProvider> CloudSync<P> {
             manifest_key: None,
             overwrite_guard: None,
             unconfirmed: HashMap::new(),
+            notices: Vec::new(),
         }
     }
 
@@ -1432,14 +1448,7 @@ impl<P: CloudProvider> CloudSync<P> {
         self.unconfirmed.clear();
         // Taken before the case matching below: which entry a local file is compared with can
         // be wrong for a group of names that differ only in case, so no overwrite relies on it.
-        self.overwrite_guard = base.as_ref().map(|base| OverwriteGuard {
-            synced: base
-                .files
-                .values()
-                .filter_map(|e| e.local.as_ref()?.sha256.clone())
-                .collect(),
-            run: run.clone(),
-        });
+        self.overwrite_guard = base.as_ref().map(|base| OverwriteGuard::of(base, &run));
 
         // Paths left alone in both directions, whose manifest entries stay as they were: they
         // are never taken for deleted.
@@ -1746,6 +1755,7 @@ impl<P: CloudProvider> CloudSync<P> {
             }
         }
 
+        result.notices.append(&mut self.notices);
         let keep_days = self.config.quarantine_keep_days;
         match prune_quarantine(&self.config.local_path, &run, keep_days).await {
             Ok(pruned) => {
@@ -1920,8 +1930,7 @@ impl<P: CloudProvider> CloudSync<P> {
                     .await
             }
             ConflictResolution::KeepBoth { renamed_to } => {
-                // Download cloud version with new name. The two sides still differ at `path`,
-                // so it isn't recorded: the local version there was never sent.
+                // Download the cloud version under a new name beside the local one.
                 let mut renamed_file = cloud_file.clone();
                 renamed_file.name = renamed_to;
                 renamed_file.path = format!(
@@ -1934,18 +1943,33 @@ impl<P: CloudProvider> CloudSync<P> {
                     renamed_file.name
                 );
 
-                if direction != SyncDirection::Upload {
-                    match self.download_file(&renamed_file).await {
-                        Ok(_) => result.downloaded += 1,
-                        Err(e) => {
-                            *retry_needed |= !e.is_permanent();
-                            result
-                                .errors
-                                .push(format!("Download conflict copy failed: {}", e));
-                        }
+                if direction == SyncDirection::Upload {
+                    return None;
+                }
+                match self.download_file(&renamed_file).await {
+                    Ok(_) => result.downloaded += 1,
+                    Err(e) => {
+                        *retry_needed |= !e.is_permanent();
+                        result
+                            .errors
+                            .push(format!("Download conflict copy failed: {}", e));
+                        return None;
                     }
                 }
-                None
+                // With the remote version kept beside it, the local one goes up in its place,
+                // so the next sync finds the two sides in step rather than making another copy.
+                // A download-only sync can't send it: the remote side is recorded, and the local
+                // side left as changed (never as synced), so the copy is made once and the local
+                // version goes up with the next sync that may upload.
+                if direction == SyncDirection::Download {
+                    return Some(ManifestEntry {
+                        remote: Some(RemoteIdentity::of(cloud_file)),
+                        local: None,
+                        sent: None,
+                    });
+                }
+                self.upload_counted(path, local, Some(cloud_file), result)
+                    .await
             }
             ConflictResolution::ManualRequired => {
                 result.conflicts.push(conflict);
@@ -1999,44 +2023,40 @@ impl<P: CloudProvider> CloudSync<P> {
         }
     }
 
-    /// Before a download writes over the local file at `path`: unless its content is one the
-    /// manifest recorded as synced, move it into quarantine first, whichever manifest entry the
-    /// sync compared it with. On a first sync (no manifest) nothing is moved. `false` if it
-    /// couldn't be moved: the download is then skipped.
-    async fn guard_overwrite(&self, path: &str, result: &mut SyncResult) -> bool {
+    /// Before a download writes over the local file `target` (at the sync path `path`): unless
+    /// its content is one the manifest recorded as synced, move it into quarantine first,
+    /// whichever manifest entry the sync compared it with, with a notice. Every download goes
+    /// through here ([`Self::download_unless`]): the full sync's, a conflict copy's, a delta
+    /// sync's. On a first sync (no manifest) nothing is moved. An error if it couldn't be moved:
+    /// the download then writes nothing.
+    async fn guard_overwrite(&mut self, path: &str, target: &Path) -> Result<()> {
         let Some(guard) = &self.overwrite_guard else {
-            return true;
+            return Ok(());
         };
-        let Ok(target) = local_path_for(&self.config.local_path, path) else {
-            return true;
-        };
-        match fs::symlink_metadata(&target).await {
+        match fs::symlink_metadata(target).await {
             Ok(meta) if meta.is_file() => {}
-            _ => return true,
+            _ => return Ok(()),
         }
-        if let Ok(content) = fs::read(&target).await {
+        if let Ok(content) = fs::read(target).await {
             if guard.synced.contains(&sha256_hex(&content)) {
-                return true;
+                return Ok(());
             }
         }
-        match quarantine(&self.config.local_path, &guard.run, path, &target).await {
+        match quarantine(&self.config.local_path, &guard.run, path, target).await {
             Ok(to) => {
-                result.notices.push(format!(
+                self.notices.push(format!(
                     "{} held local content never recorded as synced: it was moved to {} \
                      before the remote version was downloaded",
                     path,
                     to.display()
                 ));
-                true
+                Ok(())
             }
-            Err(e) => {
-                result.errors.push(format!(
-                    "{} holds local content never recorded as synced, which couldn't be moved \
-                     aside, so the remote version wasn't downloaded: {}",
-                    path, e
-                ));
-                false
-            }
+            Err(e) => Err(IntegrationError::LocalPathUnusable(format!(
+                "{:?} holds local content never recorded as synced, which couldn't be moved \
+                 aside: {}",
+                path, e
+            ))),
         }
     }
 
@@ -2050,9 +2070,6 @@ impl<P: CloudProvider> CloudSync<P> {
         result: &mut SyncResult,
         retry_needed: &mut bool,
     ) -> Option<ManifestEntry> {
-        if !self.guard_overwrite(&cloud_file.path, result).await {
-            return None;
-        }
         match self.download_unless(cloud_file, unless).await {
             Ok(None) => Some(ManifestEntry {
                 remote: Some(RemoteIdentity::of(cloud_file)),
@@ -2326,6 +2343,7 @@ impl<P: CloudProvider> CloudSync<P> {
         {
             return Err(escape());
         }
+        self.guard_overwrite(&cloud_file.path, &target).await?;
         let written = write_replace(&dir, &target, &content)
             .await
             .map_err(unusable)?;
@@ -2376,6 +2394,12 @@ impl<P: CloudProvider> CloudSync<P> {
             return self.resync().await;
         };
         self.load_manifest().await?;
+        let run = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        self.overwrite_guard = self
+            .state
+            .manifest
+            .as_ref()
+            .map(|m| OverwriteGuard::of(m, &run));
 
         let start = std::time::Instant::now();
         let mut result = SyncResult::new();
@@ -2504,6 +2528,7 @@ impl<P: CloudProvider> CloudSync<P> {
             }
         }
 
+        result.notices.append(&mut self.notices);
         // Only advance past this page once every change in it was applied or failed
         // permanently; otherwise the transiently failed files would never be retried.
         if retry_needed {
@@ -4758,6 +4783,65 @@ mod tests {
         assert!(r.conflicts.is_empty(), "{:?}", r.conflicts);
     }
 
+    /// A delta sync's downloads go through the same guard as a full sync's: a local edit the
+    /// conflict strategy overrides is moved aside, not overwritten.
+    #[tokio::test]
+    async fn a_delta_sync_moves_a_local_edit_aside_before_overwriting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = Store::default();
+        store.put("/a.txt", "a");
+        let config = SyncConfig {
+            conflict_strategy: ConflictStrategy::CloudWins,
+            ..kept(root, SyncDirection::Bidirectional)
+        };
+        let mut sync = CloudSync::new(store, config);
+        let r = sync.delta_sync().await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+
+        write(root, "a.txt", "edited here");
+        sync.provider.put("/a.txt", "edited remotely");
+        let r = sync.delta_sync().await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(read(root, "a.txt"), "edited remotely");
+        assert_eq!(r.notices.len(), 1, "{:?}", r.notices);
+        let moved = std::fs::read_dir(root.join(QUARANTINE_DIR))
+            .unwrap()
+            .flat_map(|run| walk_files(&run.unwrap().path()))
+            .map(|p| std::fs::read_to_string(p).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(moved, ["edited here"]);
+    }
+
+    /// KeepBoth in a download-only sync makes the copy once, and records nothing as synced that
+    /// wasn't: the local version goes up with the next sync that may upload.
+    #[tokio::test]
+    async fn keep_both_download_only_copies_once_and_sends_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = Store::hashed();
+        store.put("/notes.txt", "v1");
+        let mut sync = CloudSync::new(store, kept(root, SyncDirection::Bidirectional));
+        clean(&mut sync).await;
+        write(root, "notes.txt", "local edit");
+        sync.provider.put("/notes.txt", "remote edit");
+        for _ in 0..2 {
+            sync = again_with(sync, |c| {
+                c.conflict_strategy = ConflictStrategy::KeepBoth;
+                c.direction = SyncDirection::Download;
+            });
+            clean(&mut sync).await;
+        }
+        assert_eq!(sync.provider.downloads().len(), 2, "v1, then one copy");
+        assert_eq!(read(root, "notes.txt"), "local edit");
+        sync = again_with(sync, |c| c.direction = SyncDirection::Bidirectional);
+        clean(&mut sync).await;
+        assert_eq!(
+            sync.provider.content("/notes.txt").as_deref(),
+            Some("local edit")
+        );
+    }
+
     /// A manifest this server can't read stops the sync rather than sync without it (which would
     /// bring back what was deleted), and is left as it is.
     #[tokio::test]
@@ -5651,6 +5735,36 @@ mod tests {
         let r = clean(&mut sync).await;
         assert!(!root.join(QUARANTINE_DIR).join("20000101T000000Z").exists());
         assert!(has_notice(&r, "Removed 1 run from"), "{:?}", r.notices);
+    }
+
+    /// KeepBoth brings the remote version down beside the local one and then sends the local
+    /// one, so the two sides are in step: later syncs make no further copies.
+    #[tokio::test]
+    async fn keep_both_makes_one_conflict_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = Store::hashed();
+        store.put("/notes.txt", "v1");
+        let mut sync = CloudSync::new(store, kept(root, SyncDirection::Bidirectional));
+        clean(&mut sync).await;
+        write(root, "notes.txt", "local edit");
+        sync.provider.put("/notes.txt", "remote edit");
+        for _ in 0..3 {
+            sync = again_with(sync, |c| c.conflict_strategy = ConflictStrategy::KeepBoth);
+            clean(&mut sync).await;
+        }
+        let copies: Vec<_> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.starts_with("notes_conflict_"))
+            .collect();
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        assert_eq!(read(root, &copies[0]), "remote edit");
+        assert_eq!(read(root, "notes.txt"), "local edit");
+        assert_eq!(
+            sync.provider.content("/notes.txt").as_deref(),
+            Some("local edit")
+        );
     }
 
     /// What a test loses of a sync that wrote to the remote file.
