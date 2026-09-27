@@ -142,6 +142,9 @@ pub struct SyncRequest {
     pub cloud_folder: Option<String>,
     #[serde(default)]
     pub direction: Option<String>,
+    /// See [`SyncConfig::quarantine_keep_days`]: unset keeps every local copy moved aside.
+    #[serde(default)]
+    pub quarantine_keep_days: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -394,13 +397,15 @@ async fn resolve_sync_dir(
 }
 
 /// How `POST /sync` syncs: into `local_path`, from `cloud_folder`, in `direction` (`upload`,
-/// `download`, anything else both ways). Each request makes a new [`CloudSync`], so the state
+/// `download`, anything else both ways), keeping moved-aside local copies `quarantine_keep_days`
+/// (all, if unset). Each request makes a new [`CloudSync`], so the state
 /// of the last sync is kept on disk (see [`SyncConfig::persist_state`]): without it, every sync
 /// would be a first one, uploading again what was deleted remotely.
 fn sync_config(
     local_path: PathBuf,
     cloud_folder: Option<String>,
     direction: Option<&str>,
+    quarantine_keep_days: Option<u32>,
 ) -> SyncConfig {
     use crate::integrations::sync::SyncDirection;
     SyncConfig {
@@ -412,6 +417,7 @@ fn sync_config(
             _ => SyncDirection::Bidirectional,
         },
         persist_state: true,
+        quarantine_keep_days,
         ..Default::default()
     }
 }
@@ -426,7 +432,12 @@ pub async fn trigger_sync(
         "Sync directory not configured".to_string(),
     ))?;
     let local_path = resolve_sync_dir(base, req.local_path.as_deref()).await?;
-    let sync_config = sync_config(local_path, req.cloud_folder, req.direction.as_deref());
+    let sync_config = sync_config(
+        local_path,
+        req.cloud_folder,
+        req.direction.as_deref(),
+        req.quarantine_keep_days,
+    );
 
     // Wait our turn *before* reading config/token: a sync queued behind another must not run
     // with a token captured before the provider was disconnected.
@@ -722,6 +733,7 @@ mod tests {
             local_path: None,
             cloud_folder: None,
             direction: None,
+            quarantine_keep_days: None,
         };
         let queued = tokio::spawn(trigger_sync(State(state.clone()), Json(req)));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -754,8 +766,9 @@ mod tests {
             (Some("download"), SyncDirection::Download),
             (None, SyncDirection::Bidirectional),
         ] {
-            let config = sync_config("/x".into(), Some("/Notes".into()), direction);
+            let config = sync_config("/x".into(), Some("/Notes".into()), direction, None);
             assert!(config.persist_state);
+            assert_eq!(config.quarantine_keep_days, None);
             assert_eq!(config.direction, expected);
             assert_eq!(config.cloud_folder.as_deref(), Some("/Notes"));
         }
@@ -768,6 +781,7 @@ mod tests {
             local_path: None,
             cloud_folder: None,
             direction: None,
+            quarantine_keep_days: None,
         };
         let err = trigger_sync(State(IntegrationState::new()), Json(req))
             .await

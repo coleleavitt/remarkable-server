@@ -214,6 +214,81 @@ pub(crate) const MANIFEST_FILE: &str = ".rms-sync-state.json";
 /// `20260926T101500Z`). A sync never deletes a local file.
 pub(crate) const QUARANTINE_DIR: &str = ".rms-remote-deleted";
 
+/// How much [`QUARANTINE_DIR`] may hold, with no [`SyncConfig::quarantine_keep_days`], before a
+/// sync says so in its notices.
+pub(crate) const QUARANTINE_NOTICE_BYTES: u64 = 1 << 30;
+
+/// What [`prune_quarantine`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Pruned {
+    /// The runs removed.
+    removed: usize,
+    /// The bytes the runs left hold.
+    left: u64,
+}
+
+/// Remove the runs in `<root>/`[`QUARANTINE_DIR`] older than `keep_days` before `now` (this
+/// sync's run, never removed), if given, and count what is left. Only directories named as a
+/// run (`20260926T101500Z`) are removed, and nothing reached through a symlink: not the
+/// quarantine itself, nor anything in it.
+async fn prune_quarantine(root: &Path, now: &str, keep_days: Option<u32>) -> Result<Pruned> {
+    const RUN: &str = "%Y%m%dT%H%M%SZ";
+    let dir = root.join(QUARANTINE_DIR);
+    match fs::symlink_metadata(&dir).await {
+        Ok(m) if m.is_dir() => {}
+        // A symlink (or anything else): moving aside fails, with an error, and nothing there is
+        // this sync's to count; asked to prune, say why it can't.
+        Ok(_) if keep_days.is_none() => return Ok(Pruned::default()),
+        Ok(_) => {
+            return Err(IntegrationError::LocalPathUnusable(format!(
+                "{QUARANTINE_DIR}: not a directory"
+            )));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Pruned::default()),
+        Err(e) => return Err(e.into()),
+    }
+    let cutoff = match (keep_days, chrono::NaiveDateTime::parse_from_str(now, RUN)) {
+        (Some(days), Ok(now)) => Some(now - chrono::Duration::days(days.into())),
+        _ => None,
+    };
+    let mut pruned = Pruned::default();
+    let mut runs = fs::read_dir(&dir).await?;
+    while let Some(run) = runs.next_entry().await? {
+        let meta = fs::symlink_metadata(run.path()).await?;
+        let name = run.file_name();
+        let started = name
+            .to_str()
+            .and_then(|n| chrono::NaiveDateTime::parse_from_str(n, RUN).ok());
+        if let (Some(cutoff), Some(started), true) = (cutoff, started, meta.is_dir()) {
+            if started < cutoff && name.to_str() != Some(now) {
+                fs::remove_dir_all(run.path()).await?;
+                pruned.removed += 1;
+                continue;
+            }
+        }
+        pruned.left += disk_usage(&run.path()).await?;
+    }
+    Ok(pruned)
+}
+
+/// The bytes of the files at or under `path`, not following symlinks.
+async fn disk_usage(path: &Path) -> Result<u64> {
+    let mut total = 0;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let meta = fs::symlink_metadata(&path).await?;
+        if meta.is_dir() {
+            let mut entries = fs::read_dir(&path).await?;
+            while let Some(e) = entries.next_entry().await? {
+                stack.push(e.path());
+            }
+        } else if meta.is_file() {
+            total += meta.len();
+        }
+    }
+    Ok(total)
+}
+
 /// Whether `name` is one of the sync engine's own entries ([`LAYOUT_MARKER`],
 /// [`OLD_LAYOUT_DIR`], [`MANIFEST_FILE`], [`QUARANTINE_DIR`]).
 fn is_reserved_name(name: &str) -> bool {
@@ -893,6 +968,11 @@ pub struct SyncConfig {
     /// only as long as this `CloudSync`.
     #[serde(default)]
     pub persist_state: bool,
+    /// Remove the runs in [`QUARANTINE_DIR`] older than this many days, at the end of each full
+    /// sync. `None` (the default) keeps them all: a sync deletes nothing unless asked to. Then a
+    /// notice says when they hold more than [`QUARANTINE_NOTICE_BYTES`].
+    #[serde(default)]
+    pub quarantine_keep_days: Option<u32>,
 }
 
 impl Default for SyncConfig {
@@ -912,6 +992,7 @@ impl Default for SyncConfig {
             max_file_size: Some(100 * 1024 * 1024), // 100MB default
             sync_hidden: false,
             persist_state: false,
+            quarantine_keep_days: None,
         }
     }
 }
@@ -1665,6 +1746,33 @@ impl<P: CloudProvider> CloudSync<P> {
             }
         }
 
+        let keep_days = self.config.quarantine_keep_days;
+        match prune_quarantine(&self.config.local_path, &run, keep_days).await {
+            Ok(pruned) => {
+                if pruned.removed > 0 {
+                    result.notices.push(format!(
+                        "Removed {} from {} older than {} days",
+                        match pruned.removed {
+                            1 => "1 run".to_string(),
+                            n => format!("{} runs", n),
+                        },
+                        QUARANTINE_DIR,
+                        keep_days.unwrap_or_default()
+                    ));
+                }
+                if keep_days.is_none() && pruned.left > QUARANTINE_NOTICE_BYTES {
+                    result.notices.push(format!(
+                        "{} holds {} MiB of local copies moved aside; nothing there is removed \
+                         unless quarantine_keep_days is set",
+                        QUARANTINE_DIR,
+                        pruned.left >> 20
+                    ));
+                }
+            }
+            Err(e) => result
+                .errors
+                .push(format!("Couldn't prune {}: {}", QUARANTINE_DIR, e)),
+        }
         if !quarantined.is_empty() {
             result.notices.push(format!(
                 "{} deleted remotely since the last sync and unchanged here, moved to {}/{}/ \
@@ -5460,6 +5568,89 @@ mod tests {
         sync = again(sync);
         assert_eq!(counts(&clean(&mut sync).await), (0, 1, 0));
         assert_eq!(read(root, "notes.txt"), "v3");
+    }
+
+    /// Pruning removes only runs older than the days kept, by the name of the run; never the
+    /// current one, nor anything but a run directory, nor what a symlink points to. Without
+    /// days kept, nothing goes, and what is there is counted.
+    #[tokio::test]
+    async fn quarantine_pruning_removes_only_old_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(outside.path(), "keep.txt", "not ours");
+        let q = root.join(QUARANTINE_DIR);
+        for (run, body) in [
+            ("20000101T000000Z", "old"),
+            ("20251215T000000Z", "recent"),
+            ("20260101T000000Z", "this run"),
+            ("notes", "not a run"),
+        ] {
+            write(&q.join(run), "a/f.txt", body);
+        }
+        std::os::unix::fs::symlink(outside.path(), q.join("19990101T000000Z")).unwrap();
+
+        let now = "20260101T000000Z";
+        let kept = prune_quarantine(root, now, None).await.unwrap();
+        assert_eq!(
+            kept,
+            Pruned {
+                removed: 0,
+                left: 3 + 6 + 8 + 9
+            }
+        );
+
+        let pruned = prune_quarantine(root, now, Some(30)).await.unwrap();
+        assert_eq!(
+            pruned,
+            Pruned {
+                removed: 1,
+                left: 6 + 8 + 9
+            }
+        );
+        assert!(!q.join("20000101T000000Z").exists());
+        for left in [
+            "20251215T000000Z",
+            "20260101T000000Z",
+            "notes",
+            "19990101T000000Z",
+        ] {
+            assert!(std::fs::symlink_metadata(q.join(left)).is_ok(), "{left}");
+        }
+        assert_eq!(read(outside.path(), "keep.txt"), "not ours");
+
+        // A quarantine that is a symlink is left alone.
+        std::fs::remove_dir_all(&q).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &q).unwrap();
+        assert!(prune_quarantine(root, now, Some(0)).await.is_err());
+        assert_eq!(
+            prune_quarantine(root, now, None).await.unwrap(),
+            Pruned::default()
+        );
+        assert_eq!(read(outside.path(), "keep.txt"), "not ours");
+    }
+
+    /// A full sync with `quarantine_keep_days` prunes old runs and says so.
+    #[tokio::test]
+    async fn a_sync_prunes_the_quarantine_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join(QUARANTINE_DIR).join("20000101T000000Z"),
+            "f.txt",
+            "old",
+        );
+        let store = Store::hashed();
+        store.put("/a.txt", "a");
+        let mut sync = CloudSync::new(store, kept(root, SyncDirection::Bidirectional));
+        let r = clean(&mut sync).await;
+        assert!(root.join(QUARANTINE_DIR).join("20000101T000000Z").exists());
+        assert!(!has_notice(&r, "Removed"), "{:?}", r.notices);
+
+        sync = again_with(sync, |c| c.quarantine_keep_days = Some(30));
+        let r = clean(&mut sync).await;
+        assert!(!root.join(QUARANTINE_DIR).join("20000101T000000Z").exists());
+        assert!(has_notice(&r, "Removed 1 run from"), "{:?}", r.notices);
     }
 
     /// What a test loses of a sync that wrote to the remote file.
