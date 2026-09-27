@@ -42,6 +42,16 @@ use tokio::sync::mpsc;
 use crate::device::{DeviceManager, SESSION_RECHECK};
 
 const MAX_PACKET: usize = 1024 * 1024;
+/// The most a CONNECT may take, read before the client is authenticated: a token is a couple
+/// of KB, so an unauthenticated client can't make this process buffer [`MAX_PACKET`].
+const MAX_CONNECT_PACKET: usize = 64 * 1024;
+/// How long a client has, from its TCP connection, to finish the TLS handshake and send its
+/// CONNECT. The port is open to the internet: without it, connections that never get that far
+/// would each hold a task and a file descriptor (shared with the HTTP server) for good.
+const PRE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Connections not yet authenticated at once; more are closed at once. Authenticated ones
+/// don't count, so a flood of these can't keep the tablet out for longer than it lasts.
+const MAX_PRE_AUTH: usize = 64;
 /// Rooms without activity for this long are dropped (rmfakecloud `roomTimeout`).
 const ROOM_TIMEOUT: Duration = Duration::from_secs(60);
 const ROOM_SWEEP: Duration = Duration::from_secs(15);
@@ -490,42 +500,72 @@ impl Broker {
                 sweeper.sweep_rooms();
             }
         });
+        let pre_auth = Arc::new(tokio::sync::Semaphore::new(MAX_PRE_AUTH));
         loop {
-            let (tcp, peer) = listener.accept().await?;
+            // A failed accept (out of file descriptors, say) is passing: it mustn't end the
+            // broker for the rest of the process's life.
+            let (tcp, peer) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    tracing::warn!("mqtt accept failed: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            let Ok(permit) = pre_auth.clone().try_acquire_owned() else {
+                tracing::warn!(%peer, "mqtt: too many connections not yet authenticated; closing");
+                continue;
+            };
             let (broker, tls) = (self.clone(), tls.clone());
             tokio::spawn(async move {
-                match tls.accept(tcp).await {
-                    Ok(stream) => {
-                        if let Err(e) = broker.session(stream).await {
+                match tokio::time::timeout(PRE_AUTH_TIMEOUT, tls.accept(tcp)).await {
+                    Ok(Ok(stream)) => {
+                        if let Err(e) = broker.session_after(stream, Some(permit)).await {
                             tracing::debug!(%peer, "mqtt session ended: {e}");
                         }
                     }
-                    Err(e) => tracing::warn!(%peer, "mqtt TLS handshake failed: {e}"),
+                    Ok(Err(e)) => tracing::warn!(%peer, "mqtt TLS handshake failed: {e}"),
+                    Err(_) => tracing::debug!(%peer, "mqtt TLS handshake timed out"),
                 }
             });
         }
     }
 
+    #[cfg(test)]
     async fn session<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         &self,
+        stream: S,
+    ) -> anyhow::Result<()> {
+        self.session_after(stream, None).await
+    }
+
+    /// One client's session. `pre_auth`, the connection's place among those not yet
+    /// authenticated ([`MAX_PRE_AUTH`]), is given up once it is.
+    async fn session_after<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+        &self,
         mut stream: S,
+        pre_auth: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> anyhow::Result<()> {
         let mut buf = BytesMut::with_capacity(4096);
         let mut out = BytesMut::new();
 
-        // CONNECT (must be first)
-        let connect = loop {
-            match Packet::read(&mut buf, MAX_PACKET) {
-                Ok(Packet::Connect(c)) => break c,
-                Ok(other) => anyhow::bail!("expected CONNECT, got {other:?}"),
-                Err(rumqttc::mqttbytes::Error::InsufficientBytes(_)) => {
-                    if stream.read_buf(&mut buf).await? == 0 {
-                        anyhow::bail!("closed before CONNECT");
+        // CONNECT (must be first), within PRE_AUTH_TIMEOUT and MAX_CONNECT_PACKET.
+        let connect = tokio::time::timeout(PRE_AUTH_TIMEOUT, async {
+            loop {
+                match Packet::read(&mut buf, MAX_CONNECT_PACKET) {
+                    Ok(Packet::Connect(c)) => break Ok(c),
+                    Ok(other) => anyhow::bail!("expected CONNECT, got {other:?}"),
+                    Err(rumqttc::mqttbytes::Error::InsufficientBytes(_)) => {
+                        if stream.read_buf(&mut buf).await? == 0 {
+                            anyhow::bail!("closed before CONNECT");
+                        }
                     }
+                    Err(e) => anyhow::bail!("bad packet: {e:?}"),
                 }
-                Err(e) => anyhow::bail!("bad packet: {e:?}"),
             }
-        };
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("no CONNECT within {PRE_AUTH_TIMEOUT:?}"))??;
         let token = connect
             .login
             .as_ref()
@@ -551,6 +591,7 @@ impl Broker {
             write_within(&mut stream, &out, idle).await?;
             anyhow::bail!("auth failed for client {}", connect.client_id);
         };
+        drop(pre_auth);
         // Resolves once that device is revoked (its event, or the periodic re-check, where only
         // a definite "not registered" counts: a DB hiccup keeps the session). It subscribes to
         // revocations here, before its first registration check, so none slips in between.
@@ -1195,6 +1236,23 @@ mod tests {
         }
         tablet.closed().await;
         assert!(broker.inner.clients.lock().is_empty());
+    }
+
+    /// Before it is authenticated, a connection gets [`PRE_AUTH_TIMEOUT`] to send its CONNECT,
+    /// of at most [`MAX_CONNECT_PACKET`]: a client that sends nothing, or starts a huge one,
+    /// is dropped rather than held (and buffered) for good.
+    #[tokio::test(start_paused = true)]
+    async fn unauthenticated_connections_are_bounded() {
+        let (broker, _dm, _tmp) = broker_with_recheck(Duration::from_secs(3600));
+        let (_silent, server) = tokio::io::duplex(1024);
+        let err = broker.session(server).await.unwrap_err();
+        assert!(err.to_string().contains("no CONNECT within"), "{err}");
+
+        let (mut io, server) = tokio::io::duplex(1024);
+        // CONNECT whose remaining length says 1 MB.
+        io.write_all(&[0x10, 0x80, 0x80, 0x40]).await.unwrap();
+        let err = broker.session(server).await.unwrap_err();
+        assert!(err.to_string().contains("bad packet"), "{err}");
     }
 
     #[tokio::test]
