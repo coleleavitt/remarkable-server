@@ -22,6 +22,9 @@ use crate::storage::Storage;
 /// Cap on extracted text stored per document, in bytes.
 const MAX_INDEXED_TEXT: usize = 100_000;
 
+/// The most results one search returns, whatever `limit` asks for.
+pub(crate) const MAX_SEARCH_RESULTS: usize = 100;
+
 /// How long `pdftotext` may run on one PDF before it is killed: a crafted PDF can make it
 /// spin, and each extraction holds a thread.
 const PDFTOTEXT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -303,6 +306,8 @@ impl SearchIndex {
 
         // Escape query for FTS5 (wrap terms in quotes for phrase matching if needed)
         let fts_query = Self::prepare_fts_query(&query.q);
+        let limit = query.limit.min(MAX_SEARCH_RESULTS) as i64;
+        let offset = i64::try_from(query.offset).unwrap_or(i64::MAX);
 
         // Build and execute query based on type filter
         let mut results = Vec::new();
@@ -322,15 +327,9 @@ impl SearchIndex {
                 .map_err(|e| ServerError::Database(e.to_string()))?;
 
             let rows = stmt
-                .query_map(
-                    params![
-                        &fts_query,
-                        dt.as_str(),
-                        query.limit as i64,
-                        query.offset as i64
-                    ],
-                    |row| Self::row_to_result(row),
-                )
+                .query_map(params![&fts_query, dt.as_str(), limit, offset], |row| {
+                    Self::row_to_result(row)
+                })
                 .map_err(|e| ServerError::Database(e.to_string()))?;
 
             for row in rows {
@@ -353,10 +352,9 @@ impl SearchIndex {
                 .map_err(|e| ServerError::Database(e.to_string()))?;
 
             let rows = stmt
-                .query_map(
-                    params![&fts_query, query.limit as i64, query.offset as i64],
-                    |row| Self::row_to_result(row),
-                )
+                .query_map(params![&fts_query, limit, offset], |row| {
+                    Self::row_to_result(row)
+                })
                 .map_err(|e| ServerError::Database(e.to_string()))?;
 
             for row in rows {
@@ -392,10 +390,12 @@ impl SearchIndex {
             return query.to_string();
         }
 
-        // Otherwise, prefix-match each word for partial matching
+        // Otherwise, prefix-match each word for partial matching. Each is quoted as an FTS5
+        // string, so punctuation in it (`e-mail`, `don't`, `c++`) is searched for rather than
+        // read as query syntax, which would fail the query.
         query
             .split_whitespace()
-            .map(|word| format!("{}*", word))
+            .map(|word| format!("\"{}\"*", word.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -733,6 +733,36 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].hash, "hash1");
         assert!(results[0].snippet.contains("<mark>"));
+    }
+
+    /// Words with punctuation are searched for, not read as FTS5 syntax (which failed the
+    /// query, so it found nothing); and `limit` is capped however large it is.
+    #[test]
+    fn punctuation_is_searched_for_and_limits_are_capped() {
+        let tmp = TempDir::new().unwrap();
+        let index = SearchIndex::new(tmp.path()).unwrap();
+        index
+            .index_document("h1", "notes.content", Some("Send the e-mail, don't wait"))
+            .unwrap();
+        for i in 0..(MAX_SEARCH_RESULTS + 5) {
+            index
+                .index_document(&format!("m{i}"), "many.content", Some("common"))
+                .unwrap();
+        }
+        let search = |q: &str, limit: usize| {
+            index
+                .search(&SearchQuery {
+                    q: q.into(),
+                    limit,
+                    offset: 0,
+                    doc_type: None,
+                })
+                .unwrap()
+        };
+        for q in ["e-mail", "don't", "e-ma", "mail, don"] {
+            assert_eq!(search(q, 10).len(), 1, "{q}");
+        }
+        assert_eq!(search("common", usize::MAX).len(), MAX_SEARCH_RESULTS);
     }
 
     #[test]
