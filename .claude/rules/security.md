@@ -35,3 +35,9 @@ tree; justify new ones (maintenance, license, transitive deps). Git deps pinned 
 Nothing is hard-deleted by default: quarantine (`.rms-remote-deleted/`), dry-run defaults
 (`/admin/storage/gc`), refuse to rewrite unparseable roots. No `git push --force`, no `git stash`,
 no changes on the Linode without an explicit request.
+
+Guard the sink, not the paths to it: before a write/delete/move of user data, check the invariant
+right there (e.g. `integrations/sync.rs` `guard_overwrite`: local content never recorded as synced
+is quarantined before a download replaces it). Enumerate sinks with `codegraph callers <fn>`
+and test each; decision logic upstream (plans, conflict strategies, case matching) may be wrong
+without losing data.
