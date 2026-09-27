@@ -3062,6 +3062,14 @@ today. The last evening sailing moves from 11:15 p.m. to 10:30 p.m.</p>
         }
     }
 
+    /// `ARTICLE_LIMITS` without the wall-clock parse backstop, for tests that expect a particular
+    /// counted limit (or none): on a slow CI runner the 1 s backstop can trip first and make them
+    /// depend on machine speed. The backstop itself is tested with a zero duration.
+    const COUNTED: ExtractLimits = ExtractLimits {
+        parse_time: Duration::from_secs(3600),
+        ..ARTICLE_LIMITS
+    };
+
     fn extract_under(html: &str, limits: &ExtractLimits) -> (ExtractedArticle, Option<OverLimit>) {
         extract_page(html, &Url::parse("https://e.example/a/").unwrap(), limits).unwrap()
     }
@@ -3081,7 +3089,7 @@ today. The last evening sailing moves from 11:15 p.m. to 10:30 p.m.</p>
         };
         let depth = ARTICLE_LIMITS.depth;
         // html and body are two levels, the paragraph one more.
-        let (a, over) = extract_under(&page("<span>", depth - 3), &ARTICLE_LIMITS);
+        let (a, over) = extract_under(&page("<span>", depth - 3), &COUNTED);
         assert_eq!(over, None);
         assert!(
             a.content_html
@@ -3090,7 +3098,7 @@ today. The last evening sailing moves from 11:15 p.m. to 10:30 p.m.</p>
             a.content_html
         );
 
-        let (a, over) = extract_under(&page("<span>", depth - 2), &ARTICLE_LIMITS);
+        let (a, over) = extract_under(&page("<span>", depth - 2), &COUNTED);
         assert_eq!(over, Some(OverLimit::Depth));
         assert_eq!(a.title, "T");
         assert_eq!(
@@ -3113,7 +3121,7 @@ today. The last evening sailing moves from 11:15 p.m. to 10:30 p.m.</p>
             // 4 s to parse.
             ("<ul><li>", 20_000),
         ] {
-            let (a, over) = extract_under(&page(open, n), &ARTICLE_LIMITS);
+            let (a, over) = extract_under(&page(open, n), &COUNTED);
             assert_eq!(over, Some(OverLimit::Depth), "{open} x {n}");
             assert_eq!((a.title.as_str(), a.word_count), ("T", 0), "{open} x {n}");
         }
@@ -3147,7 +3155,7 @@ today. The last evening sailing moves from 11:15 p.m. to 10:30 p.m.</p>
         assert!(work(1) < ARTICLE_LIMITS.work);
         assert!(work(3) > ARTICLE_LIMITS.work);
 
-        let (a, over) = extract_under(&page(40), &ARTICLE_LIMITS);
+        let (a, over) = extract_under(&page(40), &COUNTED);
         assert_eq!(over, Some(OverLimit::Work));
         assert_eq!(a.title, "T");
         assert_eq!(a.content_text, vec!["Hi there."; 40].join("\n\n"));
@@ -3184,7 +3192,7 @@ today. The last evening sailing moves from 11:15 p.m. to 10:30 p.m.</p>
                 "Hello",
             ),
         ] {
-            let (a, over) = extract_under(&page(&head, &h1), &ARTICLE_LIMITS);
+            let (a, over) = extract_under(&page(&head, &h1), &COUNTED);
             assert_eq!(over, Some(OverLimit::Work), "{head:.40} {h1:.40}");
             assert_eq!(a.title, title);
             assert!(
@@ -3198,14 +3206,14 @@ today. The last evening sailing moves from 11:15 p.m. to 10:30 p.m.</p>
         // A real title before the same headings, or the long one before a few, is extracted.
         let og = |title: &str| format!(r#"<meta property="og:title" content="{title}">"#);
         let title = "Harbor council adopts a new ferry timetable";
-        let (a, over) = extract_under(&page(&og(title), ""), &ARTICLE_LIMITS);
+        let (a, over) = extract_under(&page(&og(title), ""), &COUNTED);
         assert_eq!((over, a.title.as_str()), (None, title));
         assert!(a.content_text.contains("Text of part 599."));
         let few = format!(
             "<html><head>{}</head><body><h2>Part 0</h2><p>Text of part 0.</p></body></html>",
             og(long)
         );
-        let (a, over) = extract_under(&few, &ARTICLE_LIMITS);
+        let (a, over) = extract_under(&few, &COUNTED);
         assert_eq!((over, a.title.as_str()), (None, long));
         assert!(
             a.content_html
@@ -3248,7 +3256,7 @@ today. The last evening sailing moves from 11:15 p.m. to 10:30 p.m.</p>
             .collect();
         let page =
             format!("<html><head><title>Story</title></head><body>{paragraphs}</body></html>");
-        assert_eq!(extract_under(&page, &ARTICLE_LIMITS).1, None);
+        assert_eq!(extract_under(&page, &COUNTED).1, None);
 
         let check = |limits: ExtractLimits, want: OverLimit| {
             let (a, over) = extract_under(&page, &limits);
@@ -3457,7 +3465,7 @@ today. The last evening sailing moves from 11:15 p.m. to 10:30 p.m.</p>
                 "{url}: {shape:?}, limit {}",
                 ARTICLE_LIMITS.work
             );
-            let (a, over) = extract_page(html, &Url::parse(url).unwrap(), &ARTICLE_LIMITS).unwrap();
+            let (a, over) = extract_page(html, &Url::parse(url).unwrap(), &COUNTED).unwrap();
             assert_eq!(over, None, "{url}");
             assert_contains_all(&a.content_html, &[start, end]);
             assert_absent(&a.content_html, furniture);
