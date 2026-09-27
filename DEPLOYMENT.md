@@ -220,11 +220,26 @@ Layout:
   uploads; must be on the same filesystem as the blobs), `readlater.db` (read-later
   accounts incl. their credentials), `integrations/` (the only directory cloud sync
   reads/writes). Legacy `meta/*.meta` files are left in place but no longer written.
-- Host packages: `sqlite3` (the health/backup commands in the cheat sheet) and
-  `tesseract-ocr` (`apt install tesseract-ocr`), which handwriting convert
-  (`/convert/v1/handwriting`) and handwriting search run as the `tesseract` binary.
-  **The Linode currently lacks `tesseract`, so handwriting convert/search fail there**
-  until it is installed (or `HWR_COMMAND` points at another recogniser).
+- Host packages (all installed on the Linode as of 2026-09-26):
+  - `sqlite3` — the health/backup commands in the cheat sheet.
+  - `tesseract-ocr` — handwriting convert (`/convert/v1/handwriting`) and handwriting
+    search run the `tesseract` binary; without it both fail (or point `HWR_COMMAND` at
+    another recogniser).
+  - WeasyPrint for read-later accounts with `convert_format: "pdf"`. It must be 67 or later
+    (the first with `--allowed-protocols`); Ubuntu 24.04's apt package is 61.x, so it lives
+    in its own virtualenv, pinned, with the libraries it needs from apt:
+    ```sh
+    apt install python3-venv libharfbuzz-subset0      # pango/fontconfig/fonts were already present
+    python3 -m venv /opt/weasyprint
+    /opt/weasyprint/bin/pip install 'weasyprint==70.0'
+    ln -sf /opt/weasyprint/bin/weasyprint /usr/local/bin/weasyprint   # on the unit's PATH
+    ```
+    Checked inside the unit's sandbox (same user, `ProtectSystem=strict`, `ProtectHome`,
+    `PrivateTmp`, `ReadWritePaths`) with `systemd-run --wait --pipe -p User=remarkable ...
+    weasyprint --allowed-protocols http,https,data in.html out.pdf`: it prints, and refuses a
+    `file:` attachment. Its font cache goes to the service user's home,
+    `/var/lib/remarkable-server/.cache`, which is writable. To upgrade, re-run the `pip install`
+    with a newer pin. EPUB accounts (the default) need none of this.
 - Crash reports (`POST /post`) go to `CRASH_DIR`, default `./crash-dumps` relative to the
   working directory. The unit sets none (cwd `/`, `ProtectSystem=strict`), so set
   `CRASH_DIR=/var/lib/remarkable-server/crash-dumps` in the env file to keep them; otherwise
