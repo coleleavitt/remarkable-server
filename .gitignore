@@ -30,3 +30,10 @@ rm-proxy/target/
 
 # Local dependency overrides (see SETUP.md)
 /.cargo/config.toml
+
+# Local-only Claude scratch memory (see CLAUDE.md)
+/MEMORY.md
+
+# Project Claude workspace is shared policy (the global gitignore excludes .claude/)
+!/.claude/
+/.claude/settings.local.json

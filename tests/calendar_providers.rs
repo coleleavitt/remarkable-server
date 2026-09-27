@@ -980,6 +980,312 @@ async fn caldav_fallback_expands_recurring_events_in_their_time_zone() {
 }
 
 #[tokio::test]
+async fn caldav_fallback_expands_series_of_rdates_and_replaces_their_old_first_date() {
+    // A server without `expand` sends an irregular series as Apple Calendar writes it: no
+    // RRULE, its dates listed with RDATE in the series' zone (one a PERIOD), one cancelled.
+    let today = Utc::now().date_naive();
+    let d = |n: i64| (today + Duration::days(n)).format("%Y%m%d").to_string();
+    let ics = format!(
+        "BEGIN:VCALENDAR\r\nBEGIN:VTIMEZONE\r\nTZID:Asia/Kolkata\r\nBEGIN:STANDARD\r\nTZOFFSETFROM:+0530\r\nTZOFFSETTO:+0530\r\nDTSTART:19700101T000000\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:physio@dav\r\nSUMMARY:Physio\r\nDTSTART;TZID=Asia/Kolkata:{start}T090000\r\nDURATION:PT45M\r\nRDATE;TZID=Asia/Kolkata:{a}T090000,{b}T173000\r\nRDATE;VALUE=PERIOD;TZID=Asia/Kolkata:{c}T090000/PT2H\r\nEXDATE;TZID=Asia/Kolkata:{b}T173000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        start = d(-2),
+        a = d(5),
+        b = d(12),
+        c = d(40)
+    );
+    let base = serve({
+        let ics = ics.clone();
+        move |_| {
+            Router::new().fallback(move |method: Method, body: String| {
+                let ics = ics.clone();
+                async move {
+                    match method.as_str() {
+                        "PROPFIND" => multistatus(
+                            r#"<d:response><d:href>/cal/</d:href><d:propstat><d:prop>
+                                <d:resourcetype><d:collection/><cal:calendar/></d:resourcetype>
+                               </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"#,
+                        ),
+                        "REPORT" if body.contains("expand") => {
+                            (StatusCode::NOT_IMPLEMENTED, "expand unsupported").into_response()
+                        }
+                        "REPORT" => multistatus(&format!(
+                            r#"<d:response><d:href>/cal/physio.ics</d:href><d:propstat><d:prop>
+                                <d:getetag>"p1"</d:getetag>
+                                <cal:calendar-data>{}</cal:calendar-data>
+                               </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"#,
+                            ics_escape_xml(&ics)
+                        )),
+                        _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+                    }
+                }
+            })
+        }
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut mgr = CalendarManager::new(&dir.path().join("calendars.db")).unwrap();
+    mgr.add_calendar(calendar(
+        "r",
+        "Health",
+        CalendarProvider::Caldav,
+        CalendarConfig::Caldav {
+            url: format!("{}/cal/", base),
+            username: String::new(),
+            password: None,
+            bearer_token: None,
+            collection_url: None,
+        },
+    ))
+    .unwrap();
+    // What earlier versions stored for the series: its first date alone, under its UID.
+    let old = remarkable_server::calendar::parse_ics_str(&ics, "r")
+        .events
+        .pop()
+        .unwrap();
+    assert_eq!(old.id, "r:physio@dav");
+    mgr.upsert_event(&old).unwrap();
+    let state = CalendarState::new(mgr);
+
+    let axum::Json(result) = sync_calendar_endpoint(State(state.clone()), Path("r".into()))
+        .await
+        .unwrap();
+    assert!(result.success, "{:?}", result.error);
+    // DTSTART, the RDATE left and the PERIOD are stored as occurrences, with ids like an
+    // RRULE series'; the old first-date event is in the window and no longer listed, so it
+    // is removed rather than shown twice.
+    assert_eq!((result.events_synced, result.events_removed), (3, 1));
+    let at = |days: i64| {
+        (today + Duration::days(days))
+            .and_hms_opt(3, 30, 0)
+            .unwrap()
+            .and_utc()
+    };
+    let mut events: Vec<_> = all_events(&state, "r")
+        .into_iter()
+        .map(|e| (e.start, e.end - e.start, e.id, e.etag))
+        .collect();
+    events.sort();
+    let etag = Some("\"p1\"".to_string());
+    // 09:00 in India is 03:30 UTC.
+    assert_eq!(
+        events,
+        [
+            (
+                at(-2),
+                Duration::minutes(45),
+                format!("r:physio@dav:{}T033000Z", d(-2)),
+                etag.clone()
+            ),
+            (
+                at(5),
+                Duration::minutes(45),
+                format!("r:physio@dav:{}T033000Z", d(5)),
+                etag.clone()
+            ),
+            (
+                at(40),
+                Duration::hours(2),
+                format!("r:physio@dav:{}T033000Z", d(40)),
+                etag
+            ),
+        ]
+    );
+}
+
+/// How the Radicale mock answers a `calendar-multiget`.
+#[derive(Clone, Copy, PartialEq)]
+enum Multiget {
+    Serve,
+    Fail,
+}
+
+#[tokio::test]
+async fn caldav_series_of_rdates_left_unexpanded_are_fetched_whole_and_keep_their_moves() {
+    // Radicale accepts `expand` but cannot expand a series without an RRULE: it sends the
+    // master as is and drops the VEVENTs that move or cancel its occurrences. Expanding that
+    // master here would show the moved occurrence at its old time and the cancelled one as
+    // still on, so the resource is fetched whole with `calendar-multiget` and expanded here.
+    // Radicale also percent-encodes every href it sends, while the collection URL configured
+    // here spells out the `@` of an email address user name: the series is fetched still.
+    let today = Utc::now().date_naive();
+    let d = |n: i64| (today + Duration::days(n)).format("%Y%m%d").to_string();
+    let master = format!(
+        "BEGIN:VEVENT\r\nUID:physio@dav\r\nSUMMARY:Physio\r\nDTSTART:{start}T090000Z\r\nDURATION:PT45M\r\nRDATE:{a}T090000Z,{b}T090000Z,{c}T090000Z\r\nEND:VEVENT\r\n",
+        start = d(-2),
+        a = d(5),
+        b = d(12),
+        c = d(19)
+    );
+    let overrides = format!(
+        "BEGIN:VEVENT\r\nUID:physio@dav\r\nRECURRENCE-ID:{b}T090000Z\r\nSUMMARY:Physio (moved)\r\nDTSTART:{moved}T140000Z\r\nDURATION:PT45M\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:physio@dav\r\nRECURRENCE-ID:{c}T090000Z\r\nSUMMARY:Physio\r\nSTATUS:CANCELLED\r\nDTSTART:{c}T090000Z\r\nDURATION:PT45M\r\nEND:VEVENT\r\n",
+        b = d(12),
+        moved = d(13),
+        c = d(19)
+    );
+    let calendar_data = |vevents: &str| {
+        ics_escape_xml(&format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n{}END:VCALENDAR\r\n",
+            vevents
+        ))
+    };
+    let expanded_answer = format!(
+        r#"<d:response><d:href>/alice%40example.com/cal/physio.ics</d:href><d:propstat><d:prop>
+            <d:getetag>"p1"</d:getetag><cal:calendar-data>{}</cal:calendar-data>
+           </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+           <d:response><d:href>/alice%40example.com/cal/review.ics</d:href><d:propstat><d:prop>
+            <d:getetag>"r1"</d:getetag><cal:calendar-data>{}</cal:calendar-data>
+           </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"#,
+        calendar_data(&master),
+        calendar_data(&format!(
+            "BEGIN:VEVENT\r\nUID:review@dav\r\nSUMMARY:Review\r\nDTSTART:{}T120000Z\r\nEND:VEVENT\r\n",
+            d(3)
+        ))
+    );
+    let stored_answer = format!(
+        r#"<d:response><d:href>/alice%40example.com/cal/physio.ics</d:href><d:propstat><d:prop>
+            <d:getetag>"p1"</d:getetag><cal:calendar-data>{}</cal:calendar-data>
+           </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"#,
+        calendar_data(&format!("{}{}", master, overrides))
+    );
+    let multiget = Arc::new(Mutex::new(Multiget::Serve));
+    // (Depth header, body) of each REPORT.
+    let reports = Arc::new(Mutex::new(Vec::<(Option<String>, String)>::new()));
+    let base = serve({
+        let (multiget, reports) = (multiget.clone(), reports.clone());
+        move |_| {
+            Router::new().fallback(move |method: Method, headers: HeaderMap, body: String| {
+                let (expanded_answer, stored_answer) =
+                    (expanded_answer.clone(), stored_answer.clone());
+                async move {
+                    match method.as_str() {
+                        "PROPFIND" => multistatus(
+                            r#"<d:response><d:href>/alice%40example.com/cal/</d:href><d:propstat><d:prop>
+                                <d:resourcetype><d:collection/><cal:calendar/></d:resourcetype>
+                               </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"#,
+                        ),
+                        "REPORT" => {
+                            reports
+                                .lock()
+                                .push((header(&headers, "depth"), body.clone()));
+                            if body.contains("calendar-multiget") {
+                                if *multiget.lock() == Multiget::Fail {
+                                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                                }
+                                multistatus(&stored_answer)
+                            } else if body.contains("<C:expand") {
+                                multistatus(&expanded_answer)
+                            } else {
+                                (StatusCode::BAD_REQUEST, "unexpected query").into_response()
+                            }
+                        }
+                        _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+                    }
+                }
+            })
+        }
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut mgr = CalendarManager::new(&dir.path().join("calendars.db")).unwrap();
+    mgr.add_calendar(calendar(
+        "r",
+        "Health",
+        CalendarProvider::Caldav,
+        CalendarConfig::Caldav {
+            url: format!("{}/alice@example.com/cal/", base),
+            username: String::new(),
+            password: None,
+            bearer_token: None,
+            collection_url: None,
+        },
+    ))
+    .unwrap();
+    let state = CalendarState::new(mgr);
+    let sync = || {
+        let state = state.clone();
+        async move {
+            let axum::Json(r) = sync_calendar_endpoint(State(state), Path("r".into()))
+                .await
+                .unwrap();
+            r
+        }
+    };
+    let at = |days: i64, hour: u32| {
+        (today + Duration::days(days))
+            .and_hms_opt(hour, 0, 0)
+            .unwrap()
+            .and_utc()
+    };
+    let stored = || {
+        let mut events: Vec<_> = all_events(&state, "r")
+            .into_iter()
+            .map(|e| (e.start, e.id, e.summary, e.status, e.etag))
+            .collect();
+        events.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+        events
+    };
+    let physio = |days: i64, hour: u32, key: i64, summary: &str, status: EventStatus| {
+        (
+            at(days, hour),
+            format!("r:physio@dav:{}T090000Z", d(key)),
+            summary.to_string(),
+            status,
+            Some("\"p1\"".to_string()),
+        )
+    };
+    let review = (
+        at(3, 12),
+        "r:review@dav".to_string(),
+        "Review".to_string(),
+        EventStatus::Confirmed,
+        Some("\"r1\"".to_string()),
+    );
+    let expected = [
+        physio(-2, 9, -2, "Physio", EventStatus::Confirmed),
+        review.clone(),
+        physio(5, 9, 5, "Physio", EventStatus::Confirmed),
+        physio(13, 14, 12, "Physio (moved)", EventStatus::Confirmed),
+        physio(19, 9, 19, "Physio", EventStatus::Cancelled),
+    ];
+
+    let first = sync().await;
+    assert!(first.success, "{:?}", first.error);
+    assert_eq!(first.events_synced, 5);
+    assert_eq!(stored(), expected);
+    // One `expand` query, then only the series it left unexpanded is fetched again, whole
+    // (no `expand`, no filter), without a Depth header (RFC 4791 section 7.9).
+    {
+        let reports = reports.lock();
+        assert_eq!(reports.len(), 2, "{:?}", *reports);
+        let (query, multiget) = (&reports[0], &reports[1]);
+        assert_eq!(query.0.as_deref(), Some("1"));
+        assert!(query.1.contains("<C:expand"));
+        assert_eq!(multiget.0, None);
+        assert!(multiget.1.contains("<C:calendar-multiget"));
+        assert!(
+            multiget
+                .1
+                .contains("<D:href>/alice%40example.com/cal/physio.ics</D:href>")
+        );
+        assert!(!multiget.1.contains("review.ics"));
+        assert!(!multiget.1.contains("expand") && !multiget.1.contains("filter"));
+    }
+
+    // When that fetch fails, the series is not expanded from the partial master: the sync
+    // reports it and prunes nothing, and what was stored stays as it was.
+    *multiget.lock() = Multiget::Fail;
+    let failed = sync().await;
+    assert!(!failed.success);
+    let error = failed.error.unwrap();
+    assert!(
+        error.contains("calendar-multiget") && error.contains("503"),
+        "{}",
+        error
+    );
+    assert_eq!((failed.events_synced, failed.events_removed), (1, 0));
+    assert_eq!(stored(), expected);
+}
+
+#[tokio::test]
 async fn caldav_fallback_reports_rules_it_cannot_expand_and_still_prunes() {
     // A server without `expand` sends the masters: Outlook's "last weekday of the month" at
     // 16:00 Berlin time (BYSETPOS), a rule no calendar engine here expands (BYWEEKNO), and a
@@ -1060,7 +1366,7 @@ async fn caldav_fallback_reports_rules_it_cannot_expand_and_still_prunes() {
     let error = first.error.as_deref().unwrap();
     assert!(
         error.contains("1 recurring event(s) (\"Week rota\")")
-            && error.contains("only their first occurrence was stored"),
+            && error.contains("at most their first occurrence was stored"),
         "{}",
         error
     );

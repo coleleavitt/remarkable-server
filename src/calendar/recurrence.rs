@@ -5,7 +5,8 @@
 //!
 //! A rule with any other part (`BYWEEKNO`, `BYYEARDAY`, `BYHOUR`, ...), a sub-daily frequency
 //! or a `BYDAY` ordinal beyond 5 (no month has a sixth Monday) does not parse, and callers
-//! keep the event as its first occurrence. The same engine walks the onsets of VTIMEZONE
+//! keep the event as its first occurrence (unless EXDATE cancels it). A series of RDATEs
+//! without an RRULE needs no rule to expand. The same engine walks the onsets of VTIMEZONE
 //! observances.
 //!
 //! Walks are paid for in steps of a budget: each period costs one step plus one per `BY` list
