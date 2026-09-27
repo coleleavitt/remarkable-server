@@ -22,6 +22,15 @@ use crate::storage::Storage;
 /// Cap on extracted text stored per document, in bytes.
 const MAX_INDEXED_TEXT: usize = 100_000;
 
+/// How long `pdftotext` may run on one PDF before it is killed: a crafted PDF can make it
+/// spin, and each extraction holds a thread.
+const PDFTOTEXT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How much of `pdftotext`'s output is read: more than is indexed ([`MAX_INDEXED_TEXT`], in
+/// bytes of UTF-8), but bounded, as compressed PDF streams can expand into far more text than
+/// the file's size.
+const MAX_PDFTOTEXT_OUTPUT: u64 = 4 * MAX_INDEXED_TEXT as u64;
+
 /// Whether `hash` is the blob `filename` currently resolves to. A superseded version (the
 /// same filename re-uploaded with new content) is not, whether or not the storage layer still
 /// remembers a name for the old hash.
@@ -248,29 +257,27 @@ impl SearchIndex {
         };
 
         // Extract text with pdftotext
-        let output = Command::new("pdftotext")
-            .args(["-layout", "-enc", "UTF-8"])
+        let mut cmd = Command::new("pdftotext");
+        cmd.args(["-layout", "-enc", "UTF-8"])
             .arg(temp_pdf.path())
-            .arg("-")
-            .output();
+            .arg("-");
+        let output = run_bounded(cmd, PDFTOTEXT_TIMEOUT, MAX_PDFTOTEXT_OUTPUT);
         drop(temp_pdf);
 
         match output {
-            Ok(out) if out.status.success() => {
-                // Truncate to reasonable size for indexing
-                Some(
-                    truncate_on_char_boundary(
-                        &String::from_utf8_lossy(&out.stdout),
-                        MAX_INDEXED_TEXT,
-                    )
+            // Truncate to reasonable size for indexing
+            Ok(Bounded::Done(out)) => Some(
+                truncate_on_char_boundary(&String::from_utf8_lossy(&out), MAX_INDEXED_TEXT)
                     .to_string(),
-                )
+            ),
+            Ok(Bounded::Failed) => {
+                warn!("pdftotext failed for {}", filename);
+                None
             }
-            Ok(out) => {
+            Ok(Bounded::TimedOut) => {
                 warn!(
-                    "pdftotext failed for {}: {}",
-                    filename,
-                    String::from_utf8_lossy(&out.stderr)
+                    "pdftotext took over {:?} for {}; indexed without its text",
+                    PDFTOTEXT_TIMEOUT, filename
                 );
                 None
             }
@@ -599,9 +606,95 @@ pub struct IndexStats {
     pub pdf_count: usize,
 }
 
+/// How [`run_bounded`] ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Bounded {
+    /// Exited successfully, or was cut off once it had written the most that is read: its
+    /// output, up to that much.
+    Done(Vec<u8>),
+    /// Exited unsuccessfully.
+    Failed,
+    /// Killed at the deadline.
+    TimedOut,
+}
+
+/// Run `cmd` without stdin or stderr, reading at most `cap` bytes of its stdout, and kill it
+/// if it hasn't exited after `timeout`. Once `cap` bytes are read its stdout is closed, so a
+/// program still writing gets `SIGPIPE`; what it wrote is kept.
+fn run_bounded(
+    mut cmd: Command,
+    timeout: std::time::Duration,
+    cap: u64,
+) -> std::io::Result<Bounded> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = stdout.take(cap).read_to_end(&mut out);
+        out
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            // It may have exited just now; either way, reap it.
+            let _ = child.kill();
+            child.wait()?;
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let out = reader.join().unwrap_or_default();
+    Ok(match status {
+        None => Bounded::TimedOut,
+        Some(s) if s.success() || out.len() as u64 >= cap => Bounded::Done(out),
+        Some(_) => Bounded::Failed,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
+
+    fn sh(script: &str) -> Command {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", script]);
+        cmd
+    }
+
+    /// An extraction is bounded in time and output: a program that hangs is killed, and one
+    /// that writes without end is cut off at the cap, keeping what it wrote.
+    #[test]
+    fn external_extraction_is_bounded() {
+        let long = std::time::Duration::from_secs(30);
+        assert_eq!(
+            run_bounded(sh("echo hi"), long, 100).unwrap(),
+            Bounded::Done(b"hi\n".to_vec())
+        );
+        assert_eq!(
+            run_bounded(sh("exit 3"), long, 100).unwrap(),
+            Bounded::Failed
+        );
+        assert_eq!(
+            run_bounded(sh("yes"), long, 1000).unwrap(),
+            Bounded::Done(b"y\n".repeat(500))
+        );
+        let started = std::time::Instant::now();
+        assert_eq!(
+            run_bounded(sh("sleep 30"), std::time::Duration::from_millis(100), 100).unwrap(),
+            Bounded::TimedOut
+        );
+        assert!(started.elapsed() < long);
+        assert!(run_bounded(Command::new("/nonexistent/pdftotext"), long, 1).is_err());
+    }
 
     use super::*;
 
