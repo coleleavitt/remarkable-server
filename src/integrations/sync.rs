@@ -325,12 +325,18 @@ pub struct SyncManifest {
 /// One file of a [`SyncManifest`]. A side that is `None` was absent there: the file was deleted
 /// on that side and the copy on the other kept (a sync never deletes remote files). It isn't
 /// brought back while that copy stays as it was.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local: Option<LocalIdentity>,
+    /// The local content an upload that failed was sending: its reply may have been lost after
+    /// the provider stored it. Should the file then be deleted here and the remote file hold
+    /// exactly this content, that remote change was this upload, and the deletion is the
+    /// newest change: the file isn't downloaded again (see [`CloudSync::reconcile`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent: Option<LocalIdentity>,
 }
 
 impl ManifestEntry {
@@ -339,6 +345,7 @@ impl ManifestEntry {
         Self {
             remote: Some(RemoteIdentity::of(remote)),
             local: Some(local),
+            sent: None,
         }
     }
 }
@@ -701,6 +708,7 @@ fn match_case(
                     ManifestEntry {
                         remote: None,
                         local: None,
+                        sent: None,
                     },
                 );
                 found.undecided.push(spelling.clone());
@@ -939,6 +947,10 @@ pub struct CloudSync<P: CloudProvider> {
     manifest_key: Option<ManifestKey>,
     /// Set for a sync that has a manifest from an earlier one; see [`Self::guard_overwrite`].
     overwrite_guard: Option<OverwriteGuard>,
+    /// The uploads this sync started that haven't answered yet, by sync path: what each was
+    /// sending. One left when the sync records the path failed, and goes in its entry's
+    /// [`ManifestEntry::sent`].
+    unconfirmed: HashMap<String, LocalIdentity>,
 }
 
 /// What a sync with a manifest needs to keep a download from overwriting local content that
@@ -964,6 +976,7 @@ impl<P: CloudProvider> CloudSync<P> {
             conflict_resolver,
             manifest_key: None,
             overwrite_guard: None,
+            unconfirmed: HashMap::new(),
         }
     }
 
@@ -991,7 +1004,9 @@ impl<P: CloudProvider> CloudSync<P> {
     ///   again, those files are still deletions here.
     /// - Deleted here and unchanged remotely: not downloaded again, and not deleted remotely
     ///   either (a sync never deletes remote files); the manifest records it. Deleted here but
-    ///   changed remotely: downloaded again.
+    ///   changed remotely: downloaded again, unless the remote file holds exactly what a failed
+    ///   upload of it was sending ([`ManifestEntry::sent`]: a reply lost after the provider
+    ///   stored it), which makes the deletion the newer change.
     ///
     /// A path the manifest doesn't know (all of them on the first sync, or every sync without
     /// [`SyncConfig::persist_state`] and a new `CloudSync`) is synced as with no state: a file
@@ -1333,6 +1348,7 @@ impl<P: CloudProvider> CloudSync<P> {
             false => self.state.manifest.take(),
         };
         let run = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        self.unconfirmed.clear();
         // Taken before the case matching below: which entry a local file is compared with can
         // be wrong for a group of names that differ only in case, so no overwrite relies on it.
         self.overwrite_guard = base.as_ref().map(|base| OverwriteGuard {
@@ -1474,6 +1490,7 @@ impl<P: CloudProvider> CloudSync<P> {
                         ManifestEntry {
                             remote: file.map(RemoteIdentity::of),
                             local: local.map(|l| l.identity(sha256)),
+                            sent: None,
                         },
                     );
                     continue;
@@ -1495,6 +1512,7 @@ impl<P: CloudProvider> CloudSync<P> {
                         ManifestEntry {
                             remote: Some(RemoteIdentity::of(f)),
                             local: None,
+                            sent: None,
                         },
                     );
                     continue;
@@ -1518,6 +1536,7 @@ impl<P: CloudProvider> CloudSync<P> {
                         ManifestEntry {
                             remote: entry.remote.clone(),
                             local: Some(l.identity(sha256)),
+                            sent: entry.sent.clone(),
                         },
                     );
                     continue;
@@ -1597,8 +1616,25 @@ impl<P: CloudProvider> CloudSync<P> {
                     entry
                 }
                 Step::Download => {
-                    self.download_counted(&cloud_map[&path], &mut result, &mut retry_needed)
-                        .await
+                    // Deleted here after an upload whose reply was lost: the remote change may be
+                    // that upload (see `ManifestEntry::sent`).
+                    let unless = old
+                        .as_ref()
+                        .and_then(|e| e.sent.as_ref())
+                        .filter(|_| !local_files.contains_key(&path))
+                        .and_then(|sent| sent.sha256.clone());
+                    let entry = self
+                        .download_counted(
+                            &cloud_map[&path],
+                            unless.as_deref(),
+                            &mut result,
+                            &mut retry_needed,
+                        )
+                        .await;
+                    if entry.as_ref().is_some_and(|e| e.local.is_none()) {
+                        kept_remotely.push(path.clone());
+                    }
+                    entry
                 }
                 Step::Both { known } => {
                     self.sync_both(
@@ -1612,16 +1648,20 @@ impl<P: CloudProvider> CloudSync<P> {
                     .await
                 }
             };
-            // A failure keeps the old entry (or none), so the next sync sees the same change.
-            match (recorded, old) {
+            // A failure keeps the old entry (or none), so the next sync sees the same change;
+            // a failed upload adds what it was sending.
+            let sent = self.unconfirmed.remove(&path);
+            match (recorded, old, sent) {
                 _ if !track => {}
-                (Some(entry), _) => {
+                (Some(entry), ..) => {
                     manifest.files.insert(path, entry);
                 }
-                (None, Some(old)) => {
-                    manifest.files.insert(kept_under(&path), old);
+                (None, old, sent) if old.is_some() || sent.is_some() => {
+                    let mut entry = old.unwrap_or_default();
+                    entry.sent = sent.or(entry.sent);
+                    manifest.files.insert(kept_under(&path), entry);
                 }
-                (None, None) => {}
+                (None, ..) => {}
             }
         }
 
@@ -1756,7 +1796,7 @@ impl<P: CloudProvider> CloudSync<P> {
             } else if cloud_file.modified_at > last_sync && direction != SyncDirection::Upload {
                 // Cloud is newer
                 return self
-                    .download_counted(cloud_file, result, retry_needed)
+                    .download_counted(cloud_file, None, result, retry_needed)
                     .await;
             }
             return None;
@@ -1768,7 +1808,7 @@ impl<P: CloudProvider> CloudSync<P> {
                     .await
             }
             ConflictResolution::UseCloud if direction != SyncDirection::Upload => {
-                self.download_counted(cloud_file, result, retry_needed)
+                self.download_counted(cloud_file, None, result, retry_needed)
                     .await
             }
             ConflictResolution::KeepBoth { renamed_to } => {
@@ -1893,18 +1933,25 @@ impl<P: CloudProvider> CloudSync<P> {
     }
 
     /// [Download](Self::download_file) `cloud_file`, counting it in `result`; its manifest
-    /// entry, if it came. A failure that may go away sets `retry_needed`.
+    /// entry, if it came. A failure that may go away sets `retry_needed`. With `unless` (a
+    /// SHA-256), a file of that content isn't written: the entry then has no local side.
     async fn download_counted(
         &mut self,
         cloud_file: &CloudFile,
+        unless: Option<&str>,
         result: &mut SyncResult,
         retry_needed: &mut bool,
     ) -> Option<ManifestEntry> {
         if !self.guard_overwrite(&cloud_file.path, result).await {
             return None;
         }
-        match self.download_file(cloud_file).await {
-            Ok(local) => {
+        match self.download_unless(cloud_file, unless).await {
+            Ok(None) => Some(ManifestEntry {
+                remote: Some(RemoteIdentity::of(cloud_file)),
+                local: None,
+                sent: None,
+            }),
+            Ok(Some(local)) => {
                 result.downloaded += 1;
                 Some(ManifestEntry::synced(cloud_file, local))
             }
@@ -2069,17 +2116,21 @@ impl<P: CloudProvider> CloudSync<P> {
         // Determine parent folder
         let parent_id = self.config.cloud_folder.as_deref();
 
+        let sending = LocalIdentity {
+            size: content.len() as u64,
+            mtime_ns: local.mtime_ns,
+            sha256: Some(sha256_hex(&content)),
+        };
+        self.unconfirmed.insert(path.to_string(), sending.clone());
         let cloud_file = self
             .provider
             .upload_file_at(parent_id, &components, &content, None)
             .await?;
+        self.unconfirmed.remove(path);
         let entry = ManifestEntry {
             remote: Some(RemoteIdentity::of(&cloud_file)),
-            local: Some(LocalIdentity {
-                size: content.len() as u64,
-                mtime_ns: local.mtime_ns,
-                sha256: Some(sha256_hex(&content)),
-            }),
+            local: Some(sending),
+            sent: None,
         };
 
         // Update state
@@ -2095,6 +2146,18 @@ impl<P: CloudProvider> CloudSync<P> {
     /// Download a file from cloud. Returns the identity of the local file written, for the
     /// manifest.
     async fn download_file(&mut self, cloud_file: &CloudFile) -> Result<LocalIdentity> {
+        self.download_unless(cloud_file, None)
+            .await?
+            .ok_or_else(|| IntegrationError::Api(format!("{}: not written", cloud_file.path)))
+    }
+
+    /// [`download_file`](Self::download_file), but `None` (nothing written) if the content's
+    /// SHA-256 is `unless`.
+    async fn download_unless(
+        &mut self,
+        cloud_file: &CloudFile,
+        unless: Option<&str>,
+    ) -> Result<Option<LocalIdentity>> {
         // Validate before touching the network or the filesystem.
         let local_path =
             local_path_for(&self.config.local_path, &cloud_file.path).inspect_err(|e| {
@@ -2117,6 +2180,10 @@ impl<P: CloudProvider> CloudSync<P> {
             )));
         }
         let content = self.provider.download_file(&cloud_file.id).await?;
+        let sha256 = sha256_hex(&content);
+        if unless == Some(sha256.as_str()) {
+            return Ok(None);
+        }
 
         // Symlinks already inside the sync root must not redirect the write (or any mkdir) elsewhere.
         let escape = || {
@@ -2168,11 +2235,11 @@ impl<P: CloudProvider> CloudSync<P> {
             .mtime_map
             .insert(cloud_file.path.clone(), cloud_file.modified_at);
 
-        Ok(LocalIdentity {
+        Ok(Some(LocalIdentity {
             size: written.len(),
             mtime_ns: mtime_ns(&written),
-            sha256: Some(sha256_hex(&content)),
-        })
+            sha256: Some(sha256),
+        }))
     }
 
     /// Perform delta sync using provider's change API: download what changed remotely. Remote
@@ -5326,6 +5393,75 @@ mod tests {
         assert_eq!(sync.provider.content("/report.pdf").as_deref(), Some("v1"));
     }
 
+    /// An upload whose reply is lost after the provider stored it leaves the entry as it was,
+    /// so the next sync sees the remote file changed. Should the file be deleted here in
+    /// between, that change is the upload itself: the deletion is the newest, and the file
+    /// isn't brought back. For an edit and for a new file.
+    #[tokio::test]
+    async fn a_file_deleted_after_an_upload_with_a_lost_reply_stays_deleted() {
+        for tracked in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let store = Store::hashed();
+            if tracked {
+                store.put("/notes.txt", "v1");
+            }
+            let mut sync = CloudSync::new(store, kept(root, SyncDirection::Bidirectional));
+            clean(&mut sync).await;
+            write(root, "notes.txt", "v2");
+            sync.provider
+                .lose_reply
+                .lock()
+                .unwrap()
+                .insert("/notes.txt".into());
+            sync = again(sync);
+            let r = sync.sync().await.unwrap();
+            assert_eq!(r.errors.len(), 1, "tracked {tracked}: {:?}", r.errors);
+            assert_eq!(sync.provider.content("/notes.txt").as_deref(), Some("v2"));
+
+            std::fs::remove_file(root.join("notes.txt")).unwrap();
+            sync = again(sync);
+            let r = clean(&mut sync).await;
+            assert_eq!(counts(&r), (0, 0, 0), "tracked {tracked}");
+            assert!(!root.join("notes.txt").exists(), "tracked {tracked}");
+            assert!(has_notice(&r, "1 file deleted here"), "{:?}", r.notices);
+            // Recorded as a deletion kept remotely: a later remote edit still comes down.
+            sync.provider.put("/notes.txt", "v3, edited there");
+            sync = again(sync);
+            assert_eq!(
+                counts(&clean(&mut sync).await),
+                (0, 1, 0),
+                "tracked {tracked}"
+            );
+            assert_eq!(read(root, "notes.txt"), "v3, edited there");
+        }
+    }
+
+    /// The record of what a failed upload was sending holds back only that content: a remote
+    /// edit made after it comes down as any remote change of a file deleted here.
+    #[tokio::test]
+    async fn a_remote_edit_after_a_lost_reply_still_comes_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = Store::hashed();
+        store.put("/notes.txt", "v1");
+        let mut sync = CloudSync::new(store, kept(root, SyncDirection::Bidirectional));
+        clean(&mut sync).await;
+        write(root, "notes.txt", "v2");
+        sync.provider
+            .lose_reply
+            .lock()
+            .unwrap()
+            .insert("/notes.txt".into());
+        sync = again(sync);
+        sync.sync().await.unwrap();
+        std::fs::remove_file(root.join("notes.txt")).unwrap();
+        sync.provider.put("/notes.txt", "v3");
+        sync = again(sync);
+        assert_eq!(counts(&clean(&mut sync).await), (0, 1, 0));
+        assert_eq!(read(root, "notes.txt"), "v3");
+    }
+
     /// What a test loses of a sync that wrote to the remote file.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Lost {
@@ -5574,7 +5710,8 @@ mod tests {
                 assert_eq!(counts(&r), (0, 1, 0), "{case}");
                 assert_eq!(r.notices.len(), 1, "{case}: {:?}", r.notices);
                 assert!(
-                    r.notices[0].starts_with("/Report.pdf held local content never recorded as synced")
+                    r.notices[0]
+                        .starts_with("/Report.pdf held local content never recorded as synced")
                         && r.notices[0].contains(&format!("{QUARANTINE_DIR}/")),
                     "{case}: {:?}",
                     r.notices
@@ -5769,6 +5906,7 @@ mod tests {
             ManifestEntry {
                 remote,
                 local: None,
+                sent: None,
             },
         );
         std::fs::write(path, serde_json::to_vec(&stored).unwrap()).unwrap();
