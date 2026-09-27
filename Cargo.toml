@@ -18,7 +18,9 @@ sha1 = "0.10"
 crc32c = "0.6"
 base64 = "0.22"
 hex = "0.4"
-jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto"] }
+# HMAC only (HS256/HS512), so no PEM parsing and no RustCrypto backend: its `rust_crypto`
+# feature pulls `rsa` (RUSTSEC-2023-0071, no fix). aws-lc-rs is already here via rustls.
+jsonwebtoken = { version = "10.3", default-features = false, features = ["aws_lc_rs"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 rand = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
@@ -37,7 +39,16 @@ urlencoding = "2"
 
 # Feed sync dependencies
 feed-rs = "2"
-readability = "0.3"
+# Readability.js port for /feeds/v1/extract, run on HTML we already fetched (no HTTP client of
+# its own). Replaces `readability` 0.3, whose default reqwest 0.11 feature pulled h2 0.3
+# (RUSTSEC-2026-0258) and rustls-pemfile 1 (unmaintained).
+dom_smoothie = "0.18.2"
+# dom_smoothie's DOM (same version it uses, no new crate): feeds.rs measures the page and
+# resolves URLs on it before and after extraction.
+dom_query = "0.28"
+# dom_query's parser (same version, no new crate): feeds.rs feeds it in chunks and counts its
+# work, to stop pages that would take it too long, which dom_query::Document::from cannot.
+html5ever = "0.39"
 epub-builder = "0.7"
 imap = "3.0.0-alpha.15"
 native-tls = "0.2"

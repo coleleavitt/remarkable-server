@@ -233,14 +233,31 @@ fn load_jwt_secret(storage_dir: &Path) -> Result<Vec<u8>> {
 
 impl DeviceManager {
     pub fn new<P: AsRef<Path>>(db_path: P, region: &str, issuer: &str) -> Result<Self> {
-        let conn = Connection::open(db_path.as_ref())?;
-        conn.execute_batch("CREATE TABLE IF NOT EXISTS devices (device_id TEXT PRIMARY KEY, device_desc TEXT NOT NULL, registered_at TEXT NOT NULL, last_refresh TEXT NOT NULL, user_id TEXT NOT NULL); CREATE TABLE IF NOT EXISTS pending_codes (code TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS passcode_resets (request_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, device_id TEXT NOT NULL, device_name TEXT NOT NULL, created TEXT NOT NULL, expires TEXT NOT NULL, approved INTEGER NOT NULL DEFAULT 0); CREATE INDEX IF NOT EXISTS passcode_resets_user_expires ON passcode_resets (user_id, expires); CREATE TABLE IF NOT EXISTS mdm_instructions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, data_key TEXT, data_value TEXT, status TEXT NOT NULL DEFAULT 'pending', detail TEXT, created TEXT NOT NULL); CREATE TABLE IF NOT EXISTS device_token_epochs (device_id TEXT PRIMARY KEY, epoch INTEGER NOT NULL);")?;
+        let conn = Self::open_db(db_path.as_ref())?;
         // One HS256 signing key for every token; see load_jwt_secret for where it comes from.
         let secret = load_jwt_secret(db_path.as_ref().parent().unwrap_or_else(|| Path::new(".")))?;
-        let encoding_key = jsonwebtoken::EncodingKey::from_secret(&secret);
-        let decoding_key = jsonwebtoken::DecodingKey::from_secret(&secret);
+        Ok(Self::from_parts(conn, region, issuer, &secret))
+    }
+    /// `new` with the signing secret given directly, so a test can pin it without the env.
+    #[cfg(test)]
+    fn with_secret(db_path: &Path, region: &str, issuer: &str, secret: &[u8]) -> Result<Self> {
+        Ok(Self::from_parts(
+            Self::open_db(db_path)?,
+            region,
+            issuer,
+            secret,
+        ))
+    }
+    fn open_db(db_path: &Path) -> Result<Connection> {
+        let conn = Connection::open(db_path)?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS devices (device_id TEXT PRIMARY KEY, device_desc TEXT NOT NULL, registered_at TEXT NOT NULL, last_refresh TEXT NOT NULL, user_id TEXT NOT NULL); CREATE TABLE IF NOT EXISTS pending_codes (code TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS passcode_resets (request_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, device_id TEXT NOT NULL, device_name TEXT NOT NULL, created TEXT NOT NULL, expires TEXT NOT NULL, approved INTEGER NOT NULL DEFAULT 0); CREATE INDEX IF NOT EXISTS passcode_resets_user_expires ON passcode_resets (user_id, expires); CREATE TABLE IF NOT EXISTS mdm_instructions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, data_key TEXT, data_value TEXT, status TEXT NOT NULL DEFAULT 'pending', detail TEXT, created TEXT NOT NULL); CREATE TABLE IF NOT EXISTS device_token_epochs (device_id TEXT PRIMARY KEY, epoch INTEGER NOT NULL);")?;
+        Ok(conn)
+    }
+    fn from_parts(conn: Connection, region: &str, issuer: &str, secret: &[u8]) -> Self {
+        let encoding_key = jsonwebtoken::EncodingKey::from_secret(secret);
+        let decoding_key = jsonwebtoken::DecodingKey::from_secret(secret);
         let (revocations, _) = tokio::sync::broadcast::channel(64);
-        Ok(Self {
+        Self {
             inner: Arc::new(Inner {
                 conn: Mutex::new(conn),
                 revocations,
@@ -249,7 +266,7 @@ impl DeviceManager {
                 encoding_key,
                 decoding_key,
             }),
-        })
+        }
     }
     fn gen_code() -> String {
         const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
@@ -1526,5 +1543,209 @@ mod revocation_tests {
         .unwrap();
         assert!(dm.validate_token(&bearer(&expired)).is_err());
         assert!(dm.caller(&bearer(&expired)).is_err());
+    }
+}
+
+/// Known-answer tests pinning the exact bytes of every token kind the server signs. The golden
+/// strings were minted by the previous signing backend (jsonwebtoken's RustCrypto HMAC) before the
+/// switch to aws-lc-rs, so they stand in for tokens the paired tablet already holds: they must keep
+/// validating, and the same claims must still sign to the same bytes. Never regenerate them; a
+/// mismatch here means already-issued tokens would stop working.
+#[cfg(test)]
+mod jwt_golden_tests {
+    use super::*;
+
+    /// Shaped like a generated `<storage>/jwt_secret`: 64 bytes hex-encoded, used as ASCII.
+    /// Longer than SHA-256's 64-byte block, so HMAC hashes the key first.
+    const SECRET: &[u8] = b"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\
+202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f";
+    /// The shortest secret `load_jwt_secret` accepts (e.g. via `JWT_SECRET`): shorter than the
+    /// block, so HMAC zero-pads it instead.
+    const SHORT_SECRET: &[u8] = b"golden-secret-exactly-32-bytes!!";
+    const ISSUER: &str = "rms.test";
+    const DEVICE_ID: &str = "RM110-000-00001";
+    const USER: &str = "local-user";
+    const IAT: i64 = 1_767_225_600; // 2026-01-01T00:00:00Z
+    const FAR_EXP: i64 = 4_102_444_800; // 2100-01-01T00:00:00Z
+    const BLOB: &str = "0123456789abcdef";
+
+    const GOLDEN_DEVICE: &str = concat!(
+        "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.",
+        "eyJzdWIiOiJyTSBEZXZpY2UgVG9rZW4iLCJpc3MiOiJybXMudGVzdCIsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJkZXZpY2UtaWQiOiJSTTExMC0wMDAtMDAwMDEiLCJkZXZpY2UtZGVzYyI6InJlbWFya2FibGUiLCJhdXRoMC11c2VyaWQiOiJsb2NhbC11c2VyIn0.",
+        "orQ8LbpcFSFF1hM7RVKeQa5Gqmc9DkiqSMO-p_ups7g"
+    );
+    const GOLDEN_DEVICE_EPOCH_SHORT_SECRET: &str = concat!(
+        "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.",
+        "eyJzdWIiOiJyTSBEZXZpY2UgVG9rZW4iLCJpc3MiOiJybXMudGVzdCIsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJkZXZpY2UtaWQiOiJSTTExMC0wMDAtMDAwMDEiLCJkZXZpY2UtZGVzYyI6InJlbWFya2FibGUiLCJhdXRoMC11c2VyaWQiOiJsb2NhbC11c2VyIiwicm1zLWVwb2NoIjoyfQ.",
+        "vMZbnllv8A3WNUAxG0s4_Hb81QvEcVLyRRwps46giJg"
+    );
+    const GOLDEN_USER: &str = concat!(
+        "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.",
+        "eyJzdWIiOiJsb2NhbC11c2VyIiwiaXNzIjoicm1zLnRlc3QiLCJpYXQiOjE3NjcyMjU2MDAsImV4cCI6NDEwMjQ0NDgwMCwibmJmIjoxNzY3MjI1NjAwLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJodHRwczovL2F1dGgucmVtYXJrYWJsZS5jb20vdGVjdG9uaWMiOiJsb2NhbCIsInNjb3BlcyI6ImludGdyIGRvY2VkaXQgc2NyZWVuc2hhcmUgc3luYzpmb3ggaHdjOi0xIG1haWw6LTEiLCJhdXRoMC1wcm9maWxlIjp7IlVzZXJJRCI6ImxvY2FsLXVzZXIiLCJFbWFpbCI6ImxvY2FsQHJtcy50ZXN0IiwiTmFtZSI6ImxvY2FsLXVzZXIiLCJOaWNrbmFtZSI6ImxvY2FsLXVzZXIiLCJsZXZlbCI6ImNvbm5lY3QiLCJJc0Nvbm5lY3RlZCI6dHJ1ZSwiSXNCZXRhIjpmYWxzZX0sImRldmljZS1pZCI6IlJNMTEwLTAwMC0wMDAwMSIsImRldmljZS1kZXNjIjoicmVtYXJrYWJsZSIsImh0dHBzOi8vYXV0aC5yZW1hcmthYmxlLmNvbS9zdWJzY3JpcHRpb24iOnsic3RhdHVzIjoiYWN0aXZlIiwicGxhbiI6ImNvbm5lY3QifX0.",
+        "dSiSari9W64KEdpC53NC2E3Fiy5c2w_tU-GmFKBKH1w"
+    );
+    const GOLDEN_BLOB: &str = concat!(
+        "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.",
+        "eyJibG9iIjoiMDEyMzQ1Njc4OWFiY2RlZiIsIndyaXRlIjp0cnVlLCJleHAiOjQxMDI0NDQ4MDB9.",
+        "mIOMXUNJRj4ljXwAO8qMWczfVfc7ZRV9_SfOa2TQIjg"
+    );
+    const GOLDEN_ID_HS512: &str = concat!(
+        "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.",
+        "eyJzdWIiOiJsb2NhbC11c2VyIiwiaXNzIjoicm1zLnRlc3QiLCJhdWQiOiJyZW1hcmthYmxlIiwiaWF0IjoxNzY3MjI1NjAwLCJleHAiOjE3NjcyMzY0MDAsImVtYWlsIjoibG9jYWxAcm1zLnRlc3QiLCJodHRwczovL2F1dGgucmVtYXJrYWJsZS5jb20vdGVjdG9uaWMiOiJsb2NhbCIsImh0dHBzOi8vYXV0aC5yZW1hcmthYmxlLmNvbS9zdWJzY3JpcHRpb24iOiJhY3RpdmUiLCJodHRwczovL2F1dGgucmVtYXJrYWJsZS5jb20vbWRtIjpmYWxzZSwiaHR0cHM6Ly9hdXRoLnJlbWFya2FibGUuY29tL2NyZWF0ZWRfYXQiOiIyMDI2LTAxLTAxVDAwOjAwOjAwKzAwOjAwIn0.",
+        "O4FprqOsO9utcBXj3fnrYQrk6qlwljgokk_AWpvApkohoIfAEuzSzu7N2VfNY0RDr19uHe3lCqYgbivv_IvvKg"
+    );
+
+    fn device_claims(epoch: i64) -> DeviceTokenClaims {
+        DeviceTokenClaims {
+            sub: "rM Device Token".into(),
+            iss: ISSUER.into(),
+            iat: IAT,
+            nbf: IAT,
+            jti: "00000000-0000-4000-8000-000000000001".into(),
+            device_id: DEVICE_ID.into(),
+            device_desc: "remarkable".into(),
+            auth0_userid: USER.into(),
+            epoch,
+        }
+    }
+    fn user_claims() -> UserTokenClaims {
+        UserTokenClaims {
+            sub: USER.into(),
+            iss: ISSUER.into(),
+            iat: IAT,
+            exp: FAR_EXP,
+            nbf: IAT,
+            jti: "00000000-0000-4000-8000-000000000002".into(),
+            tectonic: "local".into(),
+            scopes: USER_SCOPES.into(),
+            auth0_profile: Auth0Profile {
+                user_id: USER.into(),
+                email: format!("local@{ISSUER}"),
+                name: USER.into(),
+                nickname: USER.into(),
+                level: "connect".into(),
+                is_connected: true,
+                is_beta: false,
+            },
+            device_id: DEVICE_ID.into(),
+            device_desc: "remarkable".into(),
+            subscription: SubscriptionClaim {
+                status: "active".into(),
+                plan: "connect".into(),
+            },
+            epoch: 0,
+        }
+    }
+    fn blob_claims() -> BlobClaims {
+        BlobClaims {
+            blob: BLOB.into(),
+            write: true,
+            exp: FAR_EXP,
+        }
+    }
+    fn id_claims() -> IdTokenClaims {
+        IdTokenClaims {
+            sub: USER.into(),
+            iss: ISSUER.into(),
+            aud: "remarkable".into(),
+            iat: IAT,
+            exp: IAT + USER_TOKEN_LIFETIME,
+            email: format!("local@{ISSUER}"),
+            tectonic: "local".into(),
+            subscription: "active".into(),
+            mdm: false,
+            created_at: "2026-01-01T00:00:00+00:00".into(),
+        }
+    }
+    fn manager(secret: &[u8]) -> (DeviceManager, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dm =
+            DeviceManager::with_secret(&tmp.path().join("devices.db"), "local", ISSUER, secret)
+                .unwrap();
+        (dm, tmp)
+    }
+    /// Sign `claims` exactly as the server's minting paths do: same header, same key.
+    fn sign<T: Serialize>(dm: &DeviceManager, alg: Algorithm, claims: &T) -> String {
+        encode(&Header::new(alg), claims, &dm.inner.encoding_key).unwrap()
+    }
+    fn bearer(t: &str) -> String {
+        format!("Bearer {t}")
+    }
+    /// Flip one base64url character in the middle of the signature segment.
+    fn tamper(token: &str) -> String {
+        let sig_start = token.rfind('.').unwrap() + 1;
+        let mid = sig_start + (token.len() - sig_start) / 2;
+        let mut bytes = token.as_bytes().to_vec();
+        bytes[mid] = if bytes[mid] == b'A' { b'B' } else { b'A' };
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn same_claims_sign_to_the_same_bytes() {
+        let (dm, _tmp) = manager(SECRET);
+        assert_eq!(
+            sign(&dm, Algorithm::HS256, &device_claims(0)),
+            GOLDEN_DEVICE
+        );
+        assert_eq!(sign(&dm, Algorithm::HS256, &user_claims()), GOLDEN_USER);
+        assert_eq!(sign(&dm, Algorithm::HS256, &blob_claims()), GOLDEN_BLOB);
+        assert_eq!(sign(&dm, Algorithm::HS512, &id_claims()), GOLDEN_ID_HS512);
+        let (short, _tmp) = manager(SHORT_SECRET);
+        assert_eq!(
+            sign(&short, Algorithm::HS256, &device_claims(2)),
+            GOLDEN_DEVICE_EPOCH_SHORT_SECRET
+        );
+    }
+
+    #[test]
+    fn previously_issued_tokens_still_validate() {
+        let (dm, _tmp) = manager(SECRET);
+        // Register the device the way the tablet did (first pairing, so epoch 0).
+        let code = dm.create_pairing_code(USER).unwrap();
+        dm.exchange_code(&code, DEVICE_ID, "remarkable").unwrap();
+        let identity = (
+            USER.to_string(),
+            DEVICE_ID.to_string(),
+            "remarkable".to_string(),
+        );
+
+        assert_eq!(dm.caller(&bearer(GOLDEN_DEVICE)).unwrap(), identity);
+        assert_eq!(dm.caller(&bearer(GOLDEN_USER)).unwrap(), identity);
+        // The refresh paths the tablet uses with its stored device token.
+        let fresh_user = dm.refresh_user_token(GOLDEN_DEVICE).unwrap();
+        assert_eq!(dm.caller(&bearer(&fresh_user)).unwrap(), identity);
+        assert!(dm.refresh_oauth(GOLDEN_DEVICE).is_ok());
+        assert!(dm.exchange_device_token(GOLDEN_DEVICE).is_ok());
+
+        dm.verify_blob(GOLDEN_BLOB, BLOB, true).unwrap();
+        assert!(matches!(
+            dm.verify_blob(GOLDEN_BLOB, BLOB, false),
+            Err(ServerError::Unauthorized)
+        ));
+
+        let (short, _tmp) = manager(SHORT_SECRET);
+        let c = short
+            .decode_device_token_signature(GOLDEN_DEVICE_EPOCH_SHORT_SECRET)
+            .unwrap();
+        assert_eq!((c.device_id.as_str(), c.epoch), (DEVICE_ID, 2));
+    }
+
+    #[test]
+    fn verification_still_rejects_bad_signatures() {
+        let (dm, _tmp) = manager(SECRET);
+        let code = dm.create_pairing_code(USER).unwrap();
+        dm.exchange_code(&code, DEVICE_ID, "remarkable").unwrap();
+        for golden in [GOLDEN_DEVICE, GOLDEN_USER] {
+            assert!(dm.caller(&bearer(&tamper(golden))).is_err());
+        }
+        assert!(dm.verify_blob(&tamper(GOLDEN_BLOB), BLOB, true).is_err());
+        // Same claims under another install's secret: rejected.
+        let (other, _tmp) = manager(SHORT_SECRET);
+        assert!(other.decode_device_token_signature(GOLDEN_DEVICE).is_err());
+        assert!(other.verify_blob(GOLDEN_BLOB, BLOB, true).is_err());
+        assert!(
+            dm.decode_device_token_signature(GOLDEN_DEVICE_EPOCH_SHORT_SECRET)
+                .is_err()
+        );
     }
 }
