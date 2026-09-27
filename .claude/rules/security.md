@@ -18,6 +18,15 @@ nesting, CPU time, and concurrency; stream large bodies to disk (`src/upload.rs`
 user-supplied URLs (see `calendar_providers/dns.rs`); path-safety helpers for anything touching the
 filesystem (`integrations/sync.rs` `safe_components`, `create_dirs_within`).
 
+## Listeners open to the internet
+The MQTT broker (:8883) and the SMTP server take connections before any authentication. Each
+needs, before the peer is authenticated: a deadline (handshake + first command), a cap on what
+is buffered, a cap on concurrent connections, and an accept loop that survives `accept()` errors
+(EMFILE). Outbound HTTP to user-given hosts: no automatic redirects, or `dns::GuardedResolver`.
+Subprocesses on untrusted input (`pdftotext`, recognisers): a deadline and an output cap
+(`search::run_bounded`), off the async workers. Secrets: compare with `api::token_matches`;
+never put a long-lived secret in a cookie (derive a purpose-bound MAC instead).
+
 ## Supply chain
 `Cargo.lock` is committed; keep lock diffs minimal; run `cargo audit`. Prefer crates already in the
 tree; justify new ones (maintenance, license, transitive deps). Git deps pinned by `rev`.
