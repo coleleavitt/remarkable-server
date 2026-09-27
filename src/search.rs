@@ -22,6 +22,18 @@ use crate::storage::Storage;
 /// Cap on extracted text stored per document, in bytes.
 const MAX_INDEXED_TEXT: usize = 100_000;
 
+/// The most results one search returns, whatever `limit` asks for.
+pub(crate) const MAX_SEARCH_RESULTS: usize = 100;
+
+/// How long `pdftotext` may run on one PDF before it is killed: a crafted PDF can make it
+/// spin, and each extraction holds a thread.
+const PDFTOTEXT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How much of `pdftotext`'s output is read: more than is indexed ([`MAX_INDEXED_TEXT`], in
+/// bytes of UTF-8), but bounded, as compressed PDF streams can expand into far more text than
+/// the file's size.
+const MAX_PDFTOTEXT_OUTPUT: u64 = 4 * MAX_INDEXED_TEXT as u64;
+
 /// Whether `hash` is the blob `filename` currently resolves to. A superseded version (the
 /// same filename re-uploaded with new content) is not, whether or not the storage layer still
 /// remembers a name for the old hash.
@@ -248,29 +260,27 @@ impl SearchIndex {
         };
 
         // Extract text with pdftotext
-        let output = Command::new("pdftotext")
-            .args(["-layout", "-enc", "UTF-8"])
+        let mut cmd = Command::new("pdftotext");
+        cmd.args(["-layout", "-enc", "UTF-8"])
             .arg(temp_pdf.path())
-            .arg("-")
-            .output();
+            .arg("-");
+        let output = run_bounded(cmd, PDFTOTEXT_TIMEOUT, MAX_PDFTOTEXT_OUTPUT);
         drop(temp_pdf);
 
         match output {
-            Ok(out) if out.status.success() => {
-                // Truncate to reasonable size for indexing
-                Some(
-                    truncate_on_char_boundary(
-                        &String::from_utf8_lossy(&out.stdout),
-                        MAX_INDEXED_TEXT,
-                    )
+            // Truncate to reasonable size for indexing
+            Ok(Bounded::Done(out)) => Some(
+                truncate_on_char_boundary(&String::from_utf8_lossy(&out), MAX_INDEXED_TEXT)
                     .to_string(),
-                )
+            ),
+            Ok(Bounded::Failed) => {
+                warn!("pdftotext failed for {}", filename);
+                None
             }
-            Ok(out) => {
+            Ok(Bounded::TimedOut) => {
                 warn!(
-                    "pdftotext failed for {}: {}",
-                    filename,
-                    String::from_utf8_lossy(&out.stderr)
+                    "pdftotext took over {:?} for {}; indexed without its text",
+                    PDFTOTEXT_TIMEOUT, filename
                 );
                 None
             }
@@ -296,6 +306,8 @@ impl SearchIndex {
 
         // Escape query for FTS5 (wrap terms in quotes for phrase matching if needed)
         let fts_query = Self::prepare_fts_query(&query.q);
+        let limit = query.limit.min(MAX_SEARCH_RESULTS) as i64;
+        let offset = i64::try_from(query.offset).unwrap_or(i64::MAX);
 
         // Build and execute query based on type filter
         let mut results = Vec::new();
@@ -315,15 +327,9 @@ impl SearchIndex {
                 .map_err(|e| ServerError::Database(e.to_string()))?;
 
             let rows = stmt
-                .query_map(
-                    params![
-                        &fts_query,
-                        dt.as_str(),
-                        query.limit as i64,
-                        query.offset as i64
-                    ],
-                    |row| Self::row_to_result(row),
-                )
+                .query_map(params![&fts_query, dt.as_str(), limit, offset], |row| {
+                    Self::row_to_result(row)
+                })
                 .map_err(|e| ServerError::Database(e.to_string()))?;
 
             for row in rows {
@@ -346,10 +352,9 @@ impl SearchIndex {
                 .map_err(|e| ServerError::Database(e.to_string()))?;
 
             let rows = stmt
-                .query_map(
-                    params![&fts_query, query.limit as i64, query.offset as i64],
-                    |row| Self::row_to_result(row),
-                )
+                .query_map(params![&fts_query, limit, offset], |row| {
+                    Self::row_to_result(row)
+                })
                 .map_err(|e| ServerError::Database(e.to_string()))?;
 
             for row in rows {
@@ -385,10 +390,12 @@ impl SearchIndex {
             return query.to_string();
         }
 
-        // Otherwise, prefix-match each word for partial matching
+        // Otherwise, prefix-match each word for partial matching. Each is quoted as an FTS5
+        // string, so punctuation in it (`e-mail`, `don't`, `c++`) is searched for rather than
+        // read as query syntax, which would fail the query.
         query
             .split_whitespace()
-            .map(|word| format!("{}*", word))
+            .map(|word| format!("\"{}\"*", word.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -599,9 +606,133 @@ pub struct IndexStats {
     pub pdf_count: usize,
 }
 
+/// How [`run_bounded`] ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Bounded {
+    /// Exited successfully, or was cut off once it had written the most that is read: its
+    /// output, up to that much.
+    Done(Vec<u8>),
+    /// Exited unsuccessfully.
+    Failed,
+    /// Killed at the deadline.
+    TimedOut,
+}
+
+/// Run `cmd` without stdin or stderr, reading at most `cap` bytes of its stdout, and kill it
+/// (with anything it started) if it hasn't exited and closed its output within `timeout`. Once
+/// `cap` bytes are read its stdout is closed, so a program still writing gets `SIGPIPE`; what it
+/// wrote is kept.
+fn run_bounded(
+    mut cmd: Command,
+    timeout: std::time::Duration,
+    cap: u64,
+) -> std::io::Result<Bounded> {
+    use std::io::Read;
+    use std::process::Stdio;
+    // Its own process group, so the deadline kills anything it started too: a helper left
+    // running would keep the output pipe open.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = stdout.take(cap).read_to_end(&mut out);
+        let _ = tx.send(out);
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let timed_out = |child: &mut std::process::Child| -> std::io::Result<Bounded> {
+        #[cfg(unix)]
+        if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
+            // SAFETY: kill(2) with a negative pid signals that process group; no memory is
+            // involved.
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        }
+        let _ = child.kill();
+        child.wait()?;
+        // The reader ends once the last holder of the pipe is gone; not waited for.
+        Ok(Bounded::TimedOut)
+    };
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            return timed_out(&mut child);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    // Exited, but something it started may still hold the pipe open.
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    let Ok(out) = rx.recv_timeout(left) else {
+        return timed_out(&mut child);
+    };
+    Ok(if status.success() || out.len() as u64 >= cap {
+        Bounded::Done(out)
+    } else {
+        Bounded::Failed
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
+
+    fn sh(script: &str) -> Command {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", script]);
+        cmd
+    }
+
+    /// An extraction is bounded in time and output: a program that hangs is killed, and one
+    /// that writes without end is cut off at the cap, keeping what it wrote.
+    #[test]
+    fn external_extraction_is_bounded() {
+        let long = std::time::Duration::from_secs(30);
+        assert_eq!(
+            run_bounded(sh("echo hi"), long, 100).unwrap(),
+            Bounded::Done(b"hi\n".to_vec())
+        );
+        assert_eq!(
+            run_bounded(sh("exit 3"), long, 100).unwrap(),
+            Bounded::Failed
+        );
+        assert_eq!(
+            run_bounded(sh("yes"), long, 1000).unwrap(),
+            Bounded::Done(b"y\n".repeat(500))
+        );
+        // `; true` keeps the shell from exec'ing sleep (dash doesn't either), so the sleep is a
+        // grandchild holding the pipe: it has to be killed with the shell.
+        let started = std::time::Instant::now();
+        assert_eq!(
+            run_bounded(
+                sh("sleep 30; true"),
+                std::time::Duration::from_millis(100),
+                100
+            )
+            .unwrap(),
+            Bounded::TimedOut
+        );
+        assert!(started.elapsed() < long);
+        // Exits at once, leaving a background process that holds the pipe.
+        let started = std::time::Instant::now();
+        assert_eq!(
+            run_bounded(
+                sh("sleep 30 & echo started"),
+                std::time::Duration::from_millis(200),
+                100
+            )
+            .unwrap(),
+            Bounded::TimedOut
+        );
+        assert!(started.elapsed() < long);
+        assert!(run_bounded(Command::new("/nonexistent/pdftotext"), long, 1).is_err());
+    }
 
     use super::*;
 
@@ -640,6 +771,36 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].hash, "hash1");
         assert!(results[0].snippet.contains("<mark>"));
+    }
+
+    /// Words with punctuation are searched for, not read as FTS5 syntax (which failed the
+    /// query, so it found nothing); and `limit` is capped however large it is.
+    #[test]
+    fn punctuation_is_searched_for_and_limits_are_capped() {
+        let tmp = TempDir::new().unwrap();
+        let index = SearchIndex::new(tmp.path()).unwrap();
+        index
+            .index_document("h1", "notes.content", Some("Send the e-mail, don't wait"))
+            .unwrap();
+        for i in 0..(MAX_SEARCH_RESULTS + 5) {
+            index
+                .index_document(&format!("m{i}"), "many.content", Some("common"))
+                .unwrap();
+        }
+        let search = |q: &str, limit: usize| {
+            index
+                .search(&SearchQuery {
+                    q: q.into(),
+                    limit,
+                    offset: 0,
+                    doc_type: None,
+                })
+                .unwrap()
+        };
+        for q in ["e-mail", "don't", "e-ma", "mail, don"] {
+            assert_eq!(search(q, 10).len(), 1, "{q}");
+        }
+        assert_eq!(search("common", usize::MAX).len(), MAX_SEARCH_RESULTS);
     }
 
     #[test]

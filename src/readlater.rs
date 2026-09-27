@@ -501,12 +501,17 @@ impl Default for HttpTimeouts {
 }
 
 impl HttpTimeouts {
-    /// An HTTP client that gives up after these limits. Building one fails only if the TLS
-    /// backend can't be set up (when `reqwest::Client::new()` would panic).
+    /// An HTTP client that gives up after these limits, and doesn't follow redirects: none of
+    /// the providers' APIs redirect, and a Wallabag instance is a URL the user gives, so a
+    /// redirect from it could send this server (with its credentials in the body) to an internal
+    /// address it was never configured to reach (as the CalDAV client guards against). Building
+    /// one fails only if the TLS backend can't be set up (when `reqwest::Client::new()` would
+    /// panic).
     pub fn client(self) -> Result<reqwest::Client> {
         reqwest::Client::builder()
             .connect_timeout(self.connect)
             .timeout(self.request)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| ReadLaterError::Network(format!("HTTP client: {e}")))
     }
@@ -3642,6 +3647,47 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+
+    /// A Wallabag instance that redirects doesn't get this server to follow: the target (an
+    /// internal service, say) is never contacted, and the request fails.
+    #[tokio::test]
+    async fn provider_clients_do_not_follow_redirects() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = hits.clone();
+        let internal = spawn_server(axum::Router::new().fallback(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            async { "internal" }
+        }))
+        .await;
+        let target = format!("{internal}/admin");
+        let instance = spawn_server(
+            axum::Router::new()
+                .fallback(move || async move { axum::response::Redirect::temporary(&target) }),
+        )
+        .await;
+
+        let res = HttpTimeouts::default()
+            .client()
+            .unwrap()
+            .post(format!("{instance}/oauth/v2/token"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+
+        let provider = provider_for(ReadLaterProvider::Wallabag).unwrap();
+        let mut config = wallabag_config(&instance, None, None, None);
+        if let ProviderConfig::Wallabag {
+            username, password, ..
+        } = &mut config
+        {
+            *username = Some("u".into());
+            *password = Some("p".into());
+        }
+        assert!(provider.fetch_articles(&config, None).await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
 
     fn article(id: &str, provider_id: &str, added_secs: i64) -> Article {
         let t = DateTime::from_timestamp(added_secs, 0).unwrap();

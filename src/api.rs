@@ -516,10 +516,21 @@ pub(crate) fn check_admin(expected: Option<&str>, headers: &HeaderMap) -> Result
         .get("x-admin-token")
         .and_then(|v| v.to_str().ok())
         .ok_or(ServerError::Unauthorized)?;
-    if given.as_bytes() != expected.as_bytes() {
+    if !token_matches(given, expected) {
         return Err(ServerError::Unauthorized);
     }
     Ok(())
+}
+
+/// Constant-time comparison of a secret, so response timing leaks nothing about it (only
+/// whether the lengths differ).
+pub(crate) fn token_matches(given: &str, expected: &str) -> bool {
+    given.len() == expected.len()
+        && given
+            .bytes()
+            .zip(expected.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
 }
 
 /// Mint a user token. Only enabled when the `ADMIN_TOKEN` env var is set, and the
@@ -878,6 +889,23 @@ mod tests {
     use axum::http::HeaderValue;
 
     use super::*;
+
+    #[test]
+    fn admin_token_check() {
+        let with = |t: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("x-admin-token", HeaderValue::from_str(t).unwrap());
+            h
+        };
+        assert!(check_admin(Some("s3cret"), &with("s3cret")).is_ok());
+        for bad in ["s3cres", "s3cret ", "", "S3CRET"] {
+            assert!(check_admin(Some("s3cret"), &with(bad)).is_err(), "{bad:?}");
+        }
+        assert!(check_admin(None, &with("s3cret")).is_err());
+        assert!(check_admin(Some(""), &with("")).is_err());
+        assert!(token_matches("abc", "abc") && !token_matches("abc", "abd"));
+        assert!(!token_matches("ab", "abc") && !token_matches("abc", "ab"));
+    }
 
     #[tokio::test]
     async fn non_admin_token_cannot_clear_storage() {

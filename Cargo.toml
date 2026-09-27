@@ -20,6 +20,7 @@ sha1 = "0.10"
 crc32c = "0.6"
 base64 = "0.22"
 hex = "0.4"
+libc = "0.2"
 # HMAC only (HS256/HS512), so no PEM parsing and no RustCrypto backend: its `rust_crypto`
 # feature pulls `rsa` (RUSTSEC-2023-0071, no fix). aws-lc-rs is already here via rustls.
 jsonwebtoken = { version = "10.3", default-features = false, features = ["aws_lc_rs"] }

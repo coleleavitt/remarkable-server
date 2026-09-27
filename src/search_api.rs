@@ -18,11 +18,17 @@ use crate::storage::Storage;
 pub struct SearchState {
     pub index: SearchIndex,
     pub storage: Storage,
+    /// Held by the rebuild under way: one at a time, the others wait for it.
+    reindexing: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SearchState {
     pub fn new(index: SearchIndex, storage: Storage) -> Self {
-        Self { index, storage }
+        Self {
+            index,
+            storage,
+            reindexing: Default::default(),
+        }
     }
 }
 
@@ -83,7 +89,13 @@ pub async fn stats(State(state): State<SearchState>) -> Result<Json<IndexStats>>
 /// Rebuild the entire search index from storage.
 /// This may take a while for large libraries.
 pub async fn reindex(State(state): State<SearchState>) -> Result<Json<ReindexResponse>> {
-    let indexed = state.index.rebuild_from_storage(&state.storage)?;
+    // Blocking work (SQLite, a pdftotext per PDF): off the async workers, and one rebuild at a
+    // time, so repeated requests can't tie up the server.
+    let _one = state.reindexing.lock().await;
+    let (index, storage) = (state.index.clone(), state.storage.clone());
+    let indexed = tokio::task::spawn_blocking(move || index.rebuild_from_storage(&storage))
+        .await
+        .map_err(|e| crate::error::ServerError::Internal(format!("reindex: {e}")))??;
 
     Ok(Json(ReindexResponse {
         indexed,
