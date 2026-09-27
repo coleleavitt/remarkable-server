@@ -48,6 +48,14 @@ const MAX_LINE_BYTES: u64 = 1024 * 1024;
 /// some slack for lenient clients. Longer lines are discarded whole with `500`.
 const MAX_COMMAND_LINE_BYTES: u64 = 4096;
 
+/// How long a session may go without sending anything, at any point (RFC 5321 4.5.3.2 asks
+/// for at least 5 minutes): a client that stops mid-session is dropped, not held for good.
+const SMTP_IDLE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Sessions at once. Each may buffer up to [`MAX_MESSAGE_BYTES`], so without a limit
+/// connections alone could take all memory; more are told to come back later (421).
+const MAX_SMTP_SESSIONS: usize = 16;
+
 /// SMTP server configuration
 #[derive(Debug, Clone)]
 pub struct EmailConfig {
@@ -190,19 +198,34 @@ impl EmailServer {
         tracing::info!("SMTP server listening on {}", addr);
         tracing::info!("Email domain: {}", self.inner.config.domain);
 
+        let sessions = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_SMTP_SESSIONS));
         loop {
             match listener.accept().await {
-                Ok((stream, peer)) => {
+                Ok((mut stream, peer)) => {
                     tracing::debug!("SMTP connection from {}", peer);
+                    let Ok(permit) = sessions.clone().try_acquire_owned() else {
+                        tracing::warn!(
+                            "SMTP: {MAX_SMTP_SESSIONS} sessions open; turning {peer} away"
+                        );
+                        tokio::spawn(async move {
+                            let busy = stream.write_all(b"421 Too busy, try again later\r\n");
+                            let _ =
+                                tokio::time::timeout(std::time::Duration::from_secs(5), busy).await;
+                        });
+                        continue;
+                    };
                     let server = self.clone();
                     tokio::spawn(async move {
                         if let Err(e) = server.handle_connection(stream, peer).await {
                             tracing::error!("SMTP session error from {}: {}", peer, e);
                         }
+                        drop(permit);
                     });
                 }
                 Err(e) => {
                     tracing::error!("SMTP accept error: {}", e);
+                    // Out of file descriptors, say: wait rather than spin.
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             }
         }
@@ -818,13 +841,15 @@ impl<R: AsyncBufRead + Unpin> SmtpReader<R> {
         &self.buf
     }
 
-    /// Read up to `cap` bytes, stopping after the first `\n`. Returns bytes read.
+    /// Read up to `cap` bytes, stopping after the first `\n`, within [`SMTP_IDLE`]. Returns
+    /// bytes read.
     async fn read_piece(&mut self, cap: u64) -> std::io::Result<usize> {
         self.buf.clear();
-        (&mut self.inner)
-            .take(cap)
-            .read_until(b'\n', &mut self.buf)
-            .await
+        let mut limited = (&mut self.inner).take(cap);
+        let read = limited.read_until(b'\n', &mut self.buf);
+        tokio::time::timeout(SMTP_IDLE, read).await.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "SMTP client idle too long")
+        })?
     }
 
     fn piece_ends_line(&self) -> bool {
@@ -1054,6 +1079,20 @@ mod tests {
 
     fn reader(input: &[u8], command_cap: u64, data_cap: u64) -> SmtpReader<&[u8]> {
         SmtpReader::with_caps(input, command_cap, data_cap)
+    }
+
+    /// A client that stops sending, mid-command or mid-DATA, is dropped after SMTP_IDLE.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_client_times_out() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let mut r = SmtpReader::with_caps(tokio::io::BufReader::new(server), 64, 64);
+        client.write_all(b"NOOP").await.unwrap(); // no end of line, then silence
+        let err = r.read_command().await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        let mut d = DataBuf::new(1024);
+        let err = r.read_data(&mut d).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        drop(client);
     }
 
     #[tokio::test]
