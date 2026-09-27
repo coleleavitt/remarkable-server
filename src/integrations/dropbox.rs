@@ -1924,6 +1924,18 @@ mod tests {
             folder: &str,
             persist_state: bool,
         ) -> SyncResult {
+            let r = sync_unchecked(base, root, folder, persist_state).await;
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+            r
+        }
+
+        /// [`sync_with`], whether or not the result has errors.
+        async fn sync_unchecked(
+            base: &str,
+            root: &Path,
+            folder: &str,
+            persist_state: bool,
+        ) -> SyncResult {
             let config = OAuthConfig::dropbox("id".into(), None, "http://localhost/cb".into());
             let token = OAuthToken {
                 access_token: "t".into(),
@@ -1940,9 +1952,7 @@ mod tests {
                 persist_state,
                 ..Default::default()
             };
-            let r = CloudSync::new(dropbox, config).sync().await.unwrap();
-            assert!(r.errors.is_empty(), "{:?}", r.errors);
-            r
+            CloudSync::new(dropbox, config).sync().await.unwrap()
         }
 
         fn write(root: &Path, rel: &str, body: &str) {
@@ -2224,8 +2234,9 @@ mod tests {
             assert_eq!(uploads(&remote), vec!["/Notes/Sub/c.pdf"]);
 
             write(root, "Report.pdf", "R, edited here");
+            put(&mut remote.lock().unwrap(), "/Notes/sub/d.pdf", b"D");
             let r = sync_kept(&base, root, "/Notes").await;
-            assert_eq!((r.uploaded, r.downloaded, r.deleted), (1, 0, 0));
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (1, 1, 0));
             for _ in 0..2 {
                 let r = sync_kept(&base, root, "/Notes").await;
                 assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 0, 0));
@@ -2241,6 +2252,7 @@ mod tests {
                 std::fs::read(root.join("Sub/c.pdf")).unwrap(),
                 b"c, new here"
             );
+            assert_eq!(std::fs::read(root.join("Sub/d.pdf")).unwrap(), b"D");
             for gone in ["report.pdf", "sub", ".rms-remote-deleted"] {
                 assert!(!root.join(gone).exists(), "{gone}");
             }
@@ -2253,13 +2265,60 @@ mod tests {
                     "/notes/report.pdf",
                     "/notes/sub",
                     "/notes/sub/a.pdf",
-                    "/notes/sub/c.pdf"
+                    "/notes/sub/c.pdf",
+                    "/notes/sub/d.pdf"
                 ]
             );
             let (report, content) = &r.entries["/notes/report.pdf"];
             assert_eq!(report["path_display"], "/Notes/report.pdf");
             assert_eq!(content, b"R, edited here");
-            assert_eq!(r.downloads, 2);
+            assert_eq!(r.downloads, 3);
+        }
+
+        /// A file renamed here only in case, then a second local file spelled as Dropbox spells
+        /// it: that sync reports the clash and uploads the newcomer, the one spelled as listed,
+        /// over the Dropbox file. Once the newcomer is removed, the renamed file, whose content
+        /// Dropbox no longer has, is uploaded again: it is never taken for unchanged since the
+        /// sync before the clash and overwritten with the newcomer's content (review of #40,
+        /// verification round 2).
+        #[tokio::test]
+        async fn a_clash_settled_by_removing_the_newcomer_keeps_the_tracked_file() {
+            let remote = Shared::default();
+            put(&mut remote.lock().unwrap(), "/Notes/report.pdf", b"v1");
+            let base = fake(remote.clone()).await;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let in_dropbox = || {
+                remote.lock().unwrap().entries["/notes/report.pdf"]
+                    .1
+                    .clone()
+            };
+
+            let r = sync_kept(&base, root, "/Notes").await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 1, 0));
+            std::fs::rename(root.join("report.pdf"), root.join("Report.pdf")).unwrap();
+            let r = sync_kept(&base, root, "/Notes").await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 0, 0));
+
+            write(root, "report.pdf", "other");
+            let r = sync_unchecked(&base, root, "/Notes", true).await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (1, 0, 0));
+            assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+            assert!(
+                r.errors[0].contains("/Report.pdf and /report.pdf"),
+                "{:?}",
+                r.errors
+            );
+            assert_eq!(in_dropbox(), b"other");
+
+            std::fs::remove_file(root.join("report.pdf")).unwrap();
+            let r = sync_kept(&base, root, "/Notes").await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (1, 0, 0));
+            let r = sync_kept(&base, root, "/Notes").await;
+            assert_eq!((r.uploaded, r.downloaded, r.deleted), (0, 0, 0));
+            assert_eq!(std::fs::read(root.join("Report.pdf")).unwrap(), b"v1");
+            assert_eq!(in_dropbox(), b"v1");
+            assert_eq!(remote.lock().unwrap().downloads, 1);
         }
 
         /// A local name Dropbox listings skip (one starting with a letter and a colon, below the

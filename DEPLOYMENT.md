@@ -305,7 +305,11 @@ local files it left in place: check that the folder still exists and is shared w
 the account, and if its files really were deleted, delete the local copies. Dropbox
 and OneDrive paths ignore letter case: a sync that reports local files whose paths
 differ only in case syncs just the one spelled as the cloud folder lists it (if
-any) and leaves the others alone; rename them apart. A state file the server can't
+any) and leaves the others alone; rename them apart or remove the extras. The one
+left at the path is then compared with the cloud file as the last sync left it, so
+it is never overwritten with what that sync uploaded from another one (if the cloud
+file has also changed there since, the conflict strategy may decide, with a
+notice). A state file the server can't
 read (not JSON, or written by a newer version) fails the sync with an error naming
 it; delete it to start over with a first sync. Rolling back to
 an older binary is safe: it ignores both (hidden entries). Upgrading again after

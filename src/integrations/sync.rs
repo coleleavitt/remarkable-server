@@ -369,9 +369,18 @@ impl RemoteIdentity {
     /// otherwise the same id, size and modification time. Anything else counts as a change,
     /// which at worst transfers a file again.
     fn matches(&self, f: &CloudFile) -> bool {
-        match (&self.content_hash, &f.content_hash) {
-            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b) && self.size == f.size,
-            _ => self.id == f.id && self.size == f.size && self.modified_at == f.modified_at,
+        self.same(&Self::of(f))
+    }
+
+    /// Whether `other` is the same version of the file, as [`matches`](Self::matches) tells.
+    fn same(&self, other: &Self) -> bool {
+        match (&self.content_hash, &other.content_hash) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b) && self.size == other.size,
+            _ => {
+                self.id == other.id
+                    && self.size == other.size
+                    && self.modified_at == other.modified_at
+            }
         }
     }
 }
@@ -566,6 +575,17 @@ async fn quarantine(root: &Path, run: &str, path: &str, src: &Path) -> Result<Pa
     Ok(to.strip_prefix(&root).unwrap_or(&to).to_path_buf())
 }
 
+/// What [`match_case`] found, for the sync's result.
+#[derive(Debug, Default)]
+struct CaseMatch {
+    /// The local paths of each clash, for an error.
+    clashes: Vec<Vec<String>>,
+    /// Local files taken for changed on both sides because their entries, recorded under
+    /// several spellings, disagree on the version last synced (see [`case_base`]), for a
+    /// notice.
+    undecided: Vec<String>,
+}
+
 /// For a provider whose paths ignore letter case ([`CloudProvider::ignores_case`]), line the
 /// listing `cloud` and the last sync's manifest `base` up with the local tree, which tells
 /// case apart, so that a file spelled otherwise on one side is taken for the same file rather
@@ -576,21 +596,26 @@ async fn quarantine(root: &Path, run: &str, path: &str, src: &Path) -> Result<Pa
 ///
 /// Paths are grouped by their lowercase form: the local files (`local`, and those over the
 /// size limit, `local_too_large`), the listed files and the manifest entries. Where one local
-/// file has the path, the listed file and the entry (one of each at most) take its spelling;
-/// where no local file has it, the entry takes the listed file's spelling.
+/// file has the path, the listed file takes its spelling. Where none has it, the listed file
+/// keeps its own, but for the directories above it that the local tree spells otherwise
+/// ([`in_local_dirs`]): it comes down into those rather than into new ones beside them.
 ///
 /// Several local files with the path are a clash: the provider keeps one file for them all, so
 /// each upload would replace the others' content there. Only the one spelled as the listing
 /// spells the file, if any, is synced. Every other spelling in the group is left out of the
 /// sync (taken out of `local` and `cloud` and put in `out_of_view`, so its entry is kept as it
-/// was) until renamed. Returns the local paths of each clash, for an error.
+/// was) until renamed.
+///
+/// The file synced is compared with the one entry of its group that [`case_base`] picks, put
+/// under its spelling. Outside a clash, the group's other entries go: the file is recorded
+/// under one spelling from then on.
 fn match_case(
     local: &mut HashMap<String, LocalFile>,
     local_too_large: &[String],
     cloud: &mut HashMap<String, CloudFile>,
     mut base: Option<&mut SyncManifest>,
     out_of_view: &mut HashSet<String>,
-) -> Vec<Vec<String>> {
+) -> CaseMatch {
     #[derive(Default)]
     struct Spellings {
         local: BTreeSet<String>,
@@ -612,46 +637,183 @@ fn match_case(
     for path in base.iter().flat_map(|b| b.files.keys()) {
         group(&mut groups, path).recorded.insert(path.clone());
     }
+    let dirs = local_dirs(local.keys().chain(local_too_large));
 
-    let mut clashes = Vec::new();
+    let mut found = CaseMatch::default();
     for g in groups.into_values() {
-        let spellings: BTreeSet<&String> =
-            g.local.iter().chain(&g.cloud).chain(&g.recorded).collect();
-        if spellings.len() < 2 {
-            continue;
-        }
-        if g.local.len() > 1 || g.cloud.len() > 1 {
+        let clash = g.local.len() > 1 || g.cloud.len() > 1;
+        let spelling = if clash {
             let listed = match (g.cloud.first(), g.cloud.len()) {
                 (Some(c), 1) if g.local.contains(c) => Some(c),
                 _ => None,
             };
+            let spellings: BTreeSet<&String> =
+                g.local.iter().chain(&g.cloud).chain(&g.recorded).collect();
             for path in spellings.into_iter().filter(|p| Some(*p) != listed) {
                 local.remove(path);
                 cloud.remove(path);
                 out_of_view.insert(path.clone());
             }
-            clashes.push(g.local.union(&g.cloud).cloned().collect());
-            continue;
-        }
-        let Some(spelling) = g.local.first().or(g.cloud.first()) else {
+            found
+                .clashes
+                .push(g.local.union(&g.cloud).cloned().collect());
+            match listed {
+                Some(listed) => listed.clone(),
+                None => continue,
+            }
+        } else if let Some(here) = g.local.first() {
+            here.clone()
+        } else if let Some(listed) = g.cloud.first() {
+            in_local_dirs(listed, &dirs)
+        } else {
             continue;
         };
-        let listed = g.cloud.first().filter(|c| *c != spelling);
-        if let Some(mut f) = listed.and_then(|c| cloud.remove(c)) {
-            f.path = spelling.clone();
-            cloud.insert(spelling.clone(), f);
+
+        if let Some(listed) = g.cloud.first().filter(|c| **c != spelling) {
+            if let Some(mut f) = cloud.remove(listed) {
+                f.path = spelling.clone();
+                cloud.insert(spelling.clone(), f);
+            }
         }
-        let recorded = match (g.recorded.first(), g.recorded.len()) {
-            (Some(r), 1) if r != spelling => Some(r),
-            _ => None,
+        let Some(base) = base.as_deref_mut() else {
+            continue;
         };
-        if let (Some(base), Some(recorded)) = (base.as_deref_mut(), recorded) {
-            if let Some(entry) = base.files.remove(recorded) {
+        let listed = cloud.get(&spelling).filter(|f| !f.is_folder);
+        match case_base(&base.files, &g.recorded, &spelling, listed) {
+            CaseBase::Own => {}
+            CaseBase::Other(entry) => {
                 base.files.insert(spelling.clone(), entry);
+            }
+            CaseBase::Undecided(entry) => {
+                base.files.insert(spelling.clone(), entry);
+                if local.contains_key(&spelling) {
+                    found.undecided.push(spelling.clone());
+                }
+            }
+        }
+        if !clash {
+            for other in g.recorded.iter().filter(|r| **r != spelling) {
+                base.files.remove(other);
             }
         }
     }
-    clashes
+    found
+}
+
+/// Which entry [`case_base`] picks.
+#[derive(Debug)]
+enum CaseBase {
+    /// The one recorded under the spelling synced, if any.
+    Own,
+    /// One recorded under another spelling, to take its place.
+    Other(ManifestEntry),
+    /// None: the entries disagree. This one, to take its place, makes the file look changed on
+    /// both sides.
+    Undecided(ManifestEntry),
+}
+
+/// Which of the entries of a group of spellings that differ only in case (`recorded`, in
+/// `files`) the file synced as `spelling` is compared with, where the provider ignores case.
+/// `listed` is the file the listing has for the group.
+///
+/// Each entry tells what the one remote file was, and the local file spelled so, at the end of
+/// the last sync that dealt with that spelling. That can be an older version of the remote file
+/// than the last synced: a clash sync deals with the spelling listed only, and may upload its
+/// local file's content over the remote file, keeping the others' entries as they were.
+/// Compared with such an entry, a local file whose content the remote file no longer has
+/// would look unchanged since the last sync and the remote file changed, and be overwritten.
+///
+/// So where the remote file still matches an entry, that entry is taken (`spelling`'s own, if
+/// it is one of them): whatever the local file holds is then compared with what the remote file
+/// has. Where it matches none, the remote file changed since each: if they all recorded the
+/// same version of it, `spelling`'s own entry is taken (or else any); if not, which one is the
+/// last synced can't be told, and the file is taken for changed on both sides, so the conflict
+/// strategy decides ([`CaseBase::Undecided`]). Without a listed file nothing is written over
+/// the local file, and `spelling`'s own entry is taken (or else any).
+///
+/// An entry taken from another spelling describes another local file, or this one before a
+/// rename: it tells the file unchanged by its content only, never by its modification time.
+fn case_base(
+    files: &BTreeMap<String, ManifestEntry>,
+    recorded: &BTreeSet<String>,
+    spelling: &str,
+    listed: Option<&CloudFile>,
+) -> CaseBase {
+    let entries: Vec<(&String, &ManifestEntry)> = recorded
+        .iter()
+        .filter_map(|r| files.get(r).map(|e| (r, e)))
+        .collect();
+    let taken = |(r, e): (&String, &ManifestEntry)| {
+        if r == spelling {
+            return CaseBase::Own;
+        }
+        let mut e = e.clone();
+        if let Some(local) = e.local.as_mut() {
+            local.mtime_ns = None;
+        }
+        CaseBase::Other(e)
+    };
+    let Some(&first) = entries.first() else {
+        return CaseBase::Own;
+    };
+    let own = entries.iter().copied().find(|(r, _)| *r == spelling);
+    if let Some(listed) = listed {
+        let current: Vec<(&String, &ManifestEntry)> = entries
+            .iter()
+            .copied()
+            .filter(|(_, e)| e.remote.as_ref().is_some_and(|r| r.matches(listed)))
+            .collect();
+        let mine = current.iter().copied().find(|(r, _)| *r == spelling);
+        if let Some(entry) = mine.or(current.first().copied()) {
+            return taken(entry);
+        }
+        let same = |(_, e): &(&String, &ManifestEntry)| match (&e.remote, &first.1.remote) {
+            (Some(a), Some(b)) => a.same(b),
+            (a, b) => a.is_none() && b.is_none(),
+        };
+        if !entries.iter().all(same) {
+            return CaseBase::Undecided(ManifestEntry {
+                remote: first.1.remote.clone(),
+                local: None,
+            });
+        }
+    }
+    taken(own.unwrap_or(first))
+}
+
+/// The directories above the local files `paths`, by lowercase path, with the spellings the
+/// local tree has for each.
+fn local_dirs<'a>(paths: impl Iterator<Item = &'a String>) -> HashMap<String, BTreeSet<String>> {
+    let mut dirs: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for path in paths {
+        let mut dir = path.as_str();
+        while let Some(end) = dir.rfind('/').filter(|&end| end > 0) {
+            dir = &path[..end];
+            dirs.entry(dir.to_lowercase())
+                .or_default()
+                .insert(dir.to_string());
+        }
+    }
+    dirs
+}
+
+/// `path`, a listed file that no local file has under any spelling, with the directories above
+/// it spelled as the local tree spells them ([`local_dirs`]), so that it comes down into the
+/// local directory rather than into a new one, spelled as the remote folder, beside it. The
+/// deepest directory the local tree has decides; if the local tree has it under several
+/// spellings, `path` is left as listed.
+fn in_local_dirs(path: &str, dirs: &HashMap<String, BTreeSet<String>>) -> String {
+    let mut dir = path;
+    while let Some(end) = dir.rfind('/').filter(|&end| end > 0) {
+        dir = &path[..end];
+        if let Some(spellings) = dirs.get(&dir.to_lowercase()) {
+            if let (Some(here), 1) = (spellings.first(), spellings.len()) {
+                return format!("{}{}", here, &path[end..]);
+            }
+            break;
+        }
+    }
+    path.to_string()
 }
 
 /// Sync direction
@@ -850,9 +1012,13 @@ impl<P: CloudProvider> CloudSync<P> {
     /// With a provider that [ignores case](CloudProvider::ignores_case), a local path and a
     /// listed or recorded one that differ only in letter case are one file, kept under the
     /// local spelling (see [`match_case`]): a case-only rename here is neither a deletion nor
-    /// an upload of a new file, and a remote one changes nothing here. Local files that differ
-    /// only in case from each other are left alone, with an error, but for the one spelled as
-    /// listed.
+    /// an upload of a new file, and a remote one changes nothing here. A new remote file in a
+    /// folder spelled otherwise here comes down into the local directory. Local files that
+    /// differ only in case from each other are left alone, with an error, but for the one
+    /// spelled as listed. A file recorded under several such spellings is compared with the
+    /// record that still matches the remote file, so it is never taken for unchanged since an
+    /// older version of the remote file than the last synced; if none matches and they
+    /// disagree, it is taken for changed on both sides, with a notice (see [`case_base`]).
     ///
     /// The first full sync of a folder the provider kept elsewhere locally before #34 (see
     /// [`CloudProvider::legacy_layout_dir`]) moves that directory aside first; see
@@ -1170,7 +1336,7 @@ impl<P: CloudProvider> CloudSync<P> {
         // A provider that ignores case may list a file under another spelling than the local
         // one; before the size limit is applied, so that applies to the file whatever its
         // spelling on each side.
-        let case_clashes = match self.provider.ignores_case() {
+        let case = match self.provider.ignores_case() {
             true => match_case(
                 &mut local_files,
                 &local_too_large,
@@ -1178,7 +1344,7 @@ impl<P: CloudProvider> CloudSync<P> {
                 base.as_mut(),
                 &mut out_of_view,
             ),
-            false => Vec::new(),
+            false => CaseMatch::default(),
         };
 
         // A path whose file is too large on either side is left alone in both directions: a
@@ -1445,8 +1611,8 @@ impl<P: CloudProvider> CloudSync<P> {
                 some_of(&not_moved)
             ));
         }
-        if !case_clashes.is_empty() {
-            let shown: Vec<String> = case_clashes.iter().map(|c| c.join(" and ")).collect();
+        if !case.clashes.is_empty() {
+            let shown: Vec<String> = case.clashes.iter().map(|c| c.join(" and ")).collect();
             tracing::warn!(
                 "cloud sync: paths that differ only in letter case, left alone: {}",
                 shown.join("; ")
@@ -1457,6 +1623,16 @@ impl<P: CloudProvider> CloudSync<P> {
                  the cloud folder lists it, if any, is synced; the others are left alone (not \
                  uploaded, downloaded or moved aside) until renamed",
                 some_of(&shown)
+            ));
+        }
+        if !case.undecided.is_empty() {
+            result.notices.push(format!(
+                "{} recorded under spellings that differ only in letter case, whose records \
+                 disagree on the version last synced and none of which matches the cloud file \
+                 now: which side changed can't be told, so each was taken for changed on both \
+                 sides (the conflict strategy decides, unless the content is the same): {}",
+                count(case.undecided.len()),
+                some_of(&case.undecided)
             ));
         }
         if !kept_remotely.is_empty() {
@@ -4509,6 +4685,453 @@ mod tests {
             sync.provider.content("/report.pdf").as_deref(),
             Some("report")
         );
+    }
+
+    /// Where the provider ignores case: `/report.pdf` ("v1") synced down and renamed here to
+    /// `Report.pdf`, then a second local file spelled as listed, `report.pdf` ("other"). That
+    /// sync reports the clash and syncs only the file spelled as listed, uploading "other" over
+    /// the remote file `Report.pdf` was last synced with; `Report.pdf` is left alone, and its
+    /// entry, out of view, is kept as it was. The manifest now holds two entries for the one
+    /// remote file, and only the newer describes it. Returns the next sync.
+    async fn clashing_newcomer(root: &Path) -> CloudSync<Store> {
+        let store = Store {
+            hashed: true,
+            ignores_case: true,
+            ..Default::default()
+        };
+        store.put("/report.pdf", "v1");
+        let mut sync = CloudSync::new(store, kept(root, SyncDirection::Bidirectional));
+        assert_eq!(counts(&clean(&mut sync).await), (0, 1, 0));
+        std::fs::rename(root.join("report.pdf"), root.join("Report.pdf")).unwrap();
+        sync = again(sync);
+        assert_eq!(counts(&clean(&mut sync).await), (0, 0, 0));
+
+        write(root, "report.pdf", "other");
+        sync = again(sync);
+        let r = sync.sync().await.unwrap();
+        assert_eq!(counts(&r), (1, 0, 0));
+        assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+        assert!(
+            r.errors[0].contains("here they name different files: /Report.pdf and /report.pdf."),
+            "{:?}",
+            r.errors
+        );
+        assert_eq!(
+            sync.provider.content("/report.pdf").as_deref(),
+            Some("other")
+        );
+        assert_eq!(read(root, "Report.pdf"), "v1");
+        let recorded: Vec<&str> = sync
+            .state()
+            .manifest
+            .as_ref()
+            .unwrap()
+            .files
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(recorded, ["/Report.pdf", "/report.pdf"]);
+        again(sync)
+    }
+
+    /// A clash settled by removing the newcomer leaves the file whose content the remote file
+    /// no longer has. It is compared with the entry of the spelling synced last, which describes
+    /// the remote file as it is, and uploaded: never taken for unchanged since an older entry
+    /// and overwritten with the remote file (review of #40, verification round 2).
+    #[tokio::test]
+    async fn a_clash_settled_by_removing_the_newcomer_keeps_the_tracked_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut sync = clashing_newcomer(root).await;
+        std::fs::remove_file(root.join("report.pdf")).unwrap();
+        let r = clean(&mut sync).await;
+        assert_eq!(counts(&r), (1, 0, 0));
+        assert!(r.notices.is_empty(), "{:?}", r.notices);
+        assert_eq!(read(root, "Report.pdf"), "v1");
+        assert_eq!(sync.provider.content("/report.pdf").as_deref(), Some("v1"));
+        assert_eq!(sync.provider.uploads(), ["/report.pdf", "/Report.pdf"]);
+        for _ in 0..2 {
+            sync = again(sync);
+            assert_eq!(counts(&clean(&mut sync).await), (0, 0, 0));
+        }
+        assert_eq!(read(root, "Report.pdf"), "v1");
+        assert_eq!(sync.provider.downloads(), ["/report.pdf"]);
+        assert!(!root.join("report.pdf").exists());
+        assert!(quarantined(root).is_empty());
+    }
+
+    /// The other ways to settle the clash: removing the tracked file, or renaming either file
+    /// apart. Whichever file stays at the path keeps its content and ends up in the remote
+    /// file; one renamed apart is uploaded as its own.
+    #[tokio::test]
+    async fn a_clash_settled_otherwise_keeps_the_file_that_stays() {
+        // The tracked file removed: the newcomer is what the remote file has.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut sync = clashing_newcomer(root).await;
+        std::fs::remove_file(root.join("Report.pdf")).unwrap();
+        for _ in 0..2 {
+            let r = clean(&mut sync).await;
+            assert_eq!(counts(&r), (0, 0, 0));
+            assert!(r.notices.is_empty(), "{:?}", r.notices);
+            sync = again(sync);
+        }
+        assert_eq!(read(root, "report.pdf"), "other");
+        assert!(!root.join("Report.pdf").exists());
+        assert_eq!(
+            sync.provider.content("/report.pdf").as_deref(),
+            Some("other")
+        );
+        assert_eq!(sync.provider.downloads(), ["/report.pdf"]);
+
+        // The newcomer renamed apart: uploaded as its own file, and the tracked one over the
+        // remote file.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut sync = clashing_newcomer(root).await;
+        std::fs::rename(root.join("report.pdf"), root.join("report 2.pdf")).unwrap();
+        assert_eq!(counts(&clean(&mut sync).await), (2, 0, 0));
+        sync = again(sync);
+        assert_eq!(counts(&clean(&mut sync).await), (0, 0, 0));
+        assert_eq!(read(root, "Report.pdf"), "v1");
+        assert_eq!(sync.provider.content("/report.pdf").as_deref(), Some("v1"));
+        assert_eq!(
+            sync.provider.content("/report 2.pdf").as_deref(),
+            Some("other")
+        );
+
+        // The tracked file renamed apart: uploaded as its own file; the remote file already
+        // has the newcomer.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut sync = clashing_newcomer(root).await;
+        std::fs::rename(root.join("Report.pdf"), root.join("Report old.pdf")).unwrap();
+        assert_eq!(counts(&clean(&mut sync).await), (1, 0, 0));
+        sync = again(sync);
+        assert_eq!(counts(&clean(&mut sync).await), (0, 0, 0));
+        assert_eq!(read(root, "report.pdf"), "other");
+        assert_eq!(read(root, "Report old.pdf"), "v1");
+        assert_eq!(
+            sync.provider.content("/report.pdf").as_deref(),
+            Some("other")
+        );
+        assert_eq!(
+            sync.provider.content("/Report old.pdf").as_deref(),
+            Some("v1")
+        );
+
+        // The newcomer renamed only in case, so no local file is spelled as listed: nothing is
+        // synced and both entries are kept, until the newcomer goes.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut sync = clashing_newcomer(root).await;
+        std::fs::rename(root.join("report.pdf"), root.join("REPORT.pdf")).unwrap();
+        let r = sync.sync().await.unwrap();
+        assert_eq!(counts(&r), (0, 0, 0));
+        assert!(
+            r.errors[0].contains("/REPORT.pdf and /Report.pdf and /report.pdf."),
+            "{:?}",
+            r.errors
+        );
+        std::fs::remove_file(root.join("REPORT.pdf")).unwrap();
+        sync = again(sync);
+        assert_eq!(counts(&clean(&mut sync).await), (1, 0, 0));
+        assert_eq!(read(root, "Report.pdf"), "v1");
+        assert_eq!(sync.provider.content("/report.pdf").as_deref(), Some("v1"));
+    }
+
+    /// The remote file renamed there, only in case, during the clash, to the spelling of the
+    /// file whose entry is the older: that file is now the one spelled as listed, and synced.
+    /// It is compared with the entry of the upload that the remote file still is, and uploaded
+    /// over it, rather than taken for unchanged since its own entry and overwritten.
+    #[tokio::test]
+    async fn a_remote_case_rename_during_a_clash_keeps_the_file_listed_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut sync = clashing_newcomer(root).await;
+        {
+            let mut files = sync.provider.files.lock().unwrap();
+            let (file, content) = files.remove("/report.pdf").unwrap();
+            let path = "/Report.pdf".to_string();
+            files.insert(path.clone(), (CloudFile { path, ..file }, content));
+        }
+        let r = sync.sync().await.unwrap();
+        assert_eq!(counts(&r), (1, 0, 0));
+        assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+        assert_eq!(read(root, "Report.pdf"), "v1");
+        assert_eq!(read(root, "report.pdf"), "other");
+        assert_eq!(sync.provider.content("/Report.pdf").as_deref(), Some("v1"));
+
+        std::fs::remove_file(root.join("report.pdf")).unwrap();
+        for _ in 0..2 {
+            sync = again(sync);
+            assert_eq!(counts(&clean(&mut sync).await), (0, 0, 0));
+        }
+        assert_eq!(read(root, "Report.pdf"), "v1");
+        assert_eq!(sync.provider.downloads(), ["/report.pdf"]);
+    }
+
+    /// Both files edited during the clash: the one spelled as listed is uploaded, as any edit
+    /// is. Once the clash is settled, the other is compared with that upload, so only its side
+    /// changed, and it is uploaded too: neither edit is overwritten here. The conflict strategy,
+    /// which would take the remote file, is never asked.
+    #[tokio::test]
+    async fn a_clash_with_both_files_edited_keeps_both_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let sync = clashing_newcomer(root).await;
+        let mut sync = again_with(sync, |c| c.conflict_strategy = ConflictStrategy::CloudWins);
+        write(root, "Report.pdf", "v1, edited");
+        write(root, "report.pdf", "other, edited");
+        let r = sync.sync().await.unwrap();
+        assert_eq!(counts(&r), (1, 0, 0));
+        assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+        assert_eq!(
+            sync.provider.content("/report.pdf").as_deref(),
+            Some("other, edited")
+        );
+
+        std::fs::rename(root.join("report.pdf"), root.join("other.pdf")).unwrap();
+        sync = again(sync);
+        assert_eq!(counts(&clean(&mut sync).await), (2, 0, 0));
+        sync = again(sync);
+        assert_eq!(counts(&clean(&mut sync).await), (0, 0, 0));
+        assert_eq!(read(root, "Report.pdf"), "v1, edited");
+        assert_eq!(read(root, "other.pdf"), "other, edited");
+        assert_eq!(
+            sync.provider.content("/report.pdf").as_deref(),
+            Some("v1, edited")
+        );
+        assert_eq!(
+            sync.provider.content("/other.pdf").as_deref(),
+            Some("other, edited")
+        );
+        assert_eq!(sync.provider.downloads(), ["/report.pdf"]);
+    }
+
+    /// Settled while the remote file changed there too: the entries recorded under the two
+    /// spellings disagree on the version last synced and neither matches the remote file, so
+    /// which side changed can't be told. The file is taken for changed on both sides, and the
+    /// conflict strategy decides (with a notice), rather than the older entry making the local
+    /// file look unchanged and the remote one overwrite it.
+    #[tokio::test]
+    async fn a_clash_settled_while_the_remote_file_changed_is_a_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let sync = clashing_newcomer(root).await;
+        sync.provider.put("/report.pdf", "edited there");
+        std::fs::remove_file(root.join("report.pdf")).unwrap();
+        let mut sync = again_with(sync, |c| c.conflict_strategy = ConflictStrategy::AskUser);
+        let r = clean(&mut sync).await;
+        assert_eq!(counts(&r), (0, 0, 0));
+        assert_eq!(r.conflicts.len(), 1);
+        assert_eq!(r.conflicts[0].local_path, root.join("Report.pdf"));
+        assert!(
+            has_notice(
+                &r,
+                "1 file recorded under spellings that differ only in letter case"
+            ),
+            "{:?}",
+            r.notices
+        );
+        assert!(r.notices[0].ends_with(": /Report.pdf"), "{:?}", r.notices);
+
+        // Still a conflict until it is settled, without the notice.
+        let mut sync = again(sync);
+        let r = clean(&mut sync).await;
+        assert_eq!((counts(&r), r.conflicts.len()), ((0, 0, 0), 1));
+        assert!(r.notices.is_empty(), "{:?}", r.notices);
+        assert_eq!(read(root, "Report.pdf"), "v1");
+        assert_eq!(
+            sync.provider.content("/report.pdf").as_deref(),
+            Some("edited there")
+        );
+        assert_eq!(sync.provider.downloads(), ["/report.pdf"]);
+
+        // Settled by the strategy: the local file wins.
+        let mut sync = again_with(sync, |c| c.conflict_strategy = ConflictStrategy::LocalWins);
+        assert_eq!(counts(&clean(&mut sync).await), (1, 0, 0));
+        sync = again(sync);
+        assert_eq!(counts(&clean(&mut sync).await), (0, 0, 0));
+        assert_eq!(sync.provider.content("/report.pdf").as_deref(), Some("v1"));
+    }
+
+    /// Three local spellings of one path: `Report.pdf` (tracked), then `report.pdf` (spelled as
+    /// listed) and `REPORT.pdf`. The one spelled as listed is synced; once it goes, none is
+    /// until one more goes. Whichever stays then keeps its content and is uploaded.
+    #[tokio::test]
+    async fn three_spellings_of_one_path_keep_the_one_that_stays() {
+        for (removed, stays, content) in [
+            ("REPORT.pdf", "Report.pdf", "v1"),
+            ("Report.pdf", "REPORT.pdf", "three"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let store = Store {
+                hashed: true,
+                ignores_case: true,
+                ..Default::default()
+            };
+            store.put("/report.pdf", "v1");
+            let mut sync = CloudSync::new(store, kept(root, SyncDirection::Bidirectional));
+            assert_eq!(counts(&clean(&mut sync).await), (0, 1, 0));
+            std::fs::rename(root.join("report.pdf"), root.join("Report.pdf")).unwrap();
+            sync = again(sync);
+            assert_eq!(counts(&clean(&mut sync).await), (0, 0, 0));
+
+            write(root, "report.pdf", "two");
+            write(root, "REPORT.pdf", "three");
+            sync = again(sync);
+            let r = sync.sync().await.unwrap();
+            assert_eq!(counts(&r), (1, 0, 0));
+            assert!(
+                r.errors[0].contains("/REPORT.pdf and /Report.pdf and /report.pdf."),
+                "{:?}",
+                r.errors
+            );
+            assert_eq!(sync.provider.content("/report.pdf").as_deref(), Some("two"));
+
+            std::fs::remove_file(root.join("report.pdf")).unwrap();
+            sync = again(sync);
+            let r = sync.sync().await.unwrap();
+            assert_eq!(counts(&r), (0, 0, 0));
+            assert!(
+                r.errors[0].contains("/REPORT.pdf and /Report.pdf and /report.pdf."),
+                "{:?}",
+                r.errors
+            );
+
+            std::fs::remove_file(root.join(removed)).unwrap();
+            sync = again(sync);
+            let r = clean(&mut sync).await;
+            assert_eq!(counts(&r), (1, 0, 0), "{stays}");
+            assert!(r.notices.is_empty(), "{:?}", r.notices);
+            sync = again(sync);
+            assert_eq!(counts(&clean(&mut sync).await), (0, 0, 0), "{stays}");
+            assert_eq!(read(root, stays), content);
+            assert_eq!(
+                sync.provider.content("/report.pdf").as_deref(),
+                Some(content)
+            );
+            assert_eq!(sync.provider.downloads(), ["/report.pdf"]);
+        }
+    }
+
+    /// An entry taken over from another spelling tells the file unchanged by its content only,
+    /// not by its modification time: `report.pdf` deleted here and another `Report.pdf` of the
+    /// same size put in its place with the same time (as a copy that keeps times would) is a
+    /// change here. With the remote file changed too, it is a conflict, not overwritten.
+    #[tokio::test]
+    async fn an_entry_taken_from_another_spelling_goes_by_content_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = Store {
+            hashed: true,
+            ignores_case: true,
+            ..Default::default()
+        };
+        store.put("/report.pdf", "v1");
+        let mut sync = CloudSync::new(store, kept(root, SyncDirection::Bidirectional));
+        assert_eq!(counts(&clean(&mut sync).await), (0, 1, 0));
+        let synced_at = std::fs::metadata(root.join("report.pdf"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::fs::remove_file(root.join("report.pdf")).unwrap();
+        write(root, "Report.pdf", "v2");
+        std::fs::File::options()
+            .write(true)
+            .open(root.join("Report.pdf"))
+            .unwrap()
+            .set_modified(synced_at)
+            .unwrap();
+        sync.provider.put("/report.pdf", "edited there");
+
+        let mut sync = again_with(sync, |c| c.conflict_strategy = ConflictStrategy::AskUser);
+        let r = clean(&mut sync).await;
+        assert_eq!((counts(&r), r.conflicts.len()), ((0, 0, 0), 1));
+        assert_eq!(read(root, "Report.pdf"), "v2");
+        assert_eq!(sync.provider.downloads(), ["/report.pdf"]);
+    }
+
+    /// Where the provider ignores case, a remote file new since a directory above it was renamed
+    /// here only in case comes down into that directory, not into a new one spelled as the
+    /// remote folder beside it; then it syncs like the others there (review of #40,
+    /// verification round 2).
+    #[tokio::test]
+    async fn a_new_remote_file_comes_down_into_the_directory_spelled_otherwise_here() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = Store {
+            hashed: true,
+            ignores_case: true,
+            ..Default::default()
+        };
+        store.put("/sub/a.txt", "a");
+        let mut sync = CloudSync::new(store, kept(root, SyncDirection::Bidirectional));
+        assert_eq!(counts(&clean(&mut sync).await), (0, 1, 0));
+        std::fs::rename(root.join("sub"), root.join("Sub")).unwrap();
+        sync = again(sync);
+        assert_eq!(counts(&clean(&mut sync).await), (0, 0, 0));
+
+        sync.provider.put("/sub/b.txt", "b");
+        sync.provider.put("/sub/new/c.txt", "c");
+        sync = again(sync);
+        assert_eq!(counts(&clean(&mut sync).await), (0, 2, 0));
+        sync = again(sync);
+        assert_eq!(counts(&clean(&mut sync).await), (0, 0, 0));
+        assert_eq!(read(root, "Sub/b.txt"), "b");
+        assert_eq!(read(root, "Sub/new/c.txt"), "c");
+
+        sync.provider.put("/sub/b.txt", "b, edited there");
+        write(root, "Sub/new/c.txt", "c, edited here");
+        sync = again(sync);
+        assert_eq!(counts(&clean(&mut sync).await), (1, 1, 0));
+        sync = again(sync);
+        assert_eq!(counts(&clean(&mut sync).await), (0, 0, 0));
+        assert_eq!(read(root, "Sub/b.txt"), "b, edited there");
+        assert_eq!(
+            sync.provider.content("/sub/new/c.txt").as_deref(),
+            Some("c, edited here")
+        );
+        let mut top: Vec<String> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.starts_with('.'))
+            .collect();
+        top.sort();
+        assert_eq!(top, ["Sub"]);
+        assert!(quarantined(root).is_empty());
+    }
+
+    /// A listed file that no local file has comes down into the deepest directory above it that
+    /// the local tree has, spelled as the local tree spells it, unless the local tree has that
+    /// directory under several spellings.
+    #[test]
+    fn listed_files_go_into_local_directories_spelled_otherwise() {
+        let local = [
+            "/Sub/a.txt",
+            "/Sub/Deeper/x.txt",
+            "/Two/a.txt",
+            "/two/b.txt",
+            "/Two/Three/c.txt",
+            "/top.txt",
+        ]
+        .map(String::from);
+        let dirs = local_dirs(local.iter());
+        for (listed, lands) in [
+            ("/sub/b.txt", "/Sub/b.txt"),
+            ("/SUB/deeper/c.txt", "/Sub/Deeper/c.txt"),
+            ("/sub/new/c.txt", "/Sub/new/c.txt"),
+            ("/two/c.txt", "/two/c.txt"),
+            ("/TWO/c.txt", "/TWO/c.txt"),
+            ("/two/three/d.txt", "/Two/Three/d.txt"),
+            ("/TOP.txt/x.txt", "/TOP.txt/x.txt"),
+            ("/other/x.txt", "/other/x.txt"),
+            ("/x.txt", "/x.txt"),
+        ] {
+            assert_eq!(in_local_dirs(listed, &dirs), lands, "{listed}");
+        }
     }
 
     /// Only paths a provider listing can return are tracked (see [`listable`]); a file uploaded
