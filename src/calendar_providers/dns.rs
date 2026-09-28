@@ -11,8 +11,8 @@
 //! IP literals are not looked up; [`super::caldav`] refuses internal ones for other hosts
 //! before sending anything.
 //!
-//! The feed reader resolves through it too (`crate::feeds`), trusting no host but the proxies:
-//! feed and article URLs come from users and from the feeds themselves.
+//! The feed reader resolves through it too (`crate::feeds`), trusting no host and using no
+//! proxy: feed and article URLs come from users and from the feeds themselves.
 
 use std::future::Future;
 use std::io;
@@ -95,7 +95,7 @@ fn normalize(host: &str) -> String {
 /// Hosts of the proxies reqwest takes from the environment (`ALL_PROXY`, `HTTP_PROXY`,
 /// `HTTPS_PROXY`, either case). With a proxy, reqwest only resolves the proxy's name, and the
 /// proxy reaches the servers.
-pub(crate) fn proxy_hosts(var: impl Fn(&str) -> Option<String>) -> Vec<String> {
+pub(super) fn proxy_hosts(var: impl Fn(&str) -> Option<String>) -> Vec<String> {
     [
         "ALL_PROXY",
         "all_proxy",

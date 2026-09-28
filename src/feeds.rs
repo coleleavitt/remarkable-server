@@ -1494,7 +1494,10 @@ const MAX_FETCH_REDIRECTS: usize = 10;
 /// [`dns::GuardedResolver`](crate::calendar_providers::dns::GuardedResolver), which drops
 /// internal addresses (also after a redirect, and against DNS rebinding: the connection only
 /// uses the addresses it vetted), and every redirect hop is checked like the first URL
-/// ([`check_fetch_url`]), since IP literals are never resolved.
+/// ([`check_fetch_url`]), since IP literals are never resolved. No proxy is used: through
+/// one, reqwest resolves only the proxy's name and the proxy would reach the feed's host
+/// unchecked (and `NO_PROXY` would let a trusted proxy host be reached directly), so the
+/// environment's `HTTP(S)_PROXY`/`ALL_PROXY` do not apply to feeds.
 fn feed_http_client(allow_internal: bool) -> Result<reqwest::Client> {
     use crate::calendar_providers::dns;
 
@@ -1510,11 +1513,11 @@ fn feed_http_client(allow_internal: bool) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .user_agent("remarkable-server/0.1 (RSS Reader)")
         .timeout(Duration::from_secs(30))
-        .redirect(redirects);
+        .redirect(redirects)
+        .no_proxy();
     if !allow_internal {
-        let proxies = dns::proxy_hosts(|name| std::env::var(name).ok());
         builder = builder.dns_resolver(Arc::new(dns::GuardedResolver::new(
-            proxies.iter().map(String::as_str),
+            [],
             Arc::new(dns::SystemLookup),
         )));
     }
