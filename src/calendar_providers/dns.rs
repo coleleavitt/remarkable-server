@@ -92,31 +92,6 @@ fn normalize(host: &str) -> String {
     host.trim_end_matches('.').to_ascii_lowercase()
 }
 
-/// Hosts of the proxies reqwest takes from the environment (`ALL_PROXY`, `HTTP_PROXY`,
-/// `HTTPS_PROXY`, either case). With a proxy, reqwest only resolves the proxy's name, and the
-/// proxy reaches the servers.
-pub(super) fn proxy_hosts(var: impl Fn(&str) -> Option<String>) -> Vec<String> {
-    [
-        "ALL_PROXY",
-        "all_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-    ]
-    .into_iter()
-    .filter_map(|name| var(name))
-    .filter_map(|value| {
-        let value = value.trim();
-        let url = reqwest::Url::parse(value)
-            .ok()
-            .filter(|u| u.has_host())
-            .or_else(|| reqwest::Url::parse(&format!("http://{}", value)).ok())?;
-        url.host_str().map(normalize)
-    })
-    .collect()
-}
-
 /// Resolves through `lookup`, keeping only public addresses for hosts not in `trusted`.
 pub(crate) struct GuardedResolver {
     trusted: Vec<String>,
@@ -124,7 +99,7 @@ pub(crate) struct GuardedResolver {
 }
 
 impl GuardedResolver {
-    /// `trusted`: the configured host (and the proxies), whose addresses are not filtered.
+    /// `trusted`: the configured host, whose addresses are not filtered.
     pub(crate) fn new<'a>(
         trusted: impl IntoIterator<Item = &'a str>,
         lookup: Arc<dyn Lookup>,
@@ -290,17 +265,5 @@ pub(super) mod tests {
         ] {
             assert!(!is_internal_ip(ip.parse().unwrap()), "{}", ip);
         }
-    }
-
-    #[test]
-    fn proxy_hosts_come_from_the_environment_variables() {
-        let env: HashMap<&str, &str> = HashMap::from([
-            ("HTTPS_PROXY", "http://user:pw@Proxy.corp:3128"),
-            ("http_proxy", "squid.lan:8080"),
-            ("NO_PROXY", "ignored.example"),
-        ]);
-        let hosts = proxy_hosts(|name| env.get(name).map(|v| v.to_string()));
-        assert_eq!(hosts, ["squid.lan", "proxy.corp"]);
-        assert!(proxy_hosts(|_| None).is_empty());
     }
 }
