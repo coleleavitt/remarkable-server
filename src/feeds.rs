@@ -208,6 +208,9 @@ pub struct FeedManager {
     storage: Storage,
     epub_dir: PathBuf,
     http_client: reqwest::Client,
+    /// Whether fetches may reach internal addresses: never in production (see
+    /// [`feed_http_client`]); tests serve pages from 127.0.0.1.
+    allow_internal: bool,
     /// Article extraction requests allowed to fetch or hold a page at once.
     fetch_slots: Arc<Semaphore>,
     /// Article extractions allowed to run at once (see `run_blocking_in_slot`).
@@ -229,20 +232,33 @@ impl FeedManager {
 
         std::fs::create_dir_all(epub_dir).map_err(|e| ServerError::Storage(e))?;
 
-        let http_client = reqwest::Client::builder()
-            .user_agent("remarkable-server/0.1 (RSS Reader)")
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| ServerError::Internal(e.to_string()))?;
-
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
             storage,
             epub_dir: epub_dir.to_path_buf(),
-            http_client,
+            http_client: feed_http_client(false)?,
+            allow_internal: false,
             fetch_slots: Arc::new(Semaphore::new(FETCHES_AT_ONCE)),
             extract_slots: Arc::new(Semaphore::new(EXTRACTIONS_AT_ONCE)),
         })
+    }
+
+    /// A manager whose fetches may reach internal addresses, for tests that serve pages from
+    /// 127.0.0.1.
+    #[cfg(test)]
+    fn reaching_internal_hosts(mut self) -> Self {
+        self.http_client = feed_http_client(true).unwrap();
+        self.allow_internal = true;
+        self
+    }
+
+    /// A GET of a URL a user or a feed supplied, refused before anything is sent when it is
+    /// not http(s) or names an internal IP address (see [`check_fetch_url`]).
+    fn get(&self, url: &str) -> Result<reqwest::RequestBuilder> {
+        let parsed = Url::parse(url)
+            .map_err(|e| ServerError::BadRequest(format!("invalid URL {url:?}: {e}")))?;
+        check_fetch_url(&parsed, self.allow_internal).map_err(ServerError::BadRequest)?;
+        Ok(self.http_client.get(parsed))
     }
 
     fn init_db(conn: &Connection) -> Result<()> {
@@ -471,8 +487,7 @@ impl FeedManager {
     /// Detect feed type from URL
     async fn detect_feed(&self, url: &str) -> Result<(FeedType, String)> {
         let response = self
-            .http_client
-            .get(url)
+            .get(url)?
             .send()
             .await
             .map_err(|e| ServerError::Internal(format!("Failed to fetch feed: {}", e)))?;
@@ -532,8 +547,7 @@ impl FeedManager {
     /// Fetch and parse a feed
     async fn fetch_feed(&self, subscription: &Subscription) -> Result<Vec<Article>> {
         let response = self
-            .http_client
-            .get(&subscription.url)
+            .get(&subscription.url)?
             .send()
             .await
             .map_err(|e| ServerError::Internal(format!("Failed to fetch feed: {}", e)))?;
@@ -622,8 +636,7 @@ impl FeedManager {
             .await
             .map_err(|e| ServerError::Internal(format!("Failed to fetch article: {e}")))?;
         let response = self
-            .http_client
-            .get(url)
+            .get(url)?
             .send()
             .await
             .map_err(|e| ServerError::Internal(format!("Failed to fetch article: {}", e)))?;
@@ -1470,6 +1483,70 @@ const EXTRACTIONS_AT_ONCE: usize = 1;
 /// Extraction requests that fetch or hold a page at once, each up to `ARTICLE_LIMITS.bytes`
 /// (plus the one extraction a dropped request may leave running). Others wait before fetching.
 const FETCHES_AT_ONCE: usize = 4;
+
+/// Redirects a feed or article fetch follows (feeds move, and http:// often redirects to
+/// https://), as reqwest's default.
+const MAX_FETCH_REDIRECTS: usize = 10;
+
+/// The client for feed and article fetches. Their URLs come from users (subscriptions,
+/// `POST /feeds/v1/extract`) and from feeds themselves (entry links), so none may reach this
+/// host's own services or its network: names resolve through
+/// [`dns::GuardedResolver`](crate::calendar_providers::dns::GuardedResolver), which drops
+/// internal addresses (also after a redirect, and against DNS rebinding: the connection only
+/// uses the addresses it vetted), and every redirect hop is checked like the first URL
+/// ([`check_fetch_url`]), since IP literals are never resolved.
+fn feed_http_client(allow_internal: bool) -> Result<reqwest::Client> {
+    use crate::calendar_providers::dns;
+
+    let redirects = reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= MAX_FETCH_REDIRECTS {
+            return attempt.error("too many redirects");
+        }
+        match check_fetch_url(attempt.url(), allow_internal) {
+            Ok(()) => attempt.follow(),
+            Err(reason) => attempt.error(reason),
+        }
+    });
+    let mut builder = reqwest::Client::builder()
+        .user_agent("remarkable-server/0.1 (RSS Reader)")
+        .timeout(Duration::from_secs(30))
+        .redirect(redirects);
+    if !allow_internal {
+        let proxies = dns::proxy_hosts(|name| std::env::var(name).ok());
+        builder = builder.dns_resolver(Arc::new(dns::GuardedResolver::new(
+            proxies.iter().map(String::as_str),
+            Arc::new(dns::SystemLookup),
+        )));
+    }
+    builder
+        .build()
+        .map_err(|e| ServerError::Internal(e.to_string()))
+}
+
+/// What the resolver cannot vet: a scheme other than http(s), and an internal IP literal
+/// (`http://127.0.0.1/`, `http://[::1]/`, `http://169.254.169.254/`).
+fn check_fetch_url(url: &Url, allow_internal: bool) -> std::result::Result<(), String> {
+    use crate::calendar_providers::dns::is_internal_ip;
+
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!("refusing to fetch {url}: only http and https URLs"));
+    }
+    let Some(host) = url.host_str() else {
+        return Err(format!("refusing to fetch {url}: no host"));
+    };
+    // An IPv6 host is written in brackets; a domain never parses as an address.
+    let internal = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(is_internal_ip);
+    if internal && !allow_internal {
+        return Err(format!(
+            "refusing to fetch {url}: it names an internal address"
+        ));
+    }
+    Ok(())
+}
 
 /// The limit a page went over, so that it did not go to dom_smoothie.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3563,7 +3640,8 @@ today. The last evening sailing moves from 11:15 p.m. to 10:30 p.m.</p>
             storage,
             &tmp.path().join("epub"),
         )
-        .unwrap();
+        .unwrap()
+        .reaching_internal_hosts();
         let a = manager
             .extract_article(&format!("{origin}/deep"))
             .await
@@ -3620,7 +3698,8 @@ today. The last evening sailing moves from 11:15 p.m. to 10:30 p.m.</p>
             storage,
             &tmp.path().join("epub"),
         )
-        .unwrap();
+        .unwrap()
+        .reaching_internal_hosts();
         let a = manager
             .extract_article(&format!("{origin}/s/ferry"))
             .await
@@ -3635,6 +3714,63 @@ today. The last evening sailing moves from 11:15 p.m. to 10:30 p.m.</p>
         );
         assert!(!a.content_html.contains("/s/"), "{}", a.content_html);
     }
+    /// Feed and article URLs come from users and from feeds: a fetch must not reach this host
+    /// or its network, whether named by an IP literal (checked before sending) or by a name
+    /// that resolves to one (dropped by the guarded resolver), and only http(s) is fetched.
+    #[tokio::test]
+    async fn feed_fetches_refuse_internal_addresses() {
+        use axum::routing::get;
+
+        let app = axum::Router::new().route("/secret", get(|| async { "internal only" }));
+        let origin = crate::readlater::test_support::spawn_server(app).await;
+        let port = reqwest::Url::parse(&origin).unwrap().port().unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(tmp.path().join("storage")).unwrap();
+        let manager = FeedManager::new(
+            &tmp.path().join("feeds.db"),
+            storage,
+            &tmp.path().join("epub"),
+        )
+        .unwrap();
+        for url in [
+            format!("{origin}/secret"),
+            format!("http://localhost:{port}/secret"),
+            format!("http://[::ffff:127.0.0.1]:{port}/secret"),
+            "file:///etc/passwd".to_string(),
+        ] {
+            let err = manager.extract_article(&url).await.unwrap_err();
+            assert!(!err.to_string().contains("internal only"), "{url}: {err}");
+        }
+        let subscription = Subscription {
+            id: "s".into(),
+            name: "s".into(),
+            url: format!("{origin}/secret"),
+            feed_type: FeedType::Rss,
+            folder: String::new(),
+            enabled: true,
+            fetch_interval_mins: 60,
+            last_fetch: None,
+            last_error: None,
+            article_count: 0,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert!(manager.fetch_feed(&subscription).await.is_err());
+
+        for (url, ok) in [
+            ("http://169.254.169.254/latest/meta-data/", false),
+            ("http://[::1]/", false),
+            ("http://10.0.0.8:8080/admin", false),
+            ("gopher://example.com/", false),
+            ("https://example.com/feed.xml", true),
+            ("http://93.184.216.34/", true),
+        ] {
+            let parsed = reqwest::Url::parse(url).unwrap();
+            assert_eq!(check_fetch_url(&parsed, false).is_ok(), ok, "{url}");
+        }
+    }
+
     /// Long realistic pages, built in code rather than kept as megabytes of fixture files.
     mod fixtures {
         /// Deterministic filler text: `n` words cycled from a fixed list, with a comma now and then

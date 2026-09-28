@@ -15,7 +15,7 @@ Test fixtures that look like credentials must be built at runtime (GitGuardian s
 ## Untrusted input
 Feeds/HTML, email, CalDAV/ICS, provider APIs, uploads, crash reports: bound bytes, element counts,
 nesting, CPU time, and concurrency; stream large bodies to disk (`src/upload.rs`); guard SSRF for
-user-supplied URLs (see `calendar_providers/dns.rs`); path-safety helpers for anything touching the
+user-supplied URLs (see `calendar_providers/dns.rs`; the feed reader resolves through it too); path-safety helpers for anything touching the
 filesystem (`integrations/sync.rs` `safe_components`, `create_dirs_within`).
 
 ## Listeners open to the internet
@@ -26,6 +26,8 @@ is buffered, a cap on concurrent connections, and an accept loop that survives `
 Subprocesses on untrusted input (`pdftotext`, recognisers): a deadline and an output cap
 (`search::run_bounded`), off the async workers. Secrets: compare with `api::token_matches`;
 never put a long-lived secret in a cookie (derive a purpose-bound MAC instead).
+Sweep for these with `codegraph analyze rules --builtin` (its `rust-server` rules came from
+this audit); mark a deliberate exception where it is: `// codegraph: ignore <rule-id>` and why.
 
 ## Supply chain
 `Cargo.lock` is committed; keep lock diffs minimal; run `cargo audit`. Prefer crates already in the

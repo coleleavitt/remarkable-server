@@ -96,10 +96,13 @@ async fn main() {
 
 async fn relay(listener: TcpListener, acceptor: TlsAcceptor, connector: TlsConnector, sni: ServerName<'static>, upstream: String) {
     loop {
+        // On the tablet, for xochitl's own connections to 127.0.0.1; no cap needed.
+        // codegraph: ignore rust-unbounded-accept-spawn
         let (sock, peer) = match listener.accept().await { Ok(x) => x, Err(e) => { eprintln!("accept: {e}"); tokio::time::sleep(Duration::from_millis(200)).await; continue } };
         let (acceptor, connector, sni, upstream) = (acceptor.clone(), connector.clone(), sni.clone(), upstream.clone());
         tokio::spawn(async move {
             let _ = sock.set_nodelay(true);
+            // codegraph: ignore rust-unbounded-accept-spawn
             let mut down = match tokio::time::timeout(Duration::from_secs(15), acceptor.accept(sock)).await {
                 Ok(Ok(s)) => s, Ok(Err(e)) => { eprintln!("{peer}: local TLS: {e}"); return } Err(_) => return,
             };
