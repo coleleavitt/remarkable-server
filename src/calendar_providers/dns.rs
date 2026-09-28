@@ -10,6 +10,9 @@
 //!
 //! IP literals are not looked up; [`super::caldav`] refuses internal ones for other hosts
 //! before sending anything.
+//!
+//! The feed reader resolves through it too (`crate::feeds`), trusting no host and using no
+//! proxy: feed and article URLs come from users and from the feeds themselves.
 
 use std::future::Future;
 use std::io;
@@ -45,7 +48,7 @@ impl Lookup for SystemLookup {
 /// Whether `ip` is not a public unicast address: loopback, private, link-local, CGNAT,
 /// unspecified, multicast and reserved ranges, and IPv6 forms that embed such an IPv4
 /// address.
-pub(super) fn is_internal_ip(ip: IpAddr) -> bool {
+pub(crate) fn is_internal_ip(ip: IpAddr) -> bool {
     fn v4(ip: Ipv4Addr) -> bool {
         let [a, b, ..] = ip.octets();
         ip.is_loopback()
@@ -115,14 +118,14 @@ pub(super) fn proxy_hosts(var: impl Fn(&str) -> Option<String>) -> Vec<String> {
 }
 
 /// Resolves through `lookup`, keeping only public addresses for hosts not in `trusted`.
-pub(super) struct GuardedResolver {
+pub(crate) struct GuardedResolver {
     trusted: Vec<String>,
     lookup: Arc<dyn Lookup>,
 }
 
 impl GuardedResolver {
     /// `trusted`: the configured host (and the proxies), whose addresses are not filtered.
-    pub(super) fn new<'a>(
+    pub(crate) fn new<'a>(
         trusted: impl IntoIterator<Item = &'a str>,
         lookup: Arc<dyn Lookup>,
     ) -> Self {

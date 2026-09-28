@@ -13,7 +13,7 @@
 //! the same trust level as ICS file paths.
 
 mod caldav;
-mod dns;
+pub(crate) mod dns;
 mod google;
 mod graph;
 mod oauth;

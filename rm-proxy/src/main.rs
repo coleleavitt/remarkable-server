@@ -94,11 +94,18 @@ async fn main() {
     for t in tasks { let _ = t.await; }
 }
 
+/// Relays one route runs at once. xochitl opens a handful; a route may be bound to any address
+/// (`--route`), so a flood of connections is turned away instead of taking every socket.
+const MAX_RELAYS: usize = 256;
+
 async fn relay(listener: TcpListener, acceptor: TlsAcceptor, connector: TlsConnector, sni: ServerName<'static>, upstream: String) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_RELAYS));
     loop {
         let (sock, peer) = match listener.accept().await { Ok(x) => x, Err(e) => { eprintln!("accept: {e}"); tokio::time::sleep(Duration::from_millis(200)).await; continue } };
+        let Ok(slot) = slots.clone().try_acquire_owned() else { eprintln!("{peer}: {MAX_RELAYS} relays open; closing"); continue };
         let (acceptor, connector, sni, upstream) = (acceptor.clone(), connector.clone(), sni.clone(), upstream.clone());
         tokio::spawn(async move {
+            let _slot = slot;
             let _ = sock.set_nodelay(true);
             let mut down = match tokio::time::timeout(Duration::from_secs(15), acceptor.accept(sock)).await {
                 Ok(Ok(s)) => s, Ok(Err(e)) => { eprintln!("{peer}: local TLS: {e}"); return } Err(_) => return,

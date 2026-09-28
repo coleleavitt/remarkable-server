@@ -124,6 +124,9 @@ pub(crate) const HTTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration
 
 /// HTTP client shared by all providers and the OAuth token/revoke calls.
 pub(crate) fn http_client() -> reqwest::Client {
+    // Follows redirects on purpose: the hosts are the fixed provider APIs, whose downloads
+    // redirect to their content hosts (reqwest drops `Authorization` on a cross-host hop).
+    // codegraph: ignore rust-http-client-follows-redirects
     reqwest::Client::builder()
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .timeout(HTTP_REQUEST_TIMEOUT)

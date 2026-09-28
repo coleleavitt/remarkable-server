@@ -386,9 +386,10 @@ pub async fn revoke_token(
     Ok(true)
 }
 
-/// Validate state parameter matches
+/// Validate state parameter matches. Compared in constant time: the state is the CSRF
+/// secret of the flow, and `!=` returns at the first differing byte.
 pub fn validate_state(expected: &str, received: &str) -> Result<()> {
-    if expected != received {
+    if !crate::api::token_matches(received, expected) {
         return Err(IntegrationError::OAuth(
             "State parameter mismatch - possible CSRF attack".into(),
         ));
