@@ -132,14 +132,19 @@ fn client_builder() -> reqwest::ClientBuilder {
 }
 
 /// A client for one CalDAV account configured at `configured_host`. Its names resolve
-/// through [`dns::GuardedResolver`]: only the configured host (and the proxies from the
-/// environment) may reach internal addresses, so a server cannot point this process at
-/// internal services by redirecting it to a name that resolves to one.
+/// through [`dns::GuardedResolver`]: only the configured host may reach internal addresses,
+/// so a server cannot point this process at internal services by redirecting it to a name
+/// that resolves to one. No proxy is used: through one, reqwest resolves only the proxy's
+/// name and the proxy would connect to a redirect's host unchecked (and `NO_PROXY` could
+/// send a trusted proxy host a direct connection), so `HTTP(S)_PROXY`/`ALL_PROXY` do not
+/// apply to CalDAV.
 fn caldav_client(configured_host: &str, lookup: Arc<dyn dns::Lookup>) -> Result<reqwest::Client> {
-    let proxies = dns::proxy_hosts(|name| std::env::var(name).ok());
-    let trusted = std::iter::once(configured_host).chain(proxies.iter().map(String::as_str));
     client_builder()
-        .dns_resolver(Arc::new(dns::GuardedResolver::new(trusted, lookup)))
+        .no_proxy()
+        .dns_resolver(Arc::new(dns::GuardedResolver::new(
+            [configured_host],
+            lookup,
+        )))
         .build()
         .map_err(|e| CalendarError::Backend(format!("caldav: cannot set up HTTP client: {}", e)))
 }
